@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 import shutil
+import socket
 import subprocess  # nosec B404
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
@@ -200,6 +201,14 @@ def _parsed_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | Non
     try:
         return ipaddress.ip_address(host)
     except ValueError:
+        pass
+
+    # Some system resolvers accept historical IPv4 spellings such as 127.1,
+    # one-part integers, octal, or hexadecimal. Normalize those numeric forms
+    # without resolving ordinary DNS names so loopback checks cannot be bypassed.
+    try:
+        return ipaddress.ip_address(socket.inet_aton(host))
+    except OSError:
         return None
 
 

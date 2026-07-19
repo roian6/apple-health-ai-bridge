@@ -275,6 +275,11 @@ def test_setup_page_contains_custom_scheme_qr_and_manual_code(
     "loopback_url",
     [
         "http://127.0.0.1:8765/v1/batches",
+        "https://127.1/v1/batches",
+        "https://127.0.1/v1/batches",
+        "https://2130706433/v1/batches",
+        "https://0x7f000001/v1/batches",
+        "https://0177.0.0.1/v1/batches",
         "https://receiver.localhost/v1/batches",
         "https://deep.receiver.localhost.localdomain/v1/batches",
     ],
