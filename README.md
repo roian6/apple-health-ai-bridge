@@ -133,6 +133,9 @@ TestFlight is the normal iPhone installation path. Contributors and advanced use
 - [Batch contract](docs/reference/batch-v1.md)
 - [SQLite schema](docs/reference/sqlite-v1.md)
 - [Build the iOS app](docs/self-build.md)
+- [Contribution ideas](docs/contribution-ideas.md)
+- [Support routes](SUPPORT.md)
+- [Maintainer workflow](docs/maintainer-guide.md)
 
 ## Development
 

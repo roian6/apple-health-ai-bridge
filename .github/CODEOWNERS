@@ -1,0 +1,8 @@
+# Routing ownership only. Required code-owner review remains disabled while the project has one maintainer.
+
+* @roian6
+/ios/ @roian6
+/src/ @roian6
+/docs/ @roian6
+/.github/ @roian6
+/scripts/ @roian6

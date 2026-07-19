@@ -172,7 +172,7 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     # Given
     readme = Path("README.md").read_text()
     security = Path("SECURITY.md").read_text()
-    setup_template = Path(".github/ISSUE_TEMPLATE/setup_feedback.md").read_text()
+    setup_template = Path(".github/ISSUE_TEMPLATE/setup_feedback.yml").read_text()
     issue_config = Path(".github/ISSUE_TEMPLATE/config.yml")
 
     # Then
@@ -189,7 +189,7 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
         in security
     )
     assert "healthbridge@chanhyo.dev" in security
-    assert "labels: question" in setup_template
+    assert 'labels: ["question"]' in setup_template
     assert issue_config.is_file()
     config_text = issue_config.read_text()
     assert "blank_issues_enabled: false" in config_text
