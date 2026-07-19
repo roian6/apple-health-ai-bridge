@@ -28,36 +28,36 @@ uv run health-bridge status --db .tmp/quickstart.sqlite --markdown
 uv run health-bridge mcp smoke --db .tmp/quickstart.sqlite
 ```
 
-## 2. Start the receiver and keep it running
+## 2. Prepare the route and start the receiver
 
-Use one terminal for the long-running receiver process:
+Follow [the receiver route guide](setup.md#what-the-receiver-url-means) before generating pairing material. Existing Tailscale users can use Route A; other installers should follow the provider-neutral private-ingress checklist in Route B. Direct LAN is an explicit local-only fallback, not the continuous-sync default.
+
+For a private HTTPS proxy or tunnel, keep the receiver on loopback. Use one terminal for the long-running process:
 
 ```bash
 uv run health-bridge init --db .tmp/device.sqlite
-uv run health-bridge receiver start --db .tmp/device.sqlite --host 0.0.0.0 --port 8765
+uv run health-bridge receiver start --db .tmp/device.sqlite --host 127.0.0.1 --port 8765
 ```
 
-Use a private-network hostname or IP for the iPhone-facing URL. Do **not** use `127.0.0.1` in iPhone setup material because that points to the iPhone itself, not your receiver machine.
-
-In a second terminal, verify the exact phone-facing health URL before creating pairing material:
+After the chosen route has set its exact batch URL in `HEALTH_BRIDGE_RECEIVER_URL`, derive the matching health URL in a second terminal:
 
 ```bash
-PHONE_REACHABLE_BASE_URL="http://<phone-reachable-private-host>:8765"
+: "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
+PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
 curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
 ```
 
-Only continue after `/health` succeeds on the same base URL the iPhone will use.
+Open that exact HTTPS `/health` URL on the physical iPhone too. Only continue after the same route succeeds from the phone. Do not substitute `127.0.0.1` in iPhone setup material; that would point to the iPhone itself.
 
 ## 3. Generate private setup material
 
-Generate a setup page with the `/v1/batches` URL derived from the verified base URL. See [`setup.md`](setup.md#pair-the-iphone) for the pairing flow and current receiver guidance.
+Generate a setup page with the already verified `/v1/batches` URL. The release-user handoff is documented in [Pair the iPhone](setup.md#pair-the-iphone).
 
 ```bash
-PHONE_REACHABLE_BATCH_URL="$PHONE_REACHABLE_BASE_URL/v1/batches"
 uv run health-bridge dev device-session \
   --db .tmp/device.sqlite \
   --label ios-companion \
-  --receiver-url "$PHONE_REACHABLE_BATCH_URL" \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --setup-page .tmp/ios-companion-device-session.html
 ```
 

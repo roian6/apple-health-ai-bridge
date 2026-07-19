@@ -54,6 +54,17 @@ IPV6_DIRECT_NETWORKS = tuple(
 IPV6_NONFORWARDABLE_NETWORKS = (
     ipaddress.ip_network((42540766411282592856903984951653826560, 32)),
 )
+DOCUMENTATION_HOST_SUFFIXES = (".example", ".invalid", ".test")
+DOCUMENTATION_HOSTS = frozenset(
+    {
+        "example",
+        "invalid",
+        "test",
+        "example.com",
+        "example.net",
+        "example.org",
+    }
+)
 
 
 class AccessDescriptor(BaseModel):
@@ -198,6 +209,31 @@ def _is_loopback_host(host: str) -> bool:
     return normalized in {"localhost", "localhost.localdomain"} or (
         address is not None and address.is_loopback
     )
+
+
+def _is_documentation_host(host: str) -> bool:
+    normalized = host.rstrip(".").lower()
+    return (
+        normalized in DOCUMENTATION_HOSTS
+        or any(normalized.endswith(suffix) for suffix in DOCUMENTATION_HOST_SUFFIXES)
+        or any(
+            normalized == reserved or normalized.endswith(f".{reserved}")
+            for reserved in ("example.com", "example.net", "example.org")
+        )
+        or normalized.startswith("your-private-host")
+    )
+
+
+def _reject_documentation_host(host: str) -> None:
+    if not _is_documentation_host(host):
+        return
+    message = (
+        "Receiver URL uses a reserved documentation or testing hostname. "
+        "Prepare the real phone-reachable private HTTPS route first, then retry "
+        "with its exact /v1/batches URL. See "
+        "https://github.com/roian6/apple-health-ai-bridge/blob/main/docs/setup.md."
+    )
+    raise ValueError(message)
 
 
 def _is_direct_local_host(host: str) -> bool:
@@ -388,6 +424,7 @@ def _setup_transport_notice(request: SetupRequest) -> str:
     if parsed.username is not None or parsed.password is not None:
         message = "Receiver URL must not contain a username or password."
         raise ValueError(message)
+    _reject_documentation_host(host)
     if parsed.path != "/v1/batches" or parsed.params or parsed.query or parsed.fragment:
         message = "Receiver URL must end at /v1/batches without query or fragment data."
         raise ValueError(message)

@@ -76,11 +76,13 @@ They do not expose raw SQL, pairing material, bearer tokens, token hashes, opaqu
 
 ## Deployment boundary
 
-- The receiver is intended for a trusted LAN or private network.
-- Pairing pages must never be published or pasted into chat.
-- Plain HTTP exposes health payloads and the device credential to the local network while in transit; prefer private HTTPS where practical.
+- Continuous sync away from home requires a stable phone-reachable private HTTPS route to the user-owned receiver.
+- Tailscale Serve is documented for people who already use Tailscale; an agent-managed private HTTPS ingress is the provider-neutral alternative.
+- Direct LAN access is a deliberate local-only fallback, not the primary continuous-sync path.
+- Keep the receiver on loopback behind a private HTTPS proxy or tunnel. Do not expose port `8765` or the pairing page directly to the public internet.
+- Plain LAN HTTP exposes health payloads and the device credential to that network while in transit.
 - SQLite is protected by owner-only filesystem permissions, not by an application-level database encryption layer.
-- The project includes no telemetry, advertising, hidden cloud upload, or third-party AI call by default.
+- The project includes no telemetry, advertising, hosted relay, hidden cloud upload, or third-party AI call by default.
 
 ## Operational limits
 

@@ -50,17 +50,25 @@ curl -fsS http://127.0.0.1:8765/health
 uv run health-bridge status --db .tmp/device.sqlite --markdown
 ```
 
-For a physical iPhone, the receiver URL must be reachable from the phone. Use a private LAN or private-network URL rather than `127.0.0.1`, and verify the exact phone-facing `/health` URL before generating setup material:
+For a physical iPhone, prepare the real receiver route first by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; other installers should follow the provider-neutral private-ingress checklist in Route B. Direct LAN is an explicit local-only fallback. Do not put a sample hostname into pairing material.
+
+After that route has set the exact batch URL in `HEALTH_BRIDGE_RECEIVER_URL`, derive and check its health endpoint:
 
 ```bash
-PHONE_REACHABLE_BASE_URL="http://<phone-reachable-private-host>:8765"
+: "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
+PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
 curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
+```
 
-PHONE_REACHABLE_BATCH_URL="$PHONE_REACHABLE_BASE_URL/v1/batches"
+Also open that exact HTTPS `/health` URL on the physical iPhone. Continue only after the same route succeeds from the phone.
+
+Then create the private setup page from the already verified batch URL:
+
+```bash
 uv run health-bridge dev device-session \
   --db .tmp/device.sqlite \
   --label ios-companion \
-  --receiver-url "$PHONE_REACHABLE_BATCH_URL" \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --setup-page .tmp/ios-companion-device-session.html
 ```
 
