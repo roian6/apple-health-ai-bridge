@@ -172,7 +172,9 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     # Given
     readme = Path("README.md").read_text()
     security = Path("SECURITY.md").read_text()
-    setup_template = Path(".github/ISSUE_TEMPLATE/setup_feedback.yml").read_text()
+    setup_template = Path(".github/ISSUE_TEMPLATE/setup_feedback.yml").read_text(
+        encoding="utf-8"
+    )
     issue_config = Path(".github/ISSUE_TEMPLATE/config.yml")
 
     # Then
