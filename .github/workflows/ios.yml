@@ -1,0 +1,54 @@
+name: iOS CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Swift tests and unsigned app builds
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ios/HealthBridgeCompanion
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Run Swift package tests
+        run: swift test
+
+      - name: Build unsigned iPhone simulator app
+        run: |
+          xcodebuild -project HealthBridgeCompanion.xcodeproj \
+            -target HealthBridgeCompanion \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build unsigned generic iPhone app
+        run: |
+          xcodebuild -project HealthBridgeCompanion.xcodeproj \
+            -target HealthBridgeCompanion \
+            -sdk iphoneos \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build

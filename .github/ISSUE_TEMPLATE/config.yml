@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/roian6/apple-health-ai-bridge/security/advisories/new
+    about: Report security vulnerabilities privately. Never include real health data or secrets in a public issue.
+  - name: Health Bridge support
+    url: https://healthbridge.chanhyo.dev/support
+    about: Read support options and contact information for setup or product questions.
+  - name: Privacy policy
+    url: https://healthbridge.chanhyo.dev/privacy
+    about: Review the public privacy policy for Health Bridge.

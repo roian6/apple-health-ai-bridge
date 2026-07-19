@@ -1,0 +1,6 @@
+{"record_family":"source","source_key":"synthetic.phone.alpha","name":"Synthetic Phone Alpha","kind":"phone"}
+{"record_family":"health_type","type_code":"steps","display_name":"Steps","category":"activity","default_unit":"count","sensitivity":"low"}
+{"record_family":"sample","client_record_id":"synthetic-sample-steps-20260601","source_key":"synthetic.phone.alpha","type_code":"steps","start_time":"2026-06-01T00:00:00Z","end_time":"2026-06-02T00:00:00Z","value":4321,"unit":"count"}
+{"record_family":"workout","client_record_id":"synthetic-workout-walk-20260603","source_key":"synthetic.watch.bravo","workout_type":"walking","start_time":"2026-06-03T18:00:00Z","end_time":"2026-06-03T18:32:00Z","duration_seconds":1920}
+{"record_family":"sleep_session","client_record_id":"synthetic-sleep-20260604","source_key":"synthetic.watch.bravo","start_time":"2026-06-04T03:10:00Z","end_time":"2026-06-04T10:45:00Z"}
+{"record_family":"deleted_record","source_key":"synthetic.phone.alpha","client_record_id":"synthetic-sample-steps-removed-20260605","deleted_at":"2026-06-05T09:15:00Z"}

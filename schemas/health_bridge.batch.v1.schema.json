@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/roian6/apple-health-ai-bridge/main/schemas/health_bridge.batch.v1.schema.json",
+  "title": "health_bridge.batch.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "schema_version",
+    "generated_at",
+    "export_window",
+    "sources",
+    "health_types",
+    "samples",
+    "workouts",
+    "sleep_sessions",
+    "deleted_records",
+    "sync"
+  ],
+  "properties": {
+    "schema_id": { "const": "health_bridge.batch.v1" },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.\\d+\\.\\d+$"
+    },
+    "generated_at": { "$ref": "#/$defs/utcTimestamp" },
+    "export_window": { "$ref": "#/$defs/timeWindow" },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/source" }
+    },
+    "health_types": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/healthType" }
+    },
+    "samples": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sample" }
+    },
+    "workouts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/workout" }
+    },
+    "sleep_sessions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sleepSession" }
+    },
+    "deleted_records": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/deletedRecord" }
+    },
+    "sync": { "$ref": "#/$defs/syncContext" }
+  },
+  "$defs": {
+    "utcTimestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "timeWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_time", "end_time"],
+      "properties": {
+        "start_time": { "$ref": "#/$defs/utcTimestamp" },
+        "end_time": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_key", "name", "kind"],
+      "properties": {
+        "source_key": { "type": "string", "pattern": "^(synthetic|apple_health)\\.[a-z0-9_.-]+$" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["phone", "watch", "app", "manual"] },
+        "bundle_id": { "type": "string" },
+        "device_model": { "type": "string" }
+      }
+    },
+    "healthType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type_code", "display_name", "category", "default_unit", "sensitivity", "aliases"],
+      "properties": {
+        "type_code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "category": {
+          "enum": [
+            "activity",
+            "blood_respiratory",
+            "body",
+            "environmental",
+            "fitness",
+            "heart",
+            "other",
+            "provider_specific",
+            "sleep",
+            "workout"
+          ]
+        },
+        "default_unit": { "type": "string", "minLength": 1 },
+        "sensitivity": { "enum": ["low", "moderate", "high"] },
+        "aliases": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_record_id", "source_key", "type_code", "start_time", "end_time", "value", "unit"],
+      "properties": {
+        "client_record_id": { "type": "string", "pattern": "^(synthetic|hk)-[a-z0-9-]+$" },
+        "source_key": { "type": "string", "pattern": "^(synthetic|apple_health)\\.[a-z0-9_.-]+$" },
+        "type_code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "start_time": { "$ref": "#/$defs/utcTimestamp" },
+        "end_time": { "$ref": "#/$defs/utcTimestamp" },
+        "value": { "type": "number" },
+        "unit": { "type": "string", "minLength": 1 },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "workout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_record_id",
+        "source_key",
+        "workout_type",
+        "start_time",
+        "end_time",
+        "duration_seconds"
+      ],
+      "properties": {
+        "client_record_id": { "type": "string", "pattern": "^(synthetic|hk)-[a-z0-9-]+$" },
+        "source_key": { "type": "string", "pattern": "^(synthetic|apple_health)\\.[a-z0-9_.-]+$" },
+        "workout_type": { "type": "string", "minLength": 1 },
+        "start_time": { "$ref": "#/$defs/utcTimestamp" },
+        "end_time": { "$ref": "#/$defs/utcTimestamp" },
+        "duration_seconds": { "type": "integer", "minimum": 0 },
+        "energy_kcal": { "type": "number", "minimum": 0 },
+        "distance_meters": { "type": "number", "minimum": 0 }
+      }
+    },
+    "sleepStageInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "start_time", "end_time"],
+      "properties": {
+        "stage": { "enum": ["in_bed", "awake", "core", "deep", "rem"] },
+        "start_time": { "$ref": "#/$defs/utcTimestamp" },
+        "end_time": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "sleepSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_record_id", "source_key", "start_time", "end_time", "stage_intervals"],
+      "properties": {
+        "client_record_id": { "type": "string", "pattern": "^(synthetic|hk)-[a-z0-9-]+$" },
+        "source_key": { "type": "string", "pattern": "^(synthetic|apple_health)\\.[a-z0-9_.-]+$" },
+        "start_time": { "$ref": "#/$defs/utcTimestamp" },
+        "end_time": { "$ref": "#/$defs/utcTimestamp" },
+        "stage_intervals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sleepStageInterval" }
+        }
+      }
+    },
+    "deletedRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_family", "source_key", "client_record_id", "deleted_at"],
+      "properties": {
+        "record_family": { "enum": ["sample", "workout", "sleep_session"] },
+        "source_key": { "type": "string", "pattern": "^(synthetic|apple_health)\\.[a-z0-9_.-]+$" },
+        "client_record_id": { "type": "string", "pattern": "^(synthetic|hk)-[a-z0-9-]+$" },
+        "deleted_at": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "syncContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sync_window", "cursors"],
+      "properties": {
+        "sync_window": { "$ref": "#/$defs/timeWindow" },
+        "cursors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/syncCursor" }
+        }
+      }
+    },
+    "syncCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_key", "cursor_kind", "cursor_value"],
+      "properties": {
+        "source_key": { "type": "string", "pattern": "^(synthetic|apple_health)\\.[a-z0-9_.-]+$" },
+        "cursor_kind": { "type": "string", "minLength": 1 },
+        "cursor_value": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

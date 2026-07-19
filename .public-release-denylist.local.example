@@ -1,0 +1,11 @@
+# Optional local-only strict audit denylist.
+#
+# Copy this file to .public-release-denylist.local and add private values that
+# should never appear in tracked files. The .local file is gitignored.
+#
+# Lines are case-insensitive literal matches by default.
+# Prefix with regex: for a Python regular expression.
+#
+# Examples with placeholders only:
+# private-device-label
+# regex:private-host-[0-9]+\.example\.internal

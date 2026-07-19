@@ -1,0 +1,394 @@
+name: Tagged release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Pin verified annotated tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag_object_sha: ${{ steps.pin.outputs.tag_object_sha }}
+      target_commit_sha: ${{ steps.pin.outputs.target_commit_sha }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify and pin tag object and target commit
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          event_tag_object_sha="${{ github.event.after }}"
+          [[ "$event_tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
+          tag_ref_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')"
+          [[ "$tag_ref_sha" =~ ^[0-9a-f]{40}$ ]]
+          tag_object_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")"
+          test "$tag_ref_sha" = "$tag_object_sha"
+          test "$tag_ref_sha" = "$event_tag_object_sha"
+          signed_tag_name="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tag')"
+          test "$signed_tag_name" = "$GITHUB_REF_NAME"
+          tag_verified="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.verification.verified == true and .verification.reason == "valid"')"
+          test "$tag_verified" = "true"
+          tag_identity="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tagger.name == "Chanhyo Jung" and (.tagger.email | endswith("@users.noreply.github.com"))')"
+          test "$tag_identity" = "true"
+          target_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.sha')"
+          target_type="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.type')"
+          test "$target_type" = "commit"
+          test "$target_sha" = "$(git rev-parse HEAD)"
+          commit_verified="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
+            --jq '.commit.verification.verified == true and .commit.verification.reason == "valid"')"
+          test "$commit_verified" = "true"
+          commit_identity="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
+            --jq '.author.login == "roian6" and .committer.login == "roian6" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "Chanhyo Jung" and (.commit.author.email | endswith("@users.noreply.github.com")) and (.commit.committer.email | endswith("@users.noreply.github.com"))')"
+          test "$commit_identity" = "true"
+          echo "tag_object_sha=$tag_object_sha" >> "$GITHUB_OUTPUT"
+          echo "target_commit_sha=$target_sha" >> "$GITHUB_OUTPUT"
+
+  python:
+    needs: verify
+    name: Verify tag and build Python artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PINNED_TAG_OBJECT_SHA: ${{ needs.verify.outputs.tag_object_sha }}
+      PINNED_TARGET_COMMIT_SHA: ${{ needs.verify.outputs.target_commit_sha }}
+    steps:
+      - name: Check out exact tag target
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.verify.outputs.target_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm pinned target checkout
+        run: test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.14"
+          enable-cache: false
+
+      - name: Validate tag and cross-platform versions
+        run: |
+          uv run python scripts/release_tools.py validate \
+            --repo . \
+            --tag "$GITHUB_REF_NAME"
+
+      - name: Scan Git history for credentials
+        env:
+          GITLEAKS_VERSION: "8.30.0"
+          GITLEAKS_SHA256: "79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e"
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts="--all" .
+
+      - name: Install locked dependencies
+        run: uv sync --all-extras --dev --locked
+
+      - name: Run exact-tag Python gates
+        run: |
+          uv run check-jsonschema --builtin-schema vendor.github-workflows .github/workflows/*.yml
+          uv run check-jsonschema --builtin-schema custom.github-workflows-require-timeout .github/workflows/*.yml
+          uv run python scripts/public-release-audit.py --strict
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run basedpyright
+          uv run bandit -r src -q
+          uv run pip-audit --local --skip-editable
+          uv run pytest -q
+
+      - name: Build and smoke-test distributions
+        run: |
+          rm -rf dist
+          uv build \
+            --build-constraints build-constraints.txt \
+            --require-hashes \
+            --out-dir dist
+          rm -f dist/.gitignore
+          uv run python scripts/package-smoke.py --dist-dir dist
+
+      - name: Create release metadata and checksums
+        run: |
+          commit_sha="$(git rev-parse HEAD)"
+          tree_sha="$(git rev-parse "${commit_sha}^{tree}")"
+          tag_object_sha="$PINNED_TAG_OBJECT_SHA"
+          uv run python scripts/release_tools.py manifest \
+            --repo . \
+            --dist-dir dist \
+            --tag "$GITHUB_REF_NAME" \
+            --tag-object "$tag_object_sha" \
+            --commit "$commit_sha" \
+            --tree "$tree_sha" \
+            --output dist/release-metadata.json
+          cp ".github/release/notes-${GITHUB_REF_NAME}.md" dist/release-notes.md
+          uv run python scripts/release_tools.py checksums \
+            --dist-dir dist \
+            --output dist/SHA256SUMS
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+
+      - name: Upload exact-tag release packet
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-packet-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  ios:
+    needs: verify
+    name: Verify exact-tag iOS source
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      PINNED_TARGET_COMMIT_SHA: ${{ needs.verify.outputs.target_commit_sha }}
+    defaults:
+      run:
+        working-directory: ios/HealthBridgeCompanion
+    steps:
+      - name: Check out exact tag target
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.verify.outputs.target_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm pinned target checkout
+        working-directory: .
+        run: test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
+
+      - name: Run Swift package tests
+        run: swift test
+
+      - name: Build unsigned iPhone simulator app
+        run: |
+          xcodebuild -project HealthBridgeCompanion.xcodeproj \
+            -target HealthBridgeCompanion \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build unsigned generic iPhone app
+        run: |
+          xcodebuild -project HealthBridgeCompanion.xcodeproj \
+            -target HealthBridgeCompanion \
+            -sdk iphoneos \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+  publish:
+    name: Attest and create GitHub pre-release
+    needs: [verify, python, ios]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PINNED_TAG_OBJECT_SHA: ${{ needs.verify.outputs.tag_object_sha }}
+      PINNED_TARGET_COMMIT_SHA: ${{ needs.verify.outputs.target_commit_sha }}
+    environment: github-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Refuse an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_ref_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')"
+          test "$tag_ref_sha" = "$PINNED_TAG_OBJECT_SHA"
+          tag_target_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_ref_sha}" \
+            --jq '.object.sha')"
+          test "$tag_target_sha" = "$PINNED_TARGET_COMMIT_SHA"
+          existing_release_ids="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id")"
+          if [[ -n "$existing_release_ids" ]]; then
+            echo "release already exists; refusing to replace it" >&2
+            exit 1
+          fi
+
+      - name: Check out exact tag target
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.verify.outputs.target_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download exact-tag release packet
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-packet-${{ github.ref_name }}
+          path: dist
+
+      - name: Verify downloaded release packet
+        run: |
+          set -euo pipefail
+          test ! -e dist/.git
+          commit_sha="$(git rev-parse HEAD)"
+          tree_sha="$(git rev-parse "${commit_sha}^{tree}")"
+          test "$commit_sha" = "$PINNED_TARGET_COMMIT_SHA"
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          python scripts/release_tools.py verify-packet \
+            --repo . \
+            --dist-dir dist \
+            --tag "$GITHUB_REF_NAME" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$commit_sha" \
+            --tree "$tree_sha"
+
+      - name: Create and verify draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_ref_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')"
+          test "$tag_ref_sha" = "$PINNED_TAG_OBJECT_SHA"
+          tag_target_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_ref_sha}" \
+            --jq '.object.sha')"
+          test "$tag_target_sha" = "$PINNED_TARGET_COMMIT_SHA"
+          existing_release_ids="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id")"
+          if [[ -n "$existing_release_ids" ]]; then
+            echo "release appeared after preflight; refusing to replace it" >&2
+            exit 1
+          fi
+          release_flags=(
+            --repo "$GITHUB_REPOSITORY"
+            --verify-tag
+            --title "$GITHUB_REF_NAME"
+            --notes-file dist/release-notes.md
+            --draft
+          )
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${version%%.*}" = "0" ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.whl \
+            dist/*.tar.gz \
+            dist/SHA256SUMS \
+            dist/release-metadata.json \
+            "${release_flags[@]}"
+          draft_release_id=""
+          for _ in {1..10}; do
+            draft_release_id="$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\" and .draft == true) | .id")"
+            if [[ "$draft_release_id" =~ ^[0-9]+$ ]]; then
+              break
+            fi
+            sleep 2
+          done
+          [[ "$draft_release_id" =~ ^[0-9]+$ ]]
+          echo "DRAFT_RELEASE_ID=$draft_release_id" >> "$GITHUB_ENV"
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${draft_release_id}"
+          gh api "$release_api" > "$RUNNER_TEMP/release-draft.json"
+          python scripts/release_tools.py verify-draft \
+            --repo . \
+            --dist-dir dist \
+            --release-json "$RUNNER_TEMP/release-draft.json" \
+            --notes-file dist/release-notes.md \
+            --tag "$GITHUB_REF_NAME"
+          asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
+          version="${GITHUB_REF_NAME#v}"
+          expected_assets="SHA256SUMS,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
+          test "$asset_names" = "$expected_assets"
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8 # v3.1.0
+        with:
+          subject-path: dist/*
+
+      - name: Reverify and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_ref_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')"
+          test "$tag_ref_sha" = "$PINNED_TAG_OBJECT_SHA"
+          tag_target_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_ref_sha}" \
+            --jq '.object.sha')"
+          test "$tag_target_sha" = "$PINNED_TARGET_COMMIT_SHA"
+          signed_tag_name="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_ref_sha}" \
+            --jq '.tag')"
+          test "$signed_tag_name" = "$GITHUB_REF_NAME"
+          [[ "$DRAFT_RELEASE_ID" =~ ^[0-9]+$ ]]
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          gh api "$release_api" > "$RUNNER_TEMP/release-before-publish.json"
+          python scripts/release_tools.py verify-draft \
+            --repo . \
+            --dist-dir dist \
+            --release-json "$RUNNER_TEMP/release-before-publish.json" \
+            --notes-file dist/release-notes.md \
+            --tag "$GITHUB_REF_NAME"
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+          gh api "$release_api" > "$RUNNER_TEMP/release-after-publish.json"
+          python scripts/release_tools.py verify-published \
+            --repo . \
+            --dist-dir dist \
+            --release-json "$RUNNER_TEMP/release-after-publish.json" \
+            --notes-file dist/release-notes.md \
+            --tag "$GITHUB_REF_NAME"
+          final_tag_ref_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')"
+          test "$final_tag_ref_sha" = "$PINNED_TAG_OBJECT_SHA"
+          final_target_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${final_tag_ref_sha}" \
+            --jq '.object.sha')"
+          test "$final_target_sha" = "$PINNED_TARGET_COMMIT_SHA"

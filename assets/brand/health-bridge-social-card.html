@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Apple Health AI Bridge social card</title>
+<style>
+:root{
+  --page:#e7e9ee;
+  --ink:#f8fafc;
+  --muted:#aab3c2;
+  --dark:#101318;
+  --line:rgba(255,255,255,.11);
+  --green:#3ecf8e;
+  --blue:#7ab7ff;
+  --r-lg:28px;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:0;background:#101318;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;font-feature-settings:"liga" 1;color:#11151d}
+.card{width:1280px;height:640px;overflow:hidden;margin:0;box-shadow:none;background:var(--dark);color:var(--ink)}
+.inner{height:100%;padding:64px;display:grid;grid-template-columns:minmax(0,1fr) 470px;gap:64px;align-items:center}
+.copy{display:flex;flex-direction:column;gap:22px;min-width:0}
+.brand{font-size:15px;line-height:1;font-weight:600;letter-spacing:-.03em;color:var(--muted)}
+h1{margin:0;font-size:86px;line-height:.94;letter-spacing:-.078em;font-weight:700;text-wrap:balance;max-width:760px}
+.sub{margin:0;max-width:570px;color:#c4ccd8;font-size:23px;line-height:1.28;letter-spacing:-.035em;font-weight:400}
+.visual{min-width:0}.surface{border:1px solid var(--line);border-radius:var(--r-lg);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));box-shadow:0 28px 90px rgba(0,0,0,.28)}
+.glow{background:radial-gradient(760px 420px at 82% 20%,rgba(62,207,142,.14),transparent 62%),#101318}
+.context-keywords{height:434px;padding:28px;display:grid;grid-template-rows:1fr auto;gap:22px}
+.context-map{position:relative;border:1px solid var(--line);border-radius:24px;background:radial-gradient(circle at 50% 48%,rgba(62,207,142,.13),transparent 44%),rgba(255,255,255,.026);display:grid;place-items:center;overflow:hidden}
+.context-map::before{content:"";position:absolute;inset:42px;border:1px solid rgba(255,255,255,.075);border-radius:999px}
+.context-map::after{content:"";position:absolute;inset:82px;border:1px solid rgba(62,207,142,.18);border-radius:999px}
+.hub{position:relative;z-index:2;width:186px;height:116px;border-radius:34px;border:1px solid rgba(62,207,142,.32);background:linear-gradient(180deg,rgba(62,207,142,.16),rgba(255,255,255,.045));display:grid;place-items:center;text-align:center;color:#effaf4;font-size:22px;line-height:1.02;letter-spacing:-.055em;font-weight:700}
+.node{position:absolute;z-index:3;padding:11px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.13);background:rgba(12,15,20,.78);backdrop-filter:blur(10px);color:#dce5ef;font-size:14px;line-height:1;font-weight:600;letter-spacing:-.025em}
+.node.a{left:28px;top:52px}.node.b{right:24px;top:70px}.node.c{left:52px;bottom:56px}.node.d{right:34px;bottom:54px}
+.context-keyline{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.value{min-height:76px;border:1px solid var(--line);border-radius:18px;background:rgba(255,255,255,.035);padding:17px 16px;display:flex;flex-direction:column;justify-content:center;gap:6px}
+.value strong{font-size:17px;line-height:1.1;letter-spacing:-.04em}.value span{color:#8793a3;font-size:13px;line-height:1.2;letter-spacing:-.015em}
+@media (max-width:900px){body{padding:12px}.card{width:100%;height:auto}.inner{min-height:640px;grid-template-columns:1fr!important}.visual{display:none}}
+</style>
+</head>
+<body>
+<section class="card glow" id="social-card">
+  <div class="inner">
+    <div class="copy">
+      <div class="brand">Apple Health AI Bridge</div>
+      <h1>Apple Health for your AI tools.</h1>
+      <p class="sub">An open-source bridge that turns health history into useful AI context.</p>
+    </div>
+    <div class="visual surface context-keywords" aria-hidden="true">
+      <div class="context-map">
+        <div class="node a">Apple Health history</div>
+        <div class="node b">AI tools</div>
+        <div class="node c">your questions</div>
+        <div class="node d">your control</div>
+        <div class="hub">health context<br>for AI</div>
+      </div>
+      <div class="context-keyline">
+        <div class="value"><strong>Bring the history</strong><span>Apple Health fits your workflow</span></div>
+        <div class="value"><strong>Ask with context</strong><span>AI tools get useful background</span></div>
+        <div class="value"><strong>Keep control</strong><span>read-only, open source</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+</body>
+</html>

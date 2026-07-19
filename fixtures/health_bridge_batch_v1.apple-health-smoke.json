@@ -1,0 +1,65 @@
+{
+  "schema_id": "health_bridge.batch.v1",
+  "schema_version": "1.0.0",
+  "generated_at": "2026-06-08T09:00:00Z",
+  "export_window": {
+    "start_time": "2026-06-01T00:00:00Z",
+    "end_time": "2026-06-08T00:00:00Z"
+  },
+  "sources": [
+    {
+      "source_key": "apple_health.phone",
+      "name": "Apple Health on iPhone",
+      "kind": "phone",
+      "bundle_id": "com.example.HealthBridgeCompanion",
+      "device_model": "iPhone"
+    }
+  ],
+  "health_types": [
+    {
+      "type_code": "steps",
+      "display_name": "Steps",
+      "category": "activity",
+      "default_unit": "count",
+      "sensitivity": "low",
+      "aliases": ["HKQuantityTypeIdentifierStepCount"]
+    }
+  ],
+  "samples": [
+    {
+      "client_record_id": "hk-sample-steps-20260601",
+      "source_key": "apple_health.phone",
+      "type_code": "steps",
+      "start_time": "2026-06-01T00:00:00Z",
+      "end_time": "2026-06-02T00:00:00Z",
+      "value": 4321,
+      "unit": "count",
+      "metadata": {
+        "aggregation": "daily_sum"
+      }
+    }
+  ],
+  "workouts": [],
+  "sleep_sessions": [],
+  "deleted_records": [
+    {
+      "record_family": "sample",
+      "source_key": "apple_health.phone",
+      "client_record_id": "hk-sample-steps-removed-20260605",
+      "deleted_at": "2026-06-05T09:15:00Z"
+    }
+  ],
+  "sync": {
+    "sync_window": {
+      "start_time": "2026-06-01T00:00:00Z",
+      "end_time": "2026-06-08T00:00:00Z"
+    },
+    "cursors": [
+      {
+        "source_key": "apple_health.phone",
+        "cursor_kind": "anchored_object_query",
+        "cursor_value": "cursor-1"
+      }
+    ]
+  }
+}

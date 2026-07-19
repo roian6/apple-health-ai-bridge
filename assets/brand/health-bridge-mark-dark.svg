@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="Apple Health AI Bridge dark mark">
+<path d="M48 14L76 31V65L48 82L20 65V31L48 14Z" fill="rgba(17,21,29,.045)" stroke="rgba(17,21,29,.18)" stroke-width="2"/>
+  <path d="M48 14L76 31L48 48L20 31L48 14Z" fill="rgba(17,21,29,.075)"/>
+  <path d="M20 31L48 48V82L20 65V31Z" fill="rgba(17,21,29,.050)"/>
+  <path d="M76 31L48 48V82L76 65V31Z" fill="rgba(17,21,29,.036)"/>
+  <path d="M32.5 40L48 48.5L63.5 40" fill="none" stroke="#11151D" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round" opacity=".9"/>
+  <path d="M31.5 58C41.5 50.5 54.5 50.5 64.5 58" fill="none" stroke="#3ECF8E" stroke-width="5.6" stroke-linecap="round"/>
+  <path d="M39 64H57" fill="none" stroke="#2563EB" stroke-width="3.8" stroke-linecap="round" opacity=".78"/>
+</svg>

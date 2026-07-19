@@ -1,0 +1,118 @@
+[project]
+name = "apple-health-ai-bridge"
+version = "1.0.0"
+description = "Local-first Apple Health context bridge for read-only CLI and MCP access."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.11",
+    "segno>=1.6",
+    "typer>=0.16",
+]
+
+[project.scripts]
+health-bridge = "health_bridge.cli:run"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9",
+    "basedpyright>=1.29",
+    "check-jsonschema>=0.33",
+    "pip-audit>=2.10",
+    "pytest>=8.4",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/health_bridge"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/health_bridge/storage/migrations/001_initial.sql" = "health_bridge/storage/migrations/001_initial.sql"
+"src/health_bridge/storage/migrations/002_sync_window.sql" = "health_bridge/storage/migrations/002_sync_window.sql"
+"src/health_bridge/storage/migrations/003_receiver_tokens.sql" = "health_bridge/storage/migrations/003_receiver_tokens.sql"
+"src/health_bridge/storage/migrations/004_pairing_invitations.sql" = "health_bridge/storage/migrations/004_pairing_invitations.sql"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.codegraph",
+    "/.hermes",
+    "/.public-release-denylist.local",
+    "/.tmp",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.11"
+pythonPlatform = "All"
+include = ["src", "tests"]
+exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
+reportUnusedCallResult = "warning"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportUnusedVariable = "error"
+reportMissingParameterType = "error"
+reportPrivateUsage = "error"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D203",
+    "D213",
+    "ISC001",
+    "CPY001",
+    "FBT001",
+    "FBT002",
+    "TD002",
+    "TD003",
+    "FIX002",
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "D",
+    "S101",
+    "S105",
+    "S106",
+    "S310",
+    "S603",
+    "S607",
+    "PLR2004",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+filterwarnings = ["error"]
