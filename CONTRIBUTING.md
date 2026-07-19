@@ -43,6 +43,19 @@ xcodebuild -project HealthBridgeCompanion.xcodeproj \
 
 Real-device HealthKit validation is useful, but any reported evidence must be redacted and aggregate-only.
 
+## Branches and Design Decisions
+
+Use a short branch name with one of these prefixes:
+
+- `fix/` for defects;
+- `feat/` for accepted features;
+- `docs/` for documentation;
+- `chore/` for maintenance and repository operations.
+
+Get a maintainer decision before implementation when a change affects HealthKit permissions or read/write scope, receiver authentication or pairing, disconnect/reset/deletion behavior, outbox or cursor semantics, public/hosted network paths, telemetry, analytics, advertising, third-party AI calls, privacy copy, entitlements, or App Review disclosures.
+
+Non-trivial features should link an accepted issue. The public triage, merge, and release process is recorded in [`docs/maintainer-guide.md`](docs/maintainer-guide.md).
+
 ## Before Opening a PR
 
 Run the Python gates for non-iOS changes:

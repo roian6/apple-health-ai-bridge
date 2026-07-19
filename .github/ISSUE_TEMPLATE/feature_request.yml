@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a local-first Apple Health bridge improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user need before prescribing an implementation. Proposals that change HealthKit permissions, receiver authentication, pairing, deletion, queue/cursor semantics, networking, hosted behavior, telemetry, or third-party AI paths require a maintainer decision before implementation.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: Who needs this, and what workflow would it unlock?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: What should change from the user's perspective?
+    validations:
+      required: true
+
+  - type: textarea
+    id: privacy-impact
+    attributes:
+      label: Data, privacy, and network impact
+      description: Explain affected HealthKit types or local records, new permissions, read-only boundaries, and any network, hosted, telemetry, analytics, advertising, or third-party AI path.
+      placeholder: |
+        HealthKit types or local records:
+        New permission required: yes/no
+        Read-only access preserved: yes/no
+        New network or hosted path: yes/no
+        Telemetry, analytics, advertising, or third-party AI: yes/no
+    validations:
+      required: true
+
+  - type: textarea
+    id: app-review-impact
+    attributes:
+      label: App Review impact
+      description: Would this require changes to privacy copy, App Review notes, screenshots, entitlements, or App Privacy Details?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workaround exists today?
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy and safety confirmation
+      options:
+        - label: I did not include real HealthKit values, exports, screenshots containing health data, or receiver databases.
+          required: true
+        - label: I did not include tokens, pairing material, setup-page contents, cursor values, outbox payloads, or private endpoint details.
+          required: true

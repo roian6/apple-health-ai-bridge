@@ -1,6 +1,6 @@
 # Security Policy
 
-Apple Health AI Bridge is currently a developer-preview project. The default deployment model is local-first and user-owned.
+The current stable source release is `v1.0.0`. The iOS companion is distributed through public TestFlight. The default deployment model remains local-first and user-owned.
 
 ## Sensitive Data
 
