@@ -246,8 +246,24 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     assert "local-network-only route" in setup_guide
     assert "Do not expose port 8765 directly to the public internet" in setup_guide
     assert "If no suitable private route exists" in setup_guide
+    assert "## Route C: Local-network-only fallback" in setup_guide
+    assert setup_guide.index("## Route C: Local-network-only fallback") < (
+        setup_guide.index("## Install and run core setup")
+    )
+    assert "--receiver-host 0.0.0.0" in setup_guide
+    assert "--receiver-port 8765" in setup_guide
 
     readme = Path("README.md").read_text(encoding="utf-8")
+    route_language = "\n".join(
+        (
+            readme,
+            setup_guide,
+            Path("docs/architecture.md").read_text(encoding="utf-8"),
+        )
+    )
+    assert "agent-managed private HTTPS ingress" not in route_language
+    assert "agent-managed service plan" not in route_language
+
     for copy, ordered_steps in (
         (
             readme,

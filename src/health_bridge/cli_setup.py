@@ -220,7 +220,6 @@ def _is_documentation_host(host: str) -> bool:
             normalized == reserved or normalized.endswith(f".{reserved}")
             for reserved in ("example.com", "example.net", "example.org")
         )
-        or normalized.startswith("your-private-host")
     )
 
 

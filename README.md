@@ -104,7 +104,7 @@ It does not expose raw SQL, token material, cursor values, or clinical recommend
 - Logs and agent status omit health values and credentials by default.
 - The receiver is designed for one trusted user, not mutually untrusted tenants.
 
-Do not expose the receiver's loopback port or pairing page to the public internet. For continuous sync away from home, use an existing private-network HTTPS route such as Tailscale Serve or an agent-managed private HTTPS ingress reviewed for the receiver paths. LAN-only access is a limited fallback.
+Do not expose the receiver's loopback port or pairing page to the public internet. For continuous sync away from home, use an existing private-network HTTPS route such as Tailscale Serve or an agent-assisted private HTTPS ingress reviewed for the receiver paths. LAN-only access is a limited fallback.
 
 Report vulnerabilities through GitHub’s private vulnerability reporting flow described in [SECURITY.md](SECURITY.md).
 

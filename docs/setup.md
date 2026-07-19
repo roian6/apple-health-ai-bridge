@@ -10,7 +10,7 @@ You need:
 - an approved build shown on the [Health Bridge install status page](https://healthbridge.chanhyo.dev/install/), or a self-build;
 - a macOS or Linux computer for the receiver and private database; native Windows is not currently supported;
 - [`uv`](https://docs.astral.sh/uv/);
-- for continuous sync away from home, either an existing Tailscale connection or an agent-managed private HTTPS ingress; for an explicit local-only evaluation, a same-LAN route with the limitations below;
+- for continuous sync away from home, either an existing Tailscale connection or an agent-assisted private HTTPS ingress; for an explicit local-only evaluation, a same-LAN route with the limitations below;
 - optionally, direct terminal access or a same-host stdio MCP client.
 
 ## What the receiver URL means
@@ -67,7 +67,7 @@ tailscale serve status
 
 The final status must show only that the Health Bridge handler is gone. This rollback targets HTTPS `8443` with `off` and never invokes the whole-configuration `reset` command; do not substitute `reset`.
 
-Build the exact batch URL from the current node's Tailscale DNS name, then run setup:
+Build the exact batch URL from the current node's Tailscale DNS name. This route-preparation step only sets the URL; continue with the common setup sequence below:
 
 ```bash
 TAILSCALE_DNS_NAME="$(
@@ -76,36 +76,7 @@ TAILSCALE_DNS_NAME="$(
 )"
 : "${TAILSCALE_DNS_NAME:?Tailscale did not report a DNS name; enable the required tailnet DNS/HTTPS feature and retry}"
 export HEALTH_BRIDGE_RECEIVER_URL="https://${TAILSCALE_DNS_NAME}:8443/v1/batches"
-
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.0"
-health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
 ```
-
-Setup keeps the receiver on its safe loopback default, which is the correct backend for Tailscale Serve. It creates private state and a pairing page whose single-use invitation normally expires in about 20 minutes, prints the receiver launch command, and verifies only the same-host MCP process. It does **not** prove that the iPhone can reach the receiver.
-
-Before treating Route A as a continuous-sync installation, have the installer put the printed receiver command under the host's existing service manager. The reviewed service plan must run as the receiver owner, start at boot, restart on failure, preserve the loopback bind and private database path, keep health values and credentials out of logs, and include exact stop/disable/remove rollback commands. Tailscale Serve persists only the network route; until supervision passes, sync works only while the foreground receiver process remains running.
-
-Start and enable the supervised receiver service. For a temporary evaluation only, run the printed foreground command instead. Then verify the exact route from the iPhone before scanning the pairing QR:
-
-1. Remove `/v1/batches` from `HEALTH_BRIDGE_RECEIVER_URL` and append `/health`.
-2. Open that HTTPS health URL in Safari on the iPhone while Tailscale is connected.
-3. Require the response `{"status":"ok"}`.
-4. Only then open the private pairing page on the receiver computer and scan its QR with iPhone Camera.
-
-If the iPhone cannot open `/health`, do not create another invitation yet. Check Tailscale connection state, Serve status, MagicDNS/HTTPS availability, the grant or ACL, and whether the supervised receiver process is running.
-
-If the original invitation expired while supervision or route checks were being completed, create a fresh same-label invitation only after `/health` succeeds. The new invitation rotates the previous active same-label invitation:
-
-```bash
-health-bridge receiver create-pairing \
-  --db ~/.local/share/health-bridge/health.sqlite \
-  --label iPhone \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --format setup-page \
-  --setup-page ~/.local/share/health-bridge/iphone-setup.html
-```
-
-Open only the newly written private page and delete the stale page if it was saved elsewhere.
 
 ## Route B: Agent-assisted private HTTPS ingress
 
@@ -120,33 +91,66 @@ Ask the setup agent to follow this provider-neutral ingress checklist:
 3. **Keep the receiver private.** Bind Health Bridge to `127.0.0.1:8765`; terminate phone-facing TLS at the approved proxy or tunnel. Do not expose port `8765`, use plain HTTP toward the phone, use a self-signed certificate, treat an unguessable hostname as security, enable Tailscale Funnel, or add a browser-login layer that the iOS app cannot satisfy.
 4. **Proxy only the phone protocol.** On one HTTPS origin, allow `GET /health`, `POST /v1/batches`, and `POST /v1/pairing/redeem`. Preserve the `Authorization` header and request bodies. Permit batches up to `5,000,000` bytes and pairing redemption bodies up to `4,096` bytes. Disable request-body and authorization-header logging. Supervise the receiver process and TLS certificate renewal.
 5. **Stop at a public-only design.** If the only workable route is publicly reachable, do not silently publish it. Explain that it needs a deployment-specific hardening review outside this private-ingress guide.
-6. **Verify before pairing.** After the approved route exists, set `HEALTH_BRIDGE_RECEIVER_URL` to the exact origin plus `/v1/batches` and run `health-bridge setup`. Immediately start the printed receiver command, check `GET /health` locally, and then open the exact HTTPS `/health` URL from the physical iPhone. Only after both health checks pass should the user open the generated pairing page and scan its QR.
+6. **Prepare the common handoff.** After the approved route exists, set `HEALTH_BRIDGE_RECEIVER_URL` to the exact origin plus `/v1/batches`. Do not claim phone reachability yet; continue with common setup, receiver start, and physical-iPhone verification below.
 
 Do not print or paste the private URL, pairing page, QR payload, invitation, receiver credential, or database into public chat, issues, logs, or documentation.
 
-The agent should finish with a redacted handoff containing:
+The agent should finish route preparation with a redacted handoff containing:
 
-- whether the receiver service is running;
-- whether the local `/health` check passed;
-- whether the physical iPhone opened the exact HTTPS `/health` URL;
-- the local path of the private pairing page, without its contents;
-- the next single user action;
+- confirmation that `HEALTH_BRIDGE_RECEIVER_URL` is set locally, without printing its value;
+- the loopback backend and planned supervised service;
+- the exact local and phone-facing health checks to run after receiver start, without private host details;
+- the next common setup command;
 - rollback commands for every network or service change.
+
+After the common verification sequence, the handoff must be updated with whether both health checks passed and the next single physical-iPhone action.
 
 If no suitable private route exists, the agent must stop and present the infrastructure choices rather than inventing an endpoint or silently making the receiver public.
 
+## Route C: Local-network-only fallback
+
+Use this route only for development, evaluation, or a deliberate same-LAN installation. Sync stops whenever the iPhone leaves that LAN. The phone-facing connection is plain HTTP, so health payloads and the device credential are visible to that LAN while in transit. Use only a trusted, isolated network; never forward receiver port `8765` from the router to the public internet.
+
+Set `HEALTH_BRIDGE_LAN_HOST` to the receiver's real, stable LAN hostname or private address. On macOS, a Bonjour hostname can be derived without inventing a sample endpoint:
+
+```bash
+export HEALTH_BRIDGE_LAN_HOST="$(scutil --get LocalHostName).local"
+```
+
+On Linux, have the installer select and verify the actual LAN address that belongs to the receiver's intended interface; do not blindly choose the first address when VPN, container, or multiple network interfaces exist. Numeric LAN IPs are supported, but DHCP may change them, so reserve the address or update and re-pair after a change. Then set the exact URL locally:
+
+```bash
+: "${HEALTH_BRIDGE_LAN_HOST:?Set this to the receiver's verified LAN hostname or private address}"
+export HEALTH_BRIDGE_RECEIVER_URL="http://${HEALTH_BRIDGE_LAN_HOST}:8765/v1/batches"
+```
+
+Continue with the common setup sequence below. Route C must use its explicit `0.0.0.0:8765` bind; Routes A and B keep the loopback default.
+
+After setup, use the printed receiver command with the same bind and port. Keep the iPhone on that LAN, grant the app's iOS Local Network permission, derive the health URL as `${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}/health`, and open that exact URL on the physical iPhone before pairing. The Local Network permission alert may fail to resolve the first attempt if access is denied or the route does not recover in time. If an exit node is active, enable **Allow LAN access** or use Route A or Route B instead.
+
 ## Install and run core setup
 
-If Route A did not already install the package, install the signed release after `v1.0.0` appears on the project's GitHub Releases page:
+Install the signed release after `v1.0.0` appears on the project's GitHub Releases page:
 
 ```bash
 uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.0"
 ```
 
-After Route A or Route B has set `HEALTH_BRIDGE_RECEIVER_URL` to a real, configured `/v1/batches` URL:
+After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.
+
+For Route A or Route B, keep the safe loopback bind:
 
 ```bash
 health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
+```
+
+For Route C, explicitly bind to the LAN interface and matching port:
+
+```bash
+health-bridge setup \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --receiver-host 0.0.0.0 \
+  --receiver-port 8765
 ```
 
 Core setup:
@@ -159,21 +163,17 @@ Core setup:
 
 It does **not** configure any AI or MCP client by default. Adding a client creates a new process that can read the private health database, so that action requires an explicit choice.
 
-For automation or review, request the secret-redacted onboarding schema:
-
-```bash
-health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --json
-```
+For automation or review, append `--json` to the exact Route A/B or Route C setup command above. The result is a secret-redacted onboarding schema.
 
 The JSON contains `access_descriptors`, not a supposedly universal client config. A local descriptor identifies the MCP protocol, stdio transport, executable, arguments, optional working directory, and environment references.
 
-The command creates owner-only files under `~/.local/share/health-bridge/`. The generated pairing HTML is secret because it contains a temporary single-use invitation. Do not paste it into chat, commit it, or place it on a web server.
+The command creates owner-only files under `~/.local/share/health-bridge/`. The generated pairing HTML is secret because it contains a temporary, single-use invitation that normally expires in about 20 minutes. Do not paste it into chat, commit it, or place it on a web server.
 
 ## Start and verify the receiver
 
-Run the `receiver_start_command` printed by setup as a supervised process. A private HTTPS proxy or tunnel should keep the receiver on the safe loopback default. Do not expose port 8765 directly to the public internet.
+Run the `receiver_start_command` printed by setup as a supervised process. For Route A or Route B, keep the loopback bind behind the private HTTPS route. Route C deliberately uses the printed `0.0.0.0:8765` LAN bind and must never be port-forwarded to the public internet.
+
+The current setup command prepares the exact launch command but does not install an operating-system service. The installer must use the host's existing service manager, run as the receiver owner, start at boot, restart on failure, keep health values and credentials out of logs, and provide exact stop/disable/remove rollback commands. Until supervision passes, sync works only while the foreground receiver process remains running.
 
 The printed `receiver_health_url` should return:
 
@@ -181,9 +181,27 @@ The printed `receiver_health_url` should return:
 {"status":"ok"}
 ```
 
-A successful check from the receiver host proves local readiness. A successful check from the physical iPhone over the chosen route proves phone reachability. The local MCP smoke proves neither.
+Verify in this order:
 
-The current setup command prepares the exact launch command but does not install an operating-system service. Use the existing supervised service or agent-managed service plan approved in Route B.
+1. Check the printed health URL from the receiver host to prove local readiness.
+2. Derive the phone-facing health URL as `${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}/health`.
+3. Open that exact URL on the physical iPhone. Routes A and B require their private HTTPS connection; Route C requires the same trusted LAN and iOS Local Network permission.
+4. Require `{"status":"ok"}` before opening any pairing page.
+
+The local MCP smoke proves neither receiver readiness nor phone reachability. If the physical-iPhone check fails, keep the pairing page private and fix the selected route, service, and access policy first.
+
+If the original invitation expires during service or route verification, create a fresh same-label invitation only after both health checks pass. This rotates the previous active same-label invitation:
+
+```bash
+health-bridge receiver create-pairing \
+  --db ~/.local/share/health-bridge/health.sqlite \
+  --label iPhone \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --format setup-page \
+  --setup-page ~/.local/share/health-bridge/iphone-setup.html
+```
+
+Open only the newly written private page and securely remove stale copies from every location where they were saved or transferred.
 
 ## Pair the iPhone
 
@@ -210,25 +228,11 @@ Then call `get_bridge_status` or `list_synced_metrics`, or use the direct read-o
 
 ## Connect an MCP client intentionally
 
-Configure only a client you intend to grant health-data access:
-
-```bash
-health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --configure-client hermes
-```
+Configure only a client you intend to grant health-data access. Append `--configure-client hermes` (or another documented client name) to the same Route A/B or Route C setup command used above; Route C must repeat its explicit `--receiver-host` and `--receiver-port` flags.
 
 `--configure-client` is repeatable, but configuring more than one client grants each one access. Non-interactive and `--json` runs still make no client changes unless this option is present.
 
 For another same-host stdio MCP client, render `access_descriptors` into that client's documented configuration schema. Do not copy a root key from an unrelated product.
-
-## Local-network-only fallback
-
-Use direct LAN access only when you deliberately accept that sync stops away from that LAN. Numeric LAN IPs are supported, but DHCP may change them. On macOS, `scutil --get LocalHostName` can provide a Bonjour name; append `.local` and port `8765` for a same-LAN route.
-
-Direct LAN HTTP requires an explicit non-loopback `--receiver-host`, matching receiver port, and iOS Local Network access. Plain HTTP exposes health payloads and the device credential to that LAN while in transit. The Local Network permission alert may fail to resolve the first attempt if access is denied or the route does not recover in time. If an exit node is active, enable **Allow LAN access** or use the private HTTPS route instead.
-
-This fallback is not the recommended continuous-sync configuration.
 
 ## Deployment boundaries
 
@@ -237,6 +241,7 @@ This fallback is not the recommended continuous-sync configuration.
 - Container/NAS deployment is not yet first-class; supervision, persistent paths, private HTTPS routing, and pairing handoff remain operator responsibilities.
 - Health Bridge does not silently downgrade HTTPS to HTTP or discover and trust endpoints automatically.
 - A public reverse proxy is not automatically private or hardened merely because it uses TLS.
+- Do not expose port 8765 directly to the public internet.
 
 ## Remove local bridge data
 

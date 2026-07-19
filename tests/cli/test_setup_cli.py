@@ -315,6 +315,21 @@ def test_setup_rejects_documentation_hosts_before_private_side_effects(
     assert not setup_page.exists()
 
 
+def test_setup_accepts_real_hostname_with_documentation_like_prefix(
+    tmp_path: Path,
+) -> None:
+    db_path, setup_page, args = _setup_args(tmp_path)
+    args[args.index("--receiver-url") + 1] = (
+        "https://your-private-host.company/v1/batches"
+    )
+
+    completed = _run_cli(*args)
+
+    assert completed.returncode == 0, completed.stderr
+    assert db_path.is_file()
+    assert setup_page.is_file()
+
+
 def test_setup_rejects_unusable_numeric_destinations_before_side_effects(
     tmp_path: Path,
 ) -> None:
