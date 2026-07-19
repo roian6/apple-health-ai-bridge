@@ -206,9 +206,10 @@ def _parsed_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | Non
 def _is_loopback_host(host: str) -> bool:
     normalized = host.rstrip(".").lower()
     address = _parsed_ip(normalized)
-    return normalized in {"localhost", "localhost.localdomain"} or (
-        address is not None and address.is_loopback
+    loopback_name = normalized in {"localhost", "localhost.localdomain"} or (
+        normalized.endswith((".localhost", ".localhost.localdomain"))
     )
+    return loopback_name or (address is not None and address.is_loopback)
 
 
 def _is_documentation_host(host: str) -> bool:

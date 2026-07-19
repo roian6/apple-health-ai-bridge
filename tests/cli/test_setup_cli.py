@@ -271,11 +271,20 @@ def test_setup_page_contains_custom_scheme_qr_and_manual_code(
     assert "temporary, single-use invitation" in setup_html
 
 
+@pytest.mark.parametrize(
+    "loopback_url",
+    [
+        "http://127.0.0.1:8765/v1/batches",
+        "https://receiver.localhost/v1/batches",
+        "https://deep.receiver.localhost.localdomain/v1/batches",
+    ],
+)
 def test_setup_rejects_phone_loopback_url_before_private_side_effects(
     tmp_path: Path,
+    loopback_url: str,
 ) -> None:
     db_path, setup_page, args = _setup_args(tmp_path)
-    args[args.index("--receiver-url") + 1] = "http://127.0.0.1:8765/v1/batches"
+    args[args.index("--receiver-url") + 1] = loopback_url
 
     completed = _run_cli(*args)
 

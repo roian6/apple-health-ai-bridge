@@ -34,7 +34,7 @@ Open the [official TestFlight install page](https://healthbridge.chanhyo.dev/ins
 The project does not give you a receiver URL. The URL is the private address by which the iPhone reaches your receiver computer, and it must exist before core setup can create pairing material.
 
 - **Already use Tailscale:** use the private Tailscale Serve HTTPS path documented in the [setup guide](docs/setup.md#route-a-already-use-tailscale). Tailscale is an option for existing users, not a product requirement.
-- **Use another private HTTPS ingress:** have the installer or setup agent follow the setup guide's reviewed ingress checklist. It must inspect first, show every proposed DNS, tunnel, proxy, firewall, and service change, and wait for approval before applying it.
+- **Agent-assisted private HTTPS ingress:** use the setup guide's agent-assisted path. The setup agent must inspect first, show every proposed DNS, tunnel, proxy, firewall, and service change, and wait for approval before applying it.
 - **Local network only:** supported as a deliberate local-only fallback, but automatic sync stops when the iPhone leaves that network.
 
 Do not copy a sample hostname, expose receiver port `8765` directly to the public internet, or publish the pairing page. Follow the complete [receiver setup guide](docs/setup.md) to produce and verify the real route.

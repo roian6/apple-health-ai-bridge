@@ -39,28 +39,31 @@ The manual code uses an unambiguous `5-5-5` shape. Its public selector allows th
 
 ## Create a setup page
 
-First prepare the real receiver route by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; other installers should follow the provider-neutral private-ingress checklist in Route B. Direct LAN is an explicit local-only fallback.
+First prepare the real receiver route by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
 
-After that process has set the exact batch URL in `HEALTH_BRIDGE_RECEIVER_URL`, derive the matching health endpoint and test it:
+For normal onboarding, run the route-specific `health-bridge setup` command in that guide. Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
+
+Then derive the phone-facing health endpoint:
 
 ```bash
 : "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
 PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
-curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
 ```
 
-Open that exact phone-facing `/health` URL on the physical iPhone as well. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Then create a QR-first setup page from the already verified batch URL:
+Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page.
+
+If that setup invitation expired during verification, create a fresh QR-first page from the already verified batch URL. The new same-label invitation rotates the previous active one:
 
 ```bash
-uv run health-bridge receiver create-pairing \
-  --db .tmp/receiver.sqlite \
-  --label ios-companion \
+health-bridge receiver create-pairing \
+  --db ~/.local/share/health-bridge/health.sqlite \
+  --label iPhone \
   --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --format setup-page \
-  --setup-page .tmp/ios-companion-pairing.html
+  --setup-page ~/.local/share/health-bridge/iphone-setup.html
 ```
 
-The higher-level device-session helper also creates invitation-based setup material while keeping stdout secret-redacted:
+The development-only device-session helper can also create invitation-based setup material while keeping stdout secret-redacted:
 
 ```bash
 uv run health-bridge dev device-session \

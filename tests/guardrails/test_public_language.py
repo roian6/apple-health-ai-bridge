@@ -266,6 +266,42 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
             in handoff_copy
         )
 
+    for path, ordered_steps in (
+        (
+            Path("docs/agent-assisted-setup.md"),
+            (
+                "run the matching setup command",
+                "approved service manager",
+                "printed local health URL",
+                "Open that exact phone-facing `/health` URL on the physical iPhone",
+                "open the private setup page",
+            ),
+        ),
+        (
+            Path("docs/pairing.md"),
+            (
+                "run the route-specific `health-bridge setup` command",
+                "approved service manager",
+                "printed local health URL",
+                "Open that exact phone-facing `/health` URL on the physical iPhone",
+                "open the setup-generated pairing page",
+            ),
+        ),
+        (
+            Path("docs/self-build.md"),
+            (
+                "run exactly one setup command",
+                "approved service manager",
+                "printed local health URL",
+                "Open that exact phone-facing `/health` URL on the physical iPhone",
+                "setup-generated HTML",
+            ),
+        ),
+    ):
+        text = path.read_text(encoding="utf-8")
+        positions = [text.index(step) for step in ordered_steps]
+        assert positions == sorted(positions), path
+
     readme = Path("README.md").read_text(encoding="utf-8")
     route_language = "\n".join(
         (
