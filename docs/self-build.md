@@ -39,6 +39,13 @@ uv run health-bridge init --db .tmp/device.sqlite
 uv run health-bridge receiver start --db .tmp/device.sqlite --host 127.0.0.1 --port 8765
 ```
 
+For Route C instead, use the deliberate LAN bind and never port-forward it to the public internet:
+
+```bash
+uv run health-bridge init --db .tmp/device.sqlite
+uv run health-bridge receiver start --db .tmp/device.sqlite --host 0.0.0.0 --port 8765
+```
+
 After the chosen route has set its exact batch URL in `HEALTH_BRIDGE_RECEIVER_URL`, derive the matching health URL in a second terminal:
 
 ```bash
@@ -47,7 +54,7 @@ PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
 curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
 ```
 
-Open that exact HTTPS `/health` URL on the physical iPhone too. Only continue after the same route succeeds from the phone. Do not substitute `127.0.0.1` in iPhone setup material; that would point to the iPhone itself.
+Open that exact phone-facing `/health` URL on the physical iPhone too. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only continue after the selected route succeeds from the phone. Do not substitute `127.0.0.1` in iPhone setup material; that would point to the iPhone itself.
 
 ## 3. Generate private setup material
 

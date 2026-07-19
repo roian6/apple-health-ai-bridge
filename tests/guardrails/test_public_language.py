@@ -252,6 +252,19 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     )
     assert "--receiver-host 0.0.0.0" in setup_guide
     assert "--receiver-port 8765" in setup_guide
+    assert "--receiver-host 0.0.0.0" in Path("README.md").read_text(encoding="utf-8")
+
+    for route_handoff in (
+        Path("docs/agent-assisted-setup.md"),
+        Path("docs/pairing.md"),
+        Path("docs/self-build.md"),
+    ):
+        handoff_copy = route_handoff.read_text(encoding="utf-8")
+        assert "Routes A and B use HTTPS" in handoff_copy
+        assert (
+            "Route C deliberately uses HTTP only on the same trusted LAN"
+            in handoff_copy
+        )
 
     readme = Path("README.md").read_text(encoding="utf-8")
     route_language = "\n".join(
@@ -270,8 +283,9 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
             (
                 "Prepare the receiver route",
                 "Install and run setup",
-                "Start the printed receiver command",
-                "open the exact HTTPS `/health` URL",
+                "approved service manager",
+                "printed local `/health` URL",
+                "phone-facing `/health` URL",
                 "Pair and sync",
             ),
         ),

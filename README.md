@@ -53,15 +53,24 @@ The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configur
 health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
 ```
 
+For the deliberate Route C local-network-only fallback, use the same real LAN URL and the required non-loopback bind:
+
+```bash
+health-bridge setup \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --receiver-host 0.0.0.0 \
+  --receiver-port 8765
+```
+
 `health-bridge setup` creates the private SQLite database and single-use pairing page, prepares the receiver command, emits a canonical same-host stdio MCP descriptor, verifies the local Health Bridge MCP process, and detects client adapters without modifying them.
 
-A successful local MCP check does not prove receiver readiness or phone reachability. Start the printed receiver command and open the exact HTTPS `/health` URL from the physical iPhone before scanning the pairing QR.
+A successful local MCP check does not prove receiver readiness or phone reachability. Put the printed receiver command under the host's approved service manager, start it, require `{"status":"ok"}` from the printed local `/health` URL, and then require the same response from the exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C uses HTTP only on the same trusted LAN.
 
 Adding a client creates another process that can read the private health database, so setup never does that automatically. Use an explicit `--configure-client <name>` only after choosing the client.
 
 ### 4. Pair and sync
 
-1. Require `{"status":"ok"}` from the exact HTTPS `/health` URL on the physical iPhone.
+1. Continue only after the supervised receiver, local health check, and physical-iPhone health check all pass.
 2. On the receiver computer, open the generated pairing HTML on a trusted screen. For a headless receiver, securely copy that one file to a trusted local screen; never publish it or place it on a web server.
 3. Scan the QR with iPhone Camera, open the setup link, and connect the companion app.
 4. Tap **Allow Health Access** and review Apple’s native authorization sheet.

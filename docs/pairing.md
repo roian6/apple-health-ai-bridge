@@ -49,7 +49,7 @@ PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
 curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
 ```
 
-Open that exact HTTPS `/health` URL on the physical iPhone as well. Then create a QR-first setup page from the already verified batch URL:
+Open that exact phone-facing `/health` URL on the physical iPhone as well. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Then create a QR-first setup page from the already verified batch URL:
 
 ```bash
 uv run health-bridge receiver create-pairing \

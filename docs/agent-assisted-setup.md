@@ -60,7 +60,7 @@ PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
 curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
 ```
 
-Also open that exact HTTPS `/health` URL on the physical iPhone. Continue only after the same route succeeds from the phone.
+Also open that exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Continue only after the selected route succeeds from the phone.
 
 Then create the private setup page from the already verified batch URL:
 
