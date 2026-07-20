@@ -848,13 +848,20 @@ def test_brand_readme_local_links_resolve_inside_repository() -> None:
         assert target.exists(), destination
 
 
-def test_public_install_commands_remain_pinned_to_published_v100() -> None:
+def test_public_install_commands_are_pinned_to_published_v101() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
-    pinned = "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.0"
+    pinned = "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.1"
     assert pinned in readme
     assert pinned in setup
+    for content, name in ((readme, "README.md"), (setup, "docs/setup.md")):
+        pins = re.findall(
+            r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)',
+            content,
+        )
+        assert pins, f"No versioned install pin found in {name}"
+        assert set(pins) == {"v1.0.1"}, f"Found stale install pins in {name}: {pins}"
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
     assert unpinned not in readme
     assert unpinned not in setup

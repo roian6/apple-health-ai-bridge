@@ -41,10 +41,10 @@ Do not copy a sample hostname, expose receiver port `8765` directly to the publi
 
 ### 3. Install and run setup
 
-After `v1.0.0` appears on the project's GitHub Releases page, install the receiver package:
+Install the current signed receiver release:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.0"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.1"
 ```
 
 The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configured `/v1/batches` URL. Only then run:
@@ -133,7 +133,7 @@ If the command returns `recovery-required`, do not restart the receiver. Review 
 
 ## Releases
 
-User installs are pinned to a signed version tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with SHA-256 checksums, build provenance, and metadata that ties the Python package, iOS version/build, Git tree, and batch schema together. The first coordinated public release is `v1.0.0`, paired with iOS `1.0.0 (15)`.
+User installs are pinned to a signed version tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with SHA-256 checksums, build provenance, and metadata that ties the Python package, iOS version/build, Git tree, and batch schema together. The current receiver release is `v1.0.1`, compatible with the unchanged iOS companion `1.0.0 (15)`. The first coordinated public release was `v1.0.0`.
 
 ## Build from source
 

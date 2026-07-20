@@ -41,7 +41,7 @@ def test_security_support_and_ownership_routes_are_current() -> None:
     codeowners = Path(".github/CODEOWNERS").read_text(encoding="utf-8")
 
     assert "developer-preview" not in security
-    assert "stable source release is `v1.0.0`" in security
+    assert "stable source release is `v1.0.1`" in security
     assert "public TestFlight" in security
     assert "security/advisories/new" in security
     assert "healthbridge@chanhyo.dev" in security

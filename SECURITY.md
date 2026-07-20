@@ -1,6 +1,6 @@
 # Security Policy
 
-The current stable source release is `v1.0.0`. The iOS companion is distributed through public TestFlight. The default deployment model remains local-first and user-owned.
+The current stable source release is `v1.0.1` for the receiver package, compatible with the unchanged iOS companion `1.0.0 (15)` distributed through public TestFlight. The default deployment model remains local-first and user-owned.
 
 ## Sensitive Data
 
