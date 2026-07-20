@@ -6,6 +6,8 @@ The first public launch is a coordinated cutover, not a source-only preview. Bef
 
 A private TestFlight candidate may be archived, uploaded, assigned to a private tester group, and submitted for external Beta App Review before the public tag only when the private release packet records the exact source commit and tree, signed archive metadata and checksum, complete source/package gates, and real-device smoke evidence. This validation does not authorize a public TestFlight link, App Store submission, or repository launch. Before any public action, verify the final audited one-root snapshot against the reviewed signed candidate, confirm external approval and anonymous Public Link access, then publish the required checksums and provenance.
 
+A receiver-only patch may advance the Python receiver version while keeping the last verified iOS companion version/build unchanged. For that scope, maintainers must not upload a new TestFlight build merely to make version numbers match. The exact-tag workflow must still run the iOS source gates, the versioned notes must name the compatible iOS companion and state that no TestFlight update is required, and `release-metadata.json` must set `release_scope` to `receiver` while independently recording the receiver version, iOS source version/build, and batch contract.
+
 ## Required checks
 
 ```bash

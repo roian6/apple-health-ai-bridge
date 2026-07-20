@@ -67,7 +67,7 @@ jobs:
           test "$commit_verified" = "true"
           commit_identity="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
-            --jq '.author.login == "roian6" and .committer.login == "roian6" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "Chanhyo Jung" and (.commit.author.email | endswith("@users.noreply.github.com")) and (.commit.committer.email | endswith("@users.noreply.github.com"))')"
+            --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
           test "$commit_identity" = "true"
           echo "tag_object_sha=$tag_object_sha" >> "$GITHUB_OUTPUT"
           echo "target_commit_sha=$target_sha" >> "$GITHUB_OUTPUT"
@@ -161,7 +161,12 @@ jobs:
             --output dist/release-metadata.json
           cp ".github/release/notes-${GITHUB_REF_NAME}.md" dist/release-notes.md
           uv run python scripts/release_tools.py checksums \
+            --repo . \
             --dist-dir dist \
+            --tag "$GITHUB_REF_NAME" \
+            --tag-object "$tag_object_sha" \
+            --commit "$commit_sha" \
+            --tree "$tree_sha" \
             --output dist/SHA256SUMS
           (cd dist && sha256sum --check --strict SHA256SUMS)
 
@@ -337,7 +342,10 @@ jobs:
             --dist-dir dist \
             --release-json "$RUNNER_TEMP/release-draft.json" \
             --notes-file dist/release-notes.md \
-            --tag "$GITHUB_REF_NAME"
+            --tag "$GITHUB_REF_NAME" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$(git rev-parse "${PINNED_TARGET_COMMIT_SHA}^{tree}")"
           asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
           version="${GITHUB_REF_NAME#v}"
           expected_assets="SHA256SUMS,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
@@ -373,7 +381,10 @@ jobs:
             --dist-dir dist \
             --release-json "$RUNNER_TEMP/release-before-publish.json" \
             --notes-file dist/release-notes.md \
-            --tag "$GITHUB_REF_NAME"
+            --tag "$GITHUB_REF_NAME" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$(git rev-parse "${PINNED_TARGET_COMMIT_SHA}^{tree}")"
           gh release edit "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false
@@ -383,7 +394,10 @@ jobs:
             --dist-dir dist \
             --release-json "$RUNNER_TEMP/release-after-publish.json" \
             --notes-file dist/release-notes.md \
-            --tag "$GITHUB_REF_NAME"
+            --tag "$GITHUB_REF_NAME" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$(git rev-parse "${PINNED_TARGET_COMMIT_SHA}^{tree}")"
           final_tag_ref_sha="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
             --jq '.object.sha')"

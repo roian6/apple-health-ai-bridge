@@ -14,6 +14,9 @@ from typing import Any, Final
 
 HEX_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
+STABLE_VERSION_PATTERN: Final = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+)
 XCODE_ASSIGNMENT_TEMPLATE: Final = r"\b{key}\s*=\s*([^;]+);"
 IOS_SOURCE_SETTINGS: Final = Path(
     "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
@@ -44,6 +47,17 @@ class ManifestRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ChecksumRequest:
+    repo: Path
+    dist: Path
+    tag: str
+    tag_object: str
+    commit: str
+    tree: str
+    output: Path
+
+
+@dataclass(frozen=True, slots=True)
 class PacketVerificationRequest:
     repo: Path
     dist: Path
@@ -60,6 +74,9 @@ class DraftVerificationRequest:
     release_json: Path
     notes_file: Path
     tag: str
+    tag_object: str
+    commit: str
+    tree: str
 
 
 def _project_metadata(repo: Path) -> tuple[str, str]:
@@ -105,14 +122,34 @@ def read_versions(repo: Path) -> ReleaseVersions:
     )
 
 
+def _stable_version_tuple(value: str, *, surface: str) -> tuple[int, int, int]:
+    match = STABLE_VERSION_PATTERN.fullmatch(value)
+    if match is None:
+        message = f"{surface} must be a stable semantic version"
+        raise ReleaseError(message)
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _release_scope(versions: ReleaseVersions) -> str:
+    project = _stable_version_tuple(versions.project_version, surface="project version")
+    ios = _stable_version_tuple(
+        versions.ios_marketing_version,
+        surface="iOS MARKETING_VERSION",
+    )
+    if project == ios:
+        return "coordinated"
+    if project < ios:
+        message = "receiver version must be newer than the compatible iOS version"
+        raise ReleaseError(message)
+    return "receiver"
+
+
 def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
     versions = read_versions(repo)
     expected = f"v{versions.project_version}"
     if tag != expected:
         message = f"release tag must exactly match project version: {expected}"
-        raise ReleaseError(message)
-    if versions.ios_marketing_version != versions.project_version:
-        message = "iOS MARKETING_VERSION must exactly match Python project version"
         raise ReleaseError(message)
     if not versions.ios_build.isdecimal() or int(versions.ios_build) < 1:
         message = "iOS CURRENT_PROJECT_VERSION must be a positive integer"
@@ -125,6 +162,19 @@ def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
     if f"@{tag}" not in notes:
         message = f"release notes must contain the exact install tag: @{tag}"
         raise ReleaseError(message)
+    if _release_scope(versions) == "receiver":
+        required = (
+            "Receiver-only release",
+            (
+                "Compatible iOS companion: "
+                f"`{versions.ios_marketing_version} ({versions.ios_build})`"
+            ),
+            "No TestFlight update is required",
+        )
+        missing = [marker for marker in required if marker not in notes]
+        if missing:
+            message = "receiver-only release notes are missing compatibility markers"
+            raise ReleaseError(message)
     return versions
 
 
@@ -215,8 +265,9 @@ def create_manifest(request: ManifestRequest) -> None:
             "requires_python": versions.requires_python,
             "version": versions.project_version,
         },
+        "release_scope": _release_scope(versions),
         "release_version": versions.project_version,
-        "schema_id": "health_bridge.release.v1",
+        "schema_id": "health_bridge.release.v2",
     }
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
     _atomic_write(request.output, encoded)
@@ -256,6 +307,88 @@ def _metadata_artifact_records(payload: object) -> dict[str, tuple[str, int]]:
     return expected
 
 
+def _expected_ios_metadata(repo: Path, versions: ReleaseVersions) -> dict[str, str]:
+    return {
+        "build": versions.ios_build,
+        "marketing_version": versions.ios_marketing_version,
+        "source_settings": IOS_SOURCE_SETTINGS.as_posix(),
+        "source_settings_sha256": _sha256(repo / IOS_SOURCE_SETTINGS),
+    }
+
+
+def _expected_python_artifact_names(versions: ReleaseVersions) -> set[str]:
+    return {
+        f"apple_health_ai_bridge-{versions.project_version}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{versions.project_version}.tar.gz",
+    }
+
+
+def _expected_git_identity(
+    *,
+    tag: str,
+    tag_object: str,
+    commit: str,
+    tree: str,
+) -> dict[str, str]:
+    if any(
+        HEX_SHA_PATTERN.fullmatch(value) is None for value in (tag_object, commit, tree)
+    ):
+        message = "release Git identity must use lowercase 40-character SHAs"
+        raise ReleaseError(message)
+    return {
+        "commit": commit,
+        "tag": tag,
+        "tag_object": tag_object,
+        "tree": tree,
+    }
+
+
+def _validate_release_metadata(
+    repo: Path,
+    payload: object,
+    versions: ReleaseVersions,
+    *,
+    expected_git: dict[str, str],
+) -> dict[str, tuple[str, int]]:
+    expected_top_level = {
+        "batch_contract",
+        "git",
+        "ios",
+        "python",
+        "release_scope",
+        "release_version",
+        "schema_id",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_top_level:
+        message = "release metadata top-level schema is not exact"
+        raise ReleaseError(message)
+    if (
+        payload.get("schema_id") != "health_bridge.release.v2"
+        or payload.get("release_scope") != _release_scope(versions)
+        or payload.get("release_version") != versions.project_version
+        or payload.get("batch_contract") != _batch_contract(repo)
+        or payload.get("ios") != _expected_ios_metadata(repo, versions)
+        or payload.get("git") != expected_git
+    ):
+        message = "release metadata version, scope, source, or compatibility is invalid"
+        raise ReleaseError(message)
+    python = payload.get("python")
+    if (
+        not isinstance(python, dict)
+        or set(python) != {"artifacts", "package", "requires_python", "version"}
+        or python.get("package") != "apple-health-ai-bridge"
+        or python.get("version") != versions.project_version
+        or python.get("requires_python") != versions.requires_python
+    ):
+        message = "release metadata Python package or runtime contract is invalid"
+        raise ReleaseError(message)
+    records = _metadata_artifact_records(payload)
+    if set(records) != _expected_python_artifact_names(versions):
+        message = "release metadata artifact file set is not exact"
+        raise ReleaseError(message)
+    return records
+
+
 def _exact_regular_file_names(
     directory: Path, *, excluded_names: set[str] | None = None
 ) -> set[str]:
@@ -271,25 +404,40 @@ def _exact_regular_file_names(
     return names
 
 
-def create_checksums(*, dist: Path, output: Path) -> None:
-    if output.parent.resolve() != dist.resolve():
+def create_checksums(request: ChecksumRequest) -> None:
+    versions = validate_tag(request.repo, request.tag)
+    expected_git = _expected_git_identity(
+        tag=request.tag,
+        tag_object=request.tag_object,
+        commit=request.commit,
+        tree=request.tree,
+    )
+    if request.output.parent.resolve() != request.dist.resolve():
         message = "checksum output must be inside dist directory"
         raise ReleaseError(message)
-    metadata = dist / "release-metadata.json"
+    metadata = request.dist / "release-metadata.json"
     payload = json.loads(metadata.read_text(encoding="utf-8"))
-    expected_artifacts = _metadata_artifact_records(payload)
+    expected_artifacts = _validate_release_metadata(
+        request.repo,
+        payload,
+        versions,
+        expected_git=expected_git,
+    )
     artifact_names = set(expected_artifacts)
-    release_notes = dist / "release-notes.md"
+    release_notes = request.dist / "release-notes.md"
     if not release_notes.is_file() or release_notes.is_symlink():
         message = "release-notes.md must exist before creating checksums"
         raise ReleaseError(message)
     expected_names = artifact_names | {metadata.name, release_notes.name}
-    present_names = _exact_regular_file_names(dist, excluded_names={output.name})
+    present_names = _exact_regular_file_names(
+        request.dist,
+        excluded_names={request.output.name},
+    )
     if present_names != expected_names:
         message = "release checksum inputs must exactly match release metadata"
         raise ReleaseError(message)
     for name, (expected_digest, expected_size) in expected_artifacts.items():
-        artifact = dist / name
+        artifact = request.dist / name
         if (
             artifact.stat().st_size != expected_size
             or _sha256(artifact) != expected_digest
@@ -297,9 +445,9 @@ def create_checksums(*, dist: Path, output: Path) -> None:
             message = f"artifact no longer matches release metadata: {name}"
             raise ReleaseError(message)
     public_asset_names = artifact_names | {metadata.name}
-    files = [dist / name for name in sorted(public_asset_names)]
+    files = [request.dist / name for name in sorted(public_asset_names)]
     lines = "".join(f"{_sha256(path)}  {path.name}\n" for path in files)
-    _atomic_write(output, lines.encode())
+    _atomic_write(request.output, lines.encode("utf-8"))
 
 
 def _verify_packet_checksums(dist: Path, expected_names: set[str]) -> None:
@@ -321,15 +469,6 @@ def _verify_packet_checksums(dist: Path, expected_names: set[str]) -> None:
             raise ReleaseError(message)
 
 
-def _expected_ios_metadata(repo: Path, versions: ReleaseVersions) -> dict[str, str]:
-    return {
-        "build": versions.ios_build,
-        "marketing_version": versions.ios_marketing_version,
-        "source_settings": IOS_SOURCE_SETTINGS.as_posix(),
-        "source_settings_sha256": _sha256(repo / IOS_SOURCE_SETTINGS),
-    }
-
-
 def _verify_packet_metadata(
     request: PacketVerificationRequest,
     versions: ReleaseVersions,
@@ -338,51 +477,18 @@ def _verify_packet_metadata(
     payload = json.loads(
         (request.dist / "release-metadata.json").read_text(encoding="utf-8")
     )
-    expected_top_level = {
-        "batch_contract",
-        "git",
-        "ios",
-        "python",
-        "release_version",
-        "schema_id",
-    }
-    if not isinstance(payload, dict) or set(payload) != expected_top_level:
-        message = "release metadata top-level schema is not exact"
-        raise ReleaseError(message)
-    if (
-        payload.get("schema_id") != "health_bridge.release.v1"
-        or payload.get("release_version") != versions.project_version
-        or payload.get("batch_contract")
-        != {
-            "schema_id": "health_bridge.batch.v1",
-            "schema_version": "1.0.0",
-        }
-    ):
-        message = "release metadata version or batch contract is invalid"
-        raise ReleaseError(message)
-    expected_git = {
-        "commit": request.commit,
-        "tag": request.tag,
-        "tag_object": request.tag_object,
-        "tree": request.tree,
-    }
-    if payload.get("git") != expected_git:
-        message = "release metadata Git identity does not match the verified tag"
-        raise ReleaseError(message)
-    if payload.get("ios") != _expected_ios_metadata(request.repo, versions):
-        message = "release metadata iOS settings do not match the exact tag"
-        raise ReleaseError(message)
-    python = payload.get("python")
-    if (
-        not isinstance(python, dict)
-        or set(python) != {"artifacts", "package", "requires_python", "version"}
-        or python.get("package") != "apple-health-ai-bridge"
-        or python.get("version") != versions.project_version
-        or python.get("requires_python") != versions.requires_python
-    ):
-        message = "release metadata Python package or runtime contract is invalid"
-        raise ReleaseError(message)
-    records = _metadata_artifact_records(payload)
+    expected_git = _expected_git_identity(
+        tag=request.tag,
+        tag_object=request.tag_object,
+        commit=request.commit,
+        tree=request.tree,
+    )
+    records = _validate_release_metadata(
+        request.repo,
+        payload,
+        versions,
+        expected_git=expected_git,
+    )
     expected_artifacts = expected_names - {
         "release-metadata.json",
         "release-notes.md",
@@ -483,10 +589,33 @@ def verify_release_state(
         message = "GitHub release response must be an object"
         raise ReleaseError(message)
     _verify_release_identity(payload, request, expected_draft=expected_draft)
+    metadata_payload = json.loads(
+        (request.dist / "release-metadata.json").read_text(encoding="utf-8")
+    )
+    expected_git = _expected_git_identity(
+        tag=request.tag,
+        tag_object=request.tag_object,
+        commit=request.commit,
+        tree=request.tree,
+    )
+    artifact_records = _validate_release_metadata(
+        request.repo,
+        metadata_payload,
+        versions,
+        expected_git=expected_git,
+    )
+    for name, (digest, size) in artifact_records.items():
+        local = request.dist / name
+        if (
+            local.is_symlink()
+            or not local.is_file()
+            or local.stat().st_size != size
+            or _sha256(local) != digest
+        ):
+            message = f"release metadata artifact mismatch: {name}"
+            raise ReleaseError(message)
     remote_assets = _release_asset_records(payload)
-    expected_names = {
-        f"apple_health_ai_bridge-{versions.project_version}-py3-none-any.whl",
-        f"apple_health_ai_bridge-{versions.project_version}.tar.gz",
+    expected_names = _expected_python_artifact_names(versions) | {
         "SHA256SUMS",
         "release-metadata.json",
     }
@@ -521,7 +650,12 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument("--output", type=Path, required=True)
 
     checksums = subparsers.add_parser("checksums")
+    checksums.add_argument("--repo", type=Path, required=True)
     checksums.add_argument("--dist-dir", type=Path, required=True)
+    checksums.add_argument("--tag", required=True)
+    checksums.add_argument("--tag-object", required=True)
+    checksums.add_argument("--commit", required=True)
+    checksums.add_argument("--tree", required=True)
     checksums.add_argument("--output", type=Path, required=True)
 
     verify_packet_parser = subparsers.add_parser("verify-packet")
@@ -538,6 +672,9 @@ def _parser() -> argparse.ArgumentParser:
         verify_release_parser.add_argument("--release-json", type=Path, required=True)
         verify_release_parser.add_argument("--notes-file", type=Path, required=True)
         verify_release_parser.add_argument("--tag", required=True)
+        verify_release_parser.add_argument("--tag-object", required=True)
+        verify_release_parser.add_argument("--commit", required=True)
+        verify_release_parser.add_argument("--tree", required=True)
     return parser
 
 
@@ -552,6 +689,7 @@ def main() -> int:
                         "ios_build": versions.ios_build,
                         "ios_marketing_version": versions.ios_marketing_version,
                         "project_version": versions.project_version,
+                        "release_scope": _release_scope(versions),
                         "tag": args.tag,
                     },
                     sort_keys=True,
@@ -571,7 +709,17 @@ def main() -> int:
                 )
             )
         elif args.command == "checksums":
-            create_checksums(dist=args.dist_dir, output=args.output)
+            create_checksums(
+                ChecksumRequest(
+                    repo=args.repo,
+                    dist=args.dist_dir,
+                    tag=args.tag,
+                    tag_object=args.tag_object,
+                    commit=args.commit,
+                    tree=args.tree,
+                    output=args.output,
+                )
+            )
         elif args.command == "verify-packet":
             verify_packet(
                 PacketVerificationRequest(
@@ -591,6 +739,9 @@ def main() -> int:
                     release_json=args.release_json,
                     notes_file=args.notes_file,
                     tag=args.tag,
+                    tag_object=args.tag_object,
+                    commit=args.commit,
+                    tree=args.tree,
                 ),
                 expected_draft=args.command == "verify-draft",
             )
