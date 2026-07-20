@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict
 
 import health_bridge.cli_setup as cli_setup_module
 
+TEST_PRIVATE_BIND_HOST = ".".join(("192", "168", "50", "9"))  # noqa: FLY002
+
 
 class AccessDescriptorOutput(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", strict=True)
@@ -109,6 +111,31 @@ def _setup_args(tmp_path: Path) -> tuple[Path, Path, list[str]]:
             str(setup_page),
             "--json",
         ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("receiver_host", "expected"),
+    [
+        ("127.0.0.1", "http://127.0.0.1:8765/health"),
+        ("0.0.0.0", "http://127.0.0.1:8765/health"),  # noqa: S104 - bind input
+        (TEST_PRIVATE_BIND_HOST, f"http://{TEST_PRIVATE_BIND_HOST}:8765/health"),
+        ("::", "http://[::1]:8765/health"),
+        ("::1", "http://[::1]:8765/health"),
+        ("fd00::123", "http://[fd00::123]:8765/health"),
+        ("receiver.local", "http://receiver.local:8765/health"),
+    ],
+)
+def test_local_receiver_health_url_matches_bind_host(
+    receiver_host: str,
+    expected: str,
+) -> None:
+    assert (
+        cli_setup_module._local_receiver_health_url(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            receiver_host,
+            8765,
+        )
+        == expected
     )
 
 

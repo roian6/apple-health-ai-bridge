@@ -484,6 +484,18 @@ def _setup_transport_notice(request: SetupRequest) -> str:
     return "Verify this receiver URL is reachable from the iPhone before pairing."
 
 
+def _local_receiver_health_url(receiver_host: str, receiver_port: int) -> str:
+    address = _parsed_ip(receiver_host)
+    if isinstance(address, ipaddress.IPv4Address):
+        health_host = "127.0.0.1" if address.is_unspecified else str(address)
+    elif isinstance(address, ipaddress.IPv6Address):
+        health_host = "::1" if address.is_unspecified else str(address)
+        health_host = f"[{health_host}]"
+    else:
+        health_host = receiver_host
+    return f"http://{health_host}:{receiver_port}/health"
+
+
 def build_setup_manifest(request: SetupRequest) -> SetupManifest:
     transport_notice = _setup_transport_notice(request)
     session = build_dev_device_session_manifest(
@@ -508,7 +520,10 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         "--port",
         str(request.receiver_port),
     ]
-    local_receiver_health_url = f"http://127.0.0.1:{request.receiver_port}/health"
+    local_receiver_health_url = _local_receiver_health_url(
+        request.receiver_host,
+        request.receiver_port,
+    )
     access = AccessDescriptor(
         command=request.executable,
         args=["mcp", "start", "--db", str(request.db_path)],
