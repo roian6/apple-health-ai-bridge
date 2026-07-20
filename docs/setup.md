@@ -93,6 +93,8 @@ Ask the setup agent to follow this provider-neutral ingress checklist:
 5. **Stop at a public-only design.** If the only workable route is publicly reachable, do not silently publish it. Explain that it needs a deployment-specific hardening review outside this private-ingress guide.
 6. **Prepare the common handoff.** After the approved route exists, set `HEALTH_BRIDGE_RECEIVER_URL` to the exact origin plus `/v1/batches`. Do not claim phone reachability yet; continue with common setup, receiver start, and physical-iPhone verification below.
 
+The agent must not create a provider account, activate a paid plan, incur charges, accept provider terms, or start a trial unless each action and its price or future billing effect was shown in the plan and the user gave explicit approval for each. Existing login access or approval of the overall topology is not approval for those account or billing actions.
+
 Do not print or paste the private URL, pairing page, QR payload, invitation, receiver credential, or database into public chat, issues, logs, or documentation.
 
 The agent should finish route preparation with a redacted handoff containing:

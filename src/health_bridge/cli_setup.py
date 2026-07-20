@@ -508,6 +508,7 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         "--port",
         str(request.receiver_port),
     ]
+    local_receiver_health_url = f"http://127.0.0.1:{request.receiver_port}/health"
     access = AccessDescriptor(
         command=request.executable,
         args=["mcp", "start", "--db", str(request.db_path)],
@@ -543,20 +544,33 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         configured_mcp_clients=[],
         client_configuration_status="not_requested",
         next_steps=[
-            "Start the receiver with receiver_start_command.",
             (
-                "On the receiver computer, open setup_page on a trusted screen, then "
-                "scan its QR with iPhone Camera and open the setup link. If the "
-                "receiver is headless, securely copy the HTML file to a trusted local "
-                "screen; do not publish it or place it on a public web server."
+                "Put receiver_start_command under an approved service manager, "
+                "then start the receiver."
+            ),
+            (
+                'On the receiver host, require {"status":"ok"} from the local '
+                f"health check at {local_receiver_health_url}."
+            ),
+            (
+                "On the physical iPhone, require the same response from the exact "
+                f"phone-facing health URL: {session.receiver_health_url}."
+            ),
+            (
+                "Private pairing page (open only after both health checks pass): on "
+                f"the receiver computer, open {session.setup_page} on a trusted "
+                "screen, then scan its QR with iPhone Camera and open the setup link. "
+                "If the receiver is headless, securely copy the HTML file to a trusted "
+                "local screen; do not publish it or place it on a public web server."
             ),
             (
                 "Connect the app, allow read access to all supported Apple Health "
-                "types you want to share, and enable Automatic Sync."
+                "types you want to share, enable Automatic Sync, and require the "
+                "first receiver upload ACK."
             ),
             (
-                "Use access_descriptors for a same-host stdio MCP client, or query "
-                "the database with the direct CLI."
+                "After the first receiver upload ACK, use access_descriptors for a "
+                "same-host stdio MCP client, or query the database with the direct CLI."
             ),
         ],
         warning=(
@@ -615,11 +629,7 @@ def render_setup_summary(manifest: SetupManifest) -> str:
     configured = ", ".join(manifest.configured_mcp_clients) or "none"
     lines = [
         "Health Bridge core setup prepared.",
-        (
-            "Private pairing page (open on the receiver computer): "
-            f"{manifest.setup_page}"
-        ),
-        f"Receiver health check: {manifest.receiver_health_url}",
+        f"Configured phone-facing health URL: {manifest.receiver_health_url}",
         f"Local MCP self-test: {manifest.local_mcp_status}",
         f"Detected client adapters: {detected} (no configuration is automatic)",
         f"Configured clients: {configured}",

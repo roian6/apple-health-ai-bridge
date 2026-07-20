@@ -136,11 +136,21 @@ def test_setup_default_detects_but_never_configures_clients(tmp_path: Path) -> N
     assert payload.detected_mcp_clients == ["hermes"]
     assert payload.configured_mcp_clients == []
     assert payload.client_configuration_status == "not_requested"
-    pairing_handoff = payload.next_steps[1]
+    assert len(payload.next_steps) == 6
+    assert "approved service manager" in payload.next_steps[0]
+    assert "start" in payload.next_steps[0].lower()
+    assert "http://127.0.0.1:8765/health" in payload.next_steps[1]
+    assert '{"status":"ok"}' in payload.next_steps[1]
+    assert "physical iPhone" in payload.next_steps[2]
+    assert payload.receiver_health_url in payload.next_steps[2]
+    pairing_handoff = payload.next_steps[3]
     assert "receiver computer" in pairing_handoff
     assert "trusted screen" in pairing_handoff
     assert "iPhone Camera" in pairing_handoff
     assert "Open setup_page on the iPhone" not in pairing_handoff
+    assert "first receiver upload ACK" in payload.next_steps[4]
+    assert "After the first receiver upload ACK" in payload.next_steps[5]
+    assert "MCP" in payload.next_steps[5]
     assert not log_path.exists()
 
     access = payload.access_descriptors[0]
@@ -248,10 +258,22 @@ def test_setup_human_output_states_that_configuration_is_not_automatic(
     assert completed.returncode == 0, completed.stderr
     assert "Health Bridge core setup prepared." in completed.stdout
     assert "no configuration is automatic" in completed.stdout
-    assert "Private pairing page (open on the receiver computer)" in completed.stdout
+    assert "Private pairing page (open only after both health checks pass)" in (
+        completed.stdout
+    )
     assert "trusted screen" in completed.stdout
     assert "iPhone Camera" in completed.stdout
     assert "Open setup_page on the iPhone" not in completed.stdout
+    ordered_markers = (
+        "approved service manager",
+        "http://127.0.0.1:8765/health",
+        "physical iPhone",
+        "Private pairing page (open only after both health checks pass)",
+        "first receiver upload ACK",
+        "After the first receiver upload ACK",
+    )
+    positions = [completed.stdout.index(marker) for marker in ordered_markers]
+    assert positions == sorted(positions)
     assert str(db_path) not in completed.stdout
     assert str(setup_page) in completed.stdout
 
