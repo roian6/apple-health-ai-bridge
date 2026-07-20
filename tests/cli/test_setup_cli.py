@@ -102,7 +102,7 @@ def _setup_args(tmp_path: Path) -> tuple[Path, Path, list[str]]:
         [
             "setup",
             "--receiver-url",
-            "https://healthbox.example.test/v1/batches",
+            "https://receiver.healthbridge.internal/v1/batches",
             "--db",
             str(db_path),
             "--setup-page",
@@ -122,8 +122,10 @@ def test_setup_default_detects_but_never_configures_clients(tmp_path: Path) -> N
     payload = SetupCliOutput.model_validate_json(completed.stdout)
     assert payload.schema_version == 2
     assert payload.db == str(db_path)
-    assert payload.receiver_url == "https://healthbox.example.test/v1/batches"
-    assert payload.receiver_health_url == "https://healthbox.example.test/health"
+    assert payload.receiver_url == ("https://receiver.healthbridge.internal/v1/batches")
+    assert payload.receiver_health_url == (
+        "https://receiver.healthbridge.internal/health"
+    )
     assert payload.receiver_start_command[-4:] == [
         "--host",
         "127.0.0.1",
@@ -269,11 +271,25 @@ def test_setup_page_contains_custom_scheme_qr_and_manual_code(
     assert "temporary, single-use invitation" in setup_html
 
 
+@pytest.mark.parametrize(
+    "loopback_url",
+    [
+        "http://127.0.0.1:8765/v1/batches",
+        "https://127.1/v1/batches",
+        "https://127.0.1/v1/batches",
+        "https://2130706433/v1/batches",
+        "https://0x7f000001/v1/batches",
+        "https://0177.0.0.1/v1/batches",
+        "https://receiver.localhost/v1/batches",
+        "https://deep.receiver.localhost.localdomain/v1/batches",
+    ],
+)
 def test_setup_rejects_phone_loopback_url_before_private_side_effects(
     tmp_path: Path,
+    loopback_url: str,
 ) -> None:
     db_path, setup_page, args = _setup_args(tmp_path)
-    args[args.index("--receiver-url") + 1] = "http://127.0.0.1:8765/v1/batches"
+    args[args.index("--receiver-url") + 1] = loopback_url
 
     completed = _run_cli(*args)
 
@@ -282,6 +298,50 @@ def test_setup_rejects_phone_loopback_url_before_private_side_effects(
     assert "iPhone" in completed.stderr
     assert not db_path.exists()
     assert not setup_page.exists()
+
+
+@pytest.mark.parametrize(
+    "receiver_url",
+    [
+        "https://your-private-host.example/v1/batches",
+        "https://receiver.example/v1/batches",
+        "https://receiver.example.com/v1/batches",
+        "https://receiver.example.net/v1/batches",
+        "https://receiver.example.org/v1/batches",
+        "https://receiver.invalid/v1/batches",
+        "https://receiver.test/v1/batches",
+    ],
+)
+def test_setup_rejects_documentation_hosts_before_private_side_effects(
+    tmp_path: Path,
+    receiver_url: str,
+) -> None:
+    db_path, setup_page, args = _setup_args(tmp_path)
+    args[args.index("--receiver-url") + 1] = receiver_url
+
+    completed = _run_cli(*args)
+
+    assert completed.returncode == 1
+    assert "documentation or testing hostname" in completed.stderr
+    assert "docs/setup.md" in completed.stderr
+    assert not db_path.parent.exists()
+    assert not db_path.exists()
+    assert not setup_page.exists()
+
+
+def test_setup_accepts_real_hostname_with_documentation_like_prefix(
+    tmp_path: Path,
+) -> None:
+    db_path, setup_page, args = _setup_args(tmp_path)
+    args[args.index("--receiver-url") + 1] = (
+        "https://your-private-host.company/v1/batches"
+    )
+
+    completed = _run_cli(*args)
+
+    assert completed.returncode == 0, completed.stderr
+    assert db_path.is_file()
+    assert setup_page.is_file()
 
 
 def test_setup_rejects_unusable_numeric_destinations_before_side_effects(

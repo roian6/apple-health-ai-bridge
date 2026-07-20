@@ -105,7 +105,10 @@ def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
         str,
         typer.Option(
             "--receiver-url",
-            help="Phone-reachable receiver /v1/batches URL.",
+            help=(
+                "Exact phone-reachable /v1/batches URL from a configured private "
+                "route; documentation hostnames are rejected."
+            ),
         ),
     ],
     db: Annotated[

@@ -39,32 +39,37 @@ The manual code uses an unambiguous `5-5-5` shape. Its public selector allows th
 
 ## Create a setup page
 
-Verify that the receiver URL is reachable from the iPhone, not only from the receiver machine:
+First prepare the real receiver route by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
+
+For normal onboarding, run the route-specific `health-bridge setup` command in that guide. Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
+
+Then derive the phone-facing health endpoint:
 
 ```bash
-PHONE_REACHABLE_BASE_URL="http://<phone-reachable-private-host>:8765"
-curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
+: "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
+PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
 ```
 
-Then create a QR-first setup page:
+Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page.
+
+If that setup invitation expired during verification, create a fresh QR-first page from the already verified batch URL. The new same-label invitation rotates the previous active one:
 
 ```bash
-PHONE_REACHABLE_BATCH_URL="$PHONE_REACHABLE_BASE_URL/v1/batches"
-uv run health-bridge receiver create-pairing \
-  --db .tmp/receiver.sqlite \
-  --label ios-companion \
-  --receiver-url "$PHONE_REACHABLE_BATCH_URL" \
+health-bridge receiver create-pairing \
+  --db ~/.local/share/health-bridge/health.sqlite \
+  --label iPhone \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --format setup-page \
-  --setup-page .tmp/ios-companion-pairing.html
+  --setup-page ~/.local/share/health-bridge/iphone-setup.html
 ```
 
-The higher-level device-session helper also creates invitation-based setup material while keeping stdout secret-redacted:
+The development-only device-session helper can also create invitation-based setup material while keeping stdout secret-redacted:
 
 ```bash
 uv run health-bridge dev device-session \
   --db .tmp/device.sqlite \
   --label ios-companion \
-  --receiver-url "$PHONE_REACHABLE_BATCH_URL" \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --setup-page .tmp/ios-companion-device-session.html
 ```
 

@@ -28,42 +28,43 @@ uv run health-bridge status --db .tmp/quickstart.sqlite --markdown
 uv run health-bridge mcp smoke --db .tmp/quickstart.sqlite
 ```
 
-## 2. Start the receiver and keep it running
+## 2. Prepare the route and run core setup
 
-Use one terminal for the long-running receiver process:
+Follow [the receiver route guide](setup.md#what-the-receiver-url-means) before generating pairing material. Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
 
-```bash
-uv run health-bridge init --db .tmp/device.sqlite
-uv run health-bridge receiver start --db .tmp/device.sqlite --host 0.0.0.0 --port 8765
-```
-
-Use a private-network hostname or IP for the iPhone-facing URL. Do **not** use `127.0.0.1` in iPhone setup material because that points to the iPhone itself, not your receiver machine.
-
-In a second terminal, verify the exact phone-facing health URL before creating pairing material:
+After the selected route sets `HEALTH_BRIDGE_RECEIVER_URL`, run exactly one setup command. Routes A and B keep the receiver on loopback:
 
 ```bash
-PHONE_REACHABLE_BASE_URL="http://<phone-reachable-private-host>:8765"
-curl -fsS "$PHONE_REACHABLE_BASE_URL/health"
-```
-
-Only continue after `/health` succeeds on the same base URL the iPhone will use.
-
-## 3. Generate private setup material
-
-Generate a setup page with the `/v1/batches` URL derived from the verified base URL. See [`setup.md`](setup.md#pair-the-iphone) for the pairing flow and current receiver guidance.
-
-```bash
-PHONE_REACHABLE_BATCH_URL="$PHONE_REACHABLE_BASE_URL/v1/batches"
-uv run health-bridge dev device-session \
+uv run health-bridge setup \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --db .tmp/device.sqlite \
-  --label ios-companion \
-  --receiver-url "$PHONE_REACHABLE_BATCH_URL" \
   --setup-page .tmp/ios-companion-device-session.html
 ```
 
-The command prints a secret-redacted manifest, but it can still include private receiver URLs and local paths. Do not paste it into public issues, PRs, chat, or logs. The generated HTML setup page contains a temporary, single-use pairing invitation—not the long-lived device credential. Open it only on trusted devices and delete it after pairing or expiry.
+Route C instead repeats its deliberate LAN bind and must never be port-forwarded to the public internet:
 
-Expert receiver commands such as `health-bridge receiver create-token` and `health-bridge receiver create-pairing --format json|deeplink` can produce secret-bearing output only when explicit secret-output flags are used. New pairing defaults to invitation v2; `--legacy-v1` is migration-only. Prefer `dev device-session` for agent-assisted onboarding.
+```bash
+uv run health-bridge setup \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --db .tmp/device.sqlite \
+  --setup-page .tmp/ios-companion-device-session.html \
+  --receiver-host 0.0.0.0 \
+  --receiver-port 8765
+```
+
+Setup creates the private page and prints the exact receiver command, but its same-host MCP smoke does not prove receiver or phone reachability.
+
+## 3. Supervise, start, and verify the receiver
+
+Put the printed receiver command under the approved service manager and start it. Require `{"status":"ok"}` from the printed local health URL first. Then derive the phone-facing endpoint:
+
+```bash
+PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
+```
+
+Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Do not substitute `127.0.0.1` in iPhone setup material; that would point to the iPhone itself.
+
+The setup-generated HTML contains a temporary, single-use invitation—not the long-lived device credential. Keep it private and do not open it for pairing until the app build below is installed. If it expires while building or verifying, follow [the documented fresh-invitation recovery](setup.md#start-and-verify-the-receiver) after both health checks pass.
 
 ## 4. Build, install, and launch the companion
 
@@ -100,6 +101,8 @@ open scripts/ios-device-run-local.command
 If the wrapper opens a keychain prompt, the human at the Mac must approve it. The scripts do not remove the need for Apple signing, device trust, Health permission, or physical iPhone taps.
 
 ## 5. Pair and sync on the iPhone
+
+Follow the current [Pair the iPhone](setup.md#pair-the-iphone) handoff. If the invitation expired while the app was being built, rotate it only after the receiver and both health checks still pass.
 
 On the iPhone:
 

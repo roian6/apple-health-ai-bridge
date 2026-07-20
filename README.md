@@ -20,47 +20,62 @@ Your health data stays under your control: the receiver and database run on your
 You need:
 
 - an iPhone running iOS 18 or later;
-- a macOS or Linux computer that your iPhone can reach over a trusted LAN or private network; native Windows is not currently supported;
-- an MCP client on that machine, or a terminal for direct CLI access;
+- a macOS or Linux computer that will run the receiver and store the private database; native Windows is not currently supported;
+- for continuous sync, a stable private HTTPS route that the physical iPhone can reach away from the local network; for an explicit local-only evaluation, a same-LAN route with the limitation below;
+- an MCP client on the receiver machine, or a terminal for direct CLI access;
 - [`uv`](https://docs.astral.sh/uv/) for the receiver package.
 
 ### 1. Install the iPhone app
 
-Open the [official TestFlight install page](https://healthbridge.chanhyo.dev/install/) on your iPhone and tap the verified public invitation. Health Bridge publishes this repository and website only after the matching TestFlight build is approved and the invitation has been verified anonymously.
+Open the [official TestFlight install page](https://healthbridge.chanhyo.dev/install/) on your iPhone and tap the verified public invitation.
 
-### 2. Install and prepare the bridge
+### 2. Prepare the receiver route
 
-After `v1.0.0` appears on the project's GitHub Releases page, run this on the machine that will host the receiver and MCP server:
+The project does not give you a receiver URL. The URL is the private address by which the iPhone reaches your receiver computer, and it must exist before core setup can create pairing material.
+
+- **Already use Tailscale:** use the private Tailscale Serve HTTPS path documented in the [setup guide](docs/setup.md#route-a-already-use-tailscale). Tailscale is an option for existing users, not a product requirement.
+- **Agent-assisted private HTTPS ingress:** use the setup guide's agent-assisted path. The setup agent must inspect first, show every proposed DNS, tunnel, proxy, firewall, and service change, and wait for approval before applying it.
+- **Local network only:** supported as a deliberate local-only fallback, but automatic sync stops when the iPhone leaves that network.
+
+Do not copy a sample hostname, expose receiver port `8765` directly to the public internet, or publish the pairing page. Follow the complete [receiver setup guide](docs/setup.md) to produce and verify the real route.
+
+### 3. Install and run setup
+
+After `v1.0.0` appears on the project's GitHub Releases page, install the receiver package:
 
 ```bash
 uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.0"
-health-bridge setup \
-  --receiver-url https://your-private-host.example/v1/batches
 ```
 
-`health-bridge setup`:
+The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configured `/v1/batches` URL. Only then run:
 
-- creates a private local SQLite database and single-use pairing page;
-- prepares the receiver command;
-- emits a canonical same-host stdio MCP access descriptor;
-- verifies the local Health Bridge MCP server;
-- detects available client adapters without modifying their configuration;
-- prints only secret-redacted paths, commands, and status.
+```bash
+health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
+```
 
-Adding a client creates another process that can read the private health database, so setup never does that automatically. Use an explicit `--configure-client <name>` only after choosing the client. Other same-host MCP clients can render the canonical descriptor into their own documented config format; Health Bridge is not limited to its bundled adapters.
+For the deliberate Route C local-network-only fallback, use the same real LAN URL and the required non-loopback bind:
 
-The pairing page itself is secret material. Never paste it into chat, commit it, or host it publicly.
+```bash
+health-bridge setup \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --receiver-host 0.0.0.0 \
+  --receiver-port 8765
+```
 
-### 3. Pair and sync
+`health-bridge setup` creates the private SQLite database and single-use pairing page, prepares the receiver command, emits a canonical same-host stdio MCP descriptor, verifies the local Health Bridge MCP process, and detects client adapters without modifying them.
 
-1. Start the receiver using the command printed by `health-bridge setup`.
-2. On the receiver computer, open the generated pairing HTML on a trusted screen.
-   For a headless receiver, securely copy that file to a trusted local screen; never
-   publish it or place it on a public web server.
+A successful local MCP check does not prove receiver readiness or phone reachability. Put the printed receiver command under the host's approved service manager, start it, require `{"status":"ok"}` from the printed local `/health` URL, and then require the same response from the exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C uses HTTP only on the same trusted LAN.
+
+Adding a client creates another process that can read the private health database, so setup never does that automatically. Use an explicit `--configure-client <name>` only after choosing the client.
+
+### 4. Pair and sync
+
+1. Continue only after the supervised receiver, local health check, and physical-iPhone health check all pass.
+2. On the receiver computer, open the generated pairing HTML on a trusted screen. For a headless receiver, securely copy that one file to a trusted local screen; never publish it or place it on a web server.
 3. Scan the QR with iPhone Camera, open the setup link, and connect the companion app.
 4. Tap **Allow Health Access** and review Apple’s native authorization sheet.
 5. Enable **Automatic Sync**.
-6. Wait for the first successful upload, then ask your agent about your data.
+6. Wait for the first successful receiver upload, then ask your agent about your data.
 
 Example prompts:
 
@@ -98,7 +113,7 @@ It does not expose raw SQL, token material, cursor values, or clinical recommend
 - Logs and agent status omit health values and credentials by default.
 - The receiver is designed for one trusted user, not mutually untrusted tenants.
 
-Do not expose the receiver or pairing page to the public internet. Prefer a trusted LAN, Tailscale, or another private network with HTTPS where practical.
+Do not expose the receiver's loopback port or pairing page to the public internet. For continuous sync away from home, use an existing private-network HTTPS route such as Tailscale Serve or an agent-assisted private HTTPS ingress reviewed for the receiver paths. LAN-only access is a limited fallback.
 
 Report vulnerabilities through GitHub’s private vulnerability reporting flow described in [SECURITY.md](SECURITY.md).
 

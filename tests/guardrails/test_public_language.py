@@ -225,6 +225,120 @@ def test_readme_makes_testflight_primary_without_exposing_maintainer_operations(
     assert "Allow LAN access" in setup_guide
 
 
+def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
+    onboarding_paths = (
+        Path("README.md"),
+        Path("docs/setup.md"),
+        Path("docs/pairing.md"),
+        Path("docs/self-build.md"),
+        Path("docs/agent-assisted-setup.md"),
+    )
+    onboarding_copy = "\n".join(
+        path.read_text(encoding="utf-8") for path in onboarding_paths
+    )
+    setup_guide = Path("docs/setup.md").read_text(encoding="utf-8")
+
+    assert "your-private-host.example" not in onboarding_copy
+    assert "<phone-reachable-private-host>" not in onboarding_copy
+    assert "The project does not issue this URL" in setup_guide
+    assert "Already use Tailscale" in setup_guide
+    assert "Agent-assisted private HTTPS ingress" in setup_guide
+    assert "local-network-only route" in setup_guide
+    assert "Do not expose port 8765 directly to the public internet" in setup_guide
+    assert "If no suitable private route exists" in setup_guide
+    assert "## Route C: Local-network-only fallback" in setup_guide
+    assert setup_guide.index("## Route C: Local-network-only fallback") < (
+        setup_guide.index("## Install and run core setup")
+    )
+    assert "--receiver-host 0.0.0.0" in setup_guide
+    assert "--receiver-port 8765" in setup_guide
+    assert "--receiver-host 0.0.0.0" in Path("README.md").read_text(encoding="utf-8")
+
+    for route_handoff in (
+        Path("docs/agent-assisted-setup.md"),
+        Path("docs/pairing.md"),
+        Path("docs/self-build.md"),
+    ):
+        handoff_copy = route_handoff.read_text(encoding="utf-8")
+        assert "Routes A and B use HTTPS" in handoff_copy
+        assert (
+            "Route C deliberately uses HTTP only on the same trusted LAN"
+            in handoff_copy
+        )
+
+    for path, ordered_steps in (
+        (
+            Path("docs/agent-assisted-setup.md"),
+            (
+                "run the matching setup command",
+                "approved service manager",
+                "printed local health URL",
+                "Open that exact phone-facing `/health` URL on the physical iPhone",
+                "open the private setup page",
+            ),
+        ),
+        (
+            Path("docs/pairing.md"),
+            (
+                "run the route-specific `health-bridge setup` command",
+                "approved service manager",
+                "printed local health URL",
+                "Open that exact phone-facing `/health` URL on the physical iPhone",
+                "open the setup-generated pairing page",
+            ),
+        ),
+        (
+            Path("docs/self-build.md"),
+            (
+                "run exactly one setup command",
+                "approved service manager",
+                "printed local health URL",
+                "Open that exact phone-facing `/health` URL on the physical iPhone",
+                "setup-generated HTML",
+            ),
+        ),
+    ):
+        text = path.read_text(encoding="utf-8")
+        positions = [text.index(step) for step in ordered_steps]
+        assert positions == sorted(positions), path
+
+    readme = Path("README.md").read_text(encoding="utf-8")
+    route_language = "\n".join(
+        (
+            readme,
+            setup_guide,
+            Path("docs/architecture.md").read_text(encoding="utf-8"),
+        )
+    )
+    assert "agent-managed private HTTPS ingress" not in route_language
+    assert "agent-managed service plan" not in route_language
+
+    for copy, ordered_steps in (
+        (
+            readme,
+            (
+                "Prepare the receiver route",
+                "Install and run setup",
+                "approved service manager",
+                "printed local `/health` URL",
+                "phone-facing `/health` URL",
+                "Pair and sync",
+            ),
+        ),
+        (
+            setup_guide,
+            (
+                "Choose one of the following routes",
+                "Install and run core setup",
+                "Start and verify the receiver",
+                "Pair the iPhone",
+            ),
+        ),
+    ):
+        positions = [copy.index(step) for step in ordered_steps]
+        assert positions == sorted(positions)
+
+
 def test_contributor_and_release_docs_match_ci_release_gates() -> None:
     agents = Path("AGENTS.md").read_text()
     contributing = Path("CONTRIBUTING.md").read_text()
