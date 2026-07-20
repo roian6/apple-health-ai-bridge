@@ -227,7 +227,7 @@ def _is_documentation_host(host: str) -> bool:
         normalized in DOCUMENTATION_HOSTS
         or any(normalized.endswith(suffix) for suffix in DOCUMENTATION_HOST_SUFFIXES)
         or any(
-            normalized == reserved or normalized.endswith(f".{reserved}")
+            normalized.endswith(f".{reserved}")
             for reserved in ("example.com", "example.net", "example.org")
         )
     )
