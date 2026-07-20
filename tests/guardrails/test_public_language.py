@@ -246,6 +246,12 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     assert "local-network-only route" in setup_guide
     assert "Do not expose port 8765 directly to the public internet" in setup_guide
     assert "If no suitable private route exists" in setup_guide
+    agent_guide = Path("docs/agent-assisted-setup.md").read_text(encoding="utf-8")
+    for safety_copy in (setup_guide, agent_guide):
+        assert "must not create a provider account" in safety_copy
+        assert "activate a paid plan" in safety_copy
+        assert "incur charges" in safety_copy
+        assert "explicit approval for each" in safety_copy
     assert "## Route C: Local-network-only fallback" in setup_guide
     assert setup_guide.index("## Route C: Local-network-only fallback") < (
         setup_guide.index("## Install and run core setup")

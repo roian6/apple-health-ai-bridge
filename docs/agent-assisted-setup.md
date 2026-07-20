@@ -52,6 +52,8 @@ uv run health-bridge status --db .tmp/device.sqlite --markdown
 
 For a physical iPhone, prepare the real receiver route first by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback. Do not put a sample hostname into pairing material.
 
+For Route B, an agent must not create a provider account, activate a paid plan, incur charges, accept provider terms, or start a trial unless each action and its price or future billing effect was previewed and the user gave explicit approval for each. Existing login access or approval of the overall topology is not approval for those account or billing actions.
+
 After the selected route sets `HEALTH_BRIDGE_RECEIVER_URL`, run the matching setup command. Routes A and B keep loopback:
 
 ```bash
