@@ -132,10 +132,10 @@ After setup, use the printed receiver command with the same bind and port. Keep 
 
 ## Install and run core setup
 
-Install the signed release after `v1.0.0` appears on the project's GitHub Releases page:
+Install the current signed receiver release:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.0"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.1"
 ```
 
 After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.
