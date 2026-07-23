@@ -740,7 +740,7 @@ def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  
     assert ".commit.author.email | endswith" not in workflow
     assert 'endswith("@users.noreply.github.com")' in workflow
     assert (
-        "actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8"
+        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373"
         in workflow
     )
     assert "gh release create" in workflow
