@@ -6,7 +6,7 @@ The first public launch is a coordinated cutover, not a source-only preview. Bef
 
 A private TestFlight candidate may be archived, uploaded, assigned to a private tester group, and submitted for external Beta App Review before the public tag only when the private release packet records the exact source commit and tree, signed archive metadata and checksum, complete source/package gates, and real-device smoke evidence. This validation does not authorize a public TestFlight link, App Store submission, or repository launch. Before any public action, verify the final audited one-root snapshot against the reviewed signed candidate, confirm external approval and anonymous Public Link access, then publish the required checksums and provenance.
 
-A receiver-only patch may advance the Python receiver version while keeping the last verified iOS companion version/build unchanged. For that scope, maintainers must not upload a new TestFlight build merely to make version numbers match. The exact-tag workflow must still run the iOS source gates, the versioned notes must name the compatible iOS companion and state that no TestFlight update is required, and `release-metadata.json` must set `release_scope` to `receiver` while independently recording the receiver version, iOS source version/build, and batch contract.
+A receiver-only patch may advance the Receiver/CLI version while keeping the last verified iOS Companion version/build and Batch Protocol unchanged. For that scope, maintainers must not upload a new TestFlight build merely to make version numbers match. The exact-tag workflow must still run the iOS source gates, the versioned notes must name the exact compatible iOS Companion and Batch Protocol and state that no TestFlight update is required, and `release-metadata.json` must set `release_scope` to `receiver` while independently recording every component version. A coordinated release must declare `release_scope` as `coordinated`, advance Receiver/CLI plus iOS Companion or Batch Protocol, and name the exact resulting compatibility in its notes. Update `component-versions.json` in the same commit as any authoritative version source; release validation must reject drift between that index, `pyproject.toml`, Xcode settings, and the canonical batch fixture.
 
 ## Required checks
 
@@ -25,7 +25,27 @@ uv run pytest -q
 rm -rf dist
 uv build --build-constraints build-constraints.txt --require-hashes --out-dir dist
 uv run python scripts/package-smoke.py --dist-dir dist
-uv run python scripts/release_tools.py validate --repo . --tag "v$(uv version --short)"
+version="$(uv version --short)"
+case "$version" in
+  1.0.0|1.0.1)
+    # Historical tags predate component-transition baselines.
+    uv run python scripts/release_tools.py validate --repo . --tag "v$version"
+    ;;
+  *)
+    release_tag="receiver-v$version"
+    git fetch origin main
+    tag_target_commit="$(git rev-parse HEAD)"
+    default_main_commit="$(git rev-parse origin/main)"
+    baseline_commit="$(git rev-parse "${tag_target_commit}^1")"
+    test "$tag_target_commit" = "$default_main_commit"
+    uv run python scripts/release_tools.py validate \
+      --repo . \
+      --tag "$release_tag" \
+      --tag-target-commit "$tag_target_commit" \
+      --default-main-commit "$default_main_commit" \
+      --baseline-commit "$baseline_commit"
+    ;;
+esac
 gitleaks git --redact --no-banner --log-opts='--all'
 ```
 
@@ -37,15 +57,16 @@ The package smoke inspects the wheel and source distribution, installs the wheel
 
 Before pushing a release tag, configure and read back these repository-side gates. They are not created by the workflow itself:
 
-1. Create the GitHub Actions environment **`github-release`**. Add **Required reviewers** so publishing pauses for an explicit maintainer approval after QA. Add a custom **deployment tag rule** matching `v*` and do not allow deployment from branches. If the repository has only one release maintainer, that maintainer may approve the environment gate; the approval still must be a distinct, deliberate release action after the tag jobs finish.
-2. Create an **active tag ruleset** targeting `refs/tags/v*`. Enable **Restrict creations**, **Restrict deletions**, and **Restrict updates**. Limit bypass to the release maintainer role needed to create a new signed tag; the workflow token does not need tag mutation permission. Never bypass the ruleset to move or recreate an existing version.
-3. Open GitHub repository **Settings → General → Releases** and select **Enable release immutability**. Read back all three settings immediately before the first tag: environment name and reviewer, `v*` deployment tag rule, active tag ruleset/ref pattern, and release immutability enabled.
+1. Create the GitHub Actions environment **`github-release`**. Add **Required reviewers** so publishing pauses for an explicit maintainer approval after QA. Add a deployment tag rule matching `receiver-v*` and do not allow deployments from branches or from legacy `v*` tags. This prevents the historical `v*` workflow stored in an old commit from entering the publication environment. If the repository has only one release maintainer, that maintainer may approve the environment gate; the approval still must be a distinct, deliberate release action after the tag jobs finish.
+2. Create an active tag ruleset targeting `refs/tags/v*`. Enable **Restrict creations**, **Restrict deletions**, and **Restrict updates**, with no bypass actors. Applying the ruleset preserves existing `v1.0.0` and `v1.0.1` while it denies every new legacy tag creation and prevents either historical tag from being moved, deleted, or recreated.
+3. Create a separate active tag ruleset targeting `refs/tags/receiver-v*`. Enable **Restrict creations**, **Restrict deletions**, and **Restrict updates**. Limit bypass to the release maintainer role needed to create a new signed tag; the workflow token does not need tag mutation permission. Never bypass the ruleset to move or recreate an existing version.
+4. Open GitHub repository **Settings → General → Releases** and select **Enable release immutability**. Read back all four controls immediately before the next tag: the environment name/reviewer and `receiver-v*` deployment rule, the no-bypass legacy `v*` ruleset, the protected `receiver-v*` creation ruleset, and release immutability enabled.
 
 The workflow creates a draft, attaches and attests every asset, and only then publishes it; publication locks the tag and assets. If a draft-stage workflow fails, inspect and remove only that unpublished draft before retrying. Never move or reuse a published version tag.
 
 GitHub defines the push payload's `after` field as the most recent **commit** on the pushed ref. For an annotated tag, the release workflow therefore binds the peeled target commit to `github.event.after`; it separately binds the live tag ref to the locally fetched annotated tag object, verifies the signed tag's internal name, and relies on the active tag ruleset to prevent creation/update/deletion races.
 
-Create the first public version only from the clean, reviewed root commit with the repository's configured SSH signing key:
+Create a new Receiver/CLI version only from the clean, reviewed, GitHub-verified release commit. Sign the annotated tag with the repository's configured SSH signing key:
 
 ```bash
 test "$(git config user.name)" = "Chanhyo Jung"
@@ -54,13 +75,12 @@ case "$(git config user.email)" in
   *) echo "use the GitHub noreply address shown in account settings" >&2; exit 1 ;;
 esac
 commit_sha="$(git rev-parse HEAD)"
-git verify-commit HEAD
 repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner')"
 commit_verified="$(gh api "/repos/$repo/commits/$commit_sha" \
-  --jq '.commit.verification.verified == true and .commit.verification.reason == "valid" and .author.login == "roian6" and .committer.login == "roian6"')"
+  --jq '.commit.verification.verified == true and .commit.verification.reason == "valid" and .author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub"')"
 test "$commit_verified" = "true"
-tag="v$(uv version --short)"
-git tag -s "$tag" -m "Apple Health AI Bridge ${tag#v}"
+tag="receiver-v$(uv version --short)"
+git tag -s "$tag" -m "Apple Health AI Bridge Receiver/CLI ${tag#receiver-v}"
 git verify-tag "$tag"
 test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)"
 git push origin "refs/tags/$tag"

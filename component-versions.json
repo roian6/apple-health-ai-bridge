@@ -1,0 +1,16 @@
+{
+  "batch_protocol": {
+    "schema_id": "health_bridge.batch.v1",
+    "version": "1.0.0"
+  },
+  "ios_companion": {
+    "build": "15",
+    "marketing_version": "1.0.0"
+  },
+  "receiver_cli": {
+    "release_tag": "v1.0.1",
+    "version": "1.0.1"
+  },
+  "release_scope": "receiver",
+  "schema_id": "health_bridge.component_versions.v1"
+}

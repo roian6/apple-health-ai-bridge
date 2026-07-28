@@ -14,6 +14,8 @@ RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 RELEASE_NOTES = ROOT / ".github/release/notes-v1.0.1.md"
 RELEASE_CRITERIA = ROOT / ".github/release/criteria.md"
+COMPONENT_VERSIONS = ROOT / "component-versions.json"
+VERSIONING_DOC = ROOT / "docs/versioning.md"
 XCODE_PROJECT = (
     ROOT / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
@@ -35,7 +37,7 @@ class ValidateOutput(BaseModel):
     ios_build: str
     ios_marketing_version: str
     project_version: str
-    release_scope: Literal["receiver"]
+    release_scope: Literal["receiver", "coordinated"]
     tag: str
 
 
@@ -146,6 +148,84 @@ def _create_manifest_fixture(dist: Path) -> Path:
     return metadata
 
 
+def _write_version_fixture(
+    repo: Path,
+    *,
+    receiver_version: str,
+    release_tag: str,
+    index_receiver_version: str | None = None,
+    ios_marketing_version: str = "1.0.0",
+) -> None:
+    xcode_project = repo / XCODE_PROJECT.relative_to(ROOT)
+    xcode_project.parent.mkdir(parents=True)
+    _ = xcode_project.write_text(
+        (
+            f"MARKETING_VERSION = {ios_marketing_version};\n"
+            "CURRENT_PROJECT_VERSION = 15;\n"
+        ),
+        encoding="utf-8",
+    )
+    _ = (repo / "pyproject.toml").write_text(
+        (f'[project]\nversion = "{receiver_version}"\nrequires-python = ">=3.11"\n'),
+        encoding="utf-8",
+    )
+    fixture = repo / "fixtures/health_bridge_batch_v1.synthetic.json"
+    fixture.parent.mkdir(parents=True)
+    _ = fixture.write_text(
+        json.dumps(
+            {
+                "schema_id": "health_bridge.batch.v1",
+                "schema_version": "1.0.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    notes = repo / ".github/release" / f"notes-{release_tag}.md"
+    notes.parent.mkdir(parents=True)
+    if release_tag.startswith("receiver-v"):
+        note_lines = (
+            f"# {release_tag}",
+            f"@{release_tag}",
+            "Receiver-only release",
+            f"Compatible iOS Companion: `{ios_marketing_version} (15)`",
+            "Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`",
+            "No TestFlight update is required",
+        )
+    else:
+        note_lines = (
+            f"# {release_tag}",
+            f"@{release_tag}",
+            "Receiver-only release",
+            f"Compatible iOS companion: `{ios_marketing_version} (15)`",
+            "No TestFlight update is required",
+        )
+    _ = notes.write_text("\n".join(note_lines) + "\n", encoding="utf-8")
+    _ = (repo / COMPONENT_VERSIONS.relative_to(ROOT)).write_text(
+        json.dumps(
+            {
+                "batch_protocol": {
+                    "schema_id": "health_bridge.batch.v1",
+                    "version": "1.0.0",
+                },
+                "ios_companion": {
+                    "build": "15",
+                    "marketing_version": ios_marketing_version,
+                },
+                "receiver_cli": {
+                    "release_tag": release_tag,
+                    "version": index_receiver_version or receiver_version,
+                },
+                "release_scope": "receiver",
+                "schema_id": "health_bridge.component_versions.v1",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _mutate_release_metadata(payload: dict[str, object], mutation: str) -> None:
     if mutation == "wrong-schema":
         payload["schema_id"] = "health_bridge.release.untrusted"
@@ -183,51 +263,111 @@ def test_release_validate_accepts_exact_v_prefixed_project_version() -> None:
     }
 
 
+def test_component_version_index_matches_current_release_surfaces() -> None:
+    payload = cast(
+        "dict[str, object]",
+        json.loads(COMPONENT_VERSIONS.read_text(encoding="utf-8")),
+    )
+
+    assert payload == {
+        "batch_protocol": {
+            "schema_id": "health_bridge.batch.v1",
+            "version": "1.0.0",
+        },
+        "ios_companion": {"build": "15", "marketing_version": "1.0.0"},
+        "receiver_cli": {"release_tag": "v1.0.1", "version": "1.0.1"},
+        "release_scope": "receiver",
+        "schema_id": "health_bridge.component_versions.v1",
+    }
+
+
+def test_next_receiver_release_requires_component_scoped_tag(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _write_version_fixture(
+        repo,
+        receiver_version="1.0.2",
+        release_tag="receiver-v1.0.2",
+    )
+
+    accepted = _run_release_tool(
+        "validate",
+        "--repo",
+        str(repo),
+        "--tag",
+        "receiver-v1.0.2",
+    )
+    legacy = _run_release_tool(
+        "validate",
+        "--repo",
+        str(repo),
+        "--tag",
+        "v1.0.2",
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert legacy.returncode == 1
+    assert "receiver-v1.0.2" in legacy.stderr
+
+
+def test_release_validate_rejects_component_version_index_drift(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _write_version_fixture(
+        repo,
+        receiver_version="1.0.1",
+        release_tag="v1.0.1",
+        index_receiver_version="1.0.0",
+    )
+
+    completed = _run_release_tool(
+        "validate",
+        "--repo",
+        str(repo),
+        "--tag",
+        "v1.0.1",
+    )
+
+    assert completed.returncode == 1
+    assert "component version index" in completed.stderr
+
+
 @pytest.mark.parametrize("tag", ["1.0.1", "v1.0.0", "v1.0.1-beta.1", "main"])
 def test_release_validate_rejects_noncanonical_or_mismatched_tag(tag: str) -> None:
     completed = _run_release_tool("validate", "--repo", str(ROOT), "--tag", tag)
 
     assert completed.returncode == 1
     assert completed.stdout == ""
-    assert "release tag must exactly match project version: v1.0.1" in completed.stderr
+    assert (
+        "receiver release tag must exactly match package version: v1.0.1"
+        in completed.stderr
+    )
 
 
-def test_receiver_only_release_rejects_receiver_version_behind_ios(
+def test_receiver_and_ios_semver_order_does_not_define_compatibility(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
-    xcode_project = repo / XCODE_PROJECT.relative_to(ROOT)
-    xcode_project.parent.mkdir(parents=True)
-    _ = xcode_project.write_text(
-        "MARKETING_VERSION = 1.0.1;\nCURRENT_PROJECT_VERSION = 15;\n",
-        encoding="utf-8",
-    )
-    _ = (repo / "pyproject.toml").write_text(
-        '[project]\nversion = "1.0.0"\nrequires-python = ">=3.11"\n',
-        encoding="utf-8",
-    )
-    notes_dir = repo / ".github/release"
-    notes_dir.mkdir(parents=True)
-    note_lines = (
-        "# v1.0.0",
-        "@v1.0.0",
-        "Receiver-only release",
-        "Compatible iOS companion: `1.0.1 (15)`",
-        "No TestFlight update is required",
-    )
-    _ = (notes_dir / "notes-v1.0.0.md").write_text(
-        "\n".join(note_lines) + "\n",
-        encoding="utf-8",
+    _write_version_fixture(
+        repo,
+        receiver_version="1.0.2",
+        release_tag="receiver-v1.0.2",
+        ios_marketing_version="1.1.0",
     )
 
-    completed = _run_release_tool("validate", "--repo", str(repo), "--tag", "v1.0.0")
-
-    assert completed.returncode == 1
-    assert completed.stdout == ""
-    assert (
-        "receiver version must be newer than the compatible iOS version"
-        in completed.stderr
+    completed = _run_release_tool(
+        "validate",
+        "--repo",
+        str(repo),
+        "--tag",
+        "receiver-v1.0.2",
     )
+
+    assert completed.returncode == 0, completed.stderr
+    output = ValidateOutput.model_validate_json(completed.stdout)
+    assert output.release_scope == "receiver"
+    assert output.project_version == "1.0.2"
+    assert output.ios_marketing_version == "1.1.0"
 
 
 def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> None:
@@ -682,7 +822,7 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
 def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  # noqa: PLR0915
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
-    assert 'tags: ["v*"]' in workflow
+    assert 'tags: ["receiver-v*"]' in workflow
     assert "  verify:\n" in workflow
     assert "tag_object_sha:" in workflow
     assert "target_commit_sha:" in workflow
@@ -767,7 +907,11 @@ def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  
     assert "release body does not match exact notes" in release_tool
     assert "(cd dist && sha256sum --check --strict SHA256SUMS)" in workflow
     assert "--verify-tag" in workflow
-    assert 'if [[ "${version%%.*}" = "0" ]]' in workflow
+    assert workflow.count("release_tools.py tag-info") == 1
+    assert 'prerelease="$(jq -r \'.prerelease\' <<< "$tag_info")"' in workflow
+    assert 'version="$(jq -r \'.version\' <<< "$tag_info")"' in workflow
+    assert 'if [[ "$prerelease" = "true" ]]' in workflow
+    assert 'version="${GITHUB_REF_NAME#receiver-v}"' not in workflow
     assert "release_flags+=(--prerelease)" in workflow
     assert "--notes-file dist/release-notes.md" in workflow
     assert "--generate-notes" not in workflow
@@ -801,7 +945,8 @@ def test_release_criteria_requires_live_app_store_build_readback() -> None:
     assert "github-release" in criteria
     assert "Required reviewers" in criteria
     assert "deployment tag rule" in criteria
-    assert "v*" in criteria
+    assert "receiver-v*" in criteria
+    assert "component-versions.json" in criteria
     assert "active tag ruleset" in criteria
     assert "Restrict deletions" in criteria
     assert "Restrict updates" in criteria
@@ -815,6 +960,30 @@ def test_release_criteria_requires_live_app_store_build_readback() -> None:
     assert "receiver-only patch" in criteria
     assert "must not upload a new TestFlight build" in criteria
     assert "release_scope" in criteria
+
+
+def test_public_docs_name_each_version_surface_and_transition() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    versioning = VERSIONING_DOC.read_text(encoding="utf-8")
+
+    for label in ("Receiver/CLI", "iOS Companion", "Batch Protocol"):
+        assert label in readme
+        assert label in versioning
+    assert "receiver-v1.0.2" in versioning
+    assert "ios-v1.1.0-build.16" in versioning
+    assert "Existing `v1.0.0` and `v1.0.1` tags remain immutable" in versioning
+    assert (
+        "Do not bump an unchanged component merely to make the numbers match"
+        in versioning
+    )
+    assert "component-versions.json" in versioning
+    versioning_subject = (
+        "Future release notes must state the exact compatible iOS Companion"
+    )
+    versioning_detail = "version/build and Batch Protocol schema identifier/version"
+    expected_versioning_statement = f"{versioning_subject} {versioning_detail}"
+    assert expected_versioning_statement in versioning
+    assert "Historical release notes remain as published" in versioning
 
 
 def test_release_and_self_build_docs_reference_current_guidance() -> None:

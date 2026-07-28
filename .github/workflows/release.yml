@@ -2,7 +2,7 @@ name: Tagged release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["receiver-v*"]
 
 permissions:
   contents: read
@@ -19,6 +19,8 @@ jobs:
     outputs:
       tag_object_sha: ${{ steps.pin.outputs.tag_object_sha }}
       target_commit_sha: ${{ steps.pin.outputs.target_commit_sha }}
+      default_main_commit_sha: ${{ steps.pin.outputs.default_main_commit_sha }}
+      baseline_commit_sha: ${{ steps.pin.outputs.baseline_commit_sha }}
     steps:
       - name: Check out release ref
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -69,8 +71,20 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
             --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
           test "$commit_identity" = "true"
+          default_branch="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}" \
+            --jq '.default_branch')"
+          default_main_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
+            --jq '.commit.sha')"
+          [[ "$default_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$target_sha" = "$default_main_sha"
+          baseline_sha="$(git rev-parse "${target_sha}^1")"
+          [[ "$baseline_sha" =~ ^[0-9a-f]{40}$ ]]
           echo "tag_object_sha=$tag_object_sha" >> "$GITHUB_OUTPUT"
           echo "target_commit_sha=$target_sha" >> "$GITHUB_OUTPUT"
+          echo "default_main_commit_sha=$default_main_sha" >> "$GITHUB_OUTPUT"
+          echo "baseline_commit_sha=$baseline_sha" >> "$GITHUB_OUTPUT"
 
   python:
     needs: verify
@@ -80,6 +94,8 @@ jobs:
     env:
       PINNED_TAG_OBJECT_SHA: ${{ needs.verify.outputs.tag_object_sha }}
       PINNED_TARGET_COMMIT_SHA: ${{ needs.verify.outputs.target_commit_sha }}
+      PINNED_DEFAULT_MAIN_COMMIT_SHA: ${{ needs.verify.outputs.default_main_commit_sha }}
+      PINNED_BASELINE_COMMIT_SHA: ${{ needs.verify.outputs.baseline_commit_sha }}
     steps:
       - name: Check out exact tag target
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -106,7 +122,10 @@ jobs:
         run: |
           uv run python scripts/release_tools.py validate \
             --repo . \
-            --tag "$GITHUB_REF_NAME"
+            --tag "$GITHUB_REF_NAME" \
+            --tag-target-commit "$PINNED_TARGET_COMMIT_SHA" \
+            --default-main-commit "$PINNED_DEFAULT_MAIN_COMMIT_SHA" \
+            --baseline-commit "$PINNED_BASELINE_COMMIT_SHA"
 
       - name: Scan Git history for credentials
         env:
@@ -313,8 +332,11 @@ jobs:
             --notes-file dist/release-notes.md
             --draft
           )
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "${version%%.*}" = "0" ]]; then
+          tag_info="$(python scripts/release_tools.py tag-info \
+            --tag "$GITHUB_REF_NAME")"
+          version="$(jq -r '.version' <<< "$tag_info")"
+          prerelease="$(jq -r '.prerelease' <<< "$tag_info")"
+          if [[ "$prerelease" = "true" ]]; then
             release_flags+=(--prerelease)
           fi
           gh release create "$GITHUB_REF_NAME" \
@@ -347,7 +369,6 @@ jobs:
             --commit "$PINNED_TARGET_COMMIT_SHA" \
             --tree "$(git rev-parse "${PINNED_TARGET_COMMIT_SHA}^{tree}")"
           asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
-          version="${GITHUB_REF_NAME#v}"
           expected_assets="SHA256SUMS,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
           test "$asset_names" = "$expected_assets"
 
