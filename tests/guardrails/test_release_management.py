@@ -953,7 +953,9 @@ def test_release_criteria_requires_live_app_store_build_readback() -> None:
     assert "Restrict creations" in criteria
     assert "Enable release immutability" in criteria
     assert 'git verify-tag "$tag"' in criteria
-    assert "git verify-commit HEAD" in criteria
+    assert "git verify-commit HEAD" not in criteria
+    assert '.author.login == "roian6"' in criteria
+    assert '.committer.login == "web-flow"' in criteria
     assert "/commits/$commit_sha" in criteria
     assert "lightweight tag" in criteria
     assert "build 3" not in criteria
