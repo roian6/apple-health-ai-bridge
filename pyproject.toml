@@ -1,7 +1,8 @@
 [project]
 name = "apple-health-ai-bridge"
 version = "1.0.1"
-description = "Local-first Apple Health context bridge for read-only CLI and MCP access."
+description = "Open-source receiver and read-only CLI/MCP package for Health Bridge for AI."
+keywords = ["ai-agents", "apple-health", "healthkit", "local-first", "mcp"]
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -10,6 +11,13 @@ dependencies = [
     "segno>=1.6",
     "typer>=0.16",
 ]
+
+[project.urls]
+Homepage = "https://healthbridge.chanhyo.dev/"
+Documentation = "https://github.com/roian6/apple-health-ai-bridge/tree/main/docs"
+Source = "https://github.com/roian6/apple-health-ai-bridge"
+Issues = "https://github.com/roian6/apple-health-ai-bridge/issues"
+Releases = "https://github.com/roian6/apple-health-ai-bridge/releases"
 
 [project.scripts]
 health-bridge = "health_bridge.cli:run"
