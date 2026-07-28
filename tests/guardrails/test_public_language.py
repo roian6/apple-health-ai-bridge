@@ -1,5 +1,7 @@
 import re
+import tomllib
 from pathlib import Path
+from typing import cast
 
 FORBIDDEN_PHRASES = (
     "medical advice",
@@ -184,7 +186,9 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
         "https://healthbridge.chanhyo.dev/support",
     ):
         assert url in readme
-    assert "Apple Health AI Bridge gives you a direct, self-hosted path" in readme
+    assert (
+        "Apple Health AI Bridge is the open-source project behind Health Bridge for AI."
+    ) in readme
     assert "not affiliated with, endorsed by, or sponsored by Apple Inc." in readme
     assert (
         "https://github.com/roian6/apple-health-ai-bridge/security/advisories/new"
@@ -201,6 +205,61 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     )
     assert "healthbridge.chanhyo.dev/support" in config_text
     assert "healthbridge.chanhyo.dev/privacy" in security
+
+
+def test_product_and_project_names_have_an_explicit_relationship() -> None:
+    relationship = (
+        "Apple Health AI Bridge is the open-source project behind Health Bridge for AI."
+    )
+    for path in (
+        Path("README.md"),
+        Path("docs/brand.md"),
+        Path("assets/brand/README.md"),
+    ):
+        assert relationship in path.read_text(encoding="utf-8"), path
+
+
+def test_readme_keeps_continuous_value_with_ios_timing_boundary() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
+
+    assert "continuously available to your own AI agent" in readme
+    assert (
+        "iOS controls background scheduling, so delivery timing is best-effort "
+        "rather than real-time or guaranteed at a specific moment."
+    ) in readme
+    assert "iOS controls whether and when background execution occurs" in architecture
+    assert "guaranteed to be immediate" in architecture
+
+
+def test_package_metadata_connects_distribution_to_public_surfaces() -> None:
+    with Path("pyproject.toml").open("rb") as handle:
+        pyproject = cast("dict[str, object]", tomllib.load(handle))
+    project = cast("dict[str, object]", pyproject["project"])
+
+    assert project["name"] == "apple-health-ai-bridge"
+    assert project["description"] == (
+        "Open-source receiver and read-only CLI/MCP package for Health Bridge for AI."
+    )
+    assert project["scripts"] == {"health-bridge": "health_bridge.cli:run"}
+    assert project["keywords"] == [
+        "ai-agents",
+        "apple-health",
+        "healthkit",
+        "local-first",
+        "mcp",
+    ]
+    assert project["urls"] == {
+        "Homepage": "https://healthbridge.chanhyo.dev/",
+        "Documentation": (
+            "https://github.com/roian6/apple-health-ai-bridge/tree/main/docs"
+        ),
+        "Source": "https://github.com/roian6/apple-health-ai-bridge",
+        "Issues": "https://github.com/roian6/apple-health-ai-bridge/issues",
+        "Releases": "https://github.com/roian6/apple-health-ai-bridge/releases",
+    }
+    server = Path("src/health_bridge/mcp/server.py").read_text(encoding="utf-8")
+    assert '"serverInfo": {"name": "health-bridge"' in server
 
 
 def test_readme_makes_testflight_primary_without_exposing_maintainer_operations() -> (

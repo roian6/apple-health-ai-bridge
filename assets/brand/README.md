@@ -4,6 +4,17 @@ This identity is a restrained public-release baseline for Apple Health AI Bridge
 
 It is intentionally developer-tool oriented rather than consumer wellness or clinical branding.
 
+## Naming relationship
+
+Apple Health AI Bridge is the open-source project behind Health Bridge for AI.
+
+- Use **Apple Health AI Bridge** for the repository and open-source project.
+- Use **Health Bridge for AI** for the App Store/TestFlight product, product website, install flow, and customer-facing support and privacy surfaces.
+- Use **Health Bridge** only as the compact in-app label where space benefits from the shorter name.
+- Keep `apple-health-ai-bridge`, `health-bridge`, and `health_bridge` unchanged as package, CLI/MCP, and Python identifiers.
+
+These names describe one product system. Do not imply that the repository and App Store product are separate products, and do not imply Apple affiliation.
+
 ## Core assets
 
 | Asset | Path | Use |

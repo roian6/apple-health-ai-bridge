@@ -11,9 +11,13 @@
 
 ---
 
-Apple Health AI Bridge gives you a direct, self-hosted path from Apple Health to the AI tools you choose—without routing it through a hosted intermediary. The iPhone companion continuously sends the HealthKit data you permit to a receiver you control, where read-only CLI and MCP interfaces make it available to compatible agents.
+Apple Health AI Bridge is the open-source project behind Health Bridge for AI.
+
+The project gives you a direct, self-hosted path from Apple Health to the AI tools you choose—without routing it through a hosted intermediary. The iPhone companion continuously sends the HealthKit data you permit to a receiver you control, where read-only CLI and MCP interfaces make it available to compatible agents.
 
 Your health data stays under your control: the receiver and database run on your infrastructure, AI access is read-only, and no hosted relay or third-party model is required.
+
+Automatic background sync is designed for continuous use. iOS controls background scheduling, so delivery timing is best-effort rather than real-time or guaranteed at a specific moment.
 
 ## Set up the bridge
 
