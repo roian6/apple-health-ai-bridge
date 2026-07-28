@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.roian6/health-bridge",
+  "title": "Health Bridge for AI",
+  "description": "Apple Health AI Bridge provides read-only local MCP access for Health Bridge for AI.",
+  "websiteUrl": "https://healthbridge.chanhyo.dev/apple-health-mcp/",
+  "repository": {
+    "url": "https://github.com/roian6/apple-health-ai-bridge",
+    "source": "github"
+  },
+  "version": "1.0.1"
+}

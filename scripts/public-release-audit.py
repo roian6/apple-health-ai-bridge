@@ -81,6 +81,9 @@ STRICT_DEFINITION_FILES = {
     "tests/guardrails/test_ios_app_privacy.py",
 }
 LOCAL_DENYLIST_FILES = (Path(".public-release-denylist.local"),)
+OFFICIAL_MCP_REGISTRY_FILE = Path("server.json")
+OFFICIAL_MCP_REGISTRY_OWNER = "github.roian6"
+OFFICIAL_MCP_REGISTRY_NAME = f"io.{OFFICIAL_MCP_REGISTRY_OWNER}/health-bridge"
 
 CREDENTIAL_CHARACTER_CLASS = r"A-Za-z0-9_-"
 MINIMUM_UTF16_PROBE_BYTES = 4
@@ -655,6 +658,13 @@ def scan_patterns(
             continue
         for match in pattern.regex.finditer(text):
             if is_allowed_strict_match(pattern, match):
+                continue
+            if (
+                pattern.name == "non-neutral-bundle-literal"
+                and path == OFFICIAL_MCP_REGISTRY_FILE
+                and text.startswith(OFFICIAL_MCP_REGISTRY_NAME, match.start())
+                and match.group(0) == OFFICIAL_MCP_REGISTRY_NAME.partition("/")[0]
+            ):
                 continue
             line_no = text.count("\n", 0, match.start()) + 1
             blockers.append(strict_blocker_line(path, line_no, pattern, match.group(0)))
