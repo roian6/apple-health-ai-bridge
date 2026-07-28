@@ -88,6 +88,7 @@ fixable = ["ALL"]
 unfixable = []
 
 [tool.ruff.lint.per-file-ignores]
+"scripts/release_versions.py" = ["INP001"]
 "tests/**/*.py" = [
     "D",
     "S101",
