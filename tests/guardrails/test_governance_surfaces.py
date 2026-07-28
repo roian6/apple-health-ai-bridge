@@ -94,7 +94,10 @@ def test_contribution_and_maintainer_workflow_is_versioned() -> None:
         "Swift tests and unsigned app builds",
         "squash merge",
         "v1.0.1",
-        "v1.1.0",
+        "receiver-v<semver>",
+        "ios-v<marketing-version>-build.<build>",
+        "exact compatible Batch Protocol",
         "Do not routinely disable the main ruleset",
     ):
         assert marker in maintainer
+    assert "`v1.1.0` for the next" not in maintainer

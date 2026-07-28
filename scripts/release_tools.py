@@ -5,26 +5,44 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal, assert_never
+
+from release_versions import (
+    ReleaseError,
+    canonical_receiver_tag,
+    parse_receiver_release_tag,
+    parse_semantic_version,
+)
 
 HEX_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
-STABLE_VERSION_PATTERN: Final = re.compile(
-    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
-)
 XCODE_ASSIGNMENT_TEMPLATE: Final = r"\b{key}\s*=\s*([^;]+);"
 IOS_SOURCE_SETTINGS: Final = Path(
     "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
+COMPONENT_VERSION_INDEX: Final = Path("component-versions.json")
+GIT_EXECUTABLE: Final = shutil.which("git")
 
 
-class ReleaseError(ValueError):
-    """Expected release-input failure safe to print to CI logs."""
+ReleaseScope = Literal["receiver", "coordinated"]
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentSnapshot:
+    release_scope: ReleaseScope
+    receiver_version: str
+    receiver_tag: str
+    ios_version: str
+    ios_build: int
+    batch_version: str
+    batch_schema_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +51,15 @@ class ReleaseVersions:
     requires_python: str
     ios_marketing_version: str
     ios_build: str
+    components: ComponentSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionRequest:
+    repo: Path
+    tag_target_commit: str
+    default_main_commit: str
+    baseline_commit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,41 +146,86 @@ def read_versions(repo: Path) -> ReleaseVersions:
         requires_python=requires_python,
         ios_marketing_version=_single_xcode_value(project, "MARKETING_VERSION"),
         ios_build=_single_xcode_value(project, "CURRENT_PROJECT_VERSION"),
+        components=_read_component_snapshot(
+            (repo / COMPONENT_VERSION_INDEX).read_text(encoding="utf-8"),
+            surface="component version index",
+        ),
     )
 
 
 def _stable_version_tuple(value: str, *, surface: str) -> tuple[int, int, int]:
-    match = STABLE_VERSION_PATTERN.fullmatch(value)
-    if match is None:
-        message = f"{surface} must be a stable semantic version"
-        raise ReleaseError(message)
-    major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch)
+    return parse_semantic_version(value, surface=surface).as_tuple()
 
 
 def _release_scope(versions: ReleaseVersions) -> str:
-    project = _stable_version_tuple(versions.project_version, surface="project version")
-    ios = _stable_version_tuple(
-        versions.ios_marketing_version,
-        surface="iOS MARKETING_VERSION",
+    return versions.components.release_scope
+
+
+def _expected_receiver_tag(version: str) -> str:
+    return canonical_receiver_tag(version)
+
+
+def _validate_release_notes(
+    versions: ReleaseVersions,
+    tag: str,
+    notes: str,
+) -> None:
+    if tag == "v1.0.0":
+        return
+    if tag == "v1.0.1":
+        historical_required = (
+            "Receiver-only release",
+            (
+                "Compatible iOS companion: "
+                f"`{versions.ios_marketing_version} ({versions.ios_build})`"
+            ),
+            "No TestFlight update is required",
+        )
+        if any(marker not in notes for marker in historical_required):
+            message = "historical release notes are missing compatibility markers"
+            raise ReleaseError(message)
+        return
+    exact_ios = (
+        "Compatible iOS Companion: "
+        f"`{versions.ios_marketing_version} ({versions.ios_build})`"
     )
-    if project == ios:
-        return "coordinated"
-    if project < ios:
-        message = "receiver version must be newer than the compatible iOS version"
+    exact_batch = (
+        "Compatible Batch Protocol: "
+        f"`{versions.components.batch_schema_id} "
+        f"({versions.components.batch_version})`"
+    )
+    if exact_ios not in notes:
+        message = "release notes must state exact compatible iOS Companion"
         raise ReleaseError(message)
-    return "receiver"
+    if exact_batch not in notes:
+        message = "release notes must state exact compatible Batch Protocol"
+        raise ReleaseError(message)
+    match versions.components.release_scope:
+        case "receiver":
+            required = ("Receiver-only release", "No TestFlight update is required")
+            forbidden = ("Coordinated release",)
+        case "coordinated":
+            required = ("Coordinated release",)
+            forbidden = ("Receiver-only release", "No TestFlight update is required")
+        case unreachable:
+            assert_never(unreachable)
+    if any(marker not in notes for marker in required) or any(
+        marker in notes for marker in forbidden
+    ):
+        message = "release notes do not match release_scope"
+        raise ReleaseError(message)
 
 
 def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
     versions = read_versions(repo)
-    expected = f"v{versions.project_version}"
+    expected = _expected_receiver_tag(versions.project_version)
     if tag != expected:
-        message = f"release tag must exactly match project version: {expected}"
+        message = f"receiver release tag must exactly match package version: {expected}"
         raise ReleaseError(message)
     if not versions.ios_build.isdecimal() or int(versions.ios_build) < 1:
         message = "iOS CURRENT_PROJECT_VERSION must be a positive integer"
         raise ReleaseError(message)
+    _validate_component_version_index(repo, versions, release_tag=tag)
     notes_path = repo / ".github/release" / f"notes-{tag}.md"
     if not notes_path.is_file():
         message = f"versioned release notes are missing: {notes_path}"
@@ -162,19 +234,7 @@ def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
     if f"@{tag}" not in notes:
         message = f"release notes must contain the exact install tag: @{tag}"
         raise ReleaseError(message)
-    if _release_scope(versions) == "receiver":
-        required = (
-            "Receiver-only release",
-            (
-                "Compatible iOS companion: "
-                f"`{versions.ios_marketing_version} ({versions.ios_build})`"
-            ),
-            "No TestFlight update is required",
-        )
-        missing = [marker for marker in required if marker not in notes]
-        if missing:
-            message = "receiver-only release notes are missing compatibility markers"
-            raise ReleaseError(message)
+    _validate_release_notes(versions, tag, notes)
     return versions
 
 
@@ -224,6 +284,261 @@ def _batch_contract(repo: Path) -> dict[str, str]:
         message = "canonical batch fixture is missing schema metadata"
         raise ReleaseError(message)
     return {"schema_id": schema_id, "schema_version": schema_version}
+
+
+def _required_component_string(
+    mapping: dict[str, Any],
+    key: str,
+    surface: str,
+) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str):
+        message = f"{surface} component values must be strings"
+        raise ReleaseError(message)
+    return value
+
+
+def _read_component_snapshot(raw: str, *, surface: str) -> ComponentSnapshot:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        message = f"{surface} is invalid JSON"
+        raise ReleaseError(message) from exc
+    if not isinstance(payload, dict):
+        message = f"{surface} must be an object"
+        raise ReleaseError(message)
+    if "release_scope" not in payload:
+        message = "component version index release_scope must be explicit"
+        raise ReleaseError(message)
+    expected_keys = {
+        "batch_protocol",
+        "ios_companion",
+        "receiver_cli",
+        "release_scope",
+        "schema_id",
+    }
+    batch = payload.get("batch_protocol")
+    ios = payload.get("ios_companion")
+    receiver = payload.get("receiver_cli")
+    scope = payload.get("release_scope")
+    if (
+        set(payload) != expected_keys
+        or payload.get("schema_id") != "health_bridge.component_versions.v1"
+        or not isinstance(batch, dict)
+        or set(batch) != {"schema_id", "version"}
+        or not isinstance(ios, dict)
+        or set(ios) != {"build", "marketing_version"}
+        or not isinstance(receiver, dict)
+        or set(receiver) != {"release_tag", "version"}
+    ):
+        message = f"{surface} schema is not exact"
+        raise ReleaseError(message)
+    match scope:
+        case "receiver" | "coordinated":
+            release_scope: ReleaseScope = scope
+        case _:
+            message = "component version index release_scope must be explicit"
+            raise ReleaseError(message)
+    batch_schema_id = _required_component_string(batch, "schema_id", surface)
+    batch_version = _required_component_string(batch, "version", surface)
+    ios_build = _required_component_string(ios, "build", surface)
+    ios_version = _required_component_string(ios, "marketing_version", surface)
+    receiver_tag = _required_component_string(receiver, "release_tag", surface)
+    receiver_version = _required_component_string(receiver, "version", surface)
+    _ = _stable_version_tuple(
+        receiver_version,
+        surface=f"{surface} Receiver/CLI version",
+    )
+    _ = _stable_version_tuple(
+        ios_version,
+        surface=f"{surface} iOS Companion version",
+    )
+    _ = _stable_version_tuple(
+        batch_version,
+        surface=f"{surface} Batch Protocol version",
+    )
+    if not ios_build.isdecimal() or int(ios_build) < 1:
+        message = f"{surface} iOS build must be a positive integer"
+        raise ReleaseError(message)
+    expected_tag = _expected_receiver_tag(receiver_version)
+    if receiver_tag != expected_tag:
+        message = f"{surface} Receiver/CLI tag must be {expected_tag}"
+        raise ReleaseError(message)
+    return ComponentSnapshot(
+        release_scope=release_scope,
+        receiver_version=receiver_version,
+        receiver_tag=receiver_tag,
+        ios_version=ios_version,
+        ios_build=int(ios_build),
+        batch_version=batch_version,
+        batch_schema_id=batch_schema_id,
+    )
+
+
+def _validate_component_version_index(
+    repo: Path,
+    versions: ReleaseVersions,
+    *,
+    release_tag: str,
+) -> None:
+    batch = _batch_contract(repo)
+    expected = ComponentSnapshot(
+        release_scope=versions.components.release_scope,
+        receiver_version=versions.project_version,
+        receiver_tag=release_tag,
+        ios_version=versions.ios_marketing_version,
+        ios_build=int(versions.ios_build),
+        batch_version=batch["schema_version"],
+        batch_schema_id=batch["schema_id"],
+    )
+    if versions.components != expected:
+        message = "component version index does not match release source versions"
+        raise ReleaseError(message)
+
+
+def _git_output(repo: Path, *args: str) -> str:
+    if GIT_EXECUTABLE is None:
+        message = "Git executable is required for trusted transition validation"
+        raise ReleaseError(message)
+    completed = subprocess.run(  # noqa: S603
+        [GIT_EXECUTABLE, *args],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        message = "trusted release commit could not be resolved"
+        raise ReleaseError(message)
+    return completed.stdout.strip()
+
+
+def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
+    commits = (
+        request.tag_target_commit,
+        request.default_main_commit,
+        request.baseline_commit,
+    )
+    if any(HEX_SHA_PATTERN.fullmatch(commit) is None for commit in commits):
+        message = "trusted transition commits must be lowercase 40-character Git SHAs"
+        raise ReleaseError(message)
+    checked_out = _git_output(request.repo, "rev-parse", "HEAD")
+    if checked_out != request.tag_target_commit:
+        message = "tag target must equal the checked-out commit"
+        raise ReleaseError(message)
+    if request.tag_target_commit != request.default_main_commit:
+        message = "tag target must equal the trusted default-main commit"
+        raise ReleaseError(message)
+    expected_baseline = _git_output(
+        request.repo,
+        "rev-parse",
+        f"{request.tag_target_commit}^1",
+    )
+    if request.baseline_commit != expected_baseline:
+        message = "baseline must equal the tag target's first parent"
+        raise ReleaseError(message)
+    return _read_component_snapshot(
+        _git_output(
+            request.repo,
+            "show",
+            f"{request.baseline_commit}:{COMPONENT_VERSION_INDEX.as_posix()}",
+        ),
+        surface="baseline component version index",
+    )
+
+
+def _component_change_flags(
+    candidate: ComponentSnapshot,
+    baseline: ComponentSnapshot,
+) -> tuple[bool, bool]:
+    candidate_receiver = _stable_version_tuple(
+        candidate.receiver_version,
+        surface="candidate Receiver/CLI version",
+    )
+    baseline_receiver = _stable_version_tuple(
+        baseline.receiver_version,
+        surface="baseline Receiver/CLI version",
+    )
+    if candidate_receiver <= baseline_receiver:
+        message = "Receiver/CLI version must advance from the baseline"
+        raise ReleaseError(message)
+    candidate_ios = _stable_version_tuple(
+        candidate.ios_version,
+        surface="candidate iOS Companion version",
+    )
+    baseline_ios = _stable_version_tuple(
+        baseline.ios_version,
+        surface="baseline iOS Companion version",
+    )
+    candidate_batch = _stable_version_tuple(
+        candidate.batch_version,
+        surface="candidate Batch Protocol version",
+    )
+    baseline_batch = _stable_version_tuple(
+        baseline.batch_version,
+        surface="baseline Batch Protocol version",
+    )
+    if (
+        candidate_ios < baseline_ios
+        or candidate.ios_build < baseline.ios_build
+        or candidate_batch < baseline_batch
+    ):
+        message = "component versions must not regress from the baseline"
+        raise ReleaseError(message)
+    ios_changed = (
+        candidate.ios_version,
+        candidate.ios_build,
+    ) != (
+        baseline.ios_version,
+        baseline.ios_build,
+    )
+    batch_changed = (
+        candidate.batch_version,
+        candidate.batch_schema_id,
+    ) != (
+        baseline.batch_version,
+        baseline.batch_schema_id,
+    )
+    if (
+        candidate.batch_schema_id != baseline.batch_schema_id
+        and candidate_batch == baseline_batch
+    ):
+        message = "Batch Protocol schema changes must advance its version"
+        raise ReleaseError(message)
+    if ios_changed and candidate.ios_build <= baseline.ios_build:
+        message = "iOS component updates must advance the build number"
+        raise ReleaseError(message)
+    return ios_changed, batch_changed
+
+
+def _validate_scope_transition(
+    candidate: ComponentSnapshot,
+    ios_changed: bool,
+    batch_changed: bool,
+) -> None:
+    match candidate.release_scope:
+        case "receiver":
+            if ios_changed or batch_changed:
+                message = "receiver scope must preserve baseline iOS and Batch Protocol"
+                raise ReleaseError(message)
+        case "coordinated":
+            if not ios_changed and not batch_changed:
+                message = "coordinated scope must advance iOS or Batch Protocol"
+                raise ReleaseError(message)
+        case unreachable:
+            assert_never(unreachable)
+
+
+def validate_component_transition(
+    request: TransitionRequest,
+    versions: ReleaseVersions,
+) -> None:
+    baseline = _transition_baseline(request)
+    ios_changed, batch_changed = _component_change_flags(
+        versions.components,
+        baseline,
+    )
+    _validate_scope_transition(versions.components, ios_changed, batch_changed)
 
 
 def create_manifest(request: ManifestRequest) -> None:
@@ -538,12 +853,12 @@ def _verify_release_identity(
     expected_draft: bool,
 ) -> None:
     state_name = "draft" if expected_draft else "published"
+    parsed_tag = parse_receiver_release_tag(request.tag)
     if (
         payload.get("tag_name") != request.tag
         or payload.get("name") != request.tag
         or payload.get("draft") is not expected_draft
-        or payload.get("prerelease")
-        is not request.tag.removeprefix("v").startswith("0.")
+        or payload.get("prerelease") is not parsed_tag.is_prerelease
     ):
         message = f"GitHub {state_name} release metadata is not exact"
         raise ReleaseError(message)
@@ -636,9 +951,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build exact-tag release metadata.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    tag_info = subparsers.add_parser("tag-info")
+    tag_info.add_argument("--tag", required=True)
+
     validate = subparsers.add_parser("validate")
     validate.add_argument("--repo", type=Path, required=True)
     validate.add_argument("--tag", required=True)
+    validate.add_argument("--tag-target-commit")
+    validate.add_argument("--default-main-commit")
+    validate.add_argument("--baseline-commit")
 
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("--repo", type=Path, required=True)
@@ -678,11 +999,51 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _transition_request(
+    repo: Path,
+    commits: tuple[str | None, str | None, str | None],
+) -> TransitionRequest | None:
+    match commits:
+        case (None, None, None):
+            return None
+        case (str(tag_target), str(default_main), str(baseline)):
+            return TransitionRequest(
+                repo=repo,
+                tag_target_commit=tag_target,
+                default_main_commit=default_main,
+                baseline_commit=baseline,
+            )
+        case _:
+            message = "all trusted transition commits are required together"
+            raise ReleaseError(message)
+
+
 def main() -> int:
     args = _parser().parse_args()
     try:
-        if args.command == "validate":
+        if args.command == "tag-info":
+            parsed_tag = parse_receiver_release_tag(args.tag)
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "prerelease": parsed_tag.is_prerelease,
+                        "tag": parsed_tag.tag,
+                        "version": str(parsed_tag.version),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        elif args.command == "validate":
             versions = validate_tag(args.repo, args.tag)
+            transition_commits = (
+                args.tag_target_commit,
+                args.default_main_commit,
+                args.baseline_commit,
+            )
+            transition = _transition_request(args.repo, transition_commits)
+            if transition is not None:
+                validate_component_transition(transition, versions)
             sys.stdout.write(
                 json.dumps(
                     {

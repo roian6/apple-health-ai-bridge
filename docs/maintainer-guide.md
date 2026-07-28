@@ -64,20 +64,24 @@ Fork pull requests must run with read-only workflow permissions, no repository s
 
 ## Releases
 
-Use SemVer:
+Version each component independently:
 
-- `v1.0.1` for backward-compatible fixes;
-- `v1.1.0` for the next backward-compatible feature set;
-- a major version for intentional breaking changes.
+- existing `v1.0.0` and `v1.0.1` tags are immutable historical Receiver/CLI releases;
+- future Receiver/CLI releases use `receiver-v<semver>`;
+- iOS source or distribution checkpoints use `ios-v<marketing-version>-build.<build>`;
+- Batch Protocol versions change only when the wire contract changes.
+
+Set `release_scope` explicitly in `component-versions.json`. Use `receiver` only when Receiver/CLI advances while the compatible iOS Companion and Batch Protocol remain identical to the predecessor baseline. Use `coordinated` when Receiver/CLI and at least one other component advance together; version equality never determines scope.
 
 Before release:
 
 1. collect merged work labeled `release-note` or `breaking-change`;
-2. update versions and release notes in one reviewed pull request;
-3. run the full public, Python, and iOS gates;
-4. create a signed annotated tag for the exact approved commit;
-5. let the protected exact-tag workflow build, verify, attest, and publish an immutable release;
-6. verify the remote tag, release assets, checksums, attestations, and linked site state.
+2. update each changed authoritative version source, `component-versions.json`, and release notes in one reviewed pull request;
+3. state the exact compatible iOS Companion version/build and exact compatible Batch Protocol schema identifier/version in the release notes;
+4. run the full public, Python, and iOS gates;
+5. create a signed annotated component-scoped tag for the exact approved default-branch commit;
+6. let the protected exact-tag workflow compare the tag with default main and its predecessor baseline, then build, verify, attest, and publish an immutable release;
+7. verify the remote tag, release assets, checksums, attestations, and linked site state.
 
 Treat source-release status and TestFlight/App Store distribution status as separate facts.
 

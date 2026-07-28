@@ -131,9 +131,19 @@ Run the same command with `--confirm` only after reviewing the listed database a
 
 If the command returns `recovery-required`, do not restart the receiver. Review the structured source, quarantine, and truncated path lists; the command deliberately keeps the private quarantine instead of claiming a rollback after an irreversible partial purge.
 
-## Releases
+## Component versions and releases
 
-User installs are pinned to a signed version tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with SHA-256 checksums, build provenance, and metadata that ties the Python package, iOS version/build, Git tree, and batch schema together. The current receiver release is `v1.0.1`, compatible with the unchanged iOS companion `1.0.0 (15)`. The first coordinated public release was `v1.0.0`.
+The repository contains independently released components. Always include the component label rather than referring to an unlabeled “repo version.”
+
+| Surface | Current version | Identifier |
+| --- | --- | --- |
+| Receiver/CLI | `1.0.1` | signed historical tag `v1.0.1` |
+| iOS Companion | `1.0.0` | TestFlight build `15` |
+| Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
+
+These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
+
+User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, Git tree, and Batch Protocol together. Existing `v1.0.0` and `v1.0.1` tags remain immutable; future receiver releases use component-scoped tags such as `receiver-v1.0.2`.
 
 ## Build from source
 
