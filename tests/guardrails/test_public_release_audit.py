@@ -8,20 +8,25 @@ AUDIT_PATH = ROOT / "scripts/public-release-audit.py"
 
 
 def run_strict_audit(
-    tmp_path: Path, candidate_text: str
+    tmp_path: Path,
+    candidate_text: str,
+    *,
+    candidate_path: str = "candidate.txt",
 ) -> subprocess.CompletedProcess[str]:
     git = shutil.which("git")
     assert git is not None
     script = tmp_path / "scripts/public-release-audit.py"
     script.parent.mkdir(parents=True)
     _ = shutil.copy2(AUDIT_PATH, script)
-    _ = (tmp_path / "candidate.txt").write_text(
+    candidate = tmp_path / candidate_path
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    _ = candidate.write_text(
         candidate_text,
         encoding="utf-8",
     )
     _ = subprocess.run([git, "init", "-q"], cwd=tmp_path, check=True)
     _ = subprocess.run(
-        [git, "add", "scripts/public-release-audit.py", "candidate.txt"],
+        [git, "add", "scripts/public-release-audit.py", candidate_path],
         cwd=tmp_path,
         check=True,
     )
@@ -55,3 +60,35 @@ def test_strict_audit_blocks_synthetic_prefix_extension(tmp_path: Path) -> None:
     assert result.returncode == 3
     assert "literal-device-credential" in result.stdout
     assert placeholder not in result.stdout
+
+
+def test_strict_audit_allows_exact_official_mcp_registry_name(
+    tmp_path: Path,
+) -> None:
+    registry_owner = "github.roian6"
+    registry_name = f"io.{registry_owner}/health-bridge"
+
+    result = run_strict_audit(
+        tmp_path,
+        f'{{"name":"{registry_name}"}}\n',
+        candidate_path="server.json",
+    )
+
+    assert result.returncode == 0
+    assert "strict_blockers=0" in result.stdout
+
+
+def test_strict_audit_still_blocks_other_registry_like_names(
+    tmp_path: Path,
+) -> None:
+    registry_owner = "github.someone-else"
+    registry_name = f"io.{registry_owner}/health-bridge"
+
+    result = run_strict_audit(
+        tmp_path,
+        f'{{"name":"{registry_name}"}}\n',
+        candidate_path="server.json",
+    )
+
+    assert result.returncode == 3
+    assert "non-neutral-bundle-literal" in result.stdout
