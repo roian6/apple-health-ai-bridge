@@ -6,7 +6,7 @@ import sqlite3
 import stat
 from pathlib import Path
 from subprocess import run
-from typing import Final, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 import pytest
 import typer
@@ -62,6 +62,8 @@ class ReceiverPairingInvitationCliOutput(BaseModel):
     invitation_code: str
     created_at: str
     expires_at: str
+    transport: Literal["direct", "mailbox"] | None = None
+    mailbox_protocol_version: Literal[1] | None = None
     warning: str
     pairing_url: str
 
@@ -111,8 +113,12 @@ class ReceiverPurgeCliOutput(BaseModel):
 
 
 ReceiverTokenRow: TypeAlias = tuple[str, str, str]
+PairingTransportRow: TypeAlias = tuple[str]
 RECEIVER_TOKEN_ROW_ADAPTER: Final[TypeAdapter[ReceiverTokenRow | None]] = TypeAdapter(
     ReceiverTokenRow | None,
+)
+PAIRING_TRANSPORT_ROW_ADAPTER: Final[TypeAdapter[PairingTransportRow | None]] = (
+    TypeAdapter(PairingTransportRow | None)
 )
 
 
@@ -1030,6 +1036,10 @@ def test_receiver_create_pairing_cli_defaults_to_v2_invitation_json(
     assert output.receiver_url == receiver_url
     assert output.redeem_url.endswith("/v1/pairing/redeem")
     assert output.invitation_secret.startswith("hbi_")
+    assert output.transport is None
+    assert output.mailbox_protocol_version is None
+    assert '"transport"' not in result.stdout
+    assert "mailbox_protocol_version" not in result.stdout
     assert re.fullmatch(
         r"[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}", output.invitation_code
     )
@@ -1042,7 +1052,98 @@ def test_receiver_create_pairing_cli_defaults_to_v2_invitation_json(
                 "select token_label, token_prefix, token_hash from receiver_tokens"
             ).fetchone()
         )
+        persisted_transport = PAIRING_TRANSPORT_ROW_ADAPTER.validate_python(
+            connection.execute("select transport from pairing_invitations").fetchone()
+        )
     assert receiver_token is None
+    assert persisted_transport == ("direct",)
+
+
+def test_receiver_create_pairing_cli_requires_explicit_supported_mailbox_topology(
+    tmp_path: Path,
+) -> None:
+    # Given
+    db_path = tmp_path / "receiver.sqlite"
+    mailbox_root = (
+        tmp_path
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion"
+        / "Documents/HealthBridgeMailbox/v1"
+    )
+
+    # When
+    result = run(
+        [
+            "uv",
+            "run",
+            "health-bridge",
+            "receiver",
+            "create-pairing",
+            "--db",
+            str(db_path),
+            "--label",
+            "maintainer-iphone",
+            "--receiver-url",
+            "https://health-bridge.example.test/v1/batches",
+            "--transport",
+            "icloud-mailbox",
+            "--mailbox-root",
+            str(mailbox_root),
+            "--format",
+            "json",
+            "--print-secret",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Then
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Encrypted iCloud Mailbox is unavailable on this host."
+    )
+    assert not db_path.exists()
+
+
+def test_receiver_create_pairing_rejects_mailbox_root_with_direct_transport(
+    tmp_path: Path,
+) -> None:
+    # Given
+    db_path = tmp_path / "receiver.sqlite"
+
+    # When
+    result = run(
+        [
+            "uv",
+            "run",
+            "health-bridge",
+            "receiver",
+            "create-pairing",
+            "--db",
+            str(db_path),
+            "--label",
+            "maintainer-iphone",
+            "--receiver-url",
+            "https://health-bridge.example.test/v1/batches",
+            "--transport",
+            "direct",
+            "--mailbox-root",
+            str(tmp_path / "mailbox"),
+            "--format",
+            "json",
+            "--print-secret",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Then
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Mailbox configuration requires --transport icloud-mailbox."
+    )
+    assert not db_path.exists()
 
 
 def test_receiver_create_pairing_cli_can_emit_deep_link_only(tmp_path: Path) -> None:

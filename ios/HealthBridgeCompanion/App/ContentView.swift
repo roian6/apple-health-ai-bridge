@@ -72,6 +72,27 @@ struct ContentView: View {
                 subtitle: "Scan the private QR with iPhone Camera, open its setup link, or paste it here. After pairing, the secret key stays on this iPhone."
             )
 
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Direct / Tailscale-compatible", systemImage: "network")
+                    .font(.headline)
+                Text("Recommended on Linux and Mac. The receiver setup invitation selects this transport by default.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Label("Encrypted iCloud Mailbox (Beta)", systemImage: "lock.icloud.fill")
+                    .font(.headline)
+                Text("No VPN required • Mac only • Best-effort, eventual delivery")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Text("Custom HTTPS remains a Direct connection. Local same-network-only setup is Advanced / Limited.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(14)
+            .background(Color(.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
             TextField("Paste private setup link", text: $viewModel.pairingImportText, axis: .vertical)
                 .lineLimit(2...4)
                 .textInputAutocapitalization(.never)

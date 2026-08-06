@@ -8,7 +8,7 @@ license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=45",
-    "pydantic>=2.11",
+    "pydantic>=2.12",
     "segno>=1.6",
     "typer>=0.16",
 ]
@@ -51,6 +51,7 @@ exclude = [
 "src/health_bridge/storage/migrations/002_sync_window.sql" = "health_bridge/storage/migrations/002_sync_window.sql"
 "src/health_bridge/storage/migrations/003_receiver_tokens.sql" = "health_bridge/storage/migrations/003_receiver_tokens.sql"
 "src/health_bridge/storage/migrations/004_pairing_invitations.sql" = "health_bridge/storage/migrations/004_pairing_invitations.sql"
+"src/health_bridge/storage/migrations/009_pairing_transport.sql" = "health_bridge/storage/migrations/009_pairing_transport.sql"
 
 [tool.hatch.build.targets.sdist]
 exclude = [

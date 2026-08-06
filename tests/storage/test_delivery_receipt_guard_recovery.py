@@ -30,6 +30,17 @@ def _pending_path(db_path: Path) -> Path:
     return Path(f"{db_path}.pre-008_delivery_receipts.pending")
 
 
+def _limit_migrations_to_delivery_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt_index = database.MIGRATION_IDS.index("008_delivery_receipts")
+    monkeypatch.setattr(
+        database,
+        "MIGRATION_IDS",
+        database.MIGRATION_IDS[: receipt_index + 1],
+    )
+
+
 def _trace_lifecycle_locks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[bool]:
@@ -65,14 +76,14 @@ def _interrupt_guard_once(
         message = "synthetic guard boundary"
         raise OSError(message)
 
-    monkeypatch.setattr(
-        database_migrations,
-        "finalize_delivery_receipt_rollback_guard",
-        fail_after_commit,
-    )
-    with pytest.raises(OSError, match="synthetic guard boundary"):
-        initialize_database(db_path)
-    monkeypatch.undo()
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(
+            database_migrations,
+            "finalize_delivery_receipt_rollback_guard",
+            fail_after_commit,
+        )
+        with pytest.raises(OSError, match="synthetic guard boundary"):
+            initialize_database(db_path)
 
 
 def test_restart_repairs_guard_after_migration_commit_boundary(
@@ -82,6 +93,7 @@ def test_restart_repairs_guard_after_migration_commit_boundary(
     db_path = tmp_path / "guard-boundary.sqlite"
     create_legacy_database(db_path)
     original_sha256 = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    _limit_migrations_to_delivery_receipts(monkeypatch)
     _interrupt_guard_once(db_path, monkeypatch)
 
     initialize_database(db_path)
@@ -98,6 +110,7 @@ def test_restart_replaces_malformed_guard_when_pending_state_is_valid(
 ) -> None:
     db_path = tmp_path / "malformed-guard-recovery.sqlite"
     create_legacy_database(db_path)
+    _limit_migrations_to_delivery_receipts(monkeypatch)
     _interrupt_guard_once(db_path, monkeypatch)
     _ = delivery_receipt_rollback_guard_path(db_path).write_text(
         "malformed\n",
@@ -115,6 +128,7 @@ def test_restart_replaces_stale_guard_when_pending_state_is_valid(
 ) -> None:
     db_path = tmp_path / "stale-guard-recovery.sqlite"
     create_legacy_database(db_path)
+    _limit_migrations_to_delivery_receipts(monkeypatch)
     _interrupt_guard_once(db_path, monkeypatch)
     before_line = _pending_path(db_path).read_text(encoding="ascii").splitlines()[0]
     stale_guard = f"{before_line}\npost_migration_sha256={'0' * 64}\n"
@@ -260,12 +274,17 @@ def test_concurrent_restarts_recover_one_guard(
 ) -> None:
     db_path = tmp_path / "concurrent-recovery.sqlite"
     create_legacy_database(db_path)
-    original_sha256 = hashlib.sha256(db_path.read_bytes()).hexdigest()
     _interrupt_guard_once(db_path, monkeypatch)
 
     run_concurrent_process_upgrades(db_path)
 
     assert delivery_receipt_rollback_guard_path(db_path).is_file()
     assert not _pending_path(db_path).exists()
-    assert restore_delivery_receipt_backup(db_path).value == "restored"
-    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == original_sha256
+    assert (
+        restore_delivery_receipt_backup(db_path).value == "hold_post_migration_commit"
+    )
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "select 1 from schema_migrations where migration_id = ?",
+            ("009_pairing_transport",),
+        ).fetchone() == (1,)

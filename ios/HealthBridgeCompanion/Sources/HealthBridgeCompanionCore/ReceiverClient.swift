@@ -343,10 +343,10 @@ public final class ReceiverClient: @unchecked Sendable {
             throw ReceiverPairingRedeemError.invalidResponse
         }
         let mailboxRequested: Bool
-        switch (pendingPairing.mailboxProtocolVersion, mailboxPublicIdentity) {
-        case (nil, nil):
+        switch (pendingPairing.transport, mailboxPublicIdentity) {
+        case (.direct, nil):
             mailboxRequested = false
-        case (1, .some):
+        case (.mailbox, .some):
             mailboxRequested = true
         default:
             throw ReceiverPairingRedeemError.invalidResponse
@@ -613,7 +613,7 @@ public final class ReceiverPairingCoordinator {
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
             invitationCode: nil,
-            mailboxProtocolVersion: invitation.mailboxProtocolVersion
+            transport: invitation.transport
         )
     }
 
@@ -704,7 +704,7 @@ public final class ReceiverPairingCoordinator {
         let credential: ReceiverPairingCredential
         do {
             let mailboxIdentity: MailboxPublicIdentity?
-            if pending.mailboxProtocolVersion == 1 {
+            if pending.transport == .mailbox {
                 do {
                     mailboxIdentity = try mailboxKeyStore.loadOrCreate()
                 } catch let error as MailboxKeyStoreError {

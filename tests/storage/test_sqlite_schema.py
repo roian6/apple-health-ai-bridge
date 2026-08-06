@@ -480,6 +480,7 @@ def test_initialize_database_creates_core_tables_when_database_is_empty(
         ("006_sleep_session_revisions",),
         ("007_sleep_baseline_namespaces",),
         ("008_delivery_receipts",),
+        ("009_pairing_transport",),
     ]
 
 
@@ -498,7 +499,7 @@ def test_initialize_database_is_idempotent_when_called_twice(tmp_path: Path) -> 
             "select count(*) from schema_migrations",
         )
 
-    assert migration_count == 8
+    assert migration_count == 9
 
 
 def _create_legacy_sleep_revision_database(db_path: Path) -> None:
@@ -1028,3 +1029,79 @@ def test_sqlite_wal_sidecars_are_owner_only(tmp_path: Path) -> None:
             assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in sidecars)
     finally:
         _ = os.umask(previous_umask)
+
+
+def test_pairing_transport_migration_preserves_legacy_invitations_as_direct(
+    tmp_path: Path,
+) -> None:
+    # Given
+    db_path = tmp_path / "receiver.sqlite"
+    initialize_database(db_path)
+    with connect_database(db_path) as connection:
+        column_rows = cast(
+            "list[tuple[int, str, str, int, object, int]]",
+            connection.execute("pragma table_info(pairing_invitations)").fetchall(),
+        )
+        columns = {str(row[1]) for row in column_rows}
+        if "transport" in columns:
+            _ = connection.execute(
+                "alter table pairing_invitations drop column transport"
+            )
+            _ = connection.execute(
+                "delete from schema_migrations where migration_id = ?",
+                ("009_pairing_transport",),
+            )
+        _ = connection.execute(
+            """
+            insert into pairing_invitations (
+                pairing_invitation_id, invitation_label, receiver_url,
+                invitation_secret_hash, invitation_code_selector,
+                invitation_code_hash, invitation_code_salt, created_at, expires_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "00000000-0000-4000-8000-000000000009",
+                "legacy-direct-iphone",
+                "https://health.example.test/v1/batches",
+                "0" * 64,
+                "ABCDE",
+                "1" * 64,
+                "2" * 32,
+                "2026-08-06T00:00:00Z",
+                "2026-08-06T00:20:00Z",
+            ),
+        )
+
+    # When
+    initialize_database(db_path)
+
+    # Then
+    with connect_database(db_path) as connection:
+        row = cast(
+            "tuple[str] | None",
+            connection.execute(
+                "select transport from pairing_invitations where invitation_label = ?",
+                ("legacy-direct-iphone",),
+            ).fetchone(),
+        )
+    assert row == ("direct",)
+
+
+def test_pairing_transport_migration_runs_after_delivery_receipt_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "receiver.sqlite"
+
+    initialize_database(db_path)
+
+    with connect_database(db_path) as connection:
+        migration_ids = [
+            row[0]
+            for row in fetch_text_rows(
+                connection,
+                "select migration_id from schema_migrations order by rowid",
+            )
+        ]
+    assert migration_ids.index("008_delivery_receipts") < migration_ids.index(
+        "009_pairing_transport"
+    )

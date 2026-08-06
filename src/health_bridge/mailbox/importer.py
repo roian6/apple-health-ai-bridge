@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, assert_never, cast, final
 
@@ -12,10 +13,11 @@ from health_bridge.mailbox.filesystem import (
     MailboxFileError,
     MailboxFileErrorCode,
     mailbox_writer_lock,
-    read_final,
-    revalidate_final,
+    open_mailbox_directory,
+    read_final_at,
+    revalidate_final_at,
     scan_delivery_lane,
-    unlink_same,
+    unlink_same_at,
 )
 from health_bridge.mailbox.models import (
     MailboxImportFaultHook,
@@ -26,11 +28,11 @@ from health_bridge.mailbox.publication import (
     ACK_RETENTION_MS,
     DELIVERY_RETENTION_MS,
     PublicationState,
-    cleanup_expired_finals,
-    cleanup_quarantine,
-    cleanup_stale_temps,
-    publish_final,
-    publish_quarantine,
+    cleanup_expired_finals_at,
+    cleanup_quarantine_at,
+    cleanup_stale_temps_at,
+    publish_final_at,
+    publish_quarantine_at,
 )
 from health_bridge.receiver._delivery_acceptance_crypto import (
     envelope_claims,
@@ -47,6 +49,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import Literal
 
+    from health_bridge.mailbox.filesystem import MailboxDirectoryHandle
     from health_bridge.receiver.delivery_acceptance import DeliveryTrustedConnection
 
 
@@ -58,6 +61,7 @@ class MailboxImportConfig:
     connection: DeliveryTrustedConnection
     clock_ms: Callable[[], int]
     path_replacement_retry_limit: int = 0
+    directory: MailboxDirectoryHandle | None = None
 
 
 class MailboxBusyError(Exception):
@@ -86,46 +90,55 @@ class MailboxImporter:
     ) -> MailboxImportResult:
         try:
             with mailbox_writer_lock(self._config.lock_path):
-                return self._import_locked(fault_hook)
+                if self._config.directory is not None:
+                    self._config.directory.validate_attached()
+                    return self._import_locked(self._config.directory, fault_hook)
+                with open_mailbox_directory(self._config.mailbox_path) as directory:
+                    directory.validate_attached()
+                    return self._import_locked(directory, fault_hook)
         except BlockingIOError as exc:
             raise MailboxBusyError from exc
 
     def expected_ack_path(self, delivery_path: Path) -> Path:
-        accepted = self._accept(delivery_path, None)
+        with open_mailbox_directory(self._config.mailbox_path) as directory:
+            accepted = self._accept(directory, delivery_path.name, None)
         return self._config.mailbox_path / "acks" / accepted.ack_name
 
     def _import_locked(
         self,
+        directory: MailboxDirectoryHandle,
         fault_hook: MailboxImportFaultHook | None,
     ) -> MailboxImportResult:
-        deliveries = self._config.mailbox_path / "deliveries"
-        acks = self._config.mailbox_path / "acks"
-        quarantine = self._config.mailbox_path / "quarantine"
-        scan = scan_delivery_lane(deliveries)
+        directory.validate_attached()
+        scan = scan_delivery_lane(directory.deliveries_fd)
         aggregate = MailboxImportResult(skipped=scan.skipped)
         for entry in scan.entries:
-            delivery_path = deliveries / entry.name
             try:
                 accepted = self._accept_with_path_replacement_retry(
-                    delivery_path,
+                    directory,
+                    entry.name,
                     fault_hook,
                 )
-                publication = publish_final(
-                    acks,
+                directory.validate_attached()
+                publication = publish_final_at(
+                    directory.acks_fd,
                     accepted.ack_name,
                     accepted.result.ack_bytes,
                     fault_hook,
+                    before_mutation=directory.validate_attached,
                 )
             except MailboxFileError as exc:
+                directory.validate_attached()
                 aggregate = _combine(
                     aggregate,
-                    self._quarantine(quarantine, entry.name, exc.code.value),
+                    self._quarantine(directory, entry.name, exc.code.value),
                 )
                 continue
             except DeliveryProtocolError:
+                directory.validate_attached()
                 aggregate = _combine(
                     aggregate,
-                    self._quarantine(quarantine, entry.name, "authentication_failed"),
+                    self._quarantine(directory, entry.name, "authentication_failed"),
                 )
                 continue
             except OSError:
@@ -138,31 +151,46 @@ class MailboxImporter:
                 aggregate = _combine(aggregate, MailboxImportResult(conflict=1))
                 continue
             aggregate = _combine(aggregate, _accepted_result(accepted.result))
-            self._expire_delivery(delivery_path, accepted, acks)
-        for lane in (deliveries, acks, quarantine):
-            cleanup_stale_temps(
-                lane,
+            self._expire_delivery(directory, entry.name, accepted)
+        for lane_fd in (
+            directory.deliveries_fd,
+            directory.acks_fd,
+            directory.quarantine_fd,
+        ):
+            directory.validate_attached()
+            cleanup_stale_temps_at(
+                lane_fd,
                 now_ms=self._config.clock_ms(),
                 fault_hook=fault_hook,
+                before_mutation=directory.validate_attached,
             )
-        cleanup_expired_finals(
-            acks,
+        directory.validate_attached()
+        cleanup_expired_finals_at(
+            directory.acks_fd,
             extension="hba",
             retention_ms=ACK_RETENTION_MS,
             now_ms=self._config.clock_ms(),
+            before_mutation=directory.validate_attached,
         )
-        cleanup_quarantine(quarantine, now_ms=self._config.clock_ms())
+        directory.validate_attached()
+        cleanup_quarantine_at(
+            directory.quarantine_fd,
+            now_ms=self._config.clock_ms(),
+            before_mutation=directory.validate_attached,
+        )
+        directory.validate_attached()
         return aggregate
 
     def _accept_with_path_replacement_retry(
         self,
-        delivery_path: Path,
+        directory: MailboxDirectoryHandle,
+        delivery_name: str,
         fault_hook: MailboxImportFaultHook | None,
     ) -> _AcceptedDelivery:
         remaining = self._config.path_replacement_retry_limit
         while True:
             try:
-                return self._accept(delivery_path, fault_hook)
+                return self._accept(directory, delivery_name, fault_hook)
             except MailboxFileError as exc:
                 if exc.code is not MailboxFileErrorCode.PATH_REPLACED or remaining == 0:
                     raise
@@ -170,29 +198,40 @@ class MailboxImporter:
 
     def _accept(
         self,
-        delivery_path: Path,
+        directory: MailboxDirectoryHandle,
+        delivery_name: str,
         fault_hook: MailboxImportFaultHook | None,
     ) -> _AcceptedDelivery:
-        snapshot = read_final(delivery_path, maximum_bytes=MAX_ENVELOPE_BYTES)
+        snapshot = read_final_at(
+            directory.deliveries_fd,
+            delivery_name,
+            maximum_bytes=MAX_ENVELOPE_BYTES,
+        )
         try:
             _fault(fault_hook, MailboxImportFaultPoint.AFTER_DELIVERY_OPEN)
         except RuntimeError:
-            if not revalidate_final(delivery_path, snapshot.identity):
+            if not revalidate_final_at(
+                directory.deliveries_fd, delivery_name, snapshot.identity
+            ):
                 raise MailboxFileError(
                     code=MailboxFileErrorCode.PATH_REPLACED
                 ) from None
             raise
-        if not revalidate_final(delivery_path, snapshot.identity):
+        if not revalidate_final_at(
+            directory.deliveries_fd, delivery_name, snapshot.identity
+        ):
             raise MailboxFileError(code=MailboxFileErrorCode.PATH_REPLACED)
         claims = envelope_claims(snapshot.content, self._config.connection)
-        if delivery_path.stem != claims.envelope_id.hex():
+        if delivery_name.removesuffix(".hbd") != claims.envelope_id.hex():
             code = "authentication_failed"
             raise DeliveryProtocolError(code)
         _fault(fault_hook, MailboxImportFaultPoint.BEFORE_ACCEPT)
+        directory.validate_attached()
         result = DeliveryAcceptanceService(
             self._config.db_path,
             self._config.connection,
             self._config.clock_ms,
+            before_commit_validator=directory.validate_attached,
         ).accept(
             DeliveryAcceptanceRequest(
                 envelope_bytes=snapshot.content,
@@ -209,12 +248,18 @@ class MailboxImporter:
 
     def _quarantine(
         self,
-        directory: Path,
+        directory: MailboxDirectoryHandle,
         source_name: str,
         reason: str,
     ) -> MailboxImportResult:
+        directory.validate_attached()
         try:
-            publication = publish_quarantine(directory, source_name, reason)
+            publication = publish_quarantine_at(
+                directory.quarantine_fd,
+                source_name,
+                reason,
+                before_mutation=directory.validate_attached,
+            )
         except OSError:
             return MailboxImportResult(retryable=1)
         if publication is PublicationState.CONFLICT:
@@ -223,17 +268,28 @@ class MailboxImporter:
 
     def _expire_delivery(
         self,
-        delivery_path: Path,
+        directory: MailboxDirectoryHandle,
+        delivery_name: str,
         accepted: _AcceptedDelivery,
-        ack_directory: Path,
     ) -> None:
+        directory.validate_attached()
         try:
-            ack_stat = (ack_directory / accepted.ack_name).lstat()
+            ack_stat = os.stat(
+                accepted.ack_name,
+                dir_fd=directory.acks_fd,
+                follow_symlinks=False,
+            )
         except OSError:
             return
         age_ms = self._config.clock_ms() - ack_stat.st_mtime_ns // 1_000_000
         if age_ms >= DELIVERY_RETENTION_MS:
-            _ = unlink_same(delivery_path, accepted.snapshot.identity)
+            directory.validate_attached()
+            _ = unlink_same_at(
+                directory.deliveries_fd,
+                delivery_name,
+                accepted.snapshot.identity,
+                before_unlink=directory.validate_attached,
+            )
 
 
 def _accepted_result(value: DeliveryAcceptanceResult) -> MailboxImportResult:

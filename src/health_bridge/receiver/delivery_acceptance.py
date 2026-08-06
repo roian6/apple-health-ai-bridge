@@ -61,10 +61,12 @@ class DeliveryAcceptanceService:
         db_path: Path,
         connection: DeliveryTrustedConnection,
         clock_ms: Callable[[], int],
+        before_commit_validator: Callable[[], None] | None = None,
     ) -> None:
         self._db_path = db_path
         self._connection = connection
         self._clock_ms = clock_ms
+        self._before_commit_validator = before_commit_validator
 
     def accept(
         self,
@@ -117,6 +119,8 @@ class DeliveryAcceptanceService:
                 record = committed_receipt_record(receipt, claims, self._connection)
                 _ = insert_delivery_receipt(database, record)
                 self._fault(fault_hook, DeliveryAcceptanceFaultPoint.BEFORE_COMMIT)
+                if self._before_commit_validator is not None:
+                    self._before_commit_validator()
         except DeliveryReceiptConflictError:
             return self._terminal(claims, "duplicate_conflict")
         except (sqlite3.Error, OSError, StaleOrderedSleepBaselineResetError):

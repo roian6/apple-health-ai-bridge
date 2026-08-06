@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 import typer
 from pydantic import TypeAdapter
 
+from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.private_files import (
     ensure_private_directory,
     write_private_text_file,
@@ -23,6 +24,7 @@ from health_bridge.receiver.invitations import (
     revoke_pairing_invitation,
     revoke_receiver_device,
 )
+from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.pairing import (
     ReceiverPairingInvitationBundle,
     create_receiver_pairing_bundle,
@@ -32,6 +34,12 @@ from health_bridge.receiver.pairing import (
 from health_bridge.receiver.pairing_setup_page import render_pairing_setup_page
 from health_bridge.receiver.server import serve_receiver
 from health_bridge.receiver.tokens import create_receiver_token, revoke_receiver_token
+from health_bridge.receiver.transports import (
+    PublicReceiverTransport,
+    ReceiverTransport,
+    ReceiverTransportSelectionError,
+    select_receiver_transport,
+)
 from health_bridge.storage.database import database_access_lock, database_lifecycle_lock
 
 if TYPE_CHECKING:
@@ -71,6 +79,25 @@ PURGE_WARNING: Final = (
     "Stop the receiver before confirming. This removes only the local Health Bridge "
     "SQLite database and its sidecars; it does not delete Apple Health data."
 )
+
+
+def _select_transport_or_exit(
+    requested: PublicReceiverTransport,
+    *,
+    mailbox_root: Path | None,
+    icloud_container_identifier: str | None,
+    mailbox_allowed: bool = True,
+) -> ReceiverTransport:
+    try:
+        return select_receiver_transport(
+            requested,
+            mailbox_root=mailbox_root,
+            icloud_container_identifier=icloud_container_identifier,
+            mailbox_allowed=mailbox_allowed,
+        )
+    except ReceiverTransportSelectionError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
 
 
 class PurgeRecoveryRequiredError(OSError):
@@ -626,6 +653,30 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
             "--receiver-url", help="Receiver /v1/batches URL for the companion."
         ),
     ],
+    transport: Annotated[
+        PublicReceiverTransport,
+        typer.Option(
+            "--transport",
+            help=(
+                "Choose Direct/Tailscale-compatible delivery or explicit "
+                "Encrypted iCloud Mailbox (Beta)."
+            ),
+        ),
+    ] = "direct",
+    mailbox_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--mailbox-root",
+            help="Existing macOS iCloud Documents HealthBridgeMailbox/v1 path.",
+        ),
+    ] = None,
+    icloud_container_identifier: Annotated[
+        str | None,
+        typer.Option(
+            "--icloud-container-identifier",
+            help="Expected iCloud container identifier for the mailbox root.",
+        ),
+    ] = None,
     output_format: Annotated[
         Literal["json", "deeplink", "setup-page"],
         typer.Option(
@@ -661,6 +712,12 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
     if output_format in {"json", "deeplink"} and not print_secret:
         typer.echo(PAIRING_FORMAT_REQUIRES_FLAG_MESSAGE, err=True)
         raise typer.Exit(code=1)
+    selected_transport = _select_transport_or_exit(
+        transport,
+        mailbox_root=mailbox_root,
+        icloud_container_identifier=icloud_container_identifier,
+        mailbox_allowed=not legacy_v1,
+    )
 
     if legacy_v1:
         bundle = create_receiver_pairing_bundle(
@@ -673,6 +730,7 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
             db,
             label=label,
             receiver_url=receiver_url,
+            transport=selected_transport,
         )
     deep_link = pairing_deep_link(bundle)
     if output_format == "deeplink":
@@ -727,7 +785,7 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
                 ),
             }
     else:
-        output = bundle.model_dump(mode="json")
+        output = bundle.model_dump(mode="json", exclude_none=True)
         output["pairing_url"] = deep_link
     typer.echo(json.dumps(output, sort_keys=True))
 
@@ -825,13 +883,49 @@ def start(
         int,
         typer.Option("--port", help="Bind port."),
     ] = 8765,
+    mailbox_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--mailbox-root",
+            help="Enable validated macOS iCloud mailbox pairing for this receiver.",
+        ),
+    ] = None,
+    icloud_container_identifier: Annotated[
+        str | None,
+        typer.Option(
+            "--icloud-container-identifier",
+            help="Expected iCloud container identifier for the mailbox root.",
+        ),
+    ] = None,
 ) -> None:
+    selected_transport = _select_transport_or_exit(
+        "icloud-mailbox" if mailbox_root is not None else "direct",
+        mailbox_root=mailbox_root,
+        icloud_container_identifier=icloud_container_identifier,
+    )
+    mailbox_key_store = (
+        MailboxKeyStore.production()
+        if selected_transport is ReceiverTransport.MAILBOX
+        else None
+    )
+    mailbox_connection_store = (
+        MailboxConnectionStore.production()
+        if selected_transport is ReceiverTransport.MAILBOX
+        else None
+    )
     typer.echo(
         f"health-bridge receiver listening on http://{host}:{port}",
         err=True,
     )
     try:
-        serve_receiver(db_path=db, host=host, port=port)
+        serve_receiver(
+            db_path=db,
+            host=host,
+            port=port,
+            mailbox_key_store=mailbox_key_store,
+            mailbox_connection_store=mailbox_connection_store,
+            mailbox_root=mailbox_root,
+        )
     except KeyboardInterrupt:
         raise typer.Exit(code=0) from None
 

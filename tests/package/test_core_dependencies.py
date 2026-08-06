@@ -25,6 +25,7 @@ class _PyProject(_ManifestModel):
 
 class _Dependency(_ManifestModel):
     name: str
+    specifier: str | None = None
 
 
 class _LockMetadata(_ManifestModel):
@@ -82,3 +83,28 @@ def test_cryptography_is_a_mandatory_locked_core_dependency() -> None:
         "cryptography must be a mandatory locked core dependency; missing: "
         + ", ".join(missing_locations)
     )
+
+
+def test_pydantic_minimum_matches_exclude_if_serialization_contract() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as manifest_file:
+        manifest = _PyProject.model_validate(tomllib.load(manifest_file))
+    with (ROOT / "uv.lock").open("rb") as lock_file:
+        lock = _Lock.model_validate(tomllib.load(lock_file))
+
+    project_requirement = next(
+        requirement
+        for requirement in manifest.project.dependencies
+        if requirement.startswith("pydantic")
+    )
+    root_package = next(
+        item for item in lock.package if item.name == manifest.project.name
+    )
+    assert root_package.metadata is not None
+    locked_requirement = next(
+        requirement
+        for requirement in root_package.metadata.requirements
+        if requirement.name == "pydantic"
+    )
+
+    assert project_requirement == "pydantic>=2.12"
+    assert locked_requirement.specifier == ">=2.12"

@@ -2335,7 +2335,7 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     public let installationID: String
     public let deviceCredential: String
     public let platform: String
-    public let mailboxProtocolVersion: Int?
+    public let transport: ReceiverPairingTransport
 
     public init(
         label: String,
@@ -2346,7 +2346,7 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         installationID: String,
         deviceCredential: String,
         platform: String,
-        mailboxProtocolVersion: Int? = nil
+        transport: ReceiverPairingTransport = .direct
     ) {
         self.label = label
         self.receiverURLString = receiverURLString
@@ -2356,7 +2356,68 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         self.installationID = installationID
         self.deviceCredential = deviceCredential
         self.platform = platform
-        self.mailboxProtocolVersion = mailboxProtocolVersion
+        self.transport = transport
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case label
+        case receiverURLString
+        case redeemURLString
+        case invitationSecret
+        case invitationCode
+        case installationID
+        case deviceCredential
+        case platform
+        case transport
+        case mailboxProtocolVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        label = try container.decode(String.self, forKey: .label)
+        receiverURLString = try container.decode(String.self, forKey: .receiverURLString)
+        redeemURLString = try container.decode(String.self, forKey: .redeemURLString)
+        invitationSecret = try container.decodeIfPresent(String.self, forKey: .invitationSecret)
+        invitationCode = try container.decodeIfPresent(String.self, forKey: .invitationCode)
+        installationID = try container.decode(String.self, forKey: .installationID)
+        deviceCredential = try container.decode(String.self, forKey: .deviceCredential)
+        platform = try container.decode(String.self, forKey: .platform)
+        let decodedTransport = try container.decodeIfPresent(
+            ReceiverPairingTransport.self,
+            forKey: .transport
+        )
+        let legacyMailboxProtocolVersion = try container.decodeIfPresent(
+            Int.self,
+            forKey: .mailboxProtocolVersion
+        )
+        switch (decodedTransport, legacyMailboxProtocolVersion) {
+        case (.some(.direct), nil), (nil, nil):
+            transport = .direct
+        case (.some(.mailbox), nil), (.some(.mailbox), 1):
+            transport = .mailbox
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .transport,
+                in: container,
+                debugDescription: "Pending pairing transport is inconsistent."
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(label, forKey: .label)
+        try container.encode(receiverURLString, forKey: .receiverURLString)
+        try container.encode(redeemURLString, forKey: .redeemURLString)
+        try container.encodeIfPresent(invitationSecret, forKey: .invitationSecret)
+        try container.encodeIfPresent(invitationCode, forKey: .invitationCode)
+        try container.encode(installationID, forKey: .installationID)
+        try container.encode(deviceCredential, forKey: .deviceCredential)
+        try container.encode(platform, forKey: .platform)
+        try container.encode(transport, forKey: .transport)
+        if transport == .mailbox {
+            try container.encode(1, forKey: .mailboxProtocolVersion)
+        }
     }
 
     func matches(
@@ -2364,13 +2425,13 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         redeemURLString: String,
         invitationSecret: String?,
         invitationCode: String?,
-        mailboxProtocolVersion: Int? = nil
+        transport: ReceiverPairingTransport = .direct
     ) -> Bool {
         self.receiverURLString == receiverURLString
             && self.redeemURLString == redeemURLString
             && self.invitationSecret == invitationSecret
             && self.invitationCode == invitationCode
-            && self.mailboxProtocolVersion == mailboxProtocolVersion
+            && self.transport == transport
             && platform == "ios"
     }
 }
@@ -2425,7 +2486,7 @@ public final class ReceiverPairingStateStore {
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
             invitationCode: nil,
-            mailboxProtocolVersion: invitation.mailboxProtocolVersion
+            transport: invitation.transport
         )
     }
 
@@ -2436,7 +2497,7 @@ public final class ReceiverPairingStateStore {
             redeemURLString: manualPairing.redeemURL.absoluteString,
             invitationSecret: nil,
             invitationCode: manualPairing.invitationCode,
-            mailboxProtocolVersion: nil
+            transport: .direct
         )
     }
 
@@ -2496,7 +2557,7 @@ public final class ReceiverPairingStateStore {
         redeemURLString: String,
         invitationSecret: String?,
         invitationCode: String?,
-        mailboxProtocolVersion: Int?
+        transport: ReceiverPairingTransport
     ) throws -> ReceiverPendingPairing {
         guard try !hasPendingCancellation() else {
             throw ReceiverPairingStateError.pendingPairingConflict
@@ -2507,7 +2568,7 @@ public final class ReceiverPairingStateStore {
                 redeemURLString: redeemURLString,
                 invitationSecret: invitationSecret,
                 invitationCode: invitationCode,
-                mailboxProtocolVersion: mailboxProtocolVersion
+                transport: transport
             ) else {
                 throw ReceiverPairingStateError.pendingPairingConflict
             }
@@ -2523,7 +2584,7 @@ public final class ReceiverPairingStateStore {
             installationID: installationID,
             deviceCredential: deviceCredentialGenerator(),
             platform: "ios",
-            mailboxProtocolVersion: mailboxProtocolVersion
+            transport: transport
         )
         let encoded = try JSONEncoder().encode(pending)
         guard let string = String(data: encoded, encoding: .utf8) else {

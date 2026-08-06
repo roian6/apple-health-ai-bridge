@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import json
 import tempfile
 import time
 from pathlib import Path
-from typing import Annotated, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import typer
 from pydantic import BaseModel, ConfigDict
@@ -28,6 +30,9 @@ from health_bridge.receiver._mailbox_key_policy import (
 )
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore, MailboxKeyStoreError
 from health_bridge.storage.database import initialize_database
+
+if TYPE_CHECKING:
+    from health_bridge.mailbox.filesystem import MailboxDirectoryHandle
 
 mailbox_app = typer.Typer(
     add_completion=False,
@@ -88,7 +93,12 @@ def import_mailbox(
     _emit_import_result(result, json_output)
 
 
-def production_importer(db: Path, mailbox: Path) -> MailboxImporter:
+def production_importer(
+    db: Path,
+    mailbox: Path,
+    *,
+    directory: MailboxDirectoryHandle | None = None,
+) -> MailboxImporter:
     initialize_database(db)
     connections = MailboxConnectionStore.production()
     return MailboxImporter(
@@ -98,6 +108,7 @@ def production_importer(db: Path, mailbox: Path) -> MailboxImporter:
             lock_path=connections.lock_path(mailbox),
             connection=connections.load(mailbox),
             clock_ms=lambda: time.time_ns() // 1_000_000,
+            directory=directory,
         )
     )
 

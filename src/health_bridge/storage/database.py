@@ -48,6 +48,7 @@ MIGRATION_IDS: Final = (
     "006_sleep_session_revisions",
     "007_sleep_baseline_namespaces",
     DELIVERY_RECEIPT_MIGRATION_ID,
+    "009_pairing_transport",
 )
 
 
@@ -126,6 +127,7 @@ def initialize_database(db_path: Path) -> None:
         try:
             _apply_pre_receipt_migrations(connection, db_path)
             if _delivery_receipt_migration_is_complete(connection, db_path):
+                _apply_post_receipt_migrations(connection, db_path)
                 return
         except sqlite3.Error:
             connection.rollback()
@@ -137,6 +139,7 @@ def initialize_database(db_path: Path) -> None:
         if pre_receipt_recheck_required:
             _apply_pre_receipt_migrations(connection, db_path)
         _apply_migration(connection, DELIVERY_RECEIPT_MIGRATION_ID, db_path)
+        _apply_post_receipt_migrations(connection, db_path)
 
 
 def _apply_pre_receipt_migrations(
@@ -147,6 +150,17 @@ def _apply_pre_receipt_migrations(
     for migration_id in MIGRATION_IDS[1:]:
         if migration_id == DELIVERY_RECEIPT_MIGRATION_ID:
             return
+        if _migration_was_applied(connection, migration_id):
+            continue
+        _apply_migration(connection, migration_id, db_path)
+
+
+def _apply_post_receipt_migrations(
+    connection: sqlite3.Connection,
+    db_path: Path,
+) -> None:
+    receipt_index = MIGRATION_IDS.index(DELIVERY_RECEIPT_MIGRATION_ID)
+    for migration_id in MIGRATION_IDS[receipt_index + 1 :]:
         if _migration_was_applied(connection, migration_id):
             continue
         _apply_migration(connection, migration_id, db_path)

@@ -2,10 +2,12 @@ import ipaddress
 import os
 import re
 import shutil
+import sqlite3
 import stat
+import sys
 from pathlib import Path
 from subprocess import CompletedProcess, run
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict
@@ -47,6 +49,7 @@ class SetupCliOutput(BaseModel):
     setup_page: str
     pairing_schema_id: str
     invitation_expires_at: str
+    selected_transport: Literal["direct", "mailbox"]
     receiver_start_command: list[str]
     access_descriptors: list[AccessDescriptorOutput]
     local_mcp_self_test_command: list[str]
@@ -148,6 +151,7 @@ def test_setup_default_detects_but_never_configures_clients(tmp_path: Path) -> N
     assert completed.returncode == 0, completed.stderr
     payload = SetupCliOutput.model_validate_json(completed.stdout)
     assert payload.schema_version == 2
+    assert payload.selected_transport == "direct"
     assert payload.db == str(db_path)
     assert payload.receiver_url == ("https://receiver.healthbridge.internal/v1/batches")
     assert payload.receiver_health_url == (
@@ -196,6 +200,123 @@ def test_setup_default_detects_but_never_configures_clients(tmp_path: Path) -> N
     assert "healthbridge://pair?payload=" in setup_html
     assert "invitation_token" not in completed.stdout
     assert not re.search(r"hbi_[A-Za-z0-9_-]{20,}", completed.stdout)
+
+
+def test_setup_rejects_explicit_mailbox_transport_on_linux_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    # Given
+    db_path, setup_page, args = _setup_args(tmp_path)
+    mailbox_root = (
+        tmp_path
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion"
+        / "Documents/HealthBridgeMailbox/v1"
+    )
+
+    # When
+    completed = _run_cli(
+        *args,
+        "--transport",
+        "icloud-mailbox",
+        "--mailbox-root",
+        str(mailbox_root),
+    )
+
+    # Then
+    assert completed.returncode == 1
+    assert completed.stderr.strip() == (
+        "Encrypted iCloud Mailbox is unavailable on this host."
+    )
+    assert not db_path.exists()
+    assert not setup_page.exists()
+
+
+def test_setup_provisions_explicit_mailbox_only_on_supported_mac_topology(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "synthetic-home"
+    mailbox_root = (
+        home
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion"
+        / "Documents/HealthBridgeMailbox/v1"
+    )
+    mailbox_root.mkdir(parents=True)
+    home.chmod(0o700)
+    db_path = tmp_path / "private/health.sqlite"
+    setup_page = tmp_path / "private/pair.html"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(home))
+
+    manifest = cli_setup_module.build_setup_manifest(
+        cli_setup_module.SetupRequest(
+            db_path=db_path,
+            label="synthetic-iphone",
+            receiver_url="https://receiver.healthbridge.internal/v1/batches",
+            setup_page_path=setup_page,
+            receiver_host="127.0.0.1",
+            receiver_port=8765,
+            executable="health-bridge",
+            transport="icloud-mailbox",
+            mailbox_root=mailbox_root,
+            icloud_container_identifier=("iCloud.dev.example.HealthBridgeCompanion"),
+        )
+    )
+
+    assert manifest.selected_transport == "mailbox"
+    assert manifest.receiver_start_command[-4:] == [
+        "--mailbox-root",
+        str(mailbox_root),
+        "--icloud-container-identifier",
+        "iCloud.dev.example.HealthBridgeCompanion",
+    ]
+    assert "Encrypted iCloud Mailbox (Beta)" in manifest.warning
+    assert "No VPN" in manifest.warning
+    assert "Mac only" in manifest.warning
+    assert "best-effort/eventual" in manifest.warning
+    assert "mailbox deliveries are imported" in manifest.next_steps[4]
+    assert "ACK after its database commit" in manifest.next_steps[4]
+    with sqlite3.connect(db_path) as connection:
+        invitation = cast(
+            "tuple[str] | None",
+            connection.execute("SELECT transport FROM pairing_invitations").fetchone(),
+        )
+    assert invitation == ("mailbox",)
+
+
+def test_setup_bootstraps_mailbox_hierarchy_before_creating_invitation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "synthetic-home"
+    documents = (
+        home
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion"
+        / "Documents"
+    )
+    documents.mkdir(parents=True)
+    home.chmod(0o700)
+    mailbox_root = documents / "HealthBridgeMailbox/v1"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(home))
+
+    manifest = cli_setup_module.build_setup_manifest(
+        cli_setup_module.SetupRequest(
+            db_path=tmp_path / "private/health.sqlite",
+            label="synthetic-iphone",
+            receiver_url="https://receiver.healthbridge.internal/v1/batches",
+            setup_page_path=tmp_path / "private/pair.html",
+            receiver_host="127.0.0.1",
+            receiver_port=8765,
+            executable="health-bridge",
+            transport="icloud-mailbox",
+            mailbox_root=mailbox_root,
+            icloud_container_identifier="iCloud.dev.example.HealthBridgeCompanion",
+        )
+    )
+
+    assert manifest.selected_transport == "mailbox"
+    assert mailbox_root.is_dir()
 
 
 def test_setup_configures_only_explicitly_selected_client(tmp_path: Path) -> None:

@@ -44,7 +44,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=45" },
-    { name = "pydantic", specifier = ">=2.11" },
+    { name = "pydantic", specifier = ">=2.12" },
     { name = "segno", specifier = ">=1.6" },
     { name = "typer", specifier = ">=0.16" },
 ]

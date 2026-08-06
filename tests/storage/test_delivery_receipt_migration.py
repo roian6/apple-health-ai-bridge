@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Final, TypeAlias
 import pytest
 from pydantic import TypeAdapter
 
+from health_bridge.storage import database
 from health_bridge.storage.database import initialize_database
 from health_bridge.storage.delivery_receipts import (
     DeliveryReceiptConflictError,
@@ -25,7 +26,6 @@ from health_bridge.storage.migration_backup import (
 )
 from tests.storage.delivery_receipt_migration_support import (
     EXPECTED_RECEIPT_COLUMNS,
-    LEGACY_MIGRATION_IDS,
     PROHIBITED_RECEIPT_COLUMN_PARTS,
     create_legacy_database,
     run_concurrent_process_upgrades,
@@ -77,7 +77,7 @@ def test_fresh_database_adds_receipt_schema_and_pre_migration_backup(
         backup_tables = backup.execute(
             "select name from sqlite_master where type = 'table'"
         ).fetchall()
-    assert migrations == [(value,) for value in (*LEGACY_MIGRATION_IDS, MIGRATION_ID)]
+    assert migrations == [(value,) for value in database.MIGRATION_IDS]
     assert ("delivery_receipts",) not in backup_tables
 
 
@@ -156,10 +156,17 @@ def test_failed_migration_keeps_original_and_backup_without_partial_table(
 
 def test_old_binary_restore_succeeds_before_post_migration_commit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "restorable.sqlite"
     create_legacy_database(db_path)
     original_sha256 = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    receipt_index = database.MIGRATION_IDS.index(MIGRATION_ID)
+    monkeypatch.setattr(
+        database,
+        "MIGRATION_IDS",
+        database.MIGRATION_IDS[: receipt_index + 1],
+    )
     initialize_database(db_path)
 
     decision = restore_delivery_receipt_backup(db_path)

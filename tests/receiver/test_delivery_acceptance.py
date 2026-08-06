@@ -9,6 +9,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from health_bridge.contract import delivery_v1 as delivery
+from health_bridge.mailbox.filesystem import MailboxFileError, MailboxFileErrorCode
 from health_bridge.receiver import _delivery_acceptance_crypto as acceptance_crypto
 from health_bridge.receiver.delivery_acceptance import (
     DeliveryAcceptanceFaultPoint,
@@ -56,6 +57,29 @@ def test_exact_bytes_commit_once_and_replay_byte_identical_ack(tmp_path: Path) -
         == hashlib.sha256(BATCH).hexdigest()
     )
     assert counts(db_path) == (1, 1, 1)
+
+
+def test_namespace_validator_runs_inside_transaction_before_commit(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "detached.sqlite"
+    validated = False
+
+    def reject_detached_namespace() -> None:
+        nonlocal validated
+        validated = True
+        raise MailboxFileError(MailboxFileErrorCode.PATH_REPLACED)
+
+    acceptance = service(
+        db_path,
+        before_commit_validator=reject_detached_namespace,
+    )
+
+    with pytest.raises(MailboxFileError):
+        _ = acceptance.accept(request())
+
+    assert validated
+    assert counts(db_path) == (0, 0, 0)
 
 
 def test_alternate_exact_bytes_under_new_id_follow_inner_idempotence(

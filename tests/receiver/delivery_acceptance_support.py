@@ -21,6 +21,8 @@ from health_bridge.storage.sqlite_rows import fetch_one_int
 from tests.contract.delivery_v1_support import BATCH
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from health_bridge.receiver._delivery_acceptance_models import (
         DeliveryAcceptanceFaultHook,
         DeliveryAcceptanceFaultPoint,
@@ -109,12 +111,18 @@ def request(spec: RequestSpec | None = None) -> DeliveryAcceptanceRequest:
     )
 
 
-def service(db_path: Path, *, revoked: bool = False) -> DeliveryAcceptanceService:
+def service(
+    db_path: Path,
+    *,
+    revoked: bool = False,
+    before_commit_validator: Callable[[], None] | None = None,
+) -> DeliveryAcceptanceService:
     initialize_database(db_path)
     return DeliveryAcceptanceService(
         db_path,
         connection(revoked=revoked),
         lambda: NOW_MS,
+        before_commit_validator=before_commit_validator,
     )
 
 

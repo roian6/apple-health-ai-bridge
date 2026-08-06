@@ -3,14 +3,21 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 
 from health_bridge.mailbox import filesystem as mailbox_files
+from health_bridge.mailbox.filesystem import (
+    MailboxFileError,
+    file_identity,
+    open_directory,
+    unlink_same_at,
+)
 from health_bridge.mailbox.importer import MailboxBusyError
 from health_bridge.mailbox.models import MailboxImportFaultPoint
-from health_bridge.mailbox.publication import cleanup_quarantine
+from health_bridge.mailbox.publication import cleanup_quarantine, publish_final_at
 from tests.contract.delivery_v1_support import authenticated_oversize_envelope
 from tests.mailbox.importer_support import (
     DAY_MS,
@@ -29,6 +36,7 @@ from tests.mailbox.importer_support import (
     scan_size_cap,
     write_delivery,
 )
+from tests.receiver.delivery_acceptance_support import NOW_MS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -52,6 +60,227 @@ def test_imports_exact_plaintext_bytes_and_replays_idempotently(
     ack = next(value.acks.glob("*.hba"))
     assert ack_is_deterministic(value, ack)
     assert delivery.exists()
+
+
+def test_one_shot_importer_rejects_replaced_device_without_external_write(
+    tmp_path: Path,
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    importer = configured_importer(value)
+    external = tmp_path / "external-mailbox"
+    for lane in ("deliveries", "acks", "quarantine"):
+        (external / lane).mkdir(parents=True, exist_ok=True)
+    detached = value.mailbox_path.parent / "detached-device"
+    _ = value.mailbox_path.rename(detached)
+    _ = value.mailbox_path.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(MailboxFileError):
+        _ = importer.import_once()
+
+    assert database_counts(value) == (0, 0, 0)
+    assert list((external / "acks").iterdir()) == []
+    assert list((external / "quarantine").iterdir()) == []
+
+
+def test_ack_finalize_revalidates_namespace_at_mutation_boundary(
+    tmp_path: Path,
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    detached_acks = tmp_path / "detached-acks"
+    replaced = False
+
+    def detach_before_finalize(point: MailboxImportFaultPoint) -> None:
+        nonlocal replaced
+        if point is MailboxImportFaultPoint.BEFORE_ACK_RENAME and not replaced:
+            _ = value.acks.rename(detached_acks)
+            value.acks.mkdir()
+            replaced = True
+
+    with pytest.raises(MailboxFileError):
+        _ = import_once(value, fault_hook=detach_before_finalize)
+
+    assert replaced
+    assert database_counts(value) == (1, 1, 1)
+    assert list(value.acks.iterdir()) == []
+    assert list(detached_acks.glob("*.hba")) == []
+
+    restarted = import_once(value)
+
+    assert restarted.idempotent == 1
+    assert len(list(value.acks.glob("*.hba"))) == 1
+
+
+def test_cleanup_revalidates_namespace_at_each_unlink_boundary(
+    tmp_path: Path,
+) -> None:
+    value = environment(tmp_path)
+    stale = value.deliveries / ("11" * 16 + ".hbd." + "22" * 16 + ".tmp")
+    _ = stale.write_bytes(b"stale")
+    age(stale, now_ms=NOW_MS, elapsed_ms=2 * DAY_MS)
+    detached_deliveries = tmp_path / "detached-deliveries"
+    replaced = False
+
+    def detach_before_unlink(point: MailboxImportFaultPoint) -> None:
+        nonlocal replaced
+        if point is MailboxImportFaultPoint.BEFORE_CLEANUP_UNLINK and not replaced:
+            _ = value.deliveries.rename(detached_deliveries)
+            value.deliveries.mkdir()
+            replaced = True
+
+    with pytest.raises(MailboxFileError):
+        _ = import_once(value, fault_hook=detach_before_unlink)
+
+    assert replaced
+    assert list(value.deliveries.iterdir()) == []
+    assert stale.name in {path.name for path in detached_deliveries.iterdir()}
+
+
+def test_linux_partial_finalize_recovers_idempotent_ack_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    real_unlink = os.unlink
+    failed_unlinks = 0
+
+    def fail_first_two_temp_unlinks(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal failed_unlinks
+        if os.fsdecode(path).endswith(".tmp") and failed_unlinks < 2:
+            failed_unlinks += 1
+            raise OSError(errno.EIO, "synthetic unlink failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "unlink", fail_first_two_temp_unlinks)
+    first = import_once(value)
+
+    assert failed_unlinks == 2
+    assert first.retryable == 1
+    assert database_counts(value) == (1, 1, 1)
+    assert len(list(value.acks.glob("*.hba"))) == 1
+    assert len(list(value.acks.glob("*.tmp"))) == 1
+
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    restarted = import_once(value)
+
+    assert restarted.idempotent == 1
+    assert restarted.conflict == 0
+    assert len(list(value.acks.glob("*.hba"))) == 1
+    assert list(value.acks.glob("*.tmp")) == []
+    assert next(value.acks.glob("*.hba")).stat().st_nlink == 1
+
+
+def test_unlink_rechecks_entry_identity_after_ancestry_validator(
+    tmp_path: Path,
+) -> None:
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    entry = lane / "entry.tmp"
+    _ = entry.write_bytes(b"original")
+    expected = file_identity(entry.stat(follow_symlinks=False))
+    preserved = lane / "preserved.tmp"
+    directory_fd = open_directory(lane)
+
+    def replace_during_validator() -> None:
+        _ = entry.rename(preserved)
+        _ = entry.write_bytes(b"replacement")
+
+    try:
+        removed = unlink_same_at(
+            directory_fd,
+            entry.name,
+            expected,
+            before_unlink=replace_during_validator,
+        )
+    finally:
+        os.close(directory_fd)
+
+    assert not removed
+    assert entry.read_bytes() == b"replacement"
+    assert preserved.read_bytes() == b"original"
+
+
+def test_partial_finalize_identity_race_stays_retryable_without_unlink(
+    tmp_path: Path,
+) -> None:
+    lane = tmp_path / "acks"
+    lane.mkdir()
+    final_name = f"{'11' * 16}.hba"
+    temp_name = f"{final_name}.{'22' * 16}.tmp"
+    final = lane / final_name
+    temp = lane / temp_name
+    content = b"synthetic-ack"
+    _ = final.write_bytes(content)
+    os.link(final, temp)
+    preserved = lane / "preserved.tmp"
+    directory_fd = open_directory(lane)
+
+    def replace_during_validator() -> None:
+        _ = temp.rename(preserved)
+        _ = temp.write_bytes(b"replacement")
+
+    try:
+        with pytest.raises(OSError, match="publication recovery pending") as raised:
+            _ = publish_final_at(
+                directory_fd,
+                final_name,
+                content,
+                before_mutation=replace_during_validator,
+            )
+    finally:
+        os.close(directory_fd)
+
+    assert raised.value.errno == errno.EAGAIN
+    assert final.read_bytes() == content
+    assert final.stat().st_nlink == 2
+    assert preserved.read_bytes() == content
+    assert temp.read_bytes() == b"replacement"
+
+
+def test_mailbox_directory_close_attempts_every_descriptor_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = environment(tmp_path)
+    handle = mailbox_files.open_mailbox_directory(value.mailbox_path)
+    descriptors = (
+        handle.quarantine_fd,
+        handle.acks_fd,
+        handle.deliveries_fd,
+        handle.mailbox_fd,
+        handle.receiver_fd,
+        handle.root_fd,
+        handle.root_parent_fd,
+    )
+    failed_descriptor = descriptors[0]
+    real_close = os.close
+    closed: list[int] = []
+
+    failed_once = False
+
+    def recording_close(descriptor: int) -> None:
+        nonlocal failed_once
+        closed.append(descriptor)
+        if descriptor == failed_descriptor and not failed_once:
+            failed_once = True
+            raise OSError(errno.EIO, "synthetic close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", recording_close)
+    with pytest.raises(OSError, match="synthetic close failure"):
+        handle.close()
+    assert closed == list(descriptors)
+
+    handle.close()
+
+    assert closed == [*descriptors, failed_descriptor]
 
 
 def test_semantically_valid_alternate_json_keeps_original_digest(

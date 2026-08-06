@@ -216,16 +216,18 @@ final class ReceiverClientTests: XCTestCase {
         XCTAssertEqual(ReceiverPairingRedeemError.emptyBearerToken.diagnosticCode, "pairing_redeem_empty_device_credential")
     }
 
-    func testInvitationAdvertisesMailboxCapabilityWithoutChangingLegacyDefault() throws {
-        let capable = try ReceiverPairingInvitation(
+    func testInvitationCarriesExplicitMailboxIntentWithoutChangingDirectDefault() throws {
+        let mailbox = try ReceiverPairingInvitation(
             jsonData: Data(mailboxInvitationJSON.utf8)
         )
-        let legacy = try ReceiverPairingInvitation(
+        let direct = try ReceiverPairingInvitation(
             jsonData: Data(validInvitationJSON.utf8)
         )
 
-        XCTAssertEqual(capable.mailboxProtocolVersion, 1)
-        XCTAssertNil(legacy.mailboxProtocolVersion)
+        XCTAssertEqual(mailbox.transport, .mailbox)
+        XCTAssertEqual(mailbox.mailboxProtocolVersion, 1)
+        XCTAssertEqual(direct.transport, .direct)
+        XCTAssertNil(direct.mailboxProtocolVersion)
     }
 
     func testRedeemInvitationPostsStagedCredentialAndInstallationWithoutAuthorization() async throws {
@@ -395,6 +397,80 @@ final class ReceiverClientTests: XCTestCase {
         XCTAssertNil(try stateStore.loadPending())
         XCTAssertFalse(try stateStore.hasPendingCancellation())
         XCTAssertEqual(try stateStore.loadOrCreateInstallationID(), syntheticInstallationID)
+    }
+
+    func testPendingPairingDecoderRequiresExplicitMailboxIntent() throws {
+        let base = """
+        {
+          "label": "synthetic-iphone",
+          "receiverURLString": "https://health-bridge.example.test/v1/batches",
+          "redeemURLString": "https://health-bridge.example.test/v1/pairing/redeem",
+          "invitationSecret": "hbi_synthetic_secret",
+          "installationID": "\(syntheticInstallationID)",
+          "deviceCredential": "\(syntheticDeviceCredential)",
+          "platform": "ios"
+        }
+        """
+        func adding(_ fields: String) -> Data {
+            Data(base.replacingOccurrences(of: "\n}", with: ",\n\(fields)\n}").utf8)
+        }
+
+        let implicitDirect = try JSONDecoder().decode(
+            ReceiverPendingPairing.self,
+            from: Data(base.utf8)
+        )
+        let explicitDirect = try JSONDecoder().decode(
+            ReceiverPendingPairing.self,
+            from: adding("  \"transport\": \"direct\"")
+        )
+        let explicitMailbox = try JSONDecoder().decode(
+            ReceiverPendingPairing.self,
+            from: adding("  \"transport\": \"mailbox\",\n  \"mailboxProtocolVersion\": 1")
+        )
+
+        XCTAssertEqual(implicitDirect.transport, .direct)
+        XCTAssertEqual(explicitDirect.transport, .direct)
+        XCTAssertEqual(explicitMailbox.transport, .mailbox)
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                ReceiverPendingPairing.self,
+                from: adding("  \"mailboxProtocolVersion\": 1")
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                ReceiverPendingPairing.self,
+                from: adding("  \"transport\": \"direct\",\n  \"mailboxProtocolVersion\": 1")
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                ReceiverPendingPairing.self,
+                from: adding("  \"transport\": \"mailbox\",\n  \"mailboxProtocolVersion\": 2")
+            )
+        )
+    }
+
+    func testNewMailboxPendingRecordSupportsImmediatePhysicalDowngrade() throws {
+        let pending = ReceiverPendingPairing(
+            label: "synthetic-iphone",
+            receiverURLString: "https://health-bridge.example.test/v1/batches",
+            redeemURLString: "https://health-bridge.example.test/v1/pairing/redeem",
+            invitationSecret: "hbi_synthetic_secret",
+            invitationCode: nil,
+            installationID: syntheticInstallationID,
+            deviceCredential: syntheticDeviceCredential,
+            platform: "ios",
+            transport: .mailbox
+        )
+
+        let encoded = try JSONEncoder().encode(pending)
+        let rollbackFixture = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+
+        XCTAssertEqual(rollbackFixture["transport"] as? String, "mailbox")
+        XCTAssertEqual(rollbackFixture["mailboxProtocolVersion"] as? Int, 1)
     }
 
     func testPairingStateStoreRejectsImplicitReplacementByDifferentInvitation() throws {
@@ -1153,7 +1229,8 @@ private let validInvitationJSON = """
   "receiver_url": "https://health-bridge.example.test/v1/batches",
   "redeem_url": "https://health-bridge.example.test/v1/pairing/redeem",
   "invitation_secret": "hbi_synthetic_secret",
-  "expires_at": "2026-07-12T09:00:00Z"
+  "expires_at": "2026-07-12T09:00:00Z",
+  "transport": "direct"
 }
 """
 
@@ -1166,6 +1243,7 @@ private let mailboxInvitationJSON = """
   "redeem_url": "https://health-bridge.example.test/v1/pairing/redeem",
   "invitation_secret": "hbi_synthetic_secret",
   "expires_at": "2026-07-12T09:00:00Z",
+  "transport": "mailbox",
   "mailbox_protocol_version": 1
 }
 """
@@ -1183,7 +1261,8 @@ private func syntheticPendingPairing(invitation: ReceiverPairingInvitation) -> R
         invitationCode: nil,
         installationID: syntheticInstallationID,
         deviceCredential: syntheticDeviceCredential,
-        platform: "ios"
+        platform: "ios",
+        transport: invitation.transport
     )
 }
 

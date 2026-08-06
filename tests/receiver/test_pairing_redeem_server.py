@@ -109,7 +109,6 @@ def test_receiver_redeems_invitation_secret_for_staged_device_credential(
         invitation_secret="hbi_synthetic_secret",
         invitation_code="ABCDE-FGHJK-MNPQR",
     )
-
     with running_receiver(db_path) as origin:
         body = redeem_body(invitation_secret=invitation.invitation_secret)
         request = Request(
@@ -141,6 +140,7 @@ def test_capable_pairing_provisions_local_mailbox_trust_without_public_root(
         db_path,
         label="personal-iphone",
         receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
         invitation_secret="hbi_synthetic_secret",
         invitation_code="ABCDE-FGHJK-MNPQR",
     )
@@ -197,11 +197,24 @@ def test_malformed_mailbox_keys_do_not_activate_direct_credential(
         db_path,
         label="personal-iphone",
         receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
         invitation_secret="hbi_synthetic_secret",
         invitation_code="ABCDE-FGHJK-MNPQR",
     )
+    key_store = MailboxKeyStore.for_testing(
+        state_dir=tmp_path / "private/receiver-keys",
+        anchor_dir=tmp_path / "private/receiver-anchor",
+    )
+    connections = MailboxConnectionStore.for_testing(
+        tmp_path / "private/connections",
+        key_store,
+    )
 
-    with running_receiver(db_path) as origin:
+    with running_receiver(
+        db_path,
+        mailbox_key_store=key_store,
+        mailbox_connection_store=connections,
+    ) as origin:
         error = open_http_error(
             Request(
                 f"{origin}/v1/pairing/redeem",
@@ -227,6 +240,119 @@ def test_malformed_mailbox_keys_do_not_activate_direct_credential(
     )
 
 
+def test_direct_invitation_does_not_select_mailbox_from_device_capability(
+    tmp_path: Path,
+) -> None:
+    # Given
+    db_path = tmp_path / "receiver.sqlite"
+    invitation = create_pairing_invitation(
+        db_path,
+        label="personal-iphone",
+        receiver_url="https://health.example.test/v1/batches",
+        invitation_secret="hbi_synthetic_secret",
+        invitation_code="ABCDE-FGHJK-MNPQR",
+    )
+    key_store = MailboxKeyStore.for_testing(
+        state_dir=tmp_path / "private/receiver-keys",
+        anchor_dir=tmp_path / "private/receiver-anchor",
+    )
+    connections = MailboxConnectionStore.for_testing(
+        tmp_path / "private/connections",
+        key_store,
+    )
+
+    # When
+    with running_receiver(
+        db_path,
+        mailbox_key_store=key_store,
+        mailbox_connection_store=connections,
+    ) as origin:
+        request = Request(
+            f"{origin}/v1/pairing/redeem",
+            data=redeem_body(
+                invitation_secret=invitation.invitation_secret,
+                device_signing_public_key="malformed-capability",
+                device_agreement_public_key="malformed-capability",
+            ),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with open_http_response(request) as response:
+            status = response.status
+            completion = PairingCompletionResponse.model_validate_json(response.read())
+
+    # Then
+    assert status == 200
+    assert completion.receiver_url == invitation.receiver_url
+    assert authenticate_receiver_token_principal(
+        db_path,
+        SYNTHETIC_DEVICE_CREDENTIAL,
+    )
+    assert not (tmp_path / "private/receiver-keys").exists()
+    assert not (tmp_path / "private/connections").exists()
+
+
+def test_mailbox_invitation_without_receiver_configuration_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    db_path = tmp_path / "receiver.sqlite"
+    invitation = create_pairing_invitation(
+        db_path,
+        label="personal-iphone",
+        receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
+        invitation_secret="hbi_synthetic_secret",
+        invitation_code="ABCDE-FGHJK-MNPQR",
+    )
+    signing = strict_base64url_encode(
+        Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    )
+    agreement = strict_base64url_encode(
+        X25519PrivateKey.generate().public_key().public_bytes_raw()
+    )
+
+    def reject_implicit_production_store() -> MailboxKeyStore:
+        message = "mailbox configuration must be explicit"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(
+        MailboxKeyStore,
+        "production",
+        reject_implicit_production_store,
+    )
+
+    # When
+    with running_receiver(db_path) as origin:
+        error = open_http_error(
+            Request(
+                f"{origin}/v1/pairing/redeem",
+                data=redeem_body(
+                    invitation_secret=invitation.invitation_secret,
+                    device_signing_public_key=signing,
+                    device_agreement_public_key=agreement,
+                ),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        )
+        response = PAIRING_ERROR_RESPONSE.validate_json(error.read())
+        status = error.code
+        error.close()
+
+    # Then
+    assert status == 503
+    assert response == {"error": "mailbox_transport_unavailable"}
+    assert (
+        authenticate_receiver_token_principal(
+            db_path,
+            SYNTHETIC_DEVICE_CREDENTIAL,
+        )
+        is None
+    )
+
+
 def test_mailbox_trust_failure_rolls_back_redemption_and_allows_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,6 +362,7 @@ def test_mailbox_trust_failure_rolls_back_redemption_and_allows_retry(
         db_path,
         label="personal-iphone",
         receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
         invitation_secret="hbi_synthetic_secret",
         invitation_code="ABCDE-FGHJK-MNPQR",
     )

@@ -44,16 +44,20 @@ from health_bridge.receiver.mailbox_pairing import (
     MailboxPairingCompletion,
     provision_mailbox_connection,
 )
+from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
 from health_bridge.receiver.tokens import (
     ReceiverTokenPrincipal,
     authenticate_receiver_token_principal,
 )
+from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import (
     database_access_lock,
     database_lifecycle_lock,
     initialize_database,
 )
 from health_bridge.storage.models import IngestResult
+
+_MAILBOX_SHUTDOWN_ERROR = "mailbox_runtime_shutdown_incomplete"
 
 MAX_BATCH_BYTES: Final = 5_000_000
 MAX_PAIRING_REDEEM_BYTES: Final = 4_096
@@ -126,7 +130,7 @@ class PairingRedeemRateLimiter:
 
 
 class ReceiverHTTPServer(ThreadingHTTPServer):
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit transport dependencies.
         self,
         host: str,
         port: int,
@@ -134,12 +138,14 @@ class ReceiverHTTPServer(ThreadingHTTPServer):
         *,
         mailbox_key_store: MailboxKeyStore | None = None,
         mailbox_connection_store: MailboxConnectionStore | None = None,
+        mailbox_worker: MailboxRuntimeWorker | None = None,
     ) -> None:
         self.db_path: Path = db_path
         self.mailbox_key_store: MailboxKeyStore | None = mailbox_key_store
         self.mailbox_connection_store: MailboxConnectionStore | None = (
             mailbox_connection_store
         )
+        self.mailbox_worker: MailboxRuntimeWorker | None = mailbox_worker
         self.pairing_redeem_limiter: PairingRedeemRateLimiter = (
             PairingRedeemRateLimiter()
         )
@@ -156,13 +162,29 @@ class ReceiverHTTPServer(ThreadingHTTPServer):
 
 @dataclass
 class _MailboxProvisioningTransaction:
-    key_store: MailboxKeyStore
-    connection_store: MailboxConnectionStore
-    device_signing_public_key: str
-    device_agreement_public_key: str
+    key_store: MailboxKeyStore | None
+    connection_store: MailboxConnectionStore | None
+    device_signing_public_key: str | None
+    device_agreement_public_key: str | None
     completion: MailboxPairingCompletion | None = None
 
     def __call__(self, redemption: PairingRedemptionCompletion) -> None:
+        match redemption.transport:
+            case ReceiverTransport.DIRECT:
+                return
+            case ReceiverTransport.MAILBOX:
+                pass
+        if self.key_store is None or self.connection_store is None:
+            raise MailboxTransportUnavailableError
+        if (
+            self.device_signing_public_key is None
+            or self.device_agreement_public_key is None
+        ):
+            raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED)
+        _validate_mailbox_public_keys(
+            self.device_signing_public_key,
+            self.device_agreement_public_key,
+        )
         self.completion = provision_mailbox_connection(
             connection_store=self.connection_store,
             key_store=self.key_store,
@@ -170,6 +192,10 @@ class _MailboxProvisioningTransaction:
             device_signing_public_key=self.device_signing_public_key,
             device_agreement_public_key=self.device_agreement_public_key,
         )
+
+
+class MailboxTransportUnavailableError(Exception):
+    pass
 
 
 class ReceiverRequestHandler(BaseHTTPRequestHandler):
@@ -189,6 +215,29 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path != "/health":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        receiver_server = getattr(self, "server", None)
+        worker = (
+            receiver_server.mailbox_worker
+            if isinstance(receiver_server, ReceiverHTTPServer)
+            else None
+        )
+        worker_error = None if worker is None else worker.health_error()
+        if worker is not None and worker_error is not None:
+            status = (
+                HTTPStatus.INTERNAL_SERVER_ERROR
+                if worker.terminal_error()
+                else HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            self._send_json(
+                status,
+                {
+                    "status": "error" if worker.terminal_error() else "degraded",
+                    "error": worker_error,
+                    "service": "health-bridge-receiver",
+                    "local_first_default": True,
+                },
+            )
             return
         self._send_json(
             HTTPStatus.OK,
@@ -272,7 +321,6 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = PairingRedeemRequest.model_validate_json(body)
-            _validate_mailbox_public_keys(payload)
             provisioning = _mailbox_provisioning_transaction(
                 self.receiver_server,
                 payload,
@@ -286,9 +334,7 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 platform=payload.platform,
                 before_commit=provisioning,
             )
-            mailbox_completion = (
-                provisioning.completion if provisioning is not None else None
-            )
+            mailbox_completion = provisioning.completion
         except (PairingInvitationError, ValidationError):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -298,6 +344,12 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
         except MailboxConnectionError as exc:
             status, error = _mailbox_connection_error_response(exc)
             self._send_json(status, {"error": error})
+            return
+        except MailboxTransportUnavailableError:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "mailbox_transport_unavailable"},
+            )
             return
         except (MailboxKeyStoreError, sqlite3.Error, OSError):
             self._send_json(
@@ -446,14 +498,13 @@ def build_receiver_server(
     )
 
 
-def _validate_mailbox_public_keys(payload: PairingRedeemRequest) -> None:
-    if payload.device_signing_public_key is None:
-        return
-    if payload.device_agreement_public_key is None:
-        raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED)
+def _validate_mailbox_public_keys(
+    device_signing_public_key: str,
+    device_agreement_public_key: str,
+) -> None:
     try:
-        _ = strict_base64url_decode(payload.device_signing_public_key, 32)
-        _ = strict_base64url_decode(payload.device_agreement_public_key, 32)
+        _ = strict_base64url_decode(device_signing_public_key, 32)
+        _ = strict_base64url_decode(device_agreement_public_key, 32)
     except MailboxKeyStoreError as exc:
         raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED) from exc
 
@@ -461,17 +512,10 @@ def _validate_mailbox_public_keys(payload: PairingRedeemRequest) -> None:
 def _mailbox_provisioning_transaction(
     server: ReceiverHTTPServer,
     payload: PairingRedeemRequest,
-) -> _MailboxProvisioningTransaction | None:
-    if (
-        payload.device_signing_public_key is None
-        or payload.device_agreement_public_key is None
-    ):
-        return None
+) -> _MailboxProvisioningTransaction:
     return _MailboxProvisioningTransaction(
-        key_store=server.mailbox_key_store or MailboxKeyStore.production(),
-        connection_store=(
-            server.mailbox_connection_store or MailboxConnectionStore.production()
-        ),
+        key_store=server.mailbox_key_store,
+        connection_store=server.mailbox_connection_store,
         device_signing_public_key=payload.device_signing_public_key,
         device_agreement_public_key=payload.device_agreement_public_key,
     )
@@ -487,14 +531,50 @@ def _mailbox_connection_error_response(
     return HTTPStatus.INTERNAL_SERVER_ERROR, "pairing_temporarily_unavailable"
 
 
-def serve_receiver(db_path: Path, host: str, port: int) -> None:
+def serve_receiver(  # noqa: PLR0913 - transport dependencies are explicit.
+    db_path: Path,
+    host: str,
+    port: int,
+    *,
+    mailbox_key_store: MailboxKeyStore | None = None,
+    mailbox_connection_store: MailboxConnectionStore | None = None,
+    mailbox_root: Path | None = None,
+) -> None:
     initialize_database(db_path)
+    worker = (
+        MailboxRuntimeWorker(db_path=db_path, mailbox_root=mailbox_root)
+        if mailbox_root is not None
+        else None
+    )
     with (
         database_lifecycle_lock(db_path, exclusive=False, create=False),
         database_access_lock(db_path, exclusive=False, create=False),
-        ReceiverHTTPServer(host=host, port=port, db_path=db_path) as server,
+        (
+            ReceiverHTTPServer(
+                host=host,
+                port=port,
+                db_path=db_path,
+                mailbox_key_store=mailbox_key_store,
+                mailbox_connection_store=mailbox_connection_store,
+                mailbox_worker=worker,
+            )
+            if worker is not None
+            else ReceiverHTTPServer(
+                host=host,
+                port=port,
+                db_path=db_path,
+                mailbox_key_store=mailbox_key_store,
+                mailbox_connection_store=mailbox_connection_store,
+            )
+        ) as server,
     ):
-        server.serve_forever()
+        if worker is not None:
+            worker.start()
+        try:
+            server.serve_forever()
+        finally:
+            if worker is not None and worker.stop() is False:
+                raise RuntimeError(_MAILBOX_SHUTDOWN_ERROR)
 
 
 def _response_for_ingest_result(result: IngestResult) -> dict[str, str | int]:

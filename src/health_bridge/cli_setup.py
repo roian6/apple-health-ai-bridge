@@ -16,6 +16,11 @@ from health_bridge.cli_dev import (
     DevDeviceSessionRequest,
     build_dev_device_session_manifest,
 )
+from health_bridge.receiver.transports import (
+    PublicReceiverTransport,
+    ReceiverTransport,
+    select_receiver_transport,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -100,6 +105,7 @@ class SetupManifest(BaseModel):
     setup_page: str
     pairing_schema_id: str
     invitation_expires_at: str
+    selected_transport: ReceiverTransport
     receiver_start_command: list[str]
     access_descriptors: list[AccessDescriptor]
     local_mcp_self_test_command: list[str]
@@ -122,6 +128,9 @@ class SetupRequest:
     receiver_port: int
     executable: str
     allow_nonlocal_receiver_address: bool = False
+    transport: PublicReceiverTransport = "direct"
+    mailbox_root: Path | None = None
+    icloud_container_identifier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,7 +506,18 @@ def _local_receiver_health_url(receiver_host: str, receiver_port: int) -> str:
 
 
 def build_setup_manifest(request: SetupRequest) -> SetupManifest:
+    selected_transport = select_receiver_transport(
+        request.transport,
+        mailbox_root=request.mailbox_root,
+        icloud_container_identifier=request.icloud_container_identifier,
+    )
     transport_notice = _setup_transport_notice(request)
+    if selected_transport is ReceiverTransport.MAILBOX:
+        transport_notice = (
+            "Encrypted iCloud Mailbox (Beta) selected. No VPN is required for "
+            "mailbox delivery; it is Mac only and best-effort/eventual, not "
+            f"instant sync. {transport_notice}"
+        )
     session = build_dev_device_session_manifest(
         DevDeviceSessionRequest(
             db_path=request.db_path,
@@ -507,6 +527,9 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
             receiver_host=request.receiver_host,
             receiver_port=request.receiver_port,
             watch_seconds=7200,
+            transport=selected_transport,
+            mailbox_root=request.mailbox_root,
+            icloud_container_identifier=request.icloud_container_identifier,
         )
     )
     receiver_start_command = [
@@ -520,6 +543,15 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         "--port",
         str(request.receiver_port),
     ]
+    if request.mailbox_root is not None:
+        receiver_start_command.extend(("--mailbox-root", str(request.mailbox_root)))
+    if request.icloud_container_identifier is not None:
+        receiver_start_command.extend(
+            (
+                "--icloud-container-identifier",
+                request.icloud_container_identifier,
+            )
+        )
     local_receiver_health_url = _local_receiver_health_url(
         request.receiver_host,
         request.receiver_port,
@@ -537,6 +569,24 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         )
         for registrar in _REGISTRARS
     ]
+    mailbox_sync_parts = (
+        "Connect the app, allow read access to all supported Apple Health types",
+        "you want to share, enable Automatic Sync, keep the receiver process",
+        "running so mailbox deliveries are imported, and require the first",
+        "receiver ACK after its database commit.",
+    )
+    direct_sync_parts = (
+        "Connect the app, allow read access to all supported Apple Health types",
+        "you want to share, enable Automatic Sync, and require the first receiver",
+        "upload ACK.",
+    )
+    mailbox_sync_step = " ".join(mailbox_sync_parts)
+    direct_sync_step = " ".join(direct_sync_parts)
+    sync_step = (
+        mailbox_sync_step
+        if selected_transport is ReceiverTransport.MAILBOX
+        else direct_sync_step
+    )
     return SetupManifest(
         db=str(request.db_path),
         receiver_url=session.receiver_url,
@@ -544,6 +594,7 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         setup_page=session.setup_page,
         pairing_schema_id=session.pairing_schema_id,
         invitation_expires_at=session.invitation_expires_at,
+        selected_transport=selected_transport,
         receiver_start_command=receiver_start_command,
         access_descriptors=[access],
         local_mcp_self_test_command=[
@@ -578,11 +629,7 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
                 "If the receiver is headless, securely copy the HTML file to a trusted "
                 "local screen; do not publish it or place it on a public web server."
             ),
-            (
-                "Connect the app, allow read access to all supported Apple Health "
-                "types you want to share, enable Automatic Sync, and require the "
-                "first receiver upload ACK."
-            ),
+            sync_step,
             (
                 "After the first receiver upload ACK, use access_descriptors for a "
                 "same-host stdio MCP client, or query the database with the direct CLI."
