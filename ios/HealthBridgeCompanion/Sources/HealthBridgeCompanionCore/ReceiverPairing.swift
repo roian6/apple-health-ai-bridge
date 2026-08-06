@@ -105,6 +105,7 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
     public let redeemURLString: String
     public let invitationSecret: String
     public let expiresAt: String
+    public let mailboxProtocolVersion: Int?
     public let receiverURL: URL
     public let redeemURL: URL
 
@@ -116,7 +117,9 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
             throw ReceiverPairingBundleError.invalidJSON
         }
         guard payload.schemaID == Self.supportedSchemaID,
-              payload.schemaVersion == Self.supportedSchemaVersion
+              payload.schemaVersion == Self.supportedSchemaVersion,
+              payload.mailboxProtocolVersion == nil
+                || payload.mailboxProtocolVersion == 1
         else {
             throw ReceiverPairingBundleError.unsupportedSchema
         }
@@ -135,6 +138,7 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         self.redeemURLString = payload.redeemURL
         self.invitationSecret = payload.invitationSecret
         self.expiresAt = payload.expiresAt
+        self.mailboxProtocolVersion = payload.mailboxProtocolVersion
         self.receiverURL = receiverURL
         self.redeemURL = redeemURL
     }
@@ -290,6 +294,7 @@ private struct InvitationPairingPayload: Decodable {
     let redeemURL: String
     let invitationSecret: String
     let expiresAt: String
+    let mailboxProtocolVersion: Int?
 
     enum CodingKeys: String, CodingKey {
         case schemaID = "schema_id"
@@ -299,6 +304,7 @@ private struct InvitationPairingPayload: Decodable {
         case redeemURL = "redeem_url"
         case invitationSecret = "invitation_secret"
         case expiresAt = "expires_at"
+        case mailboxProtocolVersion = "mailbox_protocol_version"
     }
 }
 

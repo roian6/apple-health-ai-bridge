@@ -1,27 +1,48 @@
 import json
+
+# noqa: RUF100 -- no-excuse marker "# noqa: SIZE_OK": cohesive HTTP framing and mappings.
 import sqlite3
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from typing import ClassVar, Final, Self, TypeAlias, cast, final
+from typing import ClassVar, Final, Self, TypeAlias, assert_never, cast, final
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 from typing_extensions import override
 
-from health_bridge.contract import HealthBridgeBatchV1
-from health_bridge.ingest import ingest_batch
+from health_bridge.mailbox.connections import (
+    MailboxConnectionError,
+    MailboxConnectionErrorCode,
+    MailboxConnectionStore,
+)
+from health_bridge.receiver._mailbox_key_models import (
+    MailboxKeyStoreError,
+    strict_base64url_decode,
+)
+from health_bridge.receiver.batch_acceptance import BatchAcceptanceInput
+from health_bridge.receiver.direct_http_acceptance import (
+    DirectBatchAccepted,
+    DirectBatchPayloadInvalid,
+    DirectBatchPrincipalMismatch,
+    DirectBatchSleepBaselineConflict,
+    DirectBatchStorageUnavailable,
+    DirectHTTPAcceptance,
+)
 from health_bridge.receiver.invitations import (
     PairingInvitationError,
+    PairingRedemptionCompletion,
     redeem_pairing_invitation,
 )
-from health_bridge.receiver.source_binding import (
-    SourcePrincipalMismatchError,
-    bind_batch_to_principal,
+from health_bridge.receiver.mailbox_keys import MailboxKeyStore
+from health_bridge.receiver.mailbox_pairing import (
+    MailboxPairingCompletion,
+    provision_mailbox_connection,
 )
 from health_bridge.receiver.tokens import (
     ReceiverTokenPrincipal,
@@ -33,7 +54,6 @@ from health_bridge.storage.database import (
     initialize_database,
 )
 from health_bridge.storage.models import IngestResult
-from health_bridge.storage.sleep import StaleOrderedSleepBaselineResetError
 
 MAX_BATCH_BYTES: Final = 5_000_000
 MAX_PAIRING_REDEEM_BYTES: Final = 4_096
@@ -52,11 +72,18 @@ class PairingRedeemRequest(BaseModel):
     installation_id: str
     device_credential: str
     platform: str
+    device_signing_public_key: str | None = None
+    device_agreement_public_key: str | None = None
 
     @model_validator(mode="after")
     def exactly_one_credential(self) -> Self:
         if (self.invitation_secret is None) == (self.invitation_code is None):
             message = "exactly one invitation credential is required"
+            raise ValueError(message)
+        if (self.device_signing_public_key is None) != (
+            self.device_agreement_public_key is None
+        ):
+            message = "mailbox device keys must be provided together"
             raise ValueError(message)
         return self
 
@@ -99,16 +126,50 @@ class PairingRedeemRateLimiter:
 
 
 class ReceiverHTTPServer(ThreadingHTTPServer):
-    def __init__(self, host: str, port: int, db_path: Path) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        db_path: Path,
+        *,
+        mailbox_key_store: MailboxKeyStore | None = None,
+        mailbox_connection_store: MailboxConnectionStore | None = None,
+    ) -> None:
         self.db_path: Path = db_path
+        self.mailbox_key_store: MailboxKeyStore | None = mailbox_key_store
+        self.mailbox_connection_store: MailboxConnectionStore | None = (
+            mailbox_connection_store
+        )
         self.pairing_redeem_limiter: PairingRedeemRateLimiter = (
             PairingRedeemRateLimiter()
         )
         super().__init__((host, port), ReceiverRequestHandler)
 
     @override
-    def handle_error(self, request: object, client_address: object) -> None:
+    def handle_error(
+        self,
+        request: object,  # noqa: RUF100 -- stdlib override; no-excuse "# noqa: OBJECT_OK".
+        client_address: object,  # noqa: RUF100 -- stdlib override; no-excuse "# noqa: OBJECT_OK".
+    ) -> None:
         """Suppress socketserver's default traceback and client-address dump."""
+
+
+@dataclass
+class _MailboxProvisioningTransaction:
+    key_store: MailboxKeyStore
+    connection_store: MailboxConnectionStore
+    device_signing_public_key: str
+    device_agreement_public_key: str
+    completion: MailboxPairingCompletion | None = None
+
+    def __call__(self, redemption: PairingRedemptionCompletion) -> None:
+        self.completion = provision_mailbox_connection(
+            connection_store=self.connection_store,
+            key_store=self.key_store,
+            installation_id_hash=redemption.installation_id_hash,
+            device_signing_public_key=self.device_signing_public_key,
+            device_agreement_public_key=self.device_agreement_public_key,
+        )
 
 
 class ReceiverRequestHandler(BaseHTTPRequestHandler):
@@ -120,7 +181,7 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
     def log_message(
         self,
         format: str,
-        *_args: object,
+        *_args: object,  # noqa: RUF100 -- stdlib override; no-excuse "# noqa: OBJECT_OK".
     ) -> None:
         """Keep request paths and client addresses out of default stderr logs."""
 
@@ -152,53 +213,47 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return
-        try:
-            batch = HealthBridgeBatchV1.model_validate_json(body)
-        except ValidationError:
-            self._send_json(
-                HTTPStatus.UNPROCESSABLE_ENTITY,
-                {"error": "payload does not match health_bridge.batch.v1 schema"},
-            )
-            return
-        try:
-            batch = bind_batch_to_principal(batch, principal)
-        except SourcePrincipalMismatchError:
-            self._send_json(
-                HTTPStatus.FORBIDDEN,
-                {"error": "source_principal_mismatch"},
-            )
-            return
-        result = self._ingest_batch_or_send_error(batch)
-        if result is None:
-            return
-        self._send_json(
-            HTTPStatus.ACCEPTED,
-            _response_for_ingest_result(result),
+        result = DirectHTTPAcceptance(self.receiver_server.db_path).accept(
+            BatchAcceptanceInput(exact_bytes=body, principal=principal)
         )
-
-    def _ingest_batch_or_send_error(
-        self,
-        batch: HealthBridgeBatchV1,
-    ) -> IngestResult | None:
-        try:
-            return ingest_batch(
-                self.receiver_server.db_path, batch, source_name="receiver"
-            )
-        except StaleOrderedSleepBaselineResetError as exc:
-            self._send_json(
-                HTTPStatus.CONFLICT,
-                {
-                    "error": "sleep_baseline_reset_epoch_conflict",
-                    "minimum_reset_epoch": exc.current_epoch,
-                },
-            )
-            return None
-        except (sqlite3.Error, OSError):
-            self._send_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"error": "records could not be stored"},
-            )
-            return None
+        # BasedPyright rejects an unreachable default; terminal assert_never follows.
+        match result:  # noqa: RUF100 -- no-excuse marker "# noqa: MATCH_OK"
+            case DirectBatchAccepted(ingest_result=ingest_result):
+                self._send_json(
+                    HTTPStatus.ACCEPTED,
+                    _response_for_ingest_result(ingest_result),
+                )
+                return
+            case DirectBatchPayloadInvalid():
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {"error": "payload does not match health_bridge.batch.v1 schema"},
+                )
+                return
+            case DirectBatchPrincipalMismatch():
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "source_principal_mismatch"},
+                )
+                return
+            case DirectBatchSleepBaselineConflict(
+                minimum_reset_epoch=minimum_reset_epoch
+            ):
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "error": "sleep_baseline_reset_epoch_conflict",
+                        "minimum_reset_epoch": minimum_reset_epoch,
+                    },
+                )
+                return
+            case DirectBatchStorageUnavailable():
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "records could not be stored"},
+                )
+                return
+        assert_never(result)
 
     def _handle_pairing_redeem(self) -> None:
         client_key = self.client_address[0]
@@ -217,6 +272,11 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = PairingRedeemRequest.model_validate_json(body)
+            _validate_mailbox_public_keys(payload)
+            provisioning = _mailbox_provisioning_transaction(
+                self.receiver_server,
+                payload,
+            )
             completion = redeem_pairing_invitation(
                 self.receiver_server.db_path,
                 invitation_secret=payload.invitation_secret,
@@ -224,6 +284,10 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 installation_id=payload.installation_id,
                 device_credential=payload.device_credential,
                 platform=payload.platform,
+                before_commit=provisioning,
+            )
+            mailbox_completion = (
+                provisioning.completion if provisioning is not None else None
             )
         except (PairingInvitationError, ValidationError):
             self._send_json(
@@ -231,21 +295,49 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 {"error": "pairing_invitation_invalid"},
             )
             return
-        except (sqlite3.Error, OSError):
+        except MailboxConnectionError as exc:
+            status, error = _mailbox_connection_error_response(exc)
+            self._send_json(status, {"error": error})
+            return
+        except (MailboxKeyStoreError, sqlite3.Error, OSError):
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "pairing_temporarily_unavailable"},
             )
             return
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "schema_id": "health_bridge.receiver_pairing_completion.v1",
-                "schema_version": "1.0.0",
-                "label": completion.label,
-                "receiver_url": completion.receiver_url,
-            },
-        )
+        response: JsonPayload = {
+            "schema_id": "health_bridge.receiver_pairing_completion.v1",
+            "schema_version": "1.0.0",
+            "label": completion.label,
+            "receiver_url": completion.receiver_url,
+        }
+        if mailbox_completion is not None:
+            response.update(
+                {
+                    "mailbox_protocol_version": 1,
+                    "mailbox_receiver_id": mailbox_completion.receiver_id,
+                    "mailbox_device_id": mailbox_completion.device_id,
+                    "mailbox_receiver_binding_id": (
+                        mailbox_completion.receiver_binding_id
+                    ),
+                    "mailbox_connection_generation": (
+                        mailbox_completion.connection_generation
+                    ),
+                    "mailbox_receiver_signing_public_key": (
+                        mailbox_completion.receiver_signing_public_key
+                    ),
+                    "mailbox_receiver_agreement_public_key": (
+                        mailbox_completion.receiver_agreement_public_key
+                    ),
+                    "mailbox_receiver_signing_key_id": (
+                        mailbox_completion.receiver_signing_key_id
+                    ),
+                    "mailbox_receiver_agreement_key_id": (
+                        mailbox_completion.receiver_agreement_key_id
+                    ),
+                }
+            )
+        self._send_json(HTTPStatus.OK, response)
 
     def _authorize_batch_request(self) -> ReceiverTokenPrincipal | None:
         try:
@@ -336,9 +428,63 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return
 
 
-def build_receiver_server(db_path: Path, host: str, port: int) -> ReceiverHTTPServer:
+def build_receiver_server(
+    db_path: Path,
+    host: str,
+    port: int,
+    *,
+    mailbox_key_store: MailboxKeyStore | None = None,
+    mailbox_connection_store: MailboxConnectionStore | None = None,
+) -> ReceiverHTTPServer:
     initialize_database(db_path)
-    return ReceiverHTTPServer(host=host, port=port, db_path=db_path)
+    return ReceiverHTTPServer(
+        host=host,
+        port=port,
+        db_path=db_path,
+        mailbox_key_store=mailbox_key_store,
+        mailbox_connection_store=mailbox_connection_store,
+    )
+
+
+def _validate_mailbox_public_keys(payload: PairingRedeemRequest) -> None:
+    if payload.device_signing_public_key is None:
+        return
+    if payload.device_agreement_public_key is None:
+        raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED)
+    try:
+        _ = strict_base64url_decode(payload.device_signing_public_key, 32)
+        _ = strict_base64url_decode(payload.device_agreement_public_key, 32)
+    except MailboxKeyStoreError as exc:
+        raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED) from exc
+
+
+def _mailbox_provisioning_transaction(
+    server: ReceiverHTTPServer,
+    payload: PairingRedeemRequest,
+) -> _MailboxProvisioningTransaction | None:
+    if (
+        payload.device_signing_public_key is None
+        or payload.device_agreement_public_key is None
+    ):
+        return None
+    return _MailboxProvisioningTransaction(
+        key_store=server.mailbox_key_store or MailboxKeyStore.production(),
+        connection_store=(
+            server.mailbox_connection_store or MailboxConnectionStore.production()
+        ),
+        device_signing_public_key=payload.device_signing_public_key,
+        device_agreement_public_key=payload.device_agreement_public_key,
+    )
+
+
+def _mailbox_connection_error_response(
+    error: MailboxConnectionError,
+) -> tuple[HTTPStatus, str]:
+    if error.code is MailboxConnectionErrorCode.MALFORMED:
+        return HTTPStatus.BAD_REQUEST, "mailbox_pairing_invalid"
+    if error.code is MailboxConnectionErrorCode.CONFLICT:
+        return HTTPStatus.CONFLICT, "mailbox_pairing_conflict"
+    return HTTPStatus.INTERNAL_SERVER_ERROR, "pairing_temporarily_unavailable"
 
 
 def serve_receiver(db_path: Path, host: str, port: int) -> None:

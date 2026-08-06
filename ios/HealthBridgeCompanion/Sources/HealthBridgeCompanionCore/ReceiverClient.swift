@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -67,6 +68,7 @@ public struct ReceiverPairingCredential: Equatable, Sendable {
     public let receiverURLString: String
     public let bearerToken: String
     public let tokenPrefix: String
+    public let mailboxIdentity: MailboxConnectionIdentityV1?
 }
 
 public enum ReceiverPairingRedeemError: Error, Equatable, LocalizedError {
@@ -91,6 +93,25 @@ public enum ReceiverPairingRedeemError: Error, Equatable, LocalizedError {
             return "Pairing server returned credentials for a different receiver."
         case .emptyBearerToken:
             return "Pairing server returned an empty device credential."
+        }
+    }
+
+    public var diagnosticCode: String {
+        switch self {
+        case .nonHTTPResponse:
+            "pairing_redeem_non_http_response"
+        case .invitationInvalid:
+            "pairing_redeem_invitation_invalid"
+        case .unsuccessfulStatusCode(let statusCode) where (100...599).contains(statusCode):
+            "pairing_redeem_http_\(statusCode)"
+        case .unsuccessfulStatusCode:
+            "pairing_redeem_http_error"
+        case .invalidResponse:
+            "pairing_redeem_invalid_response"
+        case .mismatchedReceiverURL:
+            "pairing_redeem_receiver_url_mismatch"
+        case .emptyBearerToken:
+            "pairing_redeem_empty_device_credential"
         }
     }
 }
@@ -119,9 +140,19 @@ public struct TerminalRequestLifecycleSnapshot: Equatable, Sendable {
     }
 }
 
-@MainActor
-public enum ReceiverConnectionTerminalBarrierError: Error, Equatable {
+public enum ReceiverConnectionTerminalBarrierError: Error, Equatable, Sendable {
     case backgroundPayloadCancellationNotFinalized
+}
+
+public enum ReceiverPairingCommitBarrierError: String, CaseIterable, Error, Sendable {
+    case cancelled = "pairing_commit_cancelled"
+    case generationInvalidationFailed = "pairing_commit_generation_failed"
+    case backgroundPayloadCancellationNotFinalized = "pairing_commit_background_cleanup_pending"
+    case outboxUnavailable = "pairing_commit_outbox_unavailable"
+    case outboxUnreadable = "pairing_commit_outbox_unreadable"
+    case outboxIdentityAdmissionNotReady = "pairing_commit_outbox_identity_not_ready"
+    case outboxNotEmpty = "pairing_commit_outbox_not_empty"
+    case outboxClearIntentActive = "pairing_commit_outbox_clear_pending"
 }
 
 @MainActor
@@ -298,7 +329,8 @@ public final class ReceiverClient: @unchecked Sendable {
     }
 
     public func redeem(
-        pendingPairing: ReceiverPendingPairing
+        pendingPairing: ReceiverPendingPairing,
+        mailboxPublicIdentity: MailboxPublicIdentity? = nil
     ) async throws -> ReceiverPairingCredential {
         guard let redeemURL = URL(string: pendingPairing.redeemURLString),
               let expectedReceiverURL = URL(string: pendingPairing.receiverURLString),
@@ -310,13 +342,26 @@ public final class ReceiverClient: @unchecked Sendable {
         else {
             throw ReceiverPairingRedeemError.invalidResponse
         }
+        let mailboxRequested: Bool
+        switch (pendingPairing.mailboxProtocolVersion, mailboxPublicIdentity) {
+        case (nil, nil):
+            mailboxRequested = false
+        case (1, .some):
+            mailboxRequested = true
+        default:
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
         let body = try JSONEncoder().encode(
             PairingRedeemRequest(
                 invitationSecret: pendingPairing.invitationSecret,
                 invitationCode: pendingPairing.invitationCode,
                 installationID: pendingPairing.installationID,
                 deviceCredential: pendingPairing.deviceCredential,
-                platform: pendingPairing.platform
+                platform: pendingPairing.platform,
+                deviceSigningPublicKey: mailboxPublicIdentity?
+                    .signingPublicKey.base64URLEncodedString(),
+                deviceAgreementPublicKey: mailboxPublicIdentity?
+                    .agreementPublicKey.base64URLEncodedString()
             )
         )
         var request = URLRequest(url: redeemURL)
@@ -358,11 +403,94 @@ public final class ReceiverClient: @unchecked Sendable {
         guard !token.isEmpty else {
             throw ReceiverPairingRedeemError.emptyBearerToken
         }
+        let mailboxIdentity = try Self.mailboxConnectionIdentity(
+            payload: payload,
+            pendingPairing: pendingPairing,
+            deviceIdentity: mailboxPublicIdentity,
+            required: mailboxRequested
+        )
         return ReceiverPairingCredential(
             label: payload.label,
             receiverURLString: payload.receiverURL,
             bearerToken: token,
-            tokenPrefix: String(token.prefix(11))
+            tokenPrefix: String(token.prefix(11)),
+            mailboxIdentity: mailboxIdentity
+        )
+    }
+
+    private static func mailboxConnectionIdentity(
+        payload: PairingCompletionPayload,
+        pendingPairing: ReceiverPendingPairing,
+        deviceIdentity: MailboxPublicIdentity?,
+        required: Bool
+    ) throws -> MailboxConnectionIdentityV1? {
+        let fieldsAreAbsent = payload.mailboxProtocolVersion == nil
+            && payload.mailboxReceiverID == nil
+            && payload.mailboxDeviceID == nil
+            && payload.mailboxReceiverBindingID == nil
+            && payload.mailboxConnectionGeneration == nil
+            && payload.mailboxReceiverSigningPublicKey == nil
+            && payload.mailboxReceiverAgreementPublicKey == nil
+            && payload.mailboxReceiverSigningKeyID == nil
+            && payload.mailboxReceiverAgreementKeyID == nil
+        if !required {
+            guard fieldsAreAbsent else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+            return nil
+        }
+        guard let deviceIdentity,
+              payload.mailboxProtocolVersion == 1,
+              let receiverIDString = payload.mailboxReceiverID,
+              let receiverID = Data(hexV1: receiverIDString),
+              receiverID.count == 16,
+              receiverID.hexV1 == receiverIDString,
+              let deviceIDString = payload.mailboxDeviceID,
+              let deviceID = Data(hexV1: deviceIDString),
+              deviceID.count == 16,
+              deviceID.hexV1 == deviceIDString,
+              let binding = payload.mailboxReceiverBindingID,
+              Data(strictBase64URL: binding, count: 32) != nil,
+              let generation = payload.mailboxConnectionGeneration,
+              generation > 0,
+              let receiverSigningEncoded = payload.mailboxReceiverSigningPublicKey,
+              let receiverSigning = Data(
+                  strictBase64URL: receiverSigningEncoded,
+                  count: 32
+              ),
+              let receiverAgreementEncoded = payload.mailboxReceiverAgreementPublicKey,
+              let receiverAgreement = Data(
+                  strictBase64URL: receiverAgreementEncoded,
+                  count: 32
+              ),
+              let receiverSigningKeyID = payload.mailboxReceiverSigningKeyID,
+              mailboxKeyIdentifier(
+                  algorithm: "ed25519",
+                  publicKey: receiverSigning
+              ) == receiverSigningKeyID,
+              let receiverAgreementKeyID = payload.mailboxReceiverAgreementKeyID,
+              mailboxKeyIdentifier(
+                  algorithm: "x25519",
+                  publicKey: receiverAgreement
+              ) == receiverAgreementKeyID else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let installationMaterial = Data(
+            "health-bridge-pairing:installation:\(pendingPairing.installationID)".utf8
+        )
+        let installationHash = Data(SHA256.hash(data: installationMaterial)).hexV1
+        return MailboxConnectionIdentityV1(
+            receiverID: receiverIDString,
+            deviceID: deviceIDString,
+            devicePrincipal: "installation:\(installationHash)",
+            deviceSigningKeyID: deviceIdentity.signingKeyID,
+            deviceAgreementKeyID: deviceIdentity.agreementKeyID,
+            receiverSigningKeyID: receiverSigningKeyID,
+            receiverAgreementKeyID: receiverAgreementKeyID,
+            receiverSigningPublicKey: receiverSigningEncoded,
+            receiverAgreementPublicKey: receiverAgreementEncoded,
+            opaqueBinding: binding,
+            connectionGeneration: UInt64(generation)
         )
     }
 
@@ -415,15 +543,20 @@ public final class ReceiverPairingCoordinator {
     private let client: ReceiverClient
     private let stateStore: ReceiverPairingStateStore
     private let settingsStore: ReceiverSettingsStore
+    private let mailboxKeyStore: MailboxKeyStore
 
     public init(
         client: ReceiverClient,
         stateStore: ReceiverPairingStateStore,
-        settingsStore: ReceiverSettingsStore
+        settingsStore: ReceiverSettingsStore,
+        mailboxKeyStore: MailboxKeyStore = MailboxKeyStore(
+            service: HealthBridgeAppIdentity.mailboxKeychainServiceName
+        )
     ) {
         self.client = client
         self.stateStore = stateStore
         self.settingsStore = settingsStore
+        self.mailboxKeyStore = mailboxKeyStore
     }
 
     public func pair(
@@ -479,7 +612,8 @@ public final class ReceiverPairingCoordinator {
             receiverURLString: invitation.receiverURLString,
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
-            invitationCode: nil
+            invitationCode: nil,
+            mailboxProtocolVersion: invitation.mailboxProtocolVersion
         )
     }
 
@@ -569,7 +703,26 @@ public final class ReceiverPairingCoordinator {
     ) async throws -> ReceiverPairingCredential {
         let credential: ReceiverPairingCredential
         do {
-            credential = try await client.redeem(pendingPairing: pending)
+            let mailboxIdentity: MailboxPublicIdentity?
+            if pending.mailboxProtocolVersion == 1 {
+                do {
+                    mailboxIdentity = try mailboxKeyStore.loadOrCreate()
+                } catch let error as MailboxKeyStoreError {
+                    throw ReceiverPairingPreflightError.mailboxKey(
+                        MailboxKeyPairingPreflightFailure(error)
+                    )
+                }
+            } else {
+                mailboxIdentity = nil
+            }
+            if let mailboxIdentity {
+                credential = try await client.redeem(
+                    pendingPairing: pending,
+                    mailboxPublicIdentity: mailboxIdentity
+                )
+            } else {
+                credential = try await client.redeem(pendingPairing: pending)
+            }
         } catch let error as ReceiverPairingRedeemError {
             if error == .invitationInvalid,
                settingsStore.receiverSettingsGenerationToken == expectedGeneration {
@@ -578,12 +731,21 @@ public final class ReceiverPairingCoordinator {
             throw error
         }
         try Task.checkCancellation()
-        try settingsStore.save(
-            receiverURLString: credential.receiverURLString,
-            bearerToken: credential.bearerToken,
-            expectedGeneration: expectedGeneration,
-            rotateBindingID: true
-        )
+        if let mailboxIdentity = credential.mailboxIdentity {
+            try settingsStore.saveMailboxPairing(
+                receiverURLString: credential.receiverURLString,
+                bearerToken: credential.bearerToken,
+                mailboxIdentity: mailboxIdentity,
+                expectedGeneration: expectedGeneration
+            )
+        } else {
+            try settingsStore.save(
+                receiverURLString: credential.receiverURLString,
+                bearerToken: credential.bearerToken,
+                expectedGeneration: expectedGeneration,
+                rotateBindingID: true
+            )
+        }
         try stateStore.clearPending()
         return credential
     }
@@ -595,6 +757,8 @@ private struct PairingRedeemRequest: Encodable {
     let installationID: String
     let deviceCredential: String
     let platform: String
+    let deviceSigningPublicKey: String?
+    let deviceAgreementPublicKey: String?
 
     enum CodingKeys: String, CodingKey {
         case invitationSecret = "invitation_secret"
@@ -602,6 +766,8 @@ private struct PairingRedeemRequest: Encodable {
         case installationID = "installation_id"
         case deviceCredential = "device_credential"
         case platform
+        case deviceSigningPublicKey = "device_signing_public_key"
+        case deviceAgreementPublicKey = "device_agreement_public_key"
     }
 }
 
@@ -614,11 +780,29 @@ private struct PairingCompletionPayload: Decodable {
     let schemaVersion: String
     let label: String
     let receiverURL: String
+    let mailboxProtocolVersion: Int?
+    let mailboxReceiverID: String?
+    let mailboxDeviceID: String?
+    let mailboxReceiverBindingID: String?
+    let mailboxConnectionGeneration: Int?
+    let mailboxReceiverSigningPublicKey: String?
+    let mailboxReceiverAgreementPublicKey: String?
+    let mailboxReceiverSigningKeyID: String?
+    let mailboxReceiverAgreementKeyID: String?
 
     enum CodingKeys: String, CodingKey {
         case schemaID = "schema_id"
         case schemaVersion = "schema_version"
         case label
         case receiverURL = "receiver_url"
+        case mailboxProtocolVersion = "mailbox_protocol_version"
+        case mailboxReceiverID = "mailbox_receiver_id"
+        case mailboxDeviceID = "mailbox_device_id"
+        case mailboxReceiverBindingID = "mailbox_receiver_binding_id"
+        case mailboxConnectionGeneration = "mailbox_connection_generation"
+        case mailboxReceiverSigningPublicKey = "mailbox_receiver_signing_public_key"
+        case mailboxReceiverAgreementPublicKey = "mailbox_receiver_agreement_public_key"
+        case mailboxReceiverSigningKeyID = "mailbox_receiver_signing_key_id"
+        case mailboxReceiverAgreementKeyID = "mailbox_receiver_agreement_key_id"
     }
 }

@@ -7,6 +7,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=45",
     "pydantic>=2.11",
     "segno>=1.6",
     "typer>=0.16",
@@ -38,6 +39,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/health_bridge"]
+exclude = [
+    "/src/health_bridge/mailbox_m2_validator.py",
+    "/src/health_bridge/mailbox_qa/m3_contract.py",
+    "/src/health_bridge/mailbox_qa/m3_evidence.py",
+    "/src/health_bridge/mailbox_qa/m3_validator.py",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/health_bridge/storage/migrations/001_initial.sql" = "health_bridge/storage/migrations/001_initial.sql"
@@ -49,8 +56,20 @@ packages = ["src/health_bridge"]
 exclude = [
     "/.codegraph",
     "/.hermes",
+    "/.omo",
     "/.public-release-denylist.local",
     "/.tmp",
+    "/src/health_bridge/mailbox_m2_validator.py",
+    "/src/health_bridge/mailbox_qa/m3_contract.py",
+    "/src/health_bridge/mailbox_qa/m3_evidence.py",
+    "/src/health_bridge/mailbox_qa/m3_validator.py",
+    "/scripts/validate-mailbox-m3-v1.py",
+    "/tests/fixtures/mailbox_m3",
+    "/tests/scripts/mailbox_m3_v1_support.py",
+    "/tests/scripts/test_mailbox_m3_parent_receipts.py",
+    "/tests/scripts/test_mailbox_qa_orchestration.py",
+    "/tests/scripts/test_validate_mailbox_m2.py",
+    "/tests/scripts/test_validate_mailbox_m3_v1.py",
 ]
 
 [tool.basedpyright]

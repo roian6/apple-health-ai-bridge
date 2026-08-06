@@ -1,0 +1,3 @@
+receipt_kind=production_preservation
+marker=synthetic_production_preservation
+marker=public_neutral_fixture

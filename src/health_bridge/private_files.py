@@ -251,6 +251,11 @@ def write_private_text_file(path: Path, content: str) -> None:
         _ = temp_path.replace(path)
         temp_path = None
         path.chmod(PRIVATE_FILE_MODE)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if fd >= 0:
             os.close(fd)

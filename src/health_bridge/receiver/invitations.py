@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import secrets
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -153,6 +154,7 @@ class IssuedPairingInvitation:
 class PairingRedemptionCompletion:
     label: str
     receiver_url: str
+    installation_id_hash: str
 
 
 def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic credentials and time.
@@ -253,6 +255,7 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
     now: datetime | None = None,
+    before_commit: Callable[[PairingRedemptionCompletion], None] | None = None,
 ) -> PairingRedemptionCompletion:
     if (invitation_secret is None) == (invitation_code is None):
         message = "Provide exactly one pairing invitation credential."
@@ -323,13 +326,16 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
                     (invitation_id, installation_id_hash, device_credential_hash),
                 ).fetchone()
             )
-            connection.commit()
             if completion is None:
+                connection.commit()
                 raise PairingInvitationError(GENERIC_INVITATION_ERROR)
-            return PairingRedemptionCompletion(
-                label=completion[0],
-                receiver_url=completion[1],
+            result = _finish_redemption(
+                completion,
+                installation_id_hash,
+                before_commit,
             )
+            connection.commit()
+            return result
 
         if (
             revoked_at is not None
@@ -383,10 +389,26 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
             """,
             (invitation_id, device_id, issued.token_id, timestamp),
         )
-        return PairingRedemptionCompletion(
-            label=completion[0],
-            receiver_url=completion[1],
+        return _finish_redemption(
+            completion,
+            installation_id_hash,
+            before_commit,
         )
+
+
+def _finish_redemption(
+    completion: InvitationResultRow,
+    installation_id_hash: str,
+    before_commit: Callable[[PairingRedemptionCompletion], None] | None,
+) -> PairingRedemptionCompletion:
+    result = PairingRedemptionCompletion(
+        label=completion[0],
+        receiver_url=completion[1],
+        installation_id_hash=installation_id_hash,
+    )
+    if before_commit is not None:
+        before_commit(result)
+    return result
 
 
 def revoke_pairing_invitation(db_path: Path, invitation_id: str) -> None:

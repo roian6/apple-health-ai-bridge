@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -16,6 +17,12 @@ from health_bridge.storage.sync_runs import insert_sync_run
 MALFORMED_JSON_SUMMARY = "Fixture JSON could not be decoded."
 SCHEMA_ERROR_SUMMARY = "Fixture did not match health_bridge.batch.v1 schema."
 STORAGE_ERROR_SUMMARY = "Fixture records could not be stored."
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionalIngestResult:
+    result: IngestResult
+    sync_run_id: int
 
 
 def ingest_fixture(db_path: Path, input_path: Path) -> IngestResult:
@@ -45,16 +52,31 @@ def ingest_batch(
     source_name: str,
 ) -> IngestResult:
     initialize_database(db_path)
-    result = _successful_result(batch)
     try:
         with connect_database(db_path) as connection:
-            upsert_batch_records(connection, batch)
-            insert_sync_run(connection, source_name, result, batch)
+            committed = ingest_batch_in_connection(
+                connection,
+                batch,
+                source_name,
+            )
     except sqlite3.Error:
         failed_result = failed_ingest_result(STORAGE_ERROR_SUMMARY)
         _record_failed_sync_run(db_path, source_name, failed_result, batch)
         raise
-    return result
+    return committed.result
+
+
+def ingest_batch_in_connection(
+    connection: sqlite3.Connection,
+    batch: HealthBridgeBatchV1,
+    source_name: str,
+) -> TransactionalIngestResult:
+    result = _successful_result(batch)
+    upsert_batch_records(connection, batch)
+    return TransactionalIngestResult(
+        result=result,
+        sync_run_id=insert_sync_run(connection, source_name, result, batch),
+    )
 
 
 def _successful_result(batch: HealthBridgeBatchV1) -> IngestResult:
@@ -105,7 +127,7 @@ def _record_failed_sync_run(
     batch: HealthBridgeBatchV1 | None = None,
 ) -> None:
     with connect_database(db_path) as connection:
-        insert_sync_run(connection, source_name, result, batch)
+        _ = insert_sync_run(connection, source_name, result, batch)
 
 
 def _is_malformed_json_error(exc: ValidationError) -> bool:

@@ -641,10 +641,13 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
         "public func beginTerminalCancellationIntent", reset_start
     )
     reset = file_outbox[reset_start:reset_end]
-    assert "if try loadConnectionRecord() != nil" in reset
+    assert "if try loadStoredConnectionRecord() != nil" in reset
     assert "let legacyToken = try tokenStore.loadToken()" in reset
     assert "explicitLegacyURL == nil" in reset
     assert "destructiveResetNotRequired" in reset
+    assert "catch ReceiverSettingsRecordError.invalidRecord" in reset
+    assert "catch KeychainReceiverTokenStoreError.invalidData" in reset
+    assert "catch {" not in reset
     assert "UInt64.random(in: 1 ... UInt64(Int.max))" in reset
 
 

@@ -15,7 +15,10 @@ dist/
 
 # Local generated/private run artifacts
 .tmp/
+.omo/
 .codegraph/
+.hermes/
+.mailbox-m1-manifest.json
 *.log
 *.sqlite
 *.sqlite-*

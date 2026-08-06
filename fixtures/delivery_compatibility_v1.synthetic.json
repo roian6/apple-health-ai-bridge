@@ -1,0 +1,248 @@
+{
+  "schema_id": "health_bridge.delivery_compatibility.v1",
+  "schema_version": 1,
+  "approved_baseline": "m2-v1-v2-synthetic",
+  "plan_sha256": "f6e982dc6804c03dd4138a05fc9fad4905073fb070f67b19697b4340478e0aaf",
+  "rows": [
+    {
+      "row_id": "python_http_v1_raw_batch",
+      "surface": "python_http",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "63bd969e3b0844c4c58af1a8c538a34e316e59166377178bdb2d2efacc03a3bf",
+      "candidate_sha256": "63bd969e3b0844c4c58af1a8c538a34e316e59166377178bdb2d2efacc03a3bf",
+      "byte_count": 4689,
+      "response_sha256": "1cfb4fac4f5c82f8319120cc1c6930cb821a701bf6956f2c5b40942d30bfefdb",
+      "http_status": 202,
+      "ingest_count": 1,
+      "connection_generation": null,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "bearer_boundary",
+        "ingest": "legacy_strict_batch_parser",
+        "generation": "receiver_token_store",
+        "finalization": "direct_mark_uploaded"
+      }
+    },
+    {
+      "row_id": "python_http_v1_unauthorized",
+      "surface": "python_http",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "candidate_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "byte_count": 2,
+      "response_sha256": "782eeaa7f1915f6783146f8180751785584f0f24bd4e503165c7fc4a597da600",
+      "http_status": 401,
+      "ingest_count": 0,
+      "connection_generation": null,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "bearer_boundary",
+        "ingest": "none",
+        "generation": "receiver_token_store",
+        "finalization": "none"
+      }
+    },
+    {
+      "row_id": "python_pairing_v1_bundle",
+      "surface": "python_pairing",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "193d18a163dc3842e38b6810628a778ba67182aa2bea01377f7ac43fca96aa10",
+      "candidate_sha256": "193d18a163dc3842e38b6810628a778ba67182aa2bea01377f7ac43fca96aa10",
+      "byte_count": 298,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 0,
+      "connection_generation": 1,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "pairing_v1_bundle",
+        "ingest": "none",
+        "generation": "receiver_settings",
+        "finalization": "none"
+      }
+    },
+    {
+      "row_id": "python_pairing_v2_invitation",
+      "surface": "python_pairing",
+      "protocol": "v2",
+      "comparison": "unchanged",
+      "baseline_sha256": "d317945d014a72403e87a2eab917bffd1ecf5db1f5188885b52bc784b7b23181",
+      "candidate_sha256": "d317945d014a72403e87a2eab917bffd1ecf5db1f5188885b52bc784b7b23181",
+      "byte_count": 319,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 0,
+      "connection_generation": 2,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "pairing_v2_invitation",
+        "ingest": "none",
+        "generation": "receiver_settings",
+        "finalization": "none"
+      }
+    },
+    {
+      "row_id": "swift_direct_upload_v1",
+      "surface": "swift_direct_upload",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "candidate_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "byte_count": 841,
+      "response_sha256": null,
+      "http_status": 202,
+      "ingest_count": 1,
+      "connection_generation": 2,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "bearer_boundary",
+        "ingest": "legacy_strict_batch_parser",
+        "generation": "receiver_settings",
+        "finalization": "direct_mark_uploaded"
+      }
+    },
+    {
+      "row_id": "swift_file_outbox_v3_read",
+      "surface": "swift_file_outbox",
+      "protocol": "v3",
+      "comparison": "unchanged",
+      "baseline_sha256": "bcce52a6353d58f0e515ef0d9a5df2c2d690826dd47669d66068120ab722612b",
+      "candidate_sha256": "bcce52a6353d58f0e515ef0d9a5df2c2d690826dd47669d66068120ab722612b",
+      "byte_count": 55,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 0,
+      "connection_generation": 3,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "none",
+        "ingest": "none",
+        "generation": "file_outbox_manifest",
+        "finalization": "direct_mark_uploaded"
+      }
+    },
+    {
+      "row_id": "swift_file_outbox_v4_read",
+      "surface": "swift_file_outbox",
+      "protocol": "v4",
+      "comparison": "exact",
+      "baseline_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "candidate_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "byte_count": 841,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 0,
+      "connection_generation": 8,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "receiver_signed_ack",
+        "ingest": "shared_acceptance",
+        "generation": "file_outbox_manifest",
+        "finalization": "mailbox_committed_ack"
+      }
+    },
+    {
+      "row_id": "package_fixture_v1",
+      "surface": "python_package",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "63bd969e3b0844c4c58af1a8c538a34e316e59166377178bdb2d2efacc03a3bf",
+      "candidate_sha256": "63bd969e3b0844c4c58af1a8c538a34e316e59166377178bdb2d2efacc03a3bf",
+      "byte_count": 4689,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 1,
+      "connection_generation": null,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "none",
+        "ingest": "legacy_strict_batch_parser",
+        "generation": "sqlite_schema",
+        "finalization": "package_smoke"
+      }
+    },
+    {
+      "row_id": "status_v1_generation",
+      "surface": "python_status",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "8fc30a841ca71533df4154b11c7f99415b7e413c7e0efd4f9f31ea36bace5058",
+      "candidate_sha256": "8fc30a841ca71533df4154b11c7f99415b7e413c7e0efd4f9f31ea36bace5058",
+      "byte_count": 2427,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 1,
+      "connection_generation": null,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "read_only_local_db",
+        "ingest": "none",
+        "generation": "status_v1",
+        "finalization": "read_only"
+      }
+    },
+    {
+      "row_id": "mcp_v1_generation",
+      "surface": "python_mcp",
+      "protocol": "v1",
+      "comparison": "unchanged",
+      "baseline_sha256": "6d6e5b295be8bced6abbeef4e847d0470ec6e4c9d18178750f35ac1fb4378ac7",
+      "candidate_sha256": "6d6e5b295be8bced6abbeef4e847d0470ec6e4c9d18178750f35ac1fb4378ac7",
+      "byte_count": 820,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 1,
+      "connection_generation": null,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "read_only_local_db",
+        "ingest": "none",
+        "generation": "mcp_v1",
+        "finalization": "read_only"
+      }
+    },
+    {
+      "row_id": "swift_encoder_file_outbox_direct_http_exact_bytes",
+      "surface": "swift_exact_bytes",
+      "protocol": "v1",
+      "comparison": "exact",
+      "baseline_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "candidate_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "byte_count": 841,
+      "response_sha256": null,
+      "http_status": 202,
+      "ingest_count": 1,
+      "connection_generation": 2,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "bearer_boundary",
+        "ingest": "legacy_strict_batch_parser",
+        "generation": "receiver_settings",
+        "finalization": "direct_mark_uploaded"
+      }
+    },
+    {
+      "row_id": "swift_file_outbox_delivery_plaintext_exact_bytes",
+      "surface": "swift_exact_bytes",
+      "protocol": "v1",
+      "comparison": "exact",
+      "baseline_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "candidate_sha256": "3ad1b8c41d0dff1ab6bc8e39ffcd98720ed2b97a70a09b42d304e26a9f1cd93a",
+      "byte_count": 841,
+      "response_sha256": null,
+      "http_status": null,
+      "ingest_count": 1,
+      "connection_generation": 8,
+      "post_enqueue_encoder_invocations": 0,
+      "ownership": {
+        "auth": "receiver_signed_ack",
+        "ingest": "shared_acceptance",
+        "generation": "file_outbox_manifest",
+        "finalization": "mailbox_committed_ack"
+      }
+    }
+  ]
+}

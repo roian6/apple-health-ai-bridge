@@ -20,6 +20,60 @@ final class ReceiverConnectionTerminalBarrierTests: XCTestCase {
         XCTAssertTrue(afterRequestRelease.admitsPayloadAction)
     }
 
+    func testConnectionTransitionPolicyIdentifiesEveryOutboxCommitBarrier() {
+        XCTAssertEqual(
+            ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
+                outboxIdentityAdmissionReady: false,
+                pendingItemCount: 0,
+                clearIntentIsActive: false
+            ),
+            .outboxIdentityAdmissionNotReady
+        )
+        XCTAssertEqual(
+            ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
+                outboxIdentityAdmissionReady: true,
+                pendingItemCount: 1,
+                clearIntentIsActive: false
+            ),
+            .outboxNotEmpty
+        )
+        XCTAssertEqual(
+            ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
+                outboxIdentityAdmissionReady: true,
+                pendingItemCount: 0,
+                clearIntentIsActive: true
+            ),
+            .outboxClearIntentActive
+        )
+        XCTAssertNil(
+            ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
+                outboxIdentityAdmissionReady: true,
+                pendingItemCount: 0,
+                clearIntentIsActive: false
+            )
+        )
+    }
+
+    func testPairingCommitBarrierCodesAreCompleteAndSecretFree() {
+        XCTAssertEqual(
+            Set(ReceiverPairingCommitBarrierError.allCases.map(\.rawValue)),
+            Set([
+                "pairing_commit_cancelled",
+                "pairing_commit_generation_failed",
+                "pairing_commit_background_cleanup_pending",
+                "pairing_commit_outbox_unavailable",
+                "pairing_commit_outbox_unreadable",
+                "pairing_commit_outbox_identity_not_ready",
+                "pairing_commit_outbox_not_empty",
+                "pairing_commit_outbox_clear_pending",
+            ])
+        )
+        for code in ReceiverPairingCommitBarrierError.allCases.map(\.rawValue) {
+            XCTAssertFalse(code.contains("mailbox_key"))
+            XCTAssertFalse(code.contains("token"))
+        }
+    }
+
     @MainActor
     func testTerminalRequestCoordinatorRejectsActionAfterFinalDrainUntilOutcomeRelease() async throws {
         let coordinator = TerminalRequestCoordinator()

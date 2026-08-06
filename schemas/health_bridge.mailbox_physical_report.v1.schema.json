@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://healthbridge.chanhyo.dev/schemas/health_bridge.mailbox_physical_report.v1.schema.json",
+  "title": "Health Bridge aggregate mailbox physical report V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "kind",
+    "run_id",
+    "challenge",
+    "embedded_commit_sha",
+    "bundle_identifier_sha256",
+    "app_version",
+    "build_number",
+    "device_identifier_sha256",
+    "device_model",
+    "os_version",
+    "receiver_fingerprint",
+    "device_signing_key_fingerprint",
+    "connection_generation",
+    "started_at_ms",
+    "finished_at_ms",
+    "scenario_results",
+    "transition_counts",
+    "receipt_id",
+    "dataset_generation",
+    "signature"
+  ],
+  "properties": {
+    "v": { "const": 1 },
+    "kind": { "const": "mailbox_physical_report" },
+    "run_id": { "$ref": "#/$defs/hex32" },
+    "challenge": { "$ref": "#/$defs/base64url32" },
+    "embedded_commit_sha": { "$ref": "#/$defs/hex40" },
+    "bundle_identifier_sha256": { "$ref": "#/$defs/hex64" },
+    "app_version": { "$ref": "#/$defs/build_text" },
+    "build_number": { "$ref": "#/$defs/build_text" },
+    "device_identifier_sha256": { "$ref": "#/$defs/hex64" },
+    "device_model": { "$ref": "#/$defs/short_text" },
+    "os_version": { "$ref": "#/$defs/short_text" },
+    "receiver_fingerprint": { "$ref": "#/$defs/hex16" },
+    "device_signing_key_fingerprint": { "$ref": "#/$defs/hex16" },
+    "connection_generation": { "$ref": "#/$defs/nonnegative_integer" },
+    "started_at_ms": { "$ref": "#/$defs/nonnegative_integer" },
+    "finished_at_ms": { "$ref": "#/$defs/nonnegative_integer" },
+    "scenario_results": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/scenario_result" }
+    },
+    "transition_counts": { "$ref": "#/$defs/transition_counts" },
+    "receipt_id": { "$ref": "#/$defs/nonnegative_integer" },
+    "dataset_generation": { "$ref": "#/$defs/nonnegative_integer" },
+    "signature": { "$ref": "#/$defs/base64url64" }
+  },
+  "$defs": {
+    "hex16": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "hex32": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "hex40": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "base64url32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "base64url64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    },
+    "short_text": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "build_text": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+    },
+    "nonnegative_integer": { "type": "integer", "minimum": 0 },
+    "scenario_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "result",
+        "started_at_ms",
+        "finished_at_ms",
+        "assertion_count"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,127}$"
+        },
+        "result": { "enum": ["pass", "fail", "hold"] },
+        "started_at_ms": { "$ref": "#/$defs/nonnegative_integer" },
+        "finished_at_ms": { "$ref": "#/$defs/nonnegative_integer" },
+        "assertion_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "transition_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collected",
+        "encrypted",
+        "published",
+        "provider_observed",
+        "ack_verified",
+        "committed_finalized",
+        "retryable_failure",
+        "terminal_failure"
+      ],
+      "properties": {
+        "collected": { "$ref": "#/$defs/nonnegative_integer" },
+        "encrypted": { "$ref": "#/$defs/nonnegative_integer" },
+        "published": { "$ref": "#/$defs/nonnegative_integer" },
+        "provider_observed": { "$ref": "#/$defs/nonnegative_integer" },
+        "ack_verified": { "$ref": "#/$defs/nonnegative_integer" },
+        "committed_finalized": { "$ref": "#/$defs/nonnegative_integer" },
+        "retryable_failure": { "$ref": "#/$defs/nonnegative_integer" },
+        "terminal_failure": { "$ref": "#/$defs/nonnegative_integer" }
+      }
+    }
+  }
+}

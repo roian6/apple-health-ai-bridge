@@ -19,6 +19,7 @@ from health_bridge.cli_dev import (
     watch_event_json,
     watch_sync_run_events,
 )
+from health_bridge.cli_mailbox import mailbox_app
 from health_bridge.cli_mcp import mcp_app
 from health_bridge.cli_query import query_app
 from health_bridge.cli_receiver import receiver_app
@@ -47,6 +48,7 @@ app = typer.Typer(
 app.add_typer(query_app, name="query")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(receiver_app, name="receiver")
+app.add_typer(mailbox_app, name="mailbox")
 dev_app = typer.Typer(
     add_completion=False,
     help="Developer and private-device setup helpers.",

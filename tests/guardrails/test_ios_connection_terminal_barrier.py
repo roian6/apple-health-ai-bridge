@@ -872,11 +872,18 @@ def test_outbox_payloads_are_receiver_bound_for_foreground_and_background() -> N
     assert "health-bridge-connection-v1:" in outbox
     assert "case legacyRecordRequiresRepair" in outbox
     assert "throw ReceiverSettingsRecordError.legacyRecordRequiresRepair" in outbox
-    assert "bindingID: settingsChanged || previous.bindingID.isEmpty" in outbox
+    save_start = outbox.index("public func save(")
+    save_end = outbox.index("public func save(", save_start + 1)
+    save = outbox[save_start:save_end]
+    assert "let settingsChanged = rotateBindingID" in save
+    assert "generation: settingsChanged" in save
+    assert "bindingID: settingsChanged || previous.localScope.bindingID.isEmpty" in save
+    assert ": previous.localScope.bindingID" in save
     assert "beginTerminalCancellationIntent" in outbox
     assert "legacyCancellationRequiresRetry" in outbox
-    assert "static let currentVersion = 3" in outbox
-    assert "if manifest.version < SequenceManifest.currentVersion" in outbox
+    assert "static let directOnlyVersion = 3" in outbox
+    assert "static let mailboxVersion = 4" in outbox
+    assert "if manifest.version < SequenceManifest.directOnlyVersion" in outbox
     assert "var receiverIdentity: String?" in outbox
     assert "_ payload: Data,\n        receiverIdentity: String\n" in outbox
     assert "public func flushPending(\n        receiverIdentity: String," in outbox

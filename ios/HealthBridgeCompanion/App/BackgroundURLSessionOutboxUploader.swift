@@ -130,17 +130,17 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             return 0
         }
         guard isUploadAllowed() else { return 0 }
-        let plans = try BackgroundOutboxUploadPlanner.plan(
-            pendingItems: pendingItems,
+        let directTransport = DirectHTTPTransport(
             receiverURL: receiverURL,
             bearerToken: bearerToken,
             receiverGeneration: receiverGeneration,
             receiverBindingID: receiverBindingID,
             alreadyScheduledItemIDs: scheduledItemIDs
-        )
-
-        for plan in plans {
-            let task = session.uploadTask(with: plan.request, fromFile: plan.fileURL)
+        ) { plan in
+            let task = self.session.uploadTask(
+                with: plan.request,
+                fromFile: plan.fileURL
+            )
             task.taskDescription = plan.taskDescription
             do {
                 try taskOwnershipStore.begin(
@@ -155,10 +155,13 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                 task.cancel()
                 throw error
             }
-            eventFinalizationCoordinator.begin(task.taskIdentifier)
+            self.eventFinalizationCoordinator.begin(task.taskIdentifier)
             task.resume()
         }
-        return plans.count
+        let result = try directTransport.deliver(
+            DeliveryTransportInput(item: pendingItems[0])
+        )
+        return result == .published ? 1 : 0
     }
 
     @MainActor
@@ -581,10 +584,10 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         }
         for record in records {
             guard let completion = record.completion else { continue }
-            let descriptor = (
+            let descriptor = DirectUploadCompletionDescriptor(
+                itemID: record.itemID,
                 receiverGeneration: record.receiverGeneration,
-                receiverBindingID: record.receiverBindingID,
-                itemID: record.itemID
+                receiverBindingID: record.receiverBindingID
             )
             guard finishCompletedUpload(
                 descriptor: descriptor,
@@ -671,20 +674,20 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         let completionBarrier = cancellationBarrier
         let finalizationCoordinator = eventFinalizationCoordinator
         let ownershipRecord = currentOwnedTaskRecord(for: taskID)
-        let descriptor: (
-            receiverGeneration: String,
-            receiverBindingID: String,
-            itemID: String
-        )?
+        let descriptor: DirectUploadCompletionDescriptor?
         if let parsed = BackgroundOutboxTaskDescriptor.descriptor(
             fromTaskDescription: task.taskDescription
         ) {
-            descriptor = parsed
+            descriptor = DirectUploadCompletionDescriptor(
+                itemID: parsed.itemID,
+                receiverGeneration: parsed.receiverGeneration,
+                receiverBindingID: parsed.receiverBindingID
+            )
         } else if let ownershipRecord {
-            descriptor = (
-                ownershipRecord.receiverGeneration,
-                ownershipRecord.receiverBindingID,
-                ownershipRecord.itemID
+            descriptor = DirectUploadCompletionDescriptor(
+                itemID: ownershipRecord.itemID,
+                receiverGeneration: ownershipRecord.receiverGeneration,
+                receiverBindingID: ownershipRecord.receiverBindingID
             )
         } else {
             descriptor = nil
@@ -740,7 +743,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
 
     @MainActor
     private func finishCompletedUpload(
-        descriptor: (receiverGeneration: String, receiverBindingID: String, itemID: String),
+        descriptor: DirectUploadCompletionDescriptor,
         completion: BackgroundUploadTaskCompletion
     ) -> Bool {
         guard let outboxDirectory = currentOutboxDirectory() else {
@@ -749,38 +752,32 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         do {
             let outbox = try FileOutbox(directory: outboxDirectory)
             let settingsStore = ReceiverSettingsStore()
-            guard descriptor.receiverGeneration == settingsStore.receiverSettingsGenerationToken,
-                  descriptor.receiverBindingID == settingsStore.receiverBindingID else {
-                return true
-            }
-
-            if let minimumResetEpoch = completion.sleepMinimumResetEpoch,
-               !completion.hadTransportError,
-               completion.statusCode == 409 {
-                let manifestStore = try FileSleepSyncManifestStore(
-                    fileURL: outboxDirectory
-                        .deletingLastPathComponent()
-                        .appendingPathComponent("sleep-sync-manifest-v1.json")
-                )
-                try SleepBaselineRejectionRecovery.recover(
-                    itemID: descriptor.itemID,
-                    minimumResetEpoch: minimumResetEpoch,
-                    outbox: outbox,
-                    manifestStore: manifestStore,
-                    epochStore: SleepResetEpochStore()
-                )
-                return true
-            }
-
-            guard !completion.hadTransportError,
-                  let statusCode = completion.statusCode,
-                  (200 ..< 300).contains(statusCode) else {
-                return true
-            }
-            if let item = try outbox.pendingItem(id: descriptor.itemID),
-               item.receiverIdentity == descriptor.receiverBindingID {
-                try outbox.markUploaded(item)
-            }
+            _ = try DirectUploadFinalizer.finish(
+                descriptor: descriptor,
+                completion: completion,
+                currentReceiverGeneration: settingsStore.receiverSettingsGenerationToken,
+                currentReceiverBindingID: settingsStore.receiverBindingID,
+                recoverSleepBaseline: { itemID, minimumResetEpoch in
+                    let manifestStore = try FileSleepSyncManifestStore(
+                        fileURL: outboxDirectory
+                            .deletingLastPathComponent()
+                            .appendingPathComponent("sleep-sync-manifest-v1.json")
+                    )
+                    try SleepBaselineRejectionRecovery.recover(
+                        itemID: itemID,
+                        minimumResetEpoch: minimumResetEpoch,
+                        outbox: outbox,
+                        manifestStore: manifestStore,
+                        epochStore: SleepResetEpochStore()
+                    )
+                },
+                retire: { itemID, receiverBindingID in
+                    if let item = try outbox.pendingItem(id: itemID),
+                       item.receiverIdentity == receiverBindingID {
+                        try outbox.markUploaded(item)
+                    }
+                }
+            )
             return true
         } catch {
             // Keep ownership durable until a later launch can replay reconciliation.

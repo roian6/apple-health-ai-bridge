@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+import health_bridge.storage._database_lock_files as database_lock_files
 import health_bridge.storage.database as database_module
 from health_bridge.storage import initialize_database
 from health_bridge.storage.database import (
@@ -52,6 +53,7 @@ EXPECTED_TABLES = {
     "receiver_token_devices",
     "pairing_invitation_redemptions",
     "sleep_baseline_namespaces",
+    "delivery_receipts",
 }
 
 
@@ -188,7 +190,7 @@ def test_parent_replacement_cannot_bypass_darwin_stable_lock(
 
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(
-        database_module,
+        database_lock_files,
         "_stable_database_lock_path",
         stable_lock_for_test,
     )
@@ -220,10 +222,10 @@ def test_parent_replacement_cannot_bypass_darwin_stable_lock(
 
 @POSIX_PERMISSION_TEST
 def test_darwin_stable_lock_namespace_is_global_per_user(tmp_path: Path) -> None:
-    first = database_module._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    first = database_lock_files._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tmp_path / "first.sqlite"
     )
-    second = database_module._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    second = database_lock_files._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tmp_path / "unrelated" / "second.sqlite"
     )
 
@@ -243,11 +245,11 @@ def test_darwin_stable_lock_root_is_repaired_to_owner_only(
         return lock_root
 
     monkeypatch.setattr(
-        database_module,
+        database_lock_files,
         "_darwin_stable_lock_root",
         stable_root_for_test,
     )
-    lock_path, lock_fd = database_module._open_stable_database_lock_fd(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    lock_path, lock_fd = database_lock_files._open_stable_database_lock_fd(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         tmp_path / "receiver.sqlite"
     )
     os.close(lock_fd)
@@ -271,9 +273,9 @@ def test_equivalent_path_alias_cannot_bypass_darwin_stable_lock(
     displaced_lock = tmp_path / "displaced-alias-access.lock"
     monkeypatch.setattr(sys, "platform", "darwin")
 
-    assert database_module._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    assert database_lock_files._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         db_path
-    ) == database_module._stable_database_lock_path(alias_path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    ) == database_lock_files._stable_database_lock_path(alias_path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     with database_access_lock(
         db_path,
@@ -320,9 +322,9 @@ def test_case_and_unicode_aliases_cannot_bypass_darwin_stable_lock(
 
     for alias in aliases:
         assert alias.samefile(db_path)
-        assert database_module._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        assert database_lock_files._stable_database_lock_path(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
             alias
-        ) == database_module._stable_database_lock_path(db_path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        ) == database_lock_files._stable_database_lock_path(db_path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     with database_access_lock(
         db_path,
@@ -357,7 +359,7 @@ def test_parent_replacement_during_darwin_acquisition_fails_closed(
     initialize_database(db_path)
     displaced_directory = tmp_path / "displaced-database"
     stable_lock_path = tmp_path / "stable-locks" / "receiver.lock"
-    original_open = database_module._open_stable_database_lock_fd  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_open = database_lock_files._open_stable_database_lock_fd  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
     def stable_lock_for_test(_db_path: Path) -> Path:
         return stable_lock_path
@@ -371,12 +373,12 @@ def test_parent_replacement_during_darwin_acquisition_fails_closed(
 
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(
-        database_module,
+        database_lock_files,
         "_stable_database_lock_path",
         stable_lock_for_test,
     )
     monkeypatch.setattr(
-        database_module,
+        database_lock_files,
         "_open_stable_database_lock_fd",
         replace_parent_before_stable_lock,
     )
@@ -400,7 +402,7 @@ def test_database_initialization_avoids_inode_flock_on_darwin(
     db_path = tmp_path / "receiver.sqlite"
     lifecycle_lock = Path(f"{db_path}.lifecycle.lock")
     access_lock = Path(f"{db_path}.access.lock")
-    original_flock = database_module._flock  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    original_flock = database_lock_files.flock
     locked_paths: set[Path] = set()
 
     def darwin_flock(
@@ -423,7 +425,7 @@ def test_database_initialization_avoids_inode_flock_on_darwin(
         original_flock(fd, exclusive=exclusive, nonblocking=nonblocking)
 
     monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(database_module, "_flock", darwin_flock)
+    monkeypatch.setattr(database_lock_files, "flock", darwin_flock)
 
     initialize_database(db_path)
 
@@ -477,6 +479,7 @@ def test_initialize_database_creates_core_tables_when_database_is_empty(
         ("005_pairing_devices",),
         ("006_sleep_session_revisions",),
         ("007_sleep_baseline_namespaces",),
+        ("008_delivery_receipts",),
     ]
 
 
@@ -495,7 +498,7 @@ def test_initialize_database_is_idempotent_when_called_twice(tmp_path: Path) -> 
             "select count(*) from schema_migrations",
         )
 
-    assert migration_count == 7
+    assert migration_count == 8
 
 
 def _create_legacy_sleep_revision_database(db_path: Path) -> None:

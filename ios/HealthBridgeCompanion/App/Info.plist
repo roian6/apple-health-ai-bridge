@@ -35,6 +35,8 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>HealthBridgeSourceCommit</key>
+	<string>$(HEALTH_BRIDGE_SOURCE_COMMIT)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
@@ -50,6 +52,18 @@
 	<string>Health Bridge does not write data to Apple Health; it only reads selected Apple Health data to sync user-owned local batches to your receiver.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Health Bridge connects to your local or Tailscale receiver for user-owned health data sync.</string>
+	<key>NSUbiquitousContainers</key>
+	<dict>
+		<key>HEALTH_BRIDGE_PRODUCTION_DOCUMENTS_CONTAINER</key>
+		<dict>
+			<key>NSUbiquitousContainerIsDocumentScopePublic</key>
+			<true/>
+			<key>NSUbiquitousContainerName</key>
+			<string>HealthBridge Mailbox</string>
+			<key>NSUbiquitousContainerSupportedFolderLevels</key>
+			<string>Any</string>
+		</dict>
+	</dict>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -19,12 +19,23 @@ import subprocess
 import tarfile
 import tempfile
 import zipfile
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import NoReturn, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_MIGRATIONS = ROOT / "src/health_bridge/storage/migrations"
 SYNTHETIC_FIXTURE = ROOT / "fixtures/health_bridge_batch_v1.synthetic.json"
+CRYPTO_IMPORT = (
+    "from cryptography.hazmat.primitives.asymmetric import ed25519,x25519; "
+    "from cryptography.hazmat.primitives.ciphers.aead import AESGCM"
+)
+QA_RUNTIME_IMPORTS = (
+    "import health_bridge.mailbox_qa.device_operations; "
+    "import health_bridge.mailbox_qa.parent_operations; "
+    "import health_bridge.mailbox_qa.receiver_operations; "
+    "import health_bridge.mailbox_qa.scenario_issuance"
+)
 FORBIDDEN_MEMBER_PARTS = {
     ".codegraph",
     ".coverage",
@@ -45,6 +56,11 @@ FORBIDDEN_OUTPUT_MARKERS = (
 
 class PackageSmokeError(RuntimeError):
     """Raised when a built release artifact fails a release invariant."""
+
+
+class CryptoPlatformMarker(StrEnum):
+    CURRENT = "current"
+    SYNTHETIC_UNSUPPORTED = "synthetic-unsupported"
 
 
 def fail(message: str) -> NoReturn:
@@ -158,6 +174,10 @@ def venv_executable(venv: Path, name: str) -> Path:
     return venv / "Scripts" / f"{name}{suffix}"
 
 
+def verify_crypto_primitives(python: Path, *, cwd: Path) -> None:
+    _ = run([str(python), "-c", CRYPTO_IMPORT], cwd=cwd)
+
+
 def smoke_installed_wheel(wheel: Path, expected_migrations: list[str]) -> None:
     """Install the wheel cleanly and run synthetic CLI/MCP checks."""
     uv = shutil.which("uv")
@@ -173,6 +193,8 @@ def smoke_installed_wheel(wheel: Path, expected_migrations: list[str]) -> None:
             [uv, "pip", "install", "--python", str(python), str(wheel)],
             cwd=temp_root,
         )
+        verify_crypto_primitives(python, cwd=temp_root)
+        _ = run([str(python), "-c", QA_RUNTIME_IMPORTS], cwd=temp_root)
         cli = venv_executable(venv, "health-bridge")
         _ = run([str(cli), "--help"], cwd=temp_root)
 
@@ -234,7 +256,24 @@ def main() -> int:
         default=Path("dist"),
         help="Directory containing exactly one wheel and one .tar.gz sdist.",
     )
+    _ = parser.add_argument(
+        "--crypto-platform-marker",
+        choices=tuple(marker.value for marker in CryptoPlatformMarker),
+        default=CryptoPlatformMarker.CURRENT.value,
+        help=argparse.SUPPRESS,
+    )
     raw_args = cast("dict[str, object]", vars(parser.parse_args()))
+    raw_crypto_platform_marker = raw_args.get("crypto_platform_marker")
+    if not isinstance(raw_crypto_platform_marker, str):
+        fail("--crypto-platform-marker must resolve to a supported marker")
+    crypto_platform_marker = CryptoPlatformMarker(raw_crypto_platform_marker)
+    match crypto_platform_marker:
+        case CryptoPlatformMarker.CURRENT:
+            pass
+        case CryptoPlatformMarker.SYNTHETIC_UNSUPPORTED:
+            reason = "cryptography dependency unavailable"
+            platform = "synthetic unsupported platform"
+            fail(f"{reason} for {platform}; package startup blocked")
     raw_dist_dir = raw_args.get("dist_dir")
     if not isinstance(raw_dist_dir, Path):
         fail("--dist-dir must resolve to a path")
@@ -246,7 +285,9 @@ def main() -> int:
     expected_migrations = validate_artifacts(wheel, sdist)
     smoke_installed_wheel(wheel, expected_migrations)
     artifact_checks = "wheel/sdist contents, migrations, fresh install"
-    runtime_checks = "synthetic status, and MCP smoke"
+    runtime_checks = (
+        "cryptography primitives, QA runtime imports, synthetic status, and MCP smoke"
+    )
     print(f"PASS: {artifact_checks}, {runtime_checks}")
     return 0
 

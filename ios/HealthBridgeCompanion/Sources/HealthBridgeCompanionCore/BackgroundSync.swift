@@ -310,6 +310,10 @@ public actor BackgroundSyncRunGate {
         pendingObserverTypeCodes.sorted()
     }
 
+    public func hasActiveRun() -> Bool {
+        isRunning
+    }
+
     public func retainObserverTypeCodes(_ typeCodes: [String]) {
         pendingObserverTypeCodes.formUnion(
             GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)

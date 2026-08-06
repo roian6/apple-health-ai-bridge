@@ -267,12 +267,75 @@ public struct FileOutboxItem: Equatable, Identifiable, Sendable {
     public let id: String
     public let fileURL: URL
     public let receiverIdentity: String?
+    public let mailboxBinding: FileOutboxMailboxBindingV1?
+    public let deliveryState: FileOutboxDeliveryStateV1?
 
-    public init(id: String, fileURL: URL, receiverIdentity: String? = nil) {
+    public init(
+        id: String,
+        fileURL: URL,
+        receiverIdentity: String? = nil,
+        mailboxBinding: FileOutboxMailboxBindingV1? = nil,
+        deliveryState: FileOutboxDeliveryStateV1? = nil
+    ) {
         self.id = id
         self.fileURL = fileURL
         self.receiverIdentity = receiverIdentity
+        self.mailboxBinding = mailboxBinding
+        self.deliveryState = deliveryState
     }
+}
+
+public struct FileOutboxMailboxBindingV1: Codable, Equatable, Sendable {
+    public let payloadSHA256: String
+    public let envelopeSHA256: String
+    public let envelopeFilename: String
+
+    public init(
+        payloadSHA256: String,
+        envelopeSHA256: String,
+        envelopeFilename: String
+    ) {
+        self.payloadSHA256 = payloadSHA256
+        self.envelopeSHA256 = envelopeSHA256
+        self.envelopeFilename = envelopeFilename
+    }
+}
+
+public enum FileOutboxMailboxError: Error, Equatable, Sendable {
+    case itemNotFound
+    case invalidDigest
+    case payloadDigestMismatch
+    case finalizationConflict
+    case invalidFinalizationIntent
+    case mailboxArtifactsRequireHold
+    case legacyReaderCannotOpen
+    case invalidDeliveryState
+    case deliveryOwnershipMismatch
+    case deliveryTransitionConflict
+}
+
+public enum FileOutboxDowngradeHoldReason: String, Codable, Equatable, Sendable {
+    case v4Manifest
+    case finalizationIntent
+    case envelopeArtifact
+}
+
+public enum FileOutboxDowngradeReadiness: Equatable, Sendable {
+    case ready
+    case hold(FileOutboxDowngradeHoldReason)
+}
+
+enum FileOutboxEnvelopeFinalizationBoundary: CaseIterable, Equatable {
+    case intentPersisted
+    case stagedEnvelopePersisted
+    case envelopeFinalized
+    case manifestBound
+}
+
+enum FileOutboxCommittedFinalizationBoundary: CaseIterable, Equatable {
+    case statePersisted
+    case payloadRetired
+    case envelopeRetired
 }
 
 public enum FileOutboxCoreLaneUploadProof: String, Codable, Equatable, Sendable {
@@ -397,18 +460,36 @@ public final class FileOutbox {
         let sequence: UInt64
         let id: String
         var receiverIdentity: String?
+        var mailboxBinding: FileOutboxMailboxBindingV1?
+        var deliveryState: FileOutboxDeliveryStateV1?
     }
 
     private struct SequenceManifest: Codable, Equatable {
-        static let currentVersion = 3
+        static let directOnlyVersion = 3
+        static let mailboxVersion = 4
 
         var version: Int
         var nextSequence: UInt64
         var entries: [SequenceEntry]
 
         static var empty: SequenceManifest {
-            SequenceManifest(version: currentVersion, nextSequence: 1, entries: [])
+            SequenceManifest(version: directOnlyVersion, nextSequence: 1, entries: [])
         }
+    }
+
+    private struct MailboxEnvelopeFinalizationIntent: Codable, Equatable {
+        static let currentVersion = 1
+
+        let version: Int
+        let itemID: String
+        let payloadSHA256: String
+        let envelopeSHA256: String
+        let stagedFilename: String
+        let envelopeFilename: String
+    }
+
+    private struct ManifestVersion: Decodable {
+        let version: Int
     }
 
     private struct EnqueueTransaction: Codable, Equatable {
@@ -432,6 +513,7 @@ public final class FileOutbox {
     private static let sequenceFilename = ".fifo-sequence"
     private static let clearIntentFilename = ".clear-intent"
     private static let enqueueTransactionFilename = ".enqueue-transaction"
+    private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
 
@@ -461,6 +543,9 @@ public final class FileOutbox {
         guard fileManager.fileExists(atPath: intentURL.path) else {
             throw FileOutboxClearIntentError.clearIntentRequired
         }
+        guard try downgradeReadiness(directory: directory, fileManager: fileManager) == .ready else {
+            throw FileOutboxMailboxError.mailboxArtifactsRequireHold
+        }
         let children = try fileManager.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
@@ -489,6 +574,7 @@ public final class FileOutbox {
         if clearIntentIsActive {
             try Self.applySensitiveFileAttributes(to: clearIntentURL, fileManager: fileManager)
         }
+        try recoverMailboxEnvelopeFinalizationIfNeeded()
         _ = try reconciledManifest()
     }
 
@@ -504,7 +590,13 @@ public final class FileOutbox {
         let fileURL = directory.appendingPathComponent(id).appendingPathExtension("json")
 
         manifest.entries.append(
-            SequenceEntry(sequence: sequence, id: id, receiverIdentity: receiverIdentity)
+            SequenceEntry(
+                sequence: sequence,
+                id: id,
+                receiverIdentity: receiverIdentity,
+                mailboxBinding: nil,
+                deliveryState: nil
+            )
         )
         manifest.nextSequence = sequence + 1
         try persistManifest(manifest)
@@ -513,7 +605,8 @@ public final class FileOutbox {
         return FileOutboxItem(
             id: id,
             fileURL: fileURL,
-            receiverIdentity: receiverIdentity
+            receiverIdentity: receiverIdentity,
+            deliveryState: nil
         )
     }
 
@@ -578,7 +671,9 @@ public final class FileOutbox {
                 return FileOutboxItem(
                     id: entry.id,
                     fileURL: fileURL,
-                    receiverIdentity: entry.receiverIdentity
+                    receiverIdentity: entry.receiverIdentity,
+                    mailboxBinding: entry.mailboxBinding,
+                    deliveryState: entry.deliveryState
                 )
             }
     }
@@ -643,9 +738,14 @@ public final class FileOutbox {
             uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
         )
         guard transaction.entries.allSatisfy({ entry in
-            manifestEntries[entry.id] == entry
-                && fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
-                && !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
+            guard let current = manifestEntries[entry.id],
+                  Self.hasSameCollectionIdentity(current, entry),
+                  !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
+            else {
+                return false
+            }
+            return fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                || current.deliveryState?.phase == .committedFinalized
         }) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
@@ -679,6 +779,14 @@ public final class FileOutbox {
     }
 
     public func markUploaded(_ item: FileOutboxItem) throws {
+        let current = try reconciledManifest().entries.first { $0.id == item.id }
+        let hasMailboxBinding = current?.mailboxBinding != nil
+        let hasDeliveryState = current?.deliveryState != nil
+        let hasEnvelope = try hasEnvelopeArtifact(for: item.id)
+        let hasIntent = try loadMailboxEnvelopeFinalizationIntent()?.itemID == item.id
+        if hasMailboxBinding || hasDeliveryState || hasEnvelope || hasIntent {
+            throw FileOutboxMailboxError.mailboxArtifactsRequireHold
+        }
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
         }
@@ -687,6 +795,9 @@ public final class FileOutbox {
 
     public func beginClearIntent() throws {
         if clearIntentIsActive { return }
+        guard try downgradeReadiness() == .ready else {
+            throw FileOutboxMailboxError.mailboxArtifactsRequireHold
+        }
         try Data("clear".utf8).write(to: clearIntentURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(to: clearIntentURL, fileManager: fileManager)
     }
@@ -694,6 +805,9 @@ public final class FileOutbox {
     public func clearPendingWhileIntentIsActive() throws -> Int {
         guard clearIntentIsActive else {
             throw FileOutboxClearIntentError.clearIntentRequired
+        }
+        guard try downgradeReadiness() == .ready else {
+            throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let items = try pendingItems()
         for item in items {
@@ -748,6 +862,495 @@ public final class FileOutbox {
         )
     }
 
+    public func finalizeMailboxEnvelope(
+        itemID: String,
+        envelope: Data,
+        expectedPayloadSHA256: String
+    ) throws -> FileOutboxMailboxBindingV1 {
+        try finalizeMailboxEnvelope(
+            itemID: itemID,
+            envelope: envelope,
+            expectedPayloadSHA256: expectedPayloadSHA256,
+            stopAfter: nil
+        )
+    }
+
+    func finalizeMailboxEnvelopeForTesting(
+        itemID: String,
+        envelope: Data,
+        expectedPayloadSHA256: String,
+        through boundary: FileOutboxEnvelopeFinalizationBoundary
+    ) throws -> FileOutboxMailboxBindingV1 {
+        try finalizeMailboxEnvelope(
+            itemID: itemID,
+            envelope: envelope,
+            expectedPayloadSHA256: expectedPayloadSHA256,
+            stopAfter: boundary
+        )
+    }
+
+    public func mailboxBinding(for itemID: String) throws -> FileOutboxMailboxBindingV1? {
+        guard Self.isSafeItemID(itemID) else { return nil }
+        return try reconciledManifest().entries.first(where: { $0.id == itemID })?
+            .mailboxBinding
+    }
+
+    public func deliveryState(for itemID: String) throws -> FileOutboxDeliveryStateV1? {
+        guard Self.isSafeItemID(itemID) else { return nil }
+        return try reconciledManifest().entries.first(where: { $0.id == itemID })?
+            .deliveryState
+    }
+
+    func compareAndSetDeliveryState(
+        itemID: String,
+        expected: FileOutboxDeliveryStateV1?,
+        updated: FileOutboxDeliveryStateV1
+    ) throws -> FileOutboxDeliveryStateV1 {
+        guard Self.isSafeItemID(itemID), updated.isStructurallyValid else {
+            throw FileOutboxMailboxError.invalidDeliveryState
+        }
+        var manifest = try reconciledManifest()
+        guard let index = manifest.entries.firstIndex(where: { $0.id == itemID }) else {
+            throw FileOutboxMailboxError.itemNotFound
+        }
+        let entry = manifest.entries[index]
+        guard entry.deliveryState == expected else {
+            throw FileOutboxMailboxError.deliveryTransitionConflict
+        }
+        guard let ownership = updated.ownership else {
+            if updated.phase != .collected && updated.phase != .encrypted {
+                throw FileOutboxMailboxError.invalidDeliveryState
+            }
+            manifest.entries[index].deliveryState = updated
+            manifest.version = SequenceManifest.mailboxVersion
+            try persistManifest(manifest)
+            return updated
+        }
+        guard entry.receiverIdentity == ownership.receiverBindingID else {
+            throw FileOutboxMailboxError.deliveryOwnershipMismatch
+        }
+        if updated.phase != .collected, entry.mailboxBinding == nil {
+            throw FileOutboxMailboxError.invalidDeliveryState
+        }
+        manifest.entries[index].deliveryState = updated
+        manifest.version = SequenceManifest.mailboxVersion
+        try persistManifest(manifest)
+        return updated
+    }
+
+    func cursorCheckpointReadyForDeliveryFinalization(
+        itemID: String,
+        ownership: OutboxDeliveryOwnershipV1
+    ) throws -> FileOutboxCursorCheckpoint? {
+        guard let transaction = try loadEnqueueTransaction(),
+              let checkpoint = transaction.cursorCheckpoint,
+              checkpoint.receiverIdentity == ownership.receiverBindingID,
+              transaction.entries.contains(where: { $0.id == itemID }) else {
+            return nil
+        }
+        let manifest = try reconciledManifest()
+        let states = Dictionary(
+            uniqueKeysWithValues: manifest.entries.compactMap { entry in
+                entry.deliveryState.map { (entry.id, $0.phase) }
+            }
+        )
+        guard transaction.entries.allSatisfy({
+            states[$0.id] == .ackVerified || states[$0.id] == .committedFinalized
+        }) else {
+            return nil
+        }
+        return checkpoint
+    }
+
+    func finalizeCommittedMailboxDelivery(
+        itemID: String,
+        expected: FileOutboxDeliveryStateV1,
+        committed: FileOutboxDeliveryStateV1,
+        fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void = { _ in }
+    ) throws -> FileOutboxDeliveryStateV1 {
+        guard expected.phase == .ackVerified,
+              committed.phase == .committedFinalized,
+              expected.ownership == committed.ownership,
+              expected.committedReceipt == committed.committedReceipt else {
+            throw FileOutboxMailboxError.invalidDeliveryState
+        }
+        var manifest = try reconciledManifest()
+        guard let index = manifest.entries.firstIndex(where: { $0.id == itemID }) else {
+            throw FileOutboxMailboxError.itemNotFound
+        }
+        if manifest.entries[index].deliveryState == committed {
+            try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
+            return committed
+        }
+        guard manifest.entries[index].deliveryState == expected,
+              manifest.entries[index].mailboxBinding != nil else {
+            throw FileOutboxMailboxError.deliveryTransitionConflict
+        }
+        manifest.entries[index].deliveryState = committed
+        try persistManifest(manifest)
+        try fault(.statePersisted)
+        try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
+        return committed
+    }
+
+    public func mailboxBoundItemsForAckScanning() throws -> [FileOutboxItem] {
+        if fileManager.fileExists(atPath: mailboxEnvelopeIntentURL.path) {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        guard fileManager.fileExists(atPath: sequenceURL.path) else {
+            return []
+        }
+        let bytes = try MailboxRegularFileReader.read(
+            sequenceURL,
+            maximumBytes: 64 * 1024 * 1024
+        )
+        let manifest = try JSONDecoder().decode(SequenceManifest.self, from: bytes)
+        try Self.validate(manifest)
+        return manifest.entries
+            .sorted { $0.sequence < $1.sequence }
+            .compactMap { entry in
+                guard let binding = entry.mailboxBinding else { return nil }
+                return FileOutboxItem(
+                    id: entry.id,
+                    fileURL: finalPayloadURL(for: entry.id),
+                    receiverIdentity: entry.receiverIdentity,
+                    mailboxBinding: binding,
+                    deliveryState: entry.deliveryState
+                )
+            }
+    }
+
+    public func downgradeReadiness() throws -> FileOutboxDowngradeReadiness {
+        try Self.downgradeReadiness(directory: directory, fileManager: fileManager)
+    }
+
+    public static func downgradeReadiness(
+        directory: URL,
+        fileManager: FileManager = .default
+    ) throws -> FileOutboxDowngradeReadiness {
+        let manifestURL = directory.appendingPathComponent(sequenceFilename)
+        if fileManager.fileExists(atPath: manifestURL.path) {
+            let header = try? JSONDecoder().decode(
+                ManifestVersion.self,
+                from: Data(contentsOf: manifestURL)
+            )
+            if let header, header.version >= SequenceManifest.mailboxVersion {
+                return .hold(.v4Manifest)
+            }
+        }
+        if fileManager.fileExists(
+            atPath: directory.appendingPathComponent(mailboxEnvelopeIntentFilename).path
+        ) {
+            return .hold(.finalizationIntent)
+        }
+        let children = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        if children.contains(where: { isEnvelopeArtifact($0) }) {
+            return .hold(.envelopeArtifact)
+        }
+        return .ready
+    }
+
+    public static func assertReadableByLegacyV3Reader(
+        directory: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        let manifestURL = directory.appendingPathComponent(sequenceFilename)
+        if fileManager.fileExists(atPath: manifestURL.path) {
+            guard let header = try? JSONDecoder().decode(
+                ManifestVersion.self,
+                from: Data(contentsOf: manifestURL)
+            ), header.version <= SequenceManifest.directOnlyVersion else {
+                throw FileOutboxMailboxError.legacyReaderCannotOpen
+            }
+        }
+        guard try downgradeReadiness(directory: directory, fileManager: fileManager) == .ready else {
+            throw FileOutboxMailboxError.legacyReaderCannotOpen
+        }
+    }
+
+    private func finalizeMailboxEnvelope(
+        itemID: String,
+        envelope: Data,
+        expectedPayloadSHA256: String,
+        stopAfter: FileOutboxEnvelopeFinalizationBoundary?
+    ) throws -> FileOutboxMailboxBindingV1 {
+        guard Self.isSafeItemID(itemID), Self.isSHA256(expectedPayloadSHA256) else {
+            throw FileOutboxMailboxError.invalidDigest
+        }
+        var manifest = try reconciledManifest()
+        guard let entryIndex = manifest.entries.firstIndex(where: { $0.id == itemID }) else {
+            throw FileOutboxMailboxError.itemNotFound
+        }
+        let payloadURL = finalPayloadURL(for: itemID)
+        let payload = try Data(contentsOf: payloadURL)
+        let payloadSHA256 = Self.sha256(payload)
+        guard payloadSHA256 == expectedPayloadSHA256 else {
+            throw FileOutboxMailboxError.payloadDigestMismatch
+        }
+        let envelopeSHA256 = Self.sha256(envelope)
+        let finalURL = finalEnvelopeURL(for: itemID)
+        let stagedURL = stagedEnvelopeURL(for: itemID)
+        let binding = FileOutboxMailboxBindingV1(
+            payloadSHA256: payloadSHA256,
+            envelopeSHA256: envelopeSHA256,
+            envelopeFilename: finalURL.lastPathComponent
+        )
+        if let existing = manifest.entries[entryIndex].mailboxBinding {
+            guard existing == binding,
+                  fileManager.fileExists(atPath: finalURL.path),
+                  Self.sha256(try Data(contentsOf: finalURL)) == envelopeSHA256 else {
+                throw FileOutboxMailboxError.finalizationConflict
+            }
+            return existing
+        }
+        guard !(try hasEnvelopeArtifact(for: itemID)) else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+
+        let intent = MailboxEnvelopeFinalizationIntent(
+            version: MailboxEnvelopeFinalizationIntent.currentVersion,
+            itemID: itemID,
+            payloadSHA256: payloadSHA256,
+            envelopeSHA256: envelopeSHA256,
+            stagedFilename: stagedURL.lastPathComponent,
+            envelopeFilename: finalURL.lastPathComponent
+        )
+        try persistMailboxEnvelopeFinalizationIntent(intent)
+        if stopAfter == .intentPersisted { return binding }
+
+        do {
+            try envelope.write(to: stagedURL, options: [.withoutOverwriting])
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain
+                && error.code == NSFileWriteFileExistsError {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        try Self.applySensitiveFileAttributes(to: stagedURL, fileManager: fileManager)
+        if stopAfter == .stagedEnvelopePersisted { return binding }
+
+        guard !fileManager.fileExists(atPath: finalURL.path) else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        try fileManager.moveItem(at: stagedURL, to: finalURL)
+        try hardenFinalEnvelope(finalURL)
+        if stopAfter == .envelopeFinalized { return binding }
+
+        manifest.entries[entryIndex].mailboxBinding = binding
+        manifest.entries[entryIndex].deliveryState = try Self.encryptedDeliveryState(
+            manifest.entries[entryIndex].deliveryState
+        )
+        manifest.version = SequenceManifest.mailboxVersion
+        try persistManifest(manifest)
+        if stopAfter == .manifestBound { return binding }
+
+        try removeIfExists(mailboxEnvelopeIntentURL)
+        return binding
+    }
+
+    private func recoverMailboxEnvelopeFinalizationIfNeeded() throws {
+        guard let intent = try loadMailboxEnvelopeFinalizationIntent() else { return }
+        guard !clearIntentIsActive else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        let loadedManifest = try loadManifest()
+        var manifest = loadedManifest ?? .empty
+        guard let entryIndex = manifest.entries.firstIndex(where: { $0.id == intent.itemID }) else {
+            throw FileOutboxMailboxError.invalidFinalizationIntent
+        }
+        let payloadURL = finalPayloadURL(for: intent.itemID)
+        guard fileManager.fileExists(atPath: payloadURL.path),
+              Self.sha256(try Data(contentsOf: payloadURL)) == intent.payloadSHA256 else {
+            throw FileOutboxMailboxError.payloadDigestMismatch
+        }
+        let stagedURL = directory.appendingPathComponent(intent.stagedFilename)
+        let finalURL = directory.appendingPathComponent(intent.envelopeFilename)
+        let stagedExists = fileManager.fileExists(atPath: stagedURL.path)
+        let finalExists = fileManager.fileExists(atPath: finalURL.path)
+        guard !(stagedExists && finalExists) else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        if !stagedExists && !finalExists {
+            try removeIfExists(mailboxEnvelopeIntentURL)
+            return
+        }
+        if stagedExists {
+            guard Self.sha256(try Data(contentsOf: stagedURL)) == intent.envelopeSHA256 else {
+                throw FileOutboxMailboxError.finalizationConflict
+            }
+            try fileManager.moveItem(at: stagedURL, to: finalURL)
+        }
+        guard Self.sha256(try Data(contentsOf: finalURL)) == intent.envelopeSHA256 else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        try hardenFinalEnvelope(finalURL)
+        let binding = FileOutboxMailboxBindingV1(
+            payloadSHA256: intent.payloadSHA256,
+            envelopeSHA256: intent.envelopeSHA256,
+            envelopeFilename: intent.envelopeFilename
+        )
+        if let existing = manifest.entries[entryIndex].mailboxBinding, existing != binding {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        manifest.entries[entryIndex].mailboxBinding = binding
+        manifest.entries[entryIndex].deliveryState = try Self.encryptedDeliveryState(
+            manifest.entries[entryIndex].deliveryState
+        )
+        manifest.version = SequenceManifest.mailboxVersion
+        try persistManifest(manifest)
+        try removeIfExists(mailboxEnvelopeIntentURL)
+    }
+
+    private func persistMailboxEnvelopeFinalizationIntent(
+        _ intent: MailboxEnvelopeFinalizationIntent
+    ) throws {
+        try Self.validate(intent)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do {
+            try encoder.encode(intent).write(
+                to: mailboxEnvelopeIntentURL,
+                options: [.withoutOverwriting]
+            )
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain
+                && error.code == NSFileWriteFileExistsError {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        try Self.applySensitiveFileAttributes(
+            to: mailboxEnvelopeIntentURL,
+            fileManager: fileManager
+        )
+    }
+
+    private func loadMailboxEnvelopeFinalizationIntent()
+        throws -> MailboxEnvelopeFinalizationIntent? {
+        guard fileManager.fileExists(atPath: mailboxEnvelopeIntentURL.path) else {
+            return nil
+        }
+        guard let intent = try? JSONDecoder().decode(
+            MailboxEnvelopeFinalizationIntent.self,
+            from: Data(contentsOf: mailboxEnvelopeIntentURL)
+        ) else {
+            throw FileOutboxMailboxError.invalidFinalizationIntent
+        }
+        try Self.validate(intent)
+        return intent
+    }
+
+    private static func validate(_ intent: MailboxEnvelopeFinalizationIntent) throws {
+        guard intent.version == MailboxEnvelopeFinalizationIntent.currentVersion,
+              isSafeItemID(intent.itemID),
+              isSHA256(intent.payloadSHA256),
+              isSHA256(intent.envelopeSHA256),
+              intent.stagedFilename == "\(intent.itemID).hbe-staged",
+              intent.envelopeFilename == "\(intent.itemID).hbe" else {
+            throw FileOutboxMailboxError.invalidFinalizationIntent
+        }
+    }
+
+    private func validateEnvelopeArtifacts(for manifest: SequenceManifest) throws {
+        let children = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        let artifacts = children.filter { Self.isEnvelopeArtifact($0) }
+        guard !artifacts.contains(where: { $0.pathExtension == "hbe-staged" }) else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        let expectedFilenames = Set(
+            manifest.entries.compactMap { entry in
+                entry.deliveryState?.phase == .committedFinalized
+                    ? nil
+                    : entry.mailboxBinding?.envelopeFilename
+            }
+        )
+        let actualFilenames = Set(artifacts.map(\.lastPathComponent))
+        guard expectedFilenames == actualFilenames else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        for entry in manifest.entries {
+            if entry.deliveryState?.phase == .committedFinalized { continue }
+            guard let binding = entry.mailboxBinding else { continue }
+            let payloadURL = finalPayloadURL(for: entry.id)
+            let envelopeURL = directory.appendingPathComponent(binding.envelopeFilename)
+            guard fileManager.fileExists(atPath: payloadURL.path),
+                  fileManager.fileExists(atPath: envelopeURL.path),
+                  Self.sha256(try Data(contentsOf: payloadURL)) == binding.payloadSHA256,
+                  Self.sha256(try Data(contentsOf: envelopeURL)) == binding.envelopeSHA256 else {
+                throw FileOutboxMailboxError.finalizationConflict
+            }
+            try hardenFinalEnvelope(envelopeURL)
+        }
+    }
+
+    private func hasEnvelopeArtifact(for itemID: String) throws -> Bool {
+        let children = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        return children.contains { fileURL in
+            Self.isEnvelopeArtifact(fileURL)
+                && (fileURL.lastPathComponent == "\(itemID).hbe"
+                    || fileURL.lastPathComponent == "\(itemID).hbe-staged")
+        }
+    }
+
+    private static func isEnvelopeArtifact(_ fileURL: URL) -> Bool {
+        fileURL.pathExtension == "hbe" || fileURL.pathExtension == "hbe-staged"
+    }
+
+    private func stagedEnvelopeURL(for itemID: String) -> URL {
+        directory.appendingPathComponent(itemID).appendingPathExtension("hbe-staged")
+    }
+
+    private func finalEnvelopeURL(for itemID: String) -> URL {
+        directory.appendingPathComponent(itemID).appendingPathExtension("hbe")
+    }
+
+    private static func encryptedDeliveryState(
+        _ state: FileOutboxDeliveryStateV1?
+    ) throws -> FileOutboxDeliveryStateV1 {
+        guard let state else {
+            return .stable(.encrypted, ownership: nil)
+        }
+        switch state.phase {
+        case .collected:
+            return .stable(.encrypted, ownership: state.ownership)
+        case .encrypted:
+            return state
+        case .published, .providerObserved, .ackVerified, .committedFinalized,
+             .retryableFailure, .terminalFailure:
+            throw FileOutboxMailboxError.deliveryTransitionConflict
+        }
+    }
+
+    private func retireCommittedArtifacts(
+        for entry: SequenceEntry,
+        fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void
+    ) throws {
+        guard entry.deliveryState?.phase == .committedFinalized,
+              let binding = entry.mailboxBinding,
+              binding.envelopeFilename == "\(entry.id).hbe" else {
+            throw FileOutboxMailboxError.invalidDeliveryState
+        }
+        try removeIfExists(finalPayloadURL(for: entry.id))
+        try fault(.payloadRetired)
+        try removeIfExists(directory.appendingPathComponent(binding.envelopeFilename))
+        try fault(.envelopeRetired)
+    }
+
+    private func hardenFinalEnvelope(_ fileURL: URL) throws {
+        try Self.applySensitiveFileAttributes(to: fileURL, fileManager: fileManager)
+        try fileManager.setAttributes([.posixPermissions: 0o400], ofItemAtPath: fileURL.path)
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func hardenExistingPayloads() throws {
         for fileURL in try payloadFileURLs() {
             try Self.applySensitiveFileAttributes(to: fileURL, fileManager: fileManager)
@@ -764,6 +1367,10 @@ public final class FileOutbox {
 
     private var enqueueTransactionURL: URL {
         directory.appendingPathComponent(Self.enqueueTransactionFilename)
+    }
+
+    private var mailboxEnvelopeIntentURL: URL {
+        directory.appendingPathComponent(Self.mailboxEnvelopeIntentFilename)
     }
 
     private func stagedPayloadURL(for id: String) -> URL {
@@ -817,7 +1424,9 @@ public final class FileOutbox {
                 SequenceEntry(
                     sequence: sequence,
                     id: id,
-                    receiverIdentity: receiverIdentity
+                    receiverIdentity: receiverIdentity,
+                    mailboxBinding: nil,
+                    deliveryState: nil
                 )
             )
             manifest.nextSequence = sequence + 1
@@ -852,6 +1461,7 @@ public final class FileOutbox {
         for entry in transaction.entries {
             let stagedURL = stagedPayloadURL(for: entry.id)
             let finalURL = finalPayloadURL(for: entry.id)
+            let existing = manifest.entries.first { $0.id == entry.id }
             if fileManager.fileExists(atPath: stagedURL.path) {
                 try Self.applySensitiveFileAttributes(
                     to: stagedURL,
@@ -863,13 +1473,16 @@ public final class FileOutbox {
                     try fileManager.moveItem(at: stagedURL, to: finalURL)
                 }
             }
-            guard fileManager.fileExists(atPath: finalURL.path) else {
+            guard fileManager.fileExists(atPath: finalURL.path)
+                || existing?.deliveryState?.phase == .committedFinalized else {
                 throw SequenceError.invalidManifest
             }
-            try Self.applySensitiveFileAttributes(
-                to: finalURL,
-                fileManager: fileManager
-            )
+            if fileManager.fileExists(atPath: finalURL.path) {
+                try Self.applySensitiveFileAttributes(
+                    to: finalURL,
+                    fileManager: fileManager
+                )
+            }
             if knownIDs.insert(entry.id).inserted {
                 manifest.entries.append(entry)
             }
@@ -886,7 +1499,9 @@ public final class FileOutbox {
             FileOutboxItem(
                 id: entry.id,
                 fileURL: finalPayloadURL(for: entry.id),
-                receiverIdentity: entry.receiverIdentity
+                receiverIdentity: entry.receiverIdentity,
+                mailboxBinding: entry.mailboxBinding,
+                deliveryState: entry.deliveryState
             )
         }
     }
@@ -926,14 +1541,23 @@ public final class FileOutbox {
         let loadedManifest = try loadManifest()
         var manifest = loadedManifest ?? .empty
         try Self.validate(manifest)
+        let manifestEntries = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
+        )
         let allPayloadsAreRecoverable = !clearIntentIsActive
             && transaction.entries.allSatisfy { entry in
                 fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
                     || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                    || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
             }
         if allPayloadsAreRecoverable {
             _ = try commitEnqueueTransaction(transaction, manifest: manifest)
             return
+        }
+        if transaction.entries.contains(where: {
+            manifestEntries[$0.id]?.deliveryState?.phase == .committedFinalized
+        }) {
+            throw FileOutboxCursorCheckpointError.pendingCommit
         }
 
         let transactionIDs = Set(transaction.entries.map(\.id))
@@ -955,16 +1579,40 @@ public final class FileOutbox {
 
     private func reconciledManifest() throws -> SequenceManifest {
         try recoverEnqueueTransactionIfNeeded()
-        let payloadURLs = try payloadFileURLs()
-        let payloadIDs = Set(payloadURLs.map(payloadID))
         let loadedManifest = try loadManifest()
         var manifest = loadedManifest ?? .empty
         try Self.validate(manifest)
-        if manifest.version < SequenceManifest.currentVersion {
-            manifest.version = SequenceManifest.currentVersion
+        if manifest.version < SequenceManifest.directOnlyVersion {
+            manifest.version = SequenceManifest.directOnlyVersion
         }
+        if manifest.version == SequenceManifest.mailboxVersion {
+            for index in manifest.entries.indices
+                where manifest.entries[index].deliveryState == nil {
+                manifest.entries[index].deliveryState = .stable(
+                    manifest.entries[index].mailboxBinding == nil ? .collected : .encrypted,
+                    ownership: nil
+                )
+            }
+        }
+        for entry in manifest.entries
+            where entry.deliveryState?.phase == .committedFinalized {
+            try retireCommittedArtifacts(for: entry, fault: { _ in })
+        }
+        let payloadURLs = try payloadFileURLs()
+        let payloadIDs = Set(payloadURLs.map(payloadID))
 
-        manifest.entries.removeAll { !payloadIDs.contains($0.id) }
+        if manifest.entries.contains(where: {
+            !payloadIDs.contains($0.id)
+                && $0.deliveryState?.phase != .committedFinalized
+                && ($0.mailboxBinding != nil || $0.deliveryState != nil)
+        }) {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        manifest.entries.removeAll {
+            $0.mailboxBinding == nil
+                && $0.deliveryState == nil
+                && !payloadIDs.contains($0.id)
+        }
         let knownIDs = Set(manifest.entries.map(\.id))
         let orphanIDs = try payloadURLs
             .map { fileURL -> OrphanPayload in
@@ -990,12 +1638,21 @@ public final class FileOutbox {
             let sequence = manifest.nextSequence
             guard sequence < UInt64.max else { throw SequenceError.exhausted }
             manifest.entries.append(
-                SequenceEntry(sequence: sequence, id: id, receiverIdentity: nil)
+                SequenceEntry(
+                    sequence: sequence,
+                    id: id,
+                    receiverIdentity: nil,
+                    mailboxBinding: nil,
+                    deliveryState: manifest.version == SequenceManifest.mailboxVersion
+                        ? .stable(.collected, ownership: nil)
+                        : nil
+                )
             )
             manifest.nextSequence = sequence + 1
         }
 
         try Self.validate(manifest)
+        try validateEnvelopeArtifacts(for: manifest)
         if manifest != loadedManifest {
             try persistManifest(manifest)
         }
@@ -1024,14 +1681,58 @@ public final class FileOutbox {
     private static func validate(_ manifest: SequenceManifest) throws {
         let ids = manifest.entries.map(\.id)
         let sequences = manifest.entries.map(\.sequence)
-        guard (1 ... SequenceManifest.currentVersion).contains(manifest.version),
+        let mailboxBindings = manifest.entries.compactMap(\.mailboxBinding)
+        let deliveryStates = manifest.entries.compactMap(\.deliveryState)
+        guard (1 ... SequenceManifest.mailboxVersion).contains(manifest.version),
               manifest.nextSequence > 0,
               ids.allSatisfy(isSafeItemID),
               Set(ids).count == ids.count,
               Set(sequences).count == sequences.count,
               sequences.allSatisfy({ $0 > 0 }),
-              (sequences.max().map { manifest.nextSequence > $0 } ?? true) else {
+              (sequences.max().map { manifest.nextSequence > $0 } ?? true),
+              (manifest.version == SequenceManifest.mailboxVersion
+                  ? !mailboxBindings.isEmpty || !deliveryStates.isEmpty
+                  : mailboxBindings.isEmpty && deliveryStates.isEmpty),
+              manifest.entries.allSatisfy({ entry in
+                  let bindingIsValid = entry.mailboxBinding.map { binding in
+                      isSHA256(binding.payloadSHA256)
+                      && isSHA256(binding.envelopeSHA256)
+                      && binding.envelopeFilename == "\(entry.id).hbe"
+                  } ?? true
+                  return bindingIsValid && deliveryStateIsValid(for: entry)
+              }) else {
             throw SequenceError.invalidManifest
+        }
+    }
+
+    private static func deliveryStateIsValid(for entry: SequenceEntry) -> Bool {
+        guard let state = entry.deliveryState else { return true }
+        guard state.isStructurallyValid,
+              state.ownership?.receiverBindingID == entry.receiverIdentity
+                || state.ownership == nil else {
+            return false
+        }
+        switch state.phase {
+        case .collected:
+            return entry.mailboxBinding == nil
+        case .encrypted, .published, .providerObserved, .ackVerified,
+             .committedFinalized, .retryableFailure, .terminalFailure:
+            return entry.mailboxBinding != nil
+        }
+    }
+
+    private static func hasSameCollectionIdentity(
+        _ lhs: SequenceEntry,
+        _ rhs: SequenceEntry
+    ) -> Bool {
+        lhs.id == rhs.id
+            && lhs.sequence == rhs.sequence
+            && lhs.receiverIdentity == rhs.receiverIdentity
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { byte in
+            (48 ... 57).contains(byte) || (97 ... 102).contains(byte)
         }
     }
 
@@ -1056,20 +1757,30 @@ public final class FileOutbox {
     }
 
     private static func applySensitiveFileAttributes(to url: URL, fileManager: FileManager) throws {
-        var resourceValues = URLResourceValues()
-        resourceValues.isExcludedFromBackup = true
-        var mutableURL = url
-        try mutableURL.setResourceValues(resourceValues)
+        let existingResourceValues = try url.resourceValues(
+            forKeys: [.isExcludedFromBackupKey]
+        )
+        if existingResourceValues.isExcludedFromBackup != true {
+            var resourceValues = URLResourceValues()
+            resourceValues.isExcludedFromBackup = true
+            var mutableURL = url
+            try mutableURL.setResourceValues(resourceValues)
+        }
 
         #if os(iOS)
-        try fileManager.setAttributes(
-            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
-            ofItemAtPath: url.path
-        )
+        let existingAttributes = try fileManager.attributesOfItem(atPath: url.path)
+        if existingAttributes[.protectionKey] as? FileProtectionType
+            != .completeUntilFirstUserAuthentication {
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: url.path
+            )
+        }
         #endif
     }
 }
 
+#if !HEALTH_BRIDGE_MAILBOX_QA
 public protocol SyncCursorStoring {
     func cursorValue(receiverBindingID: String, sourceKey: String, cursorKind: String) throws -> String?
     func saveCursorValue(
@@ -1621,6 +2332,7 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     public let installationID: String
     public let deviceCredential: String
     public let platform: String
+    public let mailboxProtocolVersion: Int?
 
     public init(
         label: String,
@@ -1630,7 +2342,8 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         invitationCode: String?,
         installationID: String,
         deviceCredential: String,
-        platform: String
+        platform: String,
+        mailboxProtocolVersion: Int? = nil
     ) {
         self.label = label
         self.receiverURLString = receiverURLString
@@ -1640,18 +2353,21 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         self.installationID = installationID
         self.deviceCredential = deviceCredential
         self.platform = platform
+        self.mailboxProtocolVersion = mailboxProtocolVersion
     }
 
     func matches(
         receiverURLString: String,
         redeemURLString: String,
         invitationSecret: String?,
-        invitationCode: String?
+        invitationCode: String?,
+        mailboxProtocolVersion: Int? = nil
     ) -> Bool {
         self.receiverURLString == receiverURLString
             && self.redeemURLString == redeemURLString
             && self.invitationSecret == invitationSecret
             && self.invitationCode == invitationCode
+            && self.mailboxProtocolVersion == mailboxProtocolVersion
             && platform == "ios"
     }
 }
@@ -1705,7 +2421,8 @@ public final class ReceiverPairingStateStore {
             receiverURLString: invitation.receiverURLString,
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
-            invitationCode: nil
+            invitationCode: nil,
+            mailboxProtocolVersion: invitation.mailboxProtocolVersion
         )
     }
 
@@ -1715,7 +2432,8 @@ public final class ReceiverPairingStateStore {
             receiverURLString: manualPairing.receiverURL.absoluteString,
             redeemURLString: manualPairing.redeemURL.absoluteString,
             invitationSecret: nil,
-            invitationCode: manualPairing.invitationCode
+            invitationCode: manualPairing.invitationCode,
+            mailboxProtocolVersion: nil
         )
     }
 
@@ -1774,7 +2492,8 @@ public final class ReceiverPairingStateStore {
         receiverURLString: String,
         redeemURLString: String,
         invitationSecret: String?,
-        invitationCode: String?
+        invitationCode: String?,
+        mailboxProtocolVersion: Int?
     ) throws -> ReceiverPendingPairing {
         guard try !hasPendingCancellation() else {
             throw ReceiverPairingStateError.pendingPairingConflict
@@ -1784,7 +2503,8 @@ public final class ReceiverPairingStateStore {
                 receiverURLString: receiverURLString,
                 redeemURLString: redeemURLString,
                 invitationSecret: invitationSecret,
-                invitationCode: invitationCode
+                invitationCode: invitationCode,
+                mailboxProtocolVersion: mailboxProtocolVersion
             ) else {
                 throw ReceiverPairingStateError.pendingPairingConflict
             }
@@ -1799,7 +2519,8 @@ public final class ReceiverPairingStateStore {
             invitationCode: invitationCode,
             installationID: installationID,
             deviceCredential: deviceCredentialGenerator(),
-            platform: "ios"
+            platform: "ios",
+            mailboxProtocolVersion: mailboxProtocolVersion
         )
         let encoded = try JSONEncoder().encode(pending)
         guard let string = String(data: encoded, encoding: .utf8) else {
@@ -1819,6 +2540,7 @@ public enum ReceiverSettingsRecordError: Error, Equatable, Sendable {
     case legacyRecordRequiresRepair
     case persistenceFailed
     case destructiveResetNotRequired
+    case transportSwitchRequiresCommittedEmptyOutbox
 }
 
 public enum ReceiverConnectionRecordRecoveryPolicy {
@@ -1847,21 +2569,268 @@ public enum ReceiverOutboxAdmissionPolicy {
 }
 
 public enum ReceiverConnectionTransitionPolicy {
+    public static func pairingCommitBarrierFailure(
+        outboxIdentityAdmissionReady: Bool,
+        pendingItemCount: Int,
+        clearIntentIsActive: Bool
+    ) -> ReceiverPairingCommitBarrierError? {
+        if !outboxIdentityAdmissionReady { return .outboxIdentityAdmissionNotReady }
+        if pendingItemCount != 0 { return .outboxNotEmpty }
+        if clearIntentIsActive { return .outboxClearIntentActive }
+        return nil
+    }
+
     public static func canBegin(
         outboxIdentityAdmissionReady: Bool,
         pendingItemCount: Int,
         clearIntentIsActive: Bool
     ) -> Bool {
-        outboxIdentityAdmissionReady
-            && pendingItemCount == 0
-            && !clearIntentIsActive
+        pairingCommitBarrierFailure(
+            outboxIdentityAdmissionReady: outboxIdentityAdmissionReady,
+            pendingItemCount: pendingItemCount,
+            clearIntentIsActive: clearIntentIsActive
+        ) == nil
+    }
+}
+
+public struct ReceiverLocalConnectionScopeV1: Codable, Equatable, Sendable {
+    public let generation: UInt64
+    public let bindingID: String
+
+    public init(generation: UInt64, bindingID: String) {
+        self.generation = generation
+        self.bindingID = bindingID
+    }
+}
+
+public enum MailboxConnectionIdentityUnavailableReason: String, Codable, Equatable, Sendable {
+    case notProvisionedByLegacyHTTPPairing
+}
+
+public struct MailboxConnectionIdentityV1: Codable, Equatable, Sendable {
+    public let receiverID: String
+    public let deviceID: String
+    public let devicePrincipal: String
+    public let deviceSigningKeyID: String
+    public let deviceAgreementKeyID: String
+    public let receiverSigningKeyID: String
+    public let receiverAgreementKeyID: String
+    public let receiverSigningPublicKey: String
+    public let receiverAgreementPublicKey: String
+    public let opaqueBinding: String
+    public let connectionGeneration: UInt64
+
+    public init(
+        receiverID: String,
+        deviceID: String,
+        devicePrincipal: String,
+        deviceSigningKeyID: String,
+        deviceAgreementKeyID: String,
+        receiverSigningKeyID: String,
+        receiverAgreementKeyID: String,
+        receiverSigningPublicKey: String,
+        receiverAgreementPublicKey: String,
+        opaqueBinding: String,
+        connectionGeneration: UInt64
+    ) {
+        self.receiverID = receiverID
+        self.deviceID = deviceID
+        self.devicePrincipal = devicePrincipal
+        self.deviceSigningKeyID = deviceSigningKeyID
+        self.deviceAgreementKeyID = deviceAgreementKeyID
+        self.receiverSigningKeyID = receiverSigningKeyID
+        self.receiverAgreementKeyID = receiverAgreementKeyID
+        self.receiverSigningPublicKey = receiverSigningPublicKey
+        self.receiverAgreementPublicKey = receiverAgreementPublicKey
+        self.opaqueBinding = opaqueBinding
+        self.connectionGeneration = connectionGeneration
+    }
+}
+
+public enum MailboxConnectionIdentityAvailability: Codable, Equatable, Sendable {
+    case unavailable(MailboxConnectionIdentityUnavailableReason)
+    case available(MailboxConnectionIdentityV1)
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+        case reason
+        case identity
+    }
+
+    private enum Availability: String, Codable {
+        case unavailable
+        case available
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Availability.self, forKey: .availability) {
+        case .unavailable:
+            guard !container.contains(.identity) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .identity,
+                    in: container,
+                    debugDescription: "Unavailable mailbox identity cannot contain identity data."
+                )
+            }
+            self = .unavailable(
+                try container.decode(
+                    MailboxConnectionIdentityUnavailableReason.self,
+                    forKey: .reason
+                )
+            )
+        case .available:
+            guard !container.contains(.reason) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .reason,
+                    in: container,
+                    debugDescription: "Available mailbox identity cannot contain an unavailable reason."
+                )
+            }
+            self = .available(
+                try container.decode(MailboxConnectionIdentityV1.self, forKey: .identity)
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .unavailable(let reason):
+            try container.encode(Availability.unavailable, forKey: .availability)
+            try container.encode(reason, forKey: .reason)
+        case .available(let identity):
+            try container.encode(Availability.available, forKey: .availability)
+            try container.encode(identity, forKey: .identity)
+        }
+    }
+}
+
+public enum ReceiverTransportKind: String, Codable, Equatable, Hashable, Sendable {
+    case directHTTP
+    case mailbox
+}
+
+public enum ReceiverTransportActivation: String, Codable, Equatable, Sendable {
+    case active
+    case inactive
+}
+
+public struct DirectHTTPConnectionConfigurationV1: Codable, Equatable, Sendable {
+    public let receiverURLString: String
+    public let bearerToken: String
+
+    public init(receiverURLString: String, bearerToken: String) {
+        self.receiverURLString = receiverURLString
+        self.bearerToken = bearerToken
+    }
+}
+
+public struct MailboxConnectionConfigurationV1: Codable, Equatable, Sendable {
+    public let protocolVersion: Int
+
+    public init(protocolVersion: Int = 1) {
+        self.protocolVersion = protocolVersion
+    }
+}
+
+public enum ReceiverTransportConfigurationV1: Codable, Equatable, Sendable {
+    case directHTTP(
+        activation: ReceiverTransportActivation,
+        configuration: DirectHTTPConnectionConfigurationV1
+    )
+    case mailbox(
+        activation: ReceiverTransportActivation,
+        configuration: MailboxConnectionConfigurationV1
+    )
+
+    public var transport: ReceiverTransportKind {
+        switch self {
+        case .directHTTP: .directHTTP
+        case .mailbox: .mailbox
+        }
+    }
+
+    public var activation: ReceiverTransportActivation {
+        switch self {
+        case .directHTTP(let activation, _), .mailbox(let activation, _): activation
+        }
+    }
+}
+
+public enum ReceiverConnectionActivationV2: Codable, Equatable, Sendable {
+    case unpaired
+    case paired(activeTransport: ReceiverTransportKind)
+
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case activeTransport
+    }
+
+    private enum State: String, Codable {
+        case unpaired
+        case paired
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(State.self, forKey: .state) {
+        case .unpaired:
+            guard !container.contains(.activeTransport) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .activeTransport,
+                    in: container,
+                    debugDescription: "Unpaired state cannot name an active transport."
+                )
+            }
+            self = .unpaired
+        case .paired:
+            self = .paired(
+                activeTransport: try container.decode(
+                    ReceiverTransportKind.self,
+                    forKey: .activeTransport
+                )
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .unpaired:
+            try container.encode(State.unpaired, forKey: .state)
+        case .paired(let activeTransport):
+            try container.encode(State.paired, forKey: .state)
+            try container.encode(activeTransport, forKey: .activeTransport)
+        }
+    }
+}
+
+public struct ReceiverConnectionRecordV2: Codable, Equatable, Sendable {
+    public let version: Int
+    public let localScope: ReceiverLocalConnectionScopeV1
+    public let mailboxIdentity: MailboxConnectionIdentityAvailability
+    public let activation: ReceiverConnectionActivationV2
+    public let transportConfigurations: [ReceiverTransportConfigurationV1]
+
+    public init(
+        localScope: ReceiverLocalConnectionScopeV1,
+        mailboxIdentity: MailboxConnectionIdentityAvailability,
+        activation: ReceiverConnectionActivationV2,
+        transportConfigurations: [ReceiverTransportConfigurationV1]
+    ) {
+        version = 2
+        self.localScope = localScope
+        self.mailboxIdentity = mailboxIdentity
+        self.activation = activation
+        self.transportConfigurations = transportConfigurations
     }
 }
 
 public final class ReceiverSettingsStore {
     public static let defaultReceiverURLString = "http://127.0.0.1:8765/v1/batches"
 
-    private struct ConnectionRecord: Codable {
+    private struct ConnectionRecordV1: Codable {
         let version: Int
         let receiverURLString: String
         let bearerToken: String
@@ -1869,9 +2838,178 @@ public final class ReceiverSettingsStore {
         let bindingID: String
     }
 
-    private static let recordPrefix = "health-bridge-connection-v1:"
+    private struct StrictConnectionRecordV1JSONParser {
+        private let bytes: [UInt8]
+        private var index = 0
+
+        init(data: Data) {
+            bytes = Array(data)
+        }
+
+        mutating func parse() throws -> ConnectionRecordV1 {
+            try consume(0x7B)
+            var seen = Set<String>()
+            var version: UInt64?
+            var receiverURLString: String?
+            var bearerToken: String?
+            var generation: UInt64?
+            var bindingID: String?
+
+            for memberIndex in 0 ..< 5 {
+                if memberIndex > 0 {
+                    try consume(0x2C)
+                }
+                skipWhitespace()
+                let key = try parseString()
+                guard seen.insert(key).inserted else {
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+                try consume(0x3A)
+                skipWhitespace()
+                switch key {
+                case "version":
+                    version = try parseUnsignedInteger()
+                case "receiverURLString":
+                    receiverURLString = try parseString()
+                case "bearerToken":
+                    bearerToken = try parseString()
+                case "generation":
+                    generation = try parseUnsignedInteger()
+                case "bindingID":
+                    bindingID = try parseString()
+                default:
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+            }
+
+            try consume(0x7D)
+            skipWhitespace()
+            guard index == bytes.count,
+                  version == 1,
+                  let receiverURLString,
+                  let bearerToken,
+                  let generation,
+                  let bindingID else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            return ConnectionRecordV1(
+                version: 1,
+                receiverURLString: receiverURLString,
+                bearerToken: bearerToken,
+                generation: generation,
+                bindingID: bindingID
+            )
+        }
+
+        private mutating func parseString() throws -> String {
+            guard index < bytes.count, bytes[index] == 0x22 else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            let start = index
+            index += 1
+            while index < bytes.count {
+                let byte = bytes[index]
+                index += 1
+                switch byte {
+                case 0x22:
+                    let encoded = Data(bytes[start ..< index])
+                    guard let value = try? JSONDecoder().decode(String.self, from: encoded) else {
+                        throw ReceiverSettingsRecordError.invalidRecord
+                    }
+                    return value
+                case 0x5C:
+                    try consumeStringEscape()
+                case 0x00 ..< 0x20:
+                    throw ReceiverSettingsRecordError.invalidRecord
+                default:
+                    continue
+                }
+            }
+            throw ReceiverSettingsRecordError.invalidRecord
+        }
+
+        private mutating func consumeStringEscape() throws {
+            guard index < bytes.count else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            let escaped = bytes[index]
+            index += 1
+            if escaped == 0x75 {
+                for _ in 0 ..< 4 {
+                    guard index < bytes.count, Self.isHexDigit(bytes[index]) else {
+                        throw ReceiverSettingsRecordError.invalidRecord
+                    }
+                    index += 1
+                }
+                return
+            }
+            guard [0x22, 0x2F, 0x5C, 0x62, 0x66, 0x6E, 0x72, 0x74].contains(escaped) else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+        }
+
+        private mutating func parseUnsignedInteger() throws -> UInt64 {
+            guard index < bytes.count, Self.isDigit(bytes[index]) else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            if bytes[index] == 0x30 {
+                index += 1
+                guard index == bytes.count || !Self.isDigit(bytes[index]) else {
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+                return 0
+            }
+            var value: UInt64 = 0
+            while index < bytes.count, Self.isDigit(bytes[index]) {
+                let digit = UInt64(bytes[index] - 0x30)
+                let multiplied = value.multipliedReportingOverflow(by: 10)
+                let added = multiplied.partialValue.addingReportingOverflow(digit)
+                guard !multiplied.overflow, !added.overflow else {
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+                value = added.partialValue
+                index += 1
+            }
+            return value
+        }
+
+        private mutating func consume(_ expected: UInt8) throws {
+            skipWhitespace()
+            guard index < bytes.count, bytes[index] == expected else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            index += 1
+        }
+
+        private mutating func skipWhitespace() {
+            while index < bytes.count,
+                  bytes[index] == 0x20 || bytes[index] == 0x09
+                    || bytes[index] == 0x0A || bytes[index] == 0x0D {
+                index += 1
+            }
+        }
+
+        private static func isDigit(_ byte: UInt8) -> Bool {
+            byte >= 0x30 && byte <= 0x39
+        }
+
+        private static func isHexDigit(_ byte: UInt8) -> Bool {
+            isDigit(byte)
+                || (byte >= 0x41 && byte <= 0x46)
+                || (byte >= 0x61 && byte <= 0x66)
+        }
+    }
+
+    private enum StoredConnectionRecord {
+        case v1(record: ConnectionRecordV1, raw: String)
+        case v2(ReceiverConnectionRecordV2)
+    }
+
+    private static let recordPrefixV1 = "health-bridge-connection-v1:"
+    private static let recordPrefixV2 = "health-bridge-connection-v2:"
     private let userDefaults: UserDefaults
     private let tokenStore: ReceiverTokenStoring
+    private let preCutoverBackupStore: ReceiverTokenStoring
     private let synchronizeUserDefaults: () -> Bool
     private let receiverURLKey = "receiverURLString"
     private let receiverSettingsGenerationKey = "receiverSettingsGeneration"
@@ -1880,23 +3018,28 @@ public final class ReceiverSettingsStore {
     public init(
         userDefaults: UserDefaults = .standard,
         tokenStore: ReceiverTokenStoring = KeychainReceiverTokenStore(),
+        preCutoverBackupStore: ReceiverTokenStoring = KeychainReceiverTokenStore(
+            account: "pre-v2-connection-record-backup"
+        ),
         synchronize: (() -> Bool)? = nil
     ) {
         self.userDefaults = userDefaults
         self.tokenStore = tokenStore
+        self.preCutoverBackupStore = preCutoverBackupStore
         self.synchronizeUserDefaults = synchronize ?? { userDefaults.synchronize() }
     }
 
     public var receiverURLString: String {
-        if let record = try? loadConnectionRecord() {
-            return record.receiverURLString
+        if let stored = try? loadStoredConnectionRecord() {
+            return directHTTPConfiguration(in: stored)?.receiverURLString
+                ?? Self.defaultReceiverURLString
         }
         return userDefaults.string(forKey: receiverURLKey) ?? Self.defaultReceiverURLString
     }
 
     public var receiverSettingsGeneration: UInt64 {
-        if let record = try? loadConnectionRecord() {
-            return record.generation
+        if let stored = try? loadStoredConnectionRecord() {
+            return localScope(in: stored).generation
         }
         return UInt64(max(0, userDefaults.integer(forKey: receiverSettingsGenerationKey)))
     }
@@ -1906,19 +3049,35 @@ public final class ReceiverSettingsStore {
     }
 
     public var receiverBindingID: String? {
-        guard let record = try? loadConnectionRecord(),
-              !record.bearerToken.isEmpty,
-              !record.bindingID.isEmpty else {
+        guard let stored = try? loadStoredConnectionRecord(),
+              let direct = directHTTPConfiguration(in: stored),
+              !direct.bearerToken.isEmpty,
+              !localScope(in: stored).bindingID.isEmpty else {
             return nil
         }
-        return record.bindingID
+        return localScope(in: stored).bindingID
+    }
+
+    public var activeTransport: ReceiverTransportKind? {
+        guard let record = try? currentConnectionRecordV2() else { return nil }
+        guard case .paired(let activeTransport) = record.activation else { return nil }
+        return activeTransport
     }
 
     @discardableResult
     public func ensureAtomicConnectionRecord() throws -> String? {
-        if let record = try loadConnectionRecord() {
-            mirror(record)
-            return record.bearerToken.isEmpty ? nil : record.bindingID
+        if let stored = try loadStoredConnectionRecord() {
+            let record: ReceiverConnectionRecordV2
+            switch stored {
+            case .v1(let legacy, _):
+                record = projectedV2(from: legacy)
+            case .v2(let current):
+                try restorePreCutoverV1IfExactMatch(current)
+                record = current
+            }
+            return directHTTPConfiguration(in: record)?.bearerToken.isEmpty == false
+                ? record.localScope.bindingID
+                : nil
         }
         let legacyToken = try tokenStore.loadToken()
         let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
@@ -1937,32 +3096,52 @@ public final class ReceiverSettingsStore {
         throw ReceiverSettingsRecordError.legacyRecordRequiresRepair
     }
 
+    public func currentConnectionRecordV2() throws -> ReceiverConnectionRecordV2? {
+        _ = try ensureAtomicConnectionRecord()
+        guard let stored = try loadStoredConnectionRecord() else { return nil }
+        switch stored {
+        case .v1(let legacy, _):
+            return projectedV2(from: legacy)
+        case .v2(let record):
+            return record
+        }
+    }
+
     @discardableResult
     public func invalidateReceiverSettingsGeneration() throws -> String {
         let current = try authoritativeRecordForMutation()
-        let record = ConnectionRecord(
-            version: 1,
-            receiverURLString: current.receiverURLString,
-            bearerToken: current.bearerToken,
-            generation: try Self.nextGeneration(after: current.generation),
-            bindingID: current.bindingID
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: try Self.nextGeneration(after: current.localScope.generation),
+                bindingID: current.localScope.bindingID
+            ),
+            mailboxIdentity: current.mailboxIdentity,
+            activation: current.activation,
+            transportConfigurations: current.transportConfigurations
         )
         try persist(record)
-        return "g\(record.generation)"
+        return "g\(record.localScope.generation)"
     }
 
     public func loadBearerToken() throws -> String {
-        if let record = try loadConnectionRecord() {
-            return record.bearerToken
+        if let stored = try loadStoredConnectionRecord() {
+            return directHTTPConfiguration(in: stored)?.bearerToken ?? ""
         }
         return try tokenStore.loadToken()
     }
 
     public func receiverSettingsAreCleared() throws -> Bool {
-        if let record = try loadConnectionRecord() {
-            return record.receiverURLString == Self.defaultReceiverURLString
-                && record.bearerToken.isEmpty
-                && record.bindingID.isEmpty
+        if let stored = try loadStoredConnectionRecord() {
+            switch stored {
+            case .v1(let record, _):
+                return record.receiverURLString == Self.defaultReceiverURLString
+                    && record.bearerToken.isEmpty
+                    && record.bindingID.isEmpty
+            case .v2(let record):
+                return record.activation == .unpaired
+                    && record.transportConfigurations.isEmpty
+                    && record.localScope.bindingID.isEmpty
+            }
         }
         let legacyToken = try tokenStore.loadToken()
         let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
@@ -1976,19 +3155,84 @@ public final class ReceiverSettingsStore {
         rotateBindingID: Bool = false
     ) throws {
         let previous = try authoritativeRecordForMutation()
+        if case .paired(activeTransport: .mailbox) = previous.activation {
+            throw ReceiverSettingsRecordError.transportSwitchRequiresCommittedEmptyOutbox
+        }
+        let previousDirect = directHTTPConfiguration(in: previous)
         let settingsChanged = rotateBindingID
-            || previous.receiverURLString != newReceiverURLString
-            || previous.bearerToken != newBearerToken
-        let record = ConnectionRecord(
-            version: 1,
-            receiverURLString: newReceiverURLString,
-            bearerToken: newBearerToken,
-            generation: settingsChanged
-                ? try Self.nextGeneration(after: previous.generation)
-                : previous.generation,
-            bindingID: settingsChanged || previous.bindingID.isEmpty
+            || previousDirect?.receiverURLString != newReceiverURLString
+            || previousDirect?.bearerToken != newBearerToken
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: settingsChanged
+                    ? try Self.nextGeneration(after: previous.localScope.generation)
+                    : previous.localScope.generation,
+                bindingID: settingsChanged || previous.localScope.bindingID.isEmpty
                 ? UUID().uuidString.lowercased()
-                : previous.bindingID
+                : previous.localScope.bindingID
+            ),
+            mailboxIdentity: .unavailable(.notProvisionedByLegacyHTTPPairing),
+            activation: .paired(activeTransport: .directHTTP),
+            transportConfigurations: [
+                .directHTTP(
+                    activation: .active,
+                    configuration: DirectHTTPConnectionConfigurationV1(
+                        receiverURLString: newReceiverURLString,
+                        bearerToken: newBearerToken
+                    )
+                ),
+            ]
+        )
+        try persist(record)
+    }
+
+    public func saveMailboxPairing(
+        receiverURLString: String,
+        bearerToken: String,
+        mailboxIdentity: MailboxConnectionIdentityV1,
+        expectedGeneration: String
+    ) throws {
+        let previous = try authoritativeRecordForMutation()
+        guard "g\(previous.localScope.generation)" == expectedGeneration else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
+        let direct = DirectHTTPConnectionConfigurationV1(
+            receiverURLString: receiverURLString,
+            bearerToken: bearerToken
+        )
+        if case .paired(activeTransport: .mailbox) = previous.activation {
+            let expected = ReceiverConnectionRecordV2(
+                localScope: previous.localScope,
+                mailboxIdentity: .available(mailboxIdentity),
+                activation: .paired(activeTransport: .mailbox),
+                transportConfigurations: [
+                    .directHTTP(activation: .inactive, configuration: direct),
+                    .mailbox(
+                        activation: .active,
+                        configuration: MailboxConnectionConfigurationV1()
+                    ),
+                ]
+            )
+            guard previous == expected else {
+                throw ReceiverSettingsRecordError
+                    .transportSwitchRequiresCommittedEmptyOutbox
+            }
+            return
+        }
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: try Self.nextGeneration(after: previous.localScope.generation),
+                bindingID: mailboxIdentity.opaqueBinding
+            ),
+            mailboxIdentity: .available(mailboxIdentity),
+            activation: .paired(activeTransport: .mailbox),
+            transportConfigurations: [
+                .directHTTP(activation: .inactive, configuration: direct),
+                .mailbox(
+                    activation: .active,
+                    configuration: MailboxConnectionConfigurationV1()
+                ),
+            ]
         )
         try persist(record)
     }
@@ -2009,15 +3253,21 @@ public final class ReceiverSettingsStore {
 
     public func clearReceiverSettings() throws {
         let previous = try authoritativeRecordForMutation()
-        let settingsChanged = previous.receiverURLString != Self.defaultReceiverURLString || !previous.bearerToken.isEmpty
-        let record = ConnectionRecord(
-            version: 1,
-            receiverURLString: Self.defaultReceiverURLString,
-            bearerToken: "",
-            generation: settingsChanged
-                ? try Self.nextGeneration(after: previous.generation)
-                : previous.generation,
-            bindingID: ""
+        if case .paired(activeTransport: .mailbox) = previous.activation {
+            throw ReceiverSettingsRecordError.transportSwitchRequiresCommittedEmptyOutbox
+        }
+        let settingsChanged = previous.activation != .unpaired
+            || !previous.transportConfigurations.isEmpty
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: settingsChanged
+                    ? try Self.nextGeneration(after: previous.localScope.generation)
+                    : previous.localScope.generation,
+                bindingID: ""
+            ),
+            mailboxIdentity: .unavailable(.notProvisionedByLegacyHTTPPairing),
+            activation: .unpaired,
+            transportConfigurations: []
         )
         try persist(record)
     }
@@ -2029,7 +3279,7 @@ public final class ReceiverSettingsStore {
 
     public func resetInvalidConnectionRecord() throws {
         do {
-            if try loadConnectionRecord() != nil {
+            if try loadStoredConnectionRecord() != nil {
                 throw ReceiverSettingsRecordError.destructiveResetNotRequired
             }
             let legacyToken = try tokenStore.loadToken()
@@ -2051,14 +3301,16 @@ public final class ReceiverSettingsStore {
         while replacementGeneration == mirroredGeneration {
             replacementGeneration = UInt64.random(in: 1 ... UInt64(Int.max))
         }
-        let record = ConnectionRecord(
-            version: 1,
-            receiverURLString: Self.defaultReceiverURLString,
-            bearerToken: "",
-            generation: replacementGeneration,
-            bindingID: ""
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: replacementGeneration,
+                bindingID: ""
+            ),
+            mailboxIdentity: .unavailable(.notProvisionedByLegacyHTTPPairing),
+            activation: .unpaired,
+            transportConfigurations: []
         )
-        try persist(record)
+        try persist(record, preservingCurrentV1: false)
         userDefaults.removeObject(forKey: terminalCancellationGenerationKey)
         guard synchronizeUserDefaults() else {
             throw ReceiverSettingsRecordError.persistenceFailed
@@ -2102,21 +3354,41 @@ public final class ReceiverSettingsStore {
         try finishTerminalCancellationIntent()
     }
 
-    private func loadConnectionRecord() throws -> ConnectionRecord? {
+    private func loadStoredConnectionRecord() throws -> StoredConnectionRecord? {
         let raw = try tokenStore.loadToken()
-        guard raw.hasPrefix(Self.recordPrefix) else { return nil }
-        let encoded = String(raw.dropFirst(Self.recordPrefix.count))
-        guard let data = Data(base64Encoded: encoded),
-              let record = try? JSONDecoder().decode(ConnectionRecord.self, from: data) else {
-            throw ReceiverSettingsRecordError.invalidRecord
+        if raw.hasPrefix(Self.recordPrefixV2) {
+            let encoded = String(raw.dropFirst(Self.recordPrefixV2.count))
+            guard let data = Data(base64Encoded: encoded),
+                  data.base64EncodedString() == encoded,
+                  let record = try? JSONDecoder().decode(
+                      ReceiverConnectionRecordV2.self,
+                      from: data
+                  ) else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            try Self.validate(record)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let canonical = try? encoder.encode(record), canonical == data else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+            return .v2(record)
         }
-        try Self.validate(record)
-        return record
+        if raw.hasPrefix(Self.recordPrefixV1) {
+            let record = try decodeStrictV1(raw)
+            return .v1(record: record, raw: raw)
+        }
+        return nil
     }
 
-    private func authoritativeRecordForMutation() throws -> ConnectionRecord {
-        if let record = try loadConnectionRecord() {
-            return record
+    private func authoritativeRecordForMutation() throws -> ReceiverConnectionRecordV2 {
+        if let stored = try loadStoredConnectionRecord() {
+            switch stored {
+            case .v1(let legacy, _):
+                return projectedV2(from: legacy)
+            case .v2(let record):
+                return record
+            }
         }
         let legacyToken = try tokenStore.loadToken()
         let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
@@ -2128,32 +3400,199 @@ public final class ReceiverSettingsStore {
         guard legacyToken.isEmpty, explicitLegacyURL == nil else {
             throw ReceiverSettingsRecordError.invalidRecord
         }
-        return ConnectionRecord(
-            version: 1,
-            receiverURLString: Self.defaultReceiverURLString,
-            bearerToken: "",
-            generation: UInt64(max(0, userDefaults.integer(forKey: receiverSettingsGenerationKey))),
-            bindingID: ""
+        return ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: UInt64(
+                    max(0, userDefaults.integer(forKey: receiverSettingsGenerationKey))
+                ),
+                bindingID: ""
+            ),
+            mailboxIdentity: .unavailable(.notProvisionedByLegacyHTTPPairing),
+            activation: .unpaired,
+            transportConfigurations: []
         )
     }
 
-    private func persist(_ record: ConnectionRecord) throws {
+    private func projectedV2(from legacy: ConnectionRecordV1) -> ReceiverConnectionRecordV2 {
+        let isUnpaired = legacy.receiverURLString == Self.defaultReceiverURLString
+            && legacy.bearerToken.isEmpty
+            && legacy.bindingID.isEmpty
+        return ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: legacy.generation,
+                bindingID: legacy.bindingID
+            ),
+            mailboxIdentity: .unavailable(.notProvisionedByLegacyHTTPPairing),
+            activation: isUnpaired ? .unpaired : .paired(activeTransport: .directHTTP),
+            transportConfigurations: isUnpaired
+                ? []
+                : [
+                    .directHTTP(
+                        activation: .active,
+                        configuration: DirectHTTPConnectionConfigurationV1(
+                            receiverURLString: legacy.receiverURLString,
+                            bearerToken: legacy.bearerToken
+                        )
+                    ),
+                ]
+        )
+    }
+
+    private func restorePreCutoverV1IfExactMatch(
+        _ current: ReceiverConnectionRecordV2
+    ) throws {
+        guard legacyV1Representation(of: current) != nil else {
+            return
+        }
+        let raw = try preCutoverBackupStore.loadToken()
+        guard !raw.isEmpty else { return }
+        let legacy = try decodeStrictV1(raw)
+        guard current == projectedV2(from: legacy) else { return }
+        try tokenStore.saveToken(raw)
+        mirror(current)
+    }
+
+    private func decodeStrictV1(_ raw: String) throws -> ConnectionRecordV1 {
+        guard raw.hasPrefix(Self.recordPrefixV1) else {
+            throw ReceiverSettingsRecordError.invalidRecord
+        }
+        let encoded = String(raw.dropFirst(Self.recordPrefixV1.count))
+        guard let data = Data(base64Encoded: encoded),
+              data.base64EncodedString() == encoded else {
+            throw ReceiverSettingsRecordError.invalidRecord
+        }
+        var parser = StrictConnectionRecordV1JSONParser(data: data)
+        let record = try parser.parse()
         try Self.validate(record)
-        let data = try JSONEncoder().encode(record)
-        try tokenStore.saveToken(Self.recordPrefix + data.base64EncodedString())
+        return record
+    }
+
+    private func persist(
+        _ record: ReceiverConnectionRecordV2,
+        preservingCurrentV1: Bool = true
+    ) throws {
+        try Self.validate(record)
+        if let legacy = legacyV1Representation(of: record) {
+            try persistV1(
+                legacy,
+                projection: record,
+                inspectCurrent: preservingCurrentV1
+            )
+            return
+        }
+        try persistV2(record, preservingCurrentV1: preservingCurrentV1)
+    }
+
+    private func persistV1(
+        _ legacy: ConnectionRecordV1,
+        projection: ReceiverConnectionRecordV2,
+        inspectCurrent: Bool
+    ) throws {
+        try Self.validate(legacy)
+        let current = inspectCurrent ? try loadStoredConnectionRecord() : nil
+        let existingBackup = try preCutoverBackupStore.loadToken()
+        let currentRaw: String?
+        if let current, case .v1(_, let raw) = current {
+            currentRaw = raw
+        } else {
+            currentRaw = nil
+        }
+
+        let targetRaw: String
+        if let current,
+           case .v1(let currentLegacy, let raw) = current,
+           projectedV2(from: currentLegacy) == projection {
+            targetRaw = raw
+        } else if !existingBackup.isEmpty,
+                  let backupLegacy = try? decodeStrictV1(existingBackup),
+                  projectedV2(from: backupLegacy) == projection {
+            targetRaw = existingBackup
+        } else {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(legacy)
+            targetRaw = Self.recordPrefixV1 + data.base64EncodedString()
+        }
+
+        let primaryChanged = currentRaw != targetRaw
+        let backupIsStale = !existingBackup.isEmpty && existingBackup != targetRaw
+        if backupIsStale {
+            try preCutoverBackupStore.saveToken("")
+        }
+        if primaryChanged {
+            try tokenStore.saveToken(targetRaw)
+        }
+        guard primaryChanged || backupIsStale else { return }
+        mirror(projection)
+    }
+
+    private func persistV2(
+        _ record: ReceiverConnectionRecordV2,
+        preservingCurrentV1: Bool
+    ) throws {
+        if preservingCurrentV1,
+           case .v1(_, let raw) = try loadStoredConnectionRecord() {
+            let existingBackup = try preCutoverBackupStore.loadToken()
+            if existingBackup.isEmpty {
+                try preCutoverBackupStore.saveToken(raw)
+            } else if existingBackup != raw {
+                throw ReceiverSettingsRecordError.persistenceFailed
+            }
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(record)
+        try tokenStore.saveToken(Self.recordPrefixV2 + data.base64EncodedString())
         mirror(record)
     }
 
-    private func mirror(_ record: ConnectionRecord) {
-        if record.receiverURLString == Self.defaultReceiverURLString {
-            userDefaults.removeObject(forKey: receiverURLKey)
-        } else {
-            userDefaults.set(record.receiverURLString, forKey: receiverURLKey)
+    private func legacyV1Representation(
+        of record: ReceiverConnectionRecordV2
+    ) -> ConnectionRecordV1? {
+        guard record.mailboxIdentity
+                == .unavailable(.notProvisionedByLegacyHTTPPairing) else {
+            return nil
         }
-        userDefaults.set(Int(record.generation), forKey: receiverSettingsGenerationKey)
+        switch record.activation {
+        case .unpaired:
+            guard record.transportConfigurations.isEmpty else { return nil }
+            return ConnectionRecordV1(
+                version: 1,
+                receiverURLString: Self.defaultReceiverURLString,
+                bearerToken: "",
+                generation: record.localScope.generation,
+                bindingID: ""
+            )
+        case .paired(activeTransport: .directHTTP):
+            guard record.transportConfigurations.count == 1,
+                  case .directHTTP(.active, let direct)
+                    = record.transportConfigurations[0] else {
+                return nil
+            }
+            return ConnectionRecordV1(
+                version: 1,
+                receiverURLString: direct.receiverURLString,
+                bearerToken: direct.bearerToken,
+                generation: record.localScope.generation,
+                bindingID: record.localScope.bindingID
+            )
+        case .paired(activeTransport: .mailbox):
+            return nil
+        }
     }
 
-    private static func validate(_ record: ConnectionRecord) throws {
+    private func mirror(_ record: ReceiverConnectionRecordV2) {
+        let direct = directHTTPConfiguration(in: record)
+        if direct?.receiverURLString == nil
+            || direct?.receiverURLString == Self.defaultReceiverURLString {
+            userDefaults.removeObject(forKey: receiverURLKey)
+        } else {
+            userDefaults.set(direct?.receiverURLString, forKey: receiverURLKey)
+        }
+        userDefaults.set(Int(record.localScope.generation), forKey: receiverSettingsGenerationKey)
+    }
+
+    private static func validate(_ record: ConnectionRecordV1) throws {
         let isUnpaired = record.receiverURLString == defaultReceiverURLString
             && record.bearerToken.isEmpty
             && record.bindingID.isEmpty
@@ -2165,6 +3604,119 @@ public final class ReceiverSettingsStore {
               isUnpaired || isPaired else {
             throw ReceiverSettingsRecordError.invalidRecord
         }
+    }
+
+    private static func validate(_ record: ReceiverConnectionRecordV2) throws {
+        guard record.version == 2,
+              record.localScope.generation <= UInt64(Int.max),
+              Set(record.transportConfigurations.map(\.transport)).count
+                == record.transportConfigurations.count else {
+            throw ReceiverSettingsRecordError.invalidRecord
+        }
+        for configuration in record.transportConfigurations {
+            switch configuration {
+            case .directHTTP(_, let direct):
+                guard !direct.receiverURLString.isEmpty, !direct.bearerToken.isEmpty else {
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+            case .mailbox(_, let mailbox):
+                guard mailbox.protocolVersion == 1 else {
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+                guard case .available = record.mailboxIdentity else {
+                    throw ReceiverSettingsRecordError.invalidRecord
+                }
+            }
+        }
+        if case .available(let identity) = record.mailboxIdentity {
+            let identifiers = [
+                identity.receiverID,
+                identity.deviceID,
+                identity.devicePrincipal,
+                identity.deviceSigningKeyID,
+                identity.deviceAgreementKeyID,
+                identity.receiverSigningKeyID,
+                identity.receiverAgreementKeyID,
+                identity.receiverSigningPublicKey,
+                identity.receiverAgreementPublicKey,
+                identity.opaqueBinding,
+            ]
+            guard identity.connectionGeneration > 0,
+                  identifiers.allSatisfy({ !$0.isEmpty }),
+                  Data(hexV1: identity.receiverID)?.count == 16,
+                  Data(hexV1: identity.deviceID)?.count == 16,
+                  let receiverSigning = Data(
+                      strictBase64URL: identity.receiverSigningPublicKey,
+                      count: 32
+                  ),
+                  let receiverAgreement = Data(
+                      strictBase64URL: identity.receiverAgreementPublicKey,
+                      count: 32
+                  ),
+                  Data(strictBase64URL: identity.opaqueBinding, count: 32) != nil,
+                  mailboxKeyIdentifier(
+                      algorithm: "ed25519",
+                      publicKey: receiverSigning
+                  ) == identity.receiverSigningKeyID,
+                  mailboxKeyIdentifier(
+                      algorithm: "x25519",
+                      publicKey: receiverAgreement
+                  ) == identity.receiverAgreementKeyID else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+        }
+        switch record.activation {
+        case .unpaired:
+            guard record.localScope.bindingID.isEmpty,
+                  record.transportConfigurations.isEmpty else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+        case .paired(let activeTransport):
+            guard !record.localScope.bindingID.isEmpty,
+                  record.transportConfigurations.filter({ $0.activation == .active }).count == 1,
+                  record.transportConfigurations.contains(where: {
+                      $0.transport == activeTransport && $0.activation == .active
+                  }) else {
+                throw ReceiverSettingsRecordError.invalidRecord
+            }
+        }
+    }
+
+    private func localScope(in stored: StoredConnectionRecord) -> ReceiverLocalConnectionScopeV1 {
+        switch stored {
+        case .v1(let record, _):
+            ReceiverLocalConnectionScopeV1(
+                generation: record.generation,
+                bindingID: record.bindingID
+            )
+        case .v2(let record): record.localScope
+        }
+    }
+
+    private func directHTTPConfiguration(
+        in stored: StoredConnectionRecord
+    ) -> DirectHTTPConnectionConfigurationV1? {
+        switch stored {
+        case .v1(let record, _):
+            guard !record.bearerToken.isEmpty else { return nil }
+            return DirectHTTPConnectionConfigurationV1(
+                receiverURLString: record.receiverURLString,
+                bearerToken: record.bearerToken
+            )
+        case .v2(let record):
+            return directHTTPConfiguration(in: record)
+        }
+    }
+
+    private func directHTTPConfiguration(
+        in record: ReceiverConnectionRecordV2
+    ) -> DirectHTTPConnectionConfigurationV1? {
+        for configuration in record.transportConfigurations {
+            if case .directHTTP(_, let direct) = configuration {
+                return direct
+            }
+        }
+        return nil
     }
 
     private static func nextGeneration(after generation: UInt64) throws -> UInt64 {
@@ -2180,3 +3732,4 @@ public final class ReceiverSettingsStore {
         }
     }
 }
+#endif
