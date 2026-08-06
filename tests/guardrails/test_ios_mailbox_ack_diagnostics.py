@@ -31,6 +31,37 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
     )
 
 
+def test_background_mailbox_failure_checks_generation_before_publication() -> None:
+    source = VIEW_MODEL.read_text(encoding="utf-8")
+    helper_start = source.index(
+        "private func schedulePendingBackgroundOutboxUploadsNow("
+    )
+    helper_end = source.index("#endif", helper_start)
+    helper = source[helper_start:helper_end]
+    mailbox_start = helper.index("if settingsStore.activeTransport == .mailbox")
+    mailbox_end = helper.index("let committedReceiverURLString", mailbox_start)
+    mailbox = helper[mailbox_start:mailbox_end]
+
+    success_publication = mailbox.index(
+        "mailboxDeliveryDiagnosticLine = summary.ackDiagnosticLine"
+    )
+    failure_catch = mailbox.index("} catch {", success_publication)
+    failure_generation_check = mailbox.index(
+        "try requireCurrentConnectionGeneration(expectedGeneration)", failure_catch
+    )
+    failure_publication = mailbox.index(
+        "MailboxDeliveryDiagnosticLine.failure(for: error)",
+        failure_catch,
+    )
+    failure_status_publication = mailbox.index(
+        'backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed:',
+        failure_catch,
+    )
+
+    assert failure_catch < failure_generation_check < failure_publication
+    assert failure_generation_check < failure_status_publication
+
+
 def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     assignments = [

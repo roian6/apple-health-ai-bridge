@@ -2786,6 +2786,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                do {
+                    try requireCurrentConnectionGeneration(expectedGeneration)
+                } catch {
+                    return
+                }
                 let description = describe(error)
                 mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
                 backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed: \(description)"
