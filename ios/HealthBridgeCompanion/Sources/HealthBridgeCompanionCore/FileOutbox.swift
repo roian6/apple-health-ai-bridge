@@ -413,6 +413,7 @@ public struct FileOutboxFlushSummary: Equatable, Sendable {
     public let uploadedCount: Int
     public let failedItemIDs: [String]
     public let failedDescriptions: [String]
+    public let mailboxDeliveryDiagnosticLine: String
 
     public var failedCount: Int { failedItemIDs.count }
 
@@ -420,12 +421,14 @@ public struct FileOutboxFlushSummary: Equatable, Sendable {
         attemptedCount: Int,
         uploadedCount: Int,
         failedItemIDs: [String],
-        failedDescriptions: [String] = []
+        failedDescriptions: [String] = [],
+        mailboxDeliveryDiagnosticLine: String = ""
     ) {
         self.attemptedCount = attemptedCount
         self.uploadedCount = uploadedCount
         self.failedItemIDs = failedItemIDs
         self.failedDescriptions = failedDescriptions
+        self.mailboxDeliveryDiagnosticLine = mailboxDeliveryDiagnosticLine
     }
 }
 

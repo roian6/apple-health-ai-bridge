@@ -43,6 +43,15 @@ private enum CompanionPrivateStorageError: LocalizedError {
     }
 }
 
+private enum MailboxDeliveryDiagnosticLine {
+    static func failure(for error: Error) -> String {
+        if let phaseError = error as? ProductionMailboxDeliveryPhaseError {
+            return "Mailbox ACK diagnostics failed: phase=\(phaseError.diagnosticCode)."
+        }
+        return "Mailbox ACK diagnostics failed: error=mailbox_delivery_failed."
+    }
+}
+
 private struct ReceiverSyncProgressScope {
     let receiverBindingID: String
     let connectionGeneration: String
@@ -2778,11 +2787,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 return
             } catch {
                 let description = describe(error)
-                if let phaseError = error as? ProductionMailboxDeliveryPhaseError {
-                    mailboxDeliveryDiagnosticLine = "Mailbox ACK diagnostics failed: phase=\(phaseError.diagnosticCode)."
-                } else {
-                    mailboxDeliveryDiagnosticLine = "Mailbox ACK diagnostics failed: error=mailbox_delivery_failed."
-                }
+                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
                 backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed: \(description)"
             }
             return
@@ -5098,18 +5103,29 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     ) async throws -> FileOutboxFlushSummary {
         try requireCurrentConnectionGeneration(expectedGeneration)
         if settingsStore.activeTransport == .mailbox {
-            let summary = try await makeProductionMailboxDelivery().deliverPending()
-            try requireCurrentConnectionGeneration(expectedGeneration)
-            return FileOutboxFlushSummary(
-                attemptedCount: summary.attemptedCount,
-                uploadedCount: summary.finalizedCount,
-                failedItemIDs: summary.terminalCount > 0
-                    ? ["mailbox_terminal_hold"]
-                    : [],
-                failedDescriptions: summary.terminalCount > 0
-                    ? ["Receiver rejected a secure mailbox item. Review the connection before retrying."]
-                    : []
-            )
+            do {
+                let summary = try await makeProductionMailboxDelivery().deliverPending()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                let flushSummary = FileOutboxFlushSummary(
+                    attemptedCount: summary.attemptedCount,
+                    uploadedCount: summary.finalizedCount,
+                    failedItemIDs: summary.terminalCount > 0
+                        ? ["mailbox_terminal_hold"]
+                        : [],
+                    failedDescriptions: summary.terminalCount > 0
+                        ? ["Receiver rejected a secure mailbox item. Review the connection before retrying."]
+                        : [],
+                    mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine
+                )
+                mailboxDeliveryDiagnosticLine = flushSummary.mailboxDeliveryDiagnosticLine
+                return flushSummary
+            } catch let cancellation as CancellationError {
+                throw cancellation
+            } catch {
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                throw error
+            }
         }
         guard let receiverIdentity = settingsStore.receiverBindingID else {
             throw CancellationError()
