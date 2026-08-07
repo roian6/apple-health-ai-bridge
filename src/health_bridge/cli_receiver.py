@@ -13,6 +13,14 @@ from urllib.request import Request, urlopen
 import typer
 from pydantic import TypeAdapter
 
+from health_bridge.cli_receiver_start import (
+    DEFAULT_RECEIVER_HOST,
+    DEFAULT_RECEIVER_PORT,
+    ReceiverStartDependencies,
+    ReceiverStartOptions,
+    run_receiver_start,
+)
+from health_bridge.launchd import load_runnable_launch_agent_request
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.private_files import (
     ensure_private_directory,
@@ -870,19 +878,19 @@ def revoke_token(
 
 
 @receiver_app.command("start")
-def start(
+def start(  # noqa: PLR0913 -- Typer exposes six independent receiver options.
     db: Annotated[
-        Path,
+        Path | None,
         typer.Option("--db", help="User-owned SQLite database path."),
-    ],
+    ] = None,
     host: Annotated[
         str,
         typer.Option("--host", help="Bind host. Keep 127.0.0.1 for local-only."),
-    ] = "127.0.0.1",
+    ] = DEFAULT_RECEIVER_HOST,
     port: Annotated[
         int,
         typer.Option("--port", help="Bind port."),
-    ] = 8765,
+    ] = DEFAULT_RECEIVER_PORT,
     mailbox_root: Annotated[
         Path | None,
         typer.Option(
@@ -897,37 +905,31 @@ def start(
             help="Expected iCloud container identifier for the mailbox root.",
         ),
     ] = None,
+    service_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--service-config",
+            help="Owner-only mailbox LaunchAgent receiver configuration.",
+        ),
+    ] = None,
 ) -> None:
-    selected_transport = _select_transport_or_exit(
-        "icloud-mailbox" if mailbox_root is not None else "direct",
-        mailbox_root=mailbox_root,
-        icloud_container_identifier=icloud_container_identifier,
-    )
-    mailbox_key_store = (
-        MailboxKeyStore.production()
-        if selected_transport is ReceiverTransport.MAILBOX
-        else None
-    )
-    mailbox_connection_store = (
-        MailboxConnectionStore.production()
-        if selected_transport is ReceiverTransport.MAILBOX
-        else None
-    )
-    typer.echo(
-        f"health-bridge receiver listening on http://{host}:{port}",
-        err=True,
-    )
-    try:
-        serve_receiver(
-            db_path=db,
+    run_receiver_start(
+        ReceiverStartOptions(
+            db=db,
             host=host,
             port=port,
-            mailbox_key_store=mailbox_key_store,
-            mailbox_connection_store=mailbox_connection_store,
             mailbox_root=mailbox_root,
-        )
-    except KeyboardInterrupt:
-        raise typer.Exit(code=0) from None
+            icloud_container_identifier=icloud_container_identifier,
+            service_config=service_config,
+        ),
+        ReceiverStartDependencies(
+            load_service_config=load_runnable_launch_agent_request,
+            select_transport=_select_transport_or_exit,
+            create_key_store=MailboxKeyStore.production,
+            create_connection_store=MailboxConnectionStore.production,
+            serve=serve_receiver,
+        ),
+    )
 
 
 @receiver_app.command("smoke")

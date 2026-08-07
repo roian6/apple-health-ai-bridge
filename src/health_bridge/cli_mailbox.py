@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 import typer
 from pydantic import BaseModel, ConfigDict
 
+from health_bridge.cli_launchd import service_app
 from health_bridge.mailbox.connections import (
     MailboxConnectionError,
     MailboxConnectionStore,
@@ -43,6 +44,7 @@ keys_app = typer.Typer(
     help="Inspect the local receiver mailbox identity.",
 )
 mailbox_app.add_typer(keys_app, name="keys")
+mailbox_app.add_typer(service_app, name="service")
 
 
 class MailboxKeysDoctorResult(BaseModel):
