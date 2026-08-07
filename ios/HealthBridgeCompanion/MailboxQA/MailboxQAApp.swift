@@ -43,6 +43,24 @@ struct HealthBridgeCompanionMailboxQAApp: App {
                     )
                 }
             }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication.protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                Task {
+                    await invocation.observeProtectedData(available: false)
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication.protectedDataDidBecomeAvailableNotification
+                )
+            ) { _ in
+                Task {
+                    await invocation.observeProtectedData(available: true)
+                }
+            }
         }
     }
 }

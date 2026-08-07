@@ -298,3 +298,18 @@ def test_qa_cloud_probe_never_blocks_the_main_actor() -> None:
     assert "private func refreshCloudProbe() async" in source
     detached = source[source.index("Task.detached(priority: .utility)") :]
     assert "forUbiquityContainerIdentifier" in detached
+
+
+def test_qa_app_observes_real_protected_data_lock_and_unlock_events() -> None:
+    source = (QA_ROOT / "MailboxQAApp.swift").read_text(encoding="utf-8")
+    invocation = (QA_ROOT / "MailboxQAInvocation.swift").read_text(encoding="utf-8")
+
+    assert "UIApplication.protectedDataWillBecomeUnavailableNotification" in source
+    assert "UIApplication.protectedDataDidBecomeAvailableNotification" in source
+    assert "observeProtectedData(available: false)" in source
+    assert "observeProtectedData(available: true)" in source
+    assert "func observeProtectedData(available: Bool) async" in invocation
+    assert (
+        "try harness(configuration: configuration).observeProtectedData(" in invocation
+    )
+    assert "available: available" in invocation

@@ -120,6 +120,15 @@ public final class MailboxQAHarness {
         let item = try ensureSyntheticItem()
         let coordinator = try coordinator(fault: fault)
         if fault != nil {
+            for _ in 0..<2 {
+                let phase = try coordinator.state(itemID: item.id)?.phase
+                if phase == .encrypted { break }
+                guard phase == nil || phase == .collected else {
+                    throw MailboxQAHarnessError.invalidState
+                }
+                let primed = try coordinator.advance(itemID: item.id)
+                try observe(primed.phase)
+            }
             guard try coordinator.state(itemID: item.id)?.phase == .encrypted else {
                 throw MailboxQAHarnessError.invalidState
             }

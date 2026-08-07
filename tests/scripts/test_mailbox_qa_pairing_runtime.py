@@ -6,7 +6,7 @@ import os
 import threading
 import uuid
 from http.client import HTTPConnection
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 from urllib.parse import parse_qs, urlparse
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -80,6 +80,38 @@ class CompletionDocument(BaseModel):
     receiver_agreement_public_key: str
     receiver_signing_key_id: str
     receiver_agreement_key_id: str
+
+
+def test_qa_receiver_health_endpoint_responds_without_mailbox_worker(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "qa-runtime"
+    runtime.mkdir(mode=0o700)
+    server = QAReceiverHTTPServer(
+        "127.0.0.1",
+        0,
+        QAReceiverRuntime(
+            db_path=runtime / "receiver.sqlite",
+            runtime_root=runtime,
+            mailbox_root=runtime / "mailbox-qa",
+            namespace="qa-health",
+        ),
+    )
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+    try:
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        payload = cast("dict[str, object]", json.loads(response.read()))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["status"] == "ok"
 
 
 def test_qa_http_pairing_redeems_one_secret_without_creating_mailbox(  # noqa: PLR0915

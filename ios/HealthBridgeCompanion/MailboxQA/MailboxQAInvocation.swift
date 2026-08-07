@@ -144,6 +144,17 @@ final class MailboxQAInvocation {
         }
     }
 
+    func observeProtectedData(available: Bool) async {
+        do {
+            let configuration = try MailboxQAConfiguration.load()
+            try harness(configuration: configuration).observeProtectedData(
+                available: available
+            )
+        } catch {
+            return
+        }
+    }
+
     private func harness(
         configuration: MailboxQAConfiguration
     ) throws -> MailboxQAHarness {

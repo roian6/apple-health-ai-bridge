@@ -58,6 +58,35 @@ final class MailboxQAHarnessTests: XCTestCase {
         )
     }
 
+    func testFreshHarnessPrimesEncryptedStateBeforePublisherFault() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true
+        )
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let provider = root.appendingPathComponent("provider", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: provider,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try QAPairingFixture()
+        let harness = try MailboxQAHarness(
+            applicationSupportRoot: support,
+            providerRoot: provider,
+            containerIdentifier: "iCloud.dev.example.healthbridge.mailboxqa",
+            pairing: fixture.record,
+            envelopeID: { fixture.envelopeID },
+            observeEnvelope: { _, _ in true }
+        )
+
+        let faulted = try harness.advance(fault: .publisherENOSPC)
+
+        XCTAssertEqual(faulted.lastPhase, .retryableFailure)
+        XCTAssertEqual(faulted.faultInjectionCount, 1)
+        XCTAssertNotNil(faulted.envelopeSHA256)
+    }
+
     func testDurableHarnessReusesEnvelopeAndFinalizesAuthenticatedAckOnce() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString,

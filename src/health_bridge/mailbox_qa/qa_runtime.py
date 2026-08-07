@@ -40,6 +40,8 @@ from health_bridge.storage.database import initialize_database
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
+
 
 @dataclass(frozen=True)
 class QAReceiverRuntime:
@@ -54,6 +56,9 @@ class QAReceiverHTTPServer(ReceiverHTTPServer):
     runtime_root: Path
     mailbox_root: Path
     namespace: str
+    mailbox_key_store: MailboxKeyStore | None
+    mailbox_connection_store: MailboxConnectionStore | None
+    mailbox_worker: MailboxRuntimeWorker | None
     pairing_redeem_limiter: PairingRedeemRateLimiter
 
     def __init__(
@@ -66,6 +71,9 @@ class QAReceiverHTTPServer(ReceiverHTTPServer):
         self.runtime_root = runtime.runtime_root
         self.mailbox_root = runtime.mailbox_root
         self.namespace = runtime.namespace
+        self.mailbox_key_store = None
+        self.mailbox_connection_store = None
+        self.mailbox_worker = None
         self.pairing_redeem_limiter = PairingRedeemRateLimiter()
         ThreadingHTTPServer.__init__(self, (host, port), QAReceiverRequestHandler)
 
