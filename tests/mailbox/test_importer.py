@@ -137,6 +137,10 @@ def test_cleanup_revalidates_namespace_at_each_unlink_boundary(
     assert stale.name in {path.name for path in detached_deliveries.iterdir()}
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="exercises the Linux renameat2 partial-finalize path",
+)
 def test_linux_partial_finalize_recovers_idempotent_ack_after_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -157,7 +161,6 @@ def test_linux_partial_finalize_recovers_idempotent_ack_after_restart(
             raise OSError(errno.EIO, "synthetic unlink failure")
         real_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(os, "unlink", fail_first_two_temp_unlinks)
     first = import_once(value)
 

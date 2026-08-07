@@ -4,8 +4,9 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from subprocess import run
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
 import pytest
 from typer.testing import CliRunner
@@ -24,9 +25,6 @@ from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
 from tests.launchd.support import service_request
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 ANSI_SGR_PATTERN: Final = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -117,9 +115,13 @@ def test_validate_is_linux_safe_and_does_not_install(tmp_path: Path) -> None:
     assert not (home / "Library/Application Support/HealthBridge/launchd").exists()
 
 
-def test_install_fails_closed_on_linux_without_side_effects(tmp_path: Path) -> None:
+def test_install_fails_closed_on_linux_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     args, home, database = _service_args(tmp_path)
     before = sorted(str(path.relative_to(home)) for path in home.rglob("*"))
+    monkeypatch.setattr(sys, "platform", "linux")
 
     result = CliRunner().invoke(
         app,
@@ -134,7 +136,10 @@ def test_install_fails_closed_on_linux_without_side_effects(tmp_path: Path) -> N
     assert database.is_file()
 
 
-def test_lifecycle_actions_fail_closed_on_linux_with_fixed_error() -> None:
+def test_lifecycle_actions_fail_closed_on_linux_with_fixed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
     runner = CliRunner()
     for command in ("status", "restart", "uninstall"):
         result = runner.invoke(app, ["mailbox", "service", command])
@@ -229,7 +234,10 @@ def test_status_json_emits_fixed_launchctl_error_code(
     assert str(request.home) not in result.output
 
 
-def test_lifecycle_json_emits_fixed_unsupported_host_code() -> None:
+def test_lifecycle_json_emits_fixed_unsupported_host_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
     result = CliRunner().invoke(
         app,
         ["mailbox", "service", "status", "--json"],
@@ -369,9 +377,7 @@ def test_direct_setup_does_not_create_launch_agent_state(tmp_path: Path) -> None
 
     result = run(
         [
-            "uv",
-            "run",
-            "health-bridge",
+            str(Path(sys.executable).with_name("health-bridge")),
             "setup",
             "--receiver-url",
             "https://receiver.healthbridge.internal/v1/batches",

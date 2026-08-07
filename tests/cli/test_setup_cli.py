@@ -202,6 +202,10 @@ def test_setup_default_detects_but_never_configures_clients(tmp_path: Path) -> N
     assert not re.search(r"hbi_[A-Za-z0-9_-]{20,}", completed.stdout)
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="exercises the unsupported Linux mailbox-host path",
+)
 def test_setup_rejects_explicit_mailbox_transport_on_linux_before_side_effects(
     tmp_path: Path,
 ) -> None:

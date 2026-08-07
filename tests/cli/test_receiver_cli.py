@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from pathlib import Path
 from subprocess import run
 from typing import Final, Literal, TypeAlias
@@ -1059,6 +1060,10 @@ def test_receiver_create_pairing_cli_defaults_to_v2_invitation_json(
     assert persisted_transport == ("direct",)
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="exercises the unsupported Linux mailbox-host path",
+)
 def test_receiver_create_pairing_cli_requires_explicit_supported_mailbox_topology(
     tmp_path: Path,
 ) -> None:

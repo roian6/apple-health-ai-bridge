@@ -4,6 +4,7 @@ import plistlib
 import stat
 from typing import TYPE_CHECKING, cast
 
+from health_bridge.cli_launchd import LAUNCHCTL_TIMEOUT_SECONDS
 from health_bridge.launchd import (
     render_launch_agent_plist,
     write_launch_agent_artifacts,
@@ -36,6 +37,19 @@ def test_rendered_launch_agent_uses_private_config_and_shell_free_argv(
     assert document["ThrottleInterval"] == 30
     assert document["ExitTimeOut"] == 10
     assert document["Umask"] == 0o077
+
+
+def test_launchctl_timeout_exceeds_child_exit_timeout(tmp_path: Path) -> None:
+    request = service_request(tmp_path)
+    document = cast(
+        "dict[str, object]",
+        plistlib.loads(render_launch_agent_plist(request)),
+    )
+
+    restart_delay = cast("int", document["ThrottleInterval"]) + cast(
+        "int", document["ExitTimeOut"]
+    )
+    assert restart_delay < LAUNCHCTL_TIMEOUT_SECONDS
 
 
 def test_rendered_launch_agent_contains_no_private_receiver_configuration(

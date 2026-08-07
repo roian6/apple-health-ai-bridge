@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import cast
@@ -201,6 +202,10 @@ def test_low_order_x25519_peer_maps_to_closed_typed_error(tmp_path: Path) -> Non
     assert captured.value.code is MailboxKeyStoreErrorCode.MALFORMED_STATE
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="exercises Linux filesystem classification",
+)
 def test_unknown_linux_filesystem_is_not_classified_as_local(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

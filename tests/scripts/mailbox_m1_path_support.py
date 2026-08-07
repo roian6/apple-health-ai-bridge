@@ -132,8 +132,6 @@ def run_fifo_swap(
     writer_mode = "writer" if with_writer else "no-writer"
     return subprocess.run(
         [
-            "timeout",
-            "3s",
             sys.executable,
             "-c",
             FIFO_SWAP_PROGRAM,
@@ -146,7 +144,7 @@ def run_fifo_swap(
         check=False,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=3,
     )
 
 

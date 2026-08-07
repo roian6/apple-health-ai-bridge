@@ -75,6 +75,8 @@ def test_directory_chain_closes_fds_and_leaves_only_empty_created_directories(
         fail_leaf,
     )
     process_fds = Path("/proc/self/fd")
+    if not process_fds.is_dir():
+        process_fds = Path("/dev/fd")
     before = len(tuple(process_fds.iterdir()))
 
     # When the same failing chain is opened repeatedly.

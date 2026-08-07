@@ -112,7 +112,7 @@ def test_darwin_rename_failure_restarts_after_commit_without_duplicate(
     value = environment(tmp_path)
     delivery = write_delivery(value)
 
-    def fail_finalize(*_args: object) -> None:
+    def fail_finalize(*_args: object, **_kwargs: object) -> None:
         raise OSError(errno.ENOSPC, "synthetic final rename failure")
 
     with monkeypatch.context() as patcher:

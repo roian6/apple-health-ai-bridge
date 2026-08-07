@@ -33,7 +33,9 @@ from health_bridge.launchd.models import LaunchdServiceErrorCode, service_paths
 from health_bridge.launchd.private_artifacts import path_entry_exists
 
 LAUNCHCTL_PATH: Final = Path("/bin/launchctl")
-LAUNCHCTL_TIMEOUT_SECONDS: Final = 10.0
+# `kickstart -k` may wait for both launchd throttling and child ExitTimeOut.
+# Keep a bounded margin beyond that manifest-level restart budget.
+LAUNCHCTL_TIMEOUT_SECONDS: Final = 45.0
 HEALTH_TIMEOUT_SECONDS: Final = 2.0
 _DRIFT_ERROR_CODES: Final = frozenset(
     {
