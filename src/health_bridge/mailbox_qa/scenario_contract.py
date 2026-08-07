@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Final, Literal, TypeAlias
 
 SYNTHETIC_PAYLOAD_SHA256: Final = (
-    "d36079986f255c222518b6800b8105444a8f426e83025420051ad52d3677b93a"
+    "766959e9b22c188f99ea887bd033ee01d755999c5bde6fc2e9e24d2237876efd"
 )
 DEVICE_SIGNATURE_DOMAIN: Final = b"health-bridge/mailbox/m3/v1/device-report/signature"
 RECEIPT_SIGNATURE_DOMAIN: Final = (

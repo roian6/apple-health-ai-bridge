@@ -1,6 +1,8 @@
+import hashlib
 import re
 from pathlib import Path
 
+from health_bridge.mailbox_qa.scenario_contract import SYNTHETIC_PAYLOAD_SHA256
 from health_bridge.receiver.batch_acceptance import (
     BatchAcceptanceCore,
     BatchAcceptanceInput,
@@ -313,3 +315,18 @@ def test_qa_app_observes_real_protected_data_lock_and_unlock_events() -> None:
         "try harness(configuration: configuration).observeProtectedData(" in invocation
     )
     assert "available: available" in invocation
+
+
+def test_m3_contract_hash_matches_the_exact_swift_qa_payload() -> None:
+    source = (
+        IOS_ROOT / "Sources/HealthBridgeCompanionCore/MailboxQASyntheticPayload.swift"
+    ).read_text(encoding="utf-8")
+    match = re.search(r'"""\n(?P<body>.*?)\n\s*"""\.utf8', source, re.DOTALL)
+    assert match is not None
+    lines = match.group("body").splitlines()
+    indentation = min(
+        len(line) - len(line.lstrip(" ")) for line in lines if line.strip()
+    )
+    payload = "\n".join(line[indentation:] for line in lines).encode()
+
+    assert hashlib.sha256(payload).hexdigest() == SYNTHETIC_PAYLOAD_SHA256
