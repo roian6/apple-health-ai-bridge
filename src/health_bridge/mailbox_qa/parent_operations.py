@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from health_bridge.contract._hbjcs1 import JsonValue, hbjcs1_encode
 from health_bridge.mailbox_qa.archive_provenance import load_archive_provenance
+from health_bridge.mailbox_qa.m3_signatures import short_fingerprint
 from health_bridge.mailbox_qa.parent_operation_files import (
     ParentOperationFileError,
     is_sha256,
@@ -32,6 +33,13 @@ if TYPE_CHECKING:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 MAXIMUM_DELAY_SECONDS = 60
+QA_ARCHIVE_PROFILES: Final = (
+    (".mailboxqa", "HealthBridgeCompanionMailboxQA"),
+    (
+        ".publicdocuments.mailboxqa",
+        "HealthBridgeCompanionPublicDocumentsQA",
+    ),
+)
 
 
 ParentOperationError = ParentOperationFileError
@@ -116,7 +124,20 @@ def issue_parent_artifact_receipts(  # noqa: PLR0913
     )
     production_snapshot_before = production_snapshot(before, seal)
     production_snapshot_after = production_snapshot(after, seal)
-    expected_qa_bundle = f"{seal.bundle_identifier}.mailboxqa"
+    qa_bundles_before = tuple(
+        value
+        for value in before
+        if value.startswith(f"{seal.bundle_identifier}.")
+        and value.endswith(".mailboxqa")
+        and not value.startswith("iCloud.")
+    )
+    qa_bundles_after = tuple(
+        value
+        for value in after
+        if value.startswith(f"{seal.bundle_identifier}.")
+        and value.endswith(".mailboxqa")
+        and not value.startswith("iCloud.")
+    )
     install_valid = (
         install_inspection.get("kind")
         == "health_bridge.mailbox_qa_install_inspection.v1"
@@ -128,6 +149,7 @@ def issue_parent_artifact_receipts(  # noqa: PLR0913
         == provenance.codesign_identity_sha256
         and is_sha256(install_inspection.get("entitlements_sha256"))
     )
+    expected_qa_profile = _expected_qa_profile(seal, context)
     observations: tuple[tuple[str, Mapping[str, bool]], ...] = (
         (
             "signed_qa_app_provenance",
@@ -138,8 +160,9 @@ def issue_parent_artifact_receipts(  # noqa: PLR0913
                 ),
                 "qa_entitlements_bound": (
                     install_valid
-                    and provenance.scheme == "HealthBridgeCompanionMailboxQA"
-                    and provenance.target == "HealthBridgeCompanionMailboxQA"
+                    and expected_qa_profile is not None
+                    and provenance.scheme == expected_qa_profile[1]
+                    and provenance.target == expected_qa_profile[1]
                 ),
             },
         ),
@@ -155,8 +178,9 @@ def issue_parent_artifact_receipts(  # noqa: PLR0913
             {
                 "qa_app_removed": (
                     qa_removed
-                    and expected_qa_bundle in before
-                    and expected_qa_bundle not in after
+                    and expected_qa_profile is not None
+                    and qa_bundles_before == (expected_qa_profile[0],)
+                    and not qa_bundles_after
                 ),
                 "qa_container_artifacts_removed": qa_removed,
             },
@@ -190,6 +214,24 @@ def issue_parent_artifact_receipts(  # noqa: PLR0913
     if len(receipts) != len(observations):
         raise ParentOperationError
     return receipts
+
+
+def _expected_qa_profile(
+    seal: ProductionIdentitySealV1,
+    context: ScenarioReceiptContextV1,
+) -> tuple[str, str] | None:
+    for bundle_suffix, archive_target in QA_ARCHIVE_PROFILES:
+        bundle = f"{seal.bundle_identifier}{bundle_suffix}"
+        container = f"iCloud.{bundle}"
+        if context.qa_bundle_fingerprint == short_fingerprint(
+            b"health-bridge/mailbox/m3/v1/qa-bundle",
+            bundle,
+        ) and context.qa_container_fingerprint == short_fingerprint(
+            b"health-bridge/mailbox/m3/v1/qa-container",
+            container,
+        ):
+            return bundle, archive_target
+    return None
 
 
 def _issue(  # noqa: PLR0913

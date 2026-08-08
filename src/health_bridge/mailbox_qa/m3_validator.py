@@ -168,10 +168,13 @@ def _validate_anchor(
     expected_commit: str,
     current_ms: int,
 ) -> None:
+    approved_qa_bundles = {
+        f"{production_seal.bundle_identifier}.mailboxqa",
+        f"{production_seal.bundle_identifier}.publicdocuments.mailboxqa",
+    }
     identifiers_are_qa = (
-        anchor.qa_bundle_identifier == f"{production_seal.bundle_identifier}.mailboxqa"
-        and anchor.qa_container_identifier
-        == f"iCloud.{production_seal.bundle_identifier}.mailboxqa"
+        anchor.qa_bundle_identifier in approved_qa_bundles
+        and anchor.qa_container_identifier == f"iCloud.{anchor.qa_bundle_identifier}"
         and anchor.qa_bundle_identifier != production_seal.bundle_identifier
         and anchor.qa_container_identifier not in production_seal.icloud_containers
     )

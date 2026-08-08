@@ -21,6 +21,7 @@ from health_bridge.mailbox_m2_validator import (
 )
 from health_bridge.mailbox_qa.archive_provenance import (
     QAArchiveProvenanceV1,
+    QALaneName,
     write_archive_provenance,
 )
 from health_bridge.mailbox_qa.device_operations import issue_device_observed_receipts
@@ -122,6 +123,9 @@ def _owner_issued_receipts(  # noqa: PLR0913
     receiver_key: Ed25519PrivateKey,
     parent_key: Ed25519PrivateKey,
     now_ms: int,
+    archive_target: QALaneName | None,
+    inventory_before_qa_bundles: tuple[str, ...] | None,
+    inventory_after_qa_bundle: str | None,
 ) -> tuple[dict[str, JsonValue], ...]:
     context = ScenarioReceiptContextV1(
         v=1,
@@ -242,8 +246,26 @@ def _owner_issued_receipts(  # noqa: PLR0913
             production_seal_fingerprint=seal_fingerprint,
             executable_sha256="33" * 32,
             codesign_identity_sha256="44" * 32,
-            scheme="HealthBridgeCompanionMailboxQA",
-            target="HealthBridgeCompanionMailboxQA",
+            scheme=(
+                archive_target
+                if archive_target is not None
+                else (
+                    "HealthBridgeCompanionPublicDocumentsQA"
+                    if f"{seal.bundle_identifier}.publicdocuments.mailboxqa"
+                    == QA_BUNDLE
+                    else "HealthBridgeCompanionMailboxQA"
+                )
+            ),
+            target=(
+                archive_target
+                if archive_target is not None
+                else (
+                    "HealthBridgeCompanionPublicDocumentsQA"
+                    if f"{seal.bundle_identifier}.publicdocuments.mailboxqa"
+                    == QA_BUNDLE
+                    else "HealthBridgeCompanionMailboxQA"
+                )
+            ),
         ),
     )
     artifact_documents: dict[str, dict[str, JsonValue]] = {
@@ -273,11 +295,23 @@ def _owner_issued_receipts(  # noqa: PLR0913
             "apps": [
                 seal.bundle_identifier,
                 seal.installed_app_path,
-                QA_BUNDLE,
+                *(
+                    inventory_before_qa_bundles
+                    if inventory_before_qa_bundles is not None
+                    else (QA_BUNDLE,)
+                ),
             ]
         },
         "inventory-after.hbjcs1": {
-            "apps": [seal.bundle_identifier, seal.installed_app_path]
+            "apps": [
+                seal.bundle_identifier,
+                seal.installed_app_path,
+                *(
+                    [inventory_after_qa_bundle]
+                    if inventory_after_qa_bundle is not None
+                    else []
+                ),
+            ]
         },
     }
     artifact_paths: dict[str, Path] = {}
@@ -304,7 +338,14 @@ def _owner_issued_receipts(  # noqa: PLR0913
     return tuple(receipts)
 
 
-def build_m3_fixture(root: Path, *, prerequisites_available: bool = True) -> M3Fixture:
+def build_m3_fixture(
+    root: Path,
+    *,
+    prerequisites_available: bool = True,
+    archive_target: QALaneName | None = None,
+    inventory_before_qa_bundles: tuple[str, ...] | None = None,
+    inventory_after_qa_bundle: str | None = None,
+) -> M3Fixture:
     root.mkdir(mode=0o700)
     receipts_dir = root / "receipts"
     receipts_dir.mkdir(mode=0o700)
@@ -428,6 +469,9 @@ def build_m3_fixture(root: Path, *, prerequisites_available: bool = True) -> M3F
         receiver_key,
         parent_key,
         now_ms,
+        archive_target,
+        inventory_before_qa_bundles,
+        inventory_after_qa_bundle,
     )
     for receipt in issued_receipts:
         scenario = receipt["scenario"]

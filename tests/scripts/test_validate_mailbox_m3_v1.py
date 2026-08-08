@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from health_bridge.mailbox_qa.m3_signatures import short_fingerprint
+from health_bridge.mailbox_qa.parent_operations import ParentOperationError
+from tests.scripts import mailbox_m3_v1_support as m3_support
 from tests.scripts.mailbox_m3_v1_support import (
     FULL_IDENTIFIER,
     build_m3_fixture,
@@ -114,6 +117,153 @@ def test_m3_v1_accepts_one_report_and_independent_signed_receipts(
     # Then: M3 passes once and the validator-local anchor is consumed.
     assert (result.returncode, result.stdout, result.stderr) == (0, "PASS M3\n", "")
     assert read(fixture.anchor)["consumed"] is True
+
+
+def test_m3_v1_accepts_nested_isolated_qa_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: the product's explicit Public Documents QA identity is nested below
+    # the production bundle namespace rather than directly appending .mailboxqa.
+    monkeypatch.setattr(
+        m3_support,
+        "QA_BUNDLE",
+        "dev.example.healthbridge.publicdocuments.mailboxqa",
+    )
+    monkeypatch.setattr(
+        m3_support,
+        "QA_CONTAINER",
+        "iCloud.dev.example.healthbridge.publicdocuments.mailboxqa",
+    )
+    fixture = build_m3_fixture(tmp_path / "attempt")
+
+    # When: the strict validator evaluates the fully signed nested QA evidence.
+    result = run(fixture)
+
+    # Then: isolation is proven by the explicitly approved Public Documents profile.
+    assert (result.returncode, result.stdout, result.stderr) == (0, "PASS M3\n", "")
+
+
+def test_m3_v1_rejects_unapproved_nested_qa_namespace(
+    tmp_path: Path,
+) -> None:
+    # Given: otherwise valid signed evidence names an arbitrary nested mailbox QA
+    # identity that the product isolation contract does not approve.
+    fixture = build_m3_fixture(tmp_path / "attempt")
+    bundle = "dev.example.healthbridge.unapproved.mailboxqa"
+    container = f"iCloud.{bundle}"
+    bundle_fingerprint = short_fingerprint(
+        b"health-bridge/mailbox/m3/v1/qa-bundle", bundle
+    )
+    container_fingerprint = short_fingerprint(
+        b"health-bridge/mailbox/m3/v1/qa-container", container
+    )
+    anchor = read(fixture.anchor)
+    anchor.update(
+        {
+            "qa_bundle_identifier": bundle,
+            "qa_container_identifier": container,
+            "qa_bundle_fingerprint": bundle_fingerprint,
+            "qa_container_fingerprint": container_fingerprint,
+        }
+    )
+    manifest = read(fixture.manifest)
+    manifest.update(
+        {
+            "qa_bundle_fingerprint": bundle_fingerprint,
+            "qa_container_fingerprint": container_fingerprint,
+        }
+    )
+    write(fixture.anchor, anchor)
+    write(fixture.manifest, manifest)
+
+    # When: the strict validator evaluates the arbitrary nested profile.
+    result = run(fixture)
+
+    # Then: only the direct-child and Public Documents profiles are accepted.
+    assert result.stdout == "FAIL M3 anchor_mismatch\n"
+
+
+def test_parent_receipts_reject_crossed_public_documents_archive_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: Public Documents bundle/container fingerprints are paired with the
+    # direct-child archive target instead of the matching PublicDocumentsQA lane.
+    monkeypatch.setattr(
+        m3_support,
+        "QA_BUNDLE",
+        "dev.example.healthbridge.publicdocuments.mailboxqa",
+    )
+    monkeypatch.setattr(
+        m3_support,
+        "QA_CONTAINER",
+        "iCloud.dev.example.healthbridge.publicdocuments.mailboxqa",
+    )
+
+    # When/Then: parent provenance must bind the identity to its exact target.
+    with pytest.raises(ParentOperationError):
+        _ = build_m3_fixture(
+            tmp_path / "attempt",
+            archive_target="HealthBridgeCompanionMailboxQA",
+        )
+
+
+def test_parent_receipts_reject_replacement_nested_qa_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: the installed nested QA app is removed but a different matching
+    # production-prefixed mailbox QA app remains after cleanup.
+    monkeypatch.setattr(
+        m3_support,
+        "QA_BUNDLE",
+        "dev.example.healthbridge.publicdocuments.mailboxqa",
+    )
+    monkeypatch.setattr(
+        m3_support,
+        "QA_CONTAINER",
+        "iCloud.dev.example.healthbridge.publicdocuments.mailboxqa",
+    )
+
+    # When/Then: cleanup cannot attest rollback until the matching QA namespace
+    # is completely absent, not merely disjoint from its pre-cleanup spelling.
+    with pytest.raises(ParentOperationError):
+        _ = build_m3_fixture(
+            tmp_path / "attempt",
+            inventory_after_qa_bundle=(
+                "dev.example.healthbridge.replacement.mailboxqa"
+            ),
+        )
+
+
+def test_parent_receipts_reject_mismatched_pre_cleanup_qa_profile(
+    tmp_path: Path,
+) -> None:
+    # Given: the direct-child context/provenance is paired with a different
+    # production-prefixed mailbox QA app in the pre-cleanup inventory.
+    mismatched = "dev.example.healthbridge.evil.mailboxqa"
+
+    # When/Then: cleanup must remove the exact profile selected by the context.
+    with pytest.raises(ParentOperationError):
+        _ = build_m3_fixture(
+            tmp_path / "attempt",
+            inventory_before_qa_bundles=(mismatched,),
+        )
+
+
+def test_parent_receipts_reject_duplicate_identical_pre_cleanup_entries(
+    tmp_path: Path,
+) -> None:
+    # Given: a malformed inventory repeats the same qualifying QA app twice.
+    duplicate = "dev.example.healthbridge.mailboxqa"
+
+    # When/Then: exact-one cardinality counts observations, not distinct names.
+    with pytest.raises(ParentOperationError):
+        _ = build_m3_fixture(
+            tmp_path / "attempt",
+            inventory_before_qa_bundles=(duplicate, duplicate),
+        )
 
 
 def test_m3_v1_holds_when_external_prerequisite_is_missing(tmp_path: Path) -> None:
