@@ -8,6 +8,8 @@ A private TestFlight candidate may be archived, uploaded, assigned to a private 
 
 A receiver-only patch may advance the Receiver/CLI version while keeping the last verified iOS Companion version/build and Batch Protocol unchanged. For that scope, maintainers must not upload a new TestFlight build merely to make version numbers match. The exact-tag workflow must still run the iOS source gates, the versioned notes must name the exact compatible iOS Companion and Batch Protocol and state that no TestFlight update is required, and `release-metadata.json` must set `release_scope` to `receiver` while independently recording every component version. A coordinated release must declare `release_scope` as `coordinated`, advance Receiver/CLI plus iOS Companion or Batch Protocol, and name the exact resulting compatibility in its notes. Update `component-versions.json` in the same commit as any authoritative version source; release validation must reject drift between that index, `pyproject.toml`, Xcode settings, and the canonical batch fixture.
 
+For the coordinated 1.1.0 packet, review every public note, checklist, and App Review surface against the same product boundary: Direct is the default and never falls back automatically; Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta with application-layer encryption, signed ACK/commit semantics, a user-owned iCloud container and receiver, and an optional per-user macOS LaunchAgent. Batch Protocol remains `health_bridge.batch.v1 (1.0.0)`. App Store Connect may remain “Data Not Collected” only while neither the developer nor an integrated third party can access the user's receiver, iCloud container, or transmitted HealthKit records.
+
 ## Required checks
 
 ```bash

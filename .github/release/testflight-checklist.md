@@ -29,7 +29,7 @@ TestFlight is the primary iPhone distribution path. The repository, GitHub Relea
 
 - [ ] The candidate is installed on an iPhone running iOS 18 or later.
 - [ ] Xcode 16 or later is used for archive and signing validation.
-- [ ] The coordinated identity is iOS version `1.0.0`, Build `15`, and Python/GitHub release `v1.0.0`.
+- [ ] The coordinated identity is iOS Companion `1.1.0 (16)`, Receiver/CLI `1.1.0` at `receiver-v1.1.0`, and Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
 - [ ] Apple Developer Program membership is active.
 - [ ] Individual vs organization seller path is decided.
 - [ ] App Store Connect access is available.
@@ -56,6 +56,8 @@ TestFlight is the primary iPhone distribution path. The repository, GitHub Relea
 - [ ] No hidden cloud, analytics, advertising hooks, data brokers, or third-party AI upload paths exist.
 - [ ] Background sync copy remains best-effort.
 - [ ] Receiver disconnect and queued-data handling are understandable.
+- [ ] Direct is described as the default transport with no automatic fallback.
+- [ ] Encrypted iCloud Mailbox is described as an explicit opt-in, Mac-only Beta using application-layer encryption, a user-owned iCloud container and receiver, signed ACK/commit semantics, and an optional per-user macOS LaunchAgent.
 
 ### Demo and reviewer access
 
@@ -119,6 +121,6 @@ When code changes after an approved beta build, prepare a new candidate rather t
 
 Safe README wording after intentional publication:
 
-> Install Health Bridge from the official TestFlight link on the project website. The published source release and TestFlight build share version `1.0.0`. Self-build remains supported for contributors and developers validating source changes.
+> Install iOS Companion `1.1.0 (16)` from the official TestFlight link on the project website. It is coordinated with Receiver/CLI `1.1.0` and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. Self-build remains supported for contributors and developers validating source changes.
 
 Avoid implying that a source-only preview is publicly launched before the matching TestFlight build is available, or that a future paid/App Store build hides core source code.

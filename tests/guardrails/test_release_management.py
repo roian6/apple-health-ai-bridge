@@ -12,7 +12,8 @@ from pydantic import BaseModel, ConfigDict
 ROOT = Path(__file__).parents[2]
 RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
-RELEASE_NOTES = ROOT / ".github/release/notes-v1.0.1.md"
+RELEASE_NOTES = ROOT / ".github/release/notes-receiver-v1.1.0.md"
+HISTORICAL_V101_RELEASE_NOTES = ROOT / ".github/release/notes-v1.0.1.md"
 RELEASE_CRITERIA = ROOT / ".github/release/criteria.md"
 COMPONENT_VERSIONS = ROOT / "component-versions.json"
 VERSIONING_DOC = ROOT / "docs/versioning.md"
@@ -55,15 +56,15 @@ class PythonReleaseOutput(BaseModel):
     artifacts: list[ArtifactOutput]
     package: Literal["apple-health-ai-bridge"]
     requires_python: Literal[">=3.11"]
-    version: Literal["1.0.1"]
+    version: Literal["1.1.0"]
 
 
 class ReleaseMetadataOutput(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", strict=True)
 
     schema_id: Literal["health_bridge.release.v2"]
-    release_scope: Literal["receiver"]
-    release_version: Literal["1.0.1"]
+    release_scope: Literal["coordinated"]
+    release_version: Literal["1.1.0"]
     git: dict[str, str]
     ios: dict[str, str]
     batch_contract: dict[str, str]
@@ -90,7 +91,7 @@ def _packet_verify_args(
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         tag_object,
         "--commit",
@@ -108,7 +109,7 @@ def _checksum_args(*, dist: Path, output: Path) -> tuple[str, ...]:
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -122,10 +123,10 @@ def _checksum_args(*, dist: Path, output: Path) -> tuple[str, ...]:
 
 def _create_manifest_fixture(dist: Path) -> Path:
     dist.mkdir(parents=True, exist_ok=True)
-    _ = (dist / "apple_health_ai_bridge-1.0.1-py3-none-any.whl").write_bytes(
+    _ = (dist / "apple_health_ai_bridge-1.1.0-py3-none-any.whl").write_bytes(
         b"wheel fixture\n"
     )
-    _ = (dist / "apple_health_ai_bridge-1.0.1.tar.gz").write_bytes(b"sdist fixture\n")
+    _ = (dist / "apple_health_ai_bridge-1.1.0.tar.gz").write_bytes(b"sdist fixture\n")
     metadata = dist / "release-metadata.json"
     completed = _run_release_tool(
         "manifest",
@@ -134,7 +135,7 @@ def _create_manifest_fixture(dist: Path) -> Path:
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -232,7 +233,7 @@ def _mutate_release_metadata(payload: dict[str, object], mutation: str) -> None:
     elif mutation == "missing-schema":
         _ = payload.pop("schema_id")
     elif mutation == "wrong-scope":
-        payload["release_scope"] = "coordinated"
+        payload["release_scope"] = "receiver"
     elif mutation == "missing-scope":
         _ = payload.pop("release_scope")
     elif mutation in {"wrong-git-commit", "missing-git-commit", "extra-git-field"}:
@@ -249,17 +250,23 @@ def _mutate_release_metadata(payload: dict[str, object], mutation: str) -> None:
         payload["unexpected"] = True
 
 
-def test_release_validate_accepts_exact_v_prefixed_project_version() -> None:
-    completed = _run_release_tool("validate", "--repo", str(ROOT), "--tag", "v1.0.1")
+def test_release_validate_accepts_exact_component_scoped_project_version() -> None:
+    completed = _run_release_tool(
+        "validate",
+        "--repo",
+        str(ROOT),
+        "--tag",
+        "receiver-v1.1.0",
+    )
 
     assert completed.returncode == 0, completed.stderr
     output = ValidateOutput.model_validate_json(completed.stdout)
     assert output.model_dump() == {
         "ios_build": _current_ios_build(),
-        "ios_marketing_version": "1.0.0",
-        "project_version": "1.0.1",
-        "release_scope": "receiver",
-        "tag": "v1.0.1",
+        "ios_marketing_version": "1.1.0",
+        "project_version": "1.1.0",
+        "release_scope": "coordinated",
+        "tag": "receiver-v1.1.0",
     }
 
 
@@ -274,9 +281,9 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "schema_id": "health_bridge.batch.v1",
             "version": "1.0.0",
         },
-        "ios_companion": {"build": "15", "marketing_version": "1.0.0"},
-        "receiver_cli": {"release_tag": "v1.0.1", "version": "1.0.1"},
-        "release_scope": "receiver",
+        "ios_companion": {"build": "16", "marketing_version": "1.1.0"},
+        "receiver_cli": {"release_tag": "receiver-v1.1.0", "version": "1.1.0"},
+        "release_scope": "coordinated",
         "schema_id": "health_bridge.component_versions.v1",
     }
 
@@ -315,8 +322,8 @@ def test_release_validate_rejects_component_version_index_drift(
     repo = tmp_path / "repo"
     _write_version_fixture(
         repo,
-        receiver_version="1.0.1",
-        release_tag="v1.0.1",
+        receiver_version="1.1.0",
+        release_tag="receiver-v1.1.0",
         index_receiver_version="1.0.0",
     )
 
@@ -325,21 +332,21 @@ def test_release_validate_rejects_component_version_index_drift(
         "--repo",
         str(repo),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
     )
 
     assert completed.returncode == 1
     assert "component version index" in completed.stderr
 
 
-@pytest.mark.parametrize("tag", ["1.0.1", "v1.0.0", "v1.0.1-beta.1", "main"])
+@pytest.mark.parametrize("tag", ["1.1.0", "v1.0.0", "receiver-v1.1.0-beta.1", "main"])
 def test_release_validate_rejects_noncanonical_or_mismatched_tag(tag: str) -> None:
     completed = _run_release_tool("validate", "--repo", str(ROOT), "--tag", tag)
 
     assert completed.returncode == 1
     assert completed.stdout == ""
     assert (
-        "receiver release tag must exactly match package version: v1.0.1"
+        "receiver release tag must exactly match package version: receiver-v1.1.0"
         in completed.stderr
     )
 
@@ -373,8 +380,8 @@ def test_receiver_and_ios_semver_order_does_not_define_compatibility(
 def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
-    wheel = dist / "apple_health_ai_bridge-1.0.1-py3-none-any.whl"
-    sdist = dist / "apple_health_ai_bridge-1.0.1.tar.gz"
+    wheel = dist / "apple_health_ai_bridge-1.1.0-py3-none-any.whl"
+    sdist = dist / "apple_health_ai_bridge-1.1.0.tar.gz"
     _ = wheel.write_bytes(b"wheel fixture\n")
     _ = sdist.write_bytes(b"sdist fixture\n")
     metadata = dist / "release-metadata.json"
@@ -390,7 +397,7 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         tag_object,
         "--commit",
@@ -411,13 +418,13 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
     payload = ReleaseMetadataOutput.model_validate_json(first_bytes)
     assert payload.git == {
         "commit": commit,
-        "tag": "v1.0.1",
+        "tag": "receiver-v1.1.0",
         "tag_object": tag_object,
         "tree": tree,
     }
     assert payload.ios == {
         "build": _current_ios_build(),
-        "marketing_version": "1.0.0",
+        "marketing_version": "1.1.0",
         "source_settings": (
             "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
         ),
@@ -443,8 +450,8 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
     assert checksum_result.returncode == 0, checksum_result.stderr
     lines = checksums.read_text(encoding="utf-8").splitlines()
     assert [line.split("  ", 1)[1] for line in lines] == [
-        "apple_health_ai_bridge-1.0.1-py3-none-any.whl",
-        "apple_health_ai_bridge-1.0.1.tar.gz",
+        "apple_health_ai_bridge-1.1.0-py3-none-any.whl",
+        "apple_health_ai_bridge-1.1.0.tar.gz",
         "release-metadata.json",
     ]
 
@@ -524,7 +531,7 @@ def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
 ) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
-    _ = (dist / "apple_health_ai_bridge-1.0.1-py3-none-any.whl").write_bytes(b"wheel")
+    _ = (dist / "apple_health_ai_bridge-1.1.0-py3-none-any.whl").write_bytes(b"wheel")
     _ = (dist / "apple_health_ai_bridge-9.9.9.tar.gz").write_bytes(b"wrong")
 
     completed = _run_release_tool(
@@ -534,7 +541,7 @@ def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -547,7 +554,7 @@ def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
 
     assert completed.returncode == 1
     assert (
-        "release artifacts must exactly match project version 1.0.1" in completed.stderr
+        "release artifacts must exactly match project version 1.1.0" in completed.stderr
     )
     assert not (dist / "release-metadata.json").exists()
 
@@ -555,8 +562,8 @@ def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
 def test_checksums_reject_artifact_changed_after_manifest(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
-    wheel = dist / "apple_health_ai_bridge-1.0.1-py3-none-any.whl"
-    sdist = dist / "apple_health_ai_bridge-1.0.1.tar.gz"
+    wheel = dist / "apple_health_ai_bridge-1.1.0-py3-none-any.whl"
+    sdist = dist / "apple_health_ai_bridge-1.1.0.tar.gz"
     _ = wheel.write_bytes(b"original wheel")
     _ = sdist.write_bytes(b"original sdist")
     metadata = dist / "release-metadata.json"
@@ -569,7 +576,7 @@ def test_checksums_reject_artifact_changed_after_manifest(tmp_path: Path) -> Non
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -595,8 +602,8 @@ def test_release_packet_rejects_directories_nested_files_and_symlinks(
 ) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
-    wheel = dist / "apple_health_ai_bridge-1.0.1-py3-none-any.whl"
-    sdist = dist / "apple_health_ai_bridge-1.0.1.tar.gz"
+    wheel = dist / "apple_health_ai_bridge-1.1.0-py3-none-any.whl"
+    sdist = dist / "apple_health_ai_bridge-1.1.0.tar.gz"
     _ = wheel.write_bytes(b"wheel")
     _ = sdist.write_bytes(b"sdist")
     metadata = dist / "release-metadata.json"
@@ -611,7 +618,7 @@ def test_release_packet_rejects_directories_nested_files_and_symlinks(
         "--dist-dir",
         str(dist),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         tag_object,
         "--commit",
@@ -649,8 +656,8 @@ def test_draft_release_verifier_checks_metadata_body_and_remote_digests(
     dist = tmp_path / "dist"
     _ = _create_manifest_fixture(dist)
     names = (
-        "apple_health_ai_bridge-1.0.1-py3-none-any.whl",
-        "apple_health_ai_bridge-1.0.1.tar.gz",
+        "apple_health_ai_bridge-1.1.0-py3-none-any.whl",
+        "apple_health_ai_bridge-1.1.0.tar.gz",
         "SHA256SUMS",
         "release-metadata.json",
     )
@@ -672,9 +679,9 @@ def test_draft_release_verifier_checks_metadata_body_and_remote_digests(
         "assets": assets,
         "body": RELEASE_NOTES.read_text(encoding="utf-8"),
         "draft": True,
-        "name": "v1.0.1",
+        "name": "receiver-v1.1.0",
         "prerelease": False,
-        "tag_name": "v1.0.1",
+        "tag_name": "receiver-v1.1.0",
     }
     _ = release_json.write_text(json.dumps(payload), encoding="utf-8")
     args = (
@@ -688,7 +695,7 @@ def test_draft_release_verifier_checks_metadata_body_and_remote_digests(
         "--notes-file",
         str(RELEASE_NOTES),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -763,8 +770,8 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
         encoding="utf-8",
     )
     names = (
-        "apple_health_ai_bridge-1.0.1-py3-none-any.whl",
-        "apple_health_ai_bridge-1.0.1.tar.gz",
+        "apple_health_ai_bridge-1.1.0-py3-none-any.whl",
+        "apple_health_ai_bridge-1.1.0.tar.gz",
         "SHA256SUMS",
         "release-metadata.json",
     )
@@ -787,9 +794,9 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
                 "assets": assets,
                 "body": RELEASE_NOTES.read_text(encoding="utf-8"),
                 "draft": draft,
-                "name": "v1.0.1",
+                "name": "receiver-v1.1.0",
                 "prerelease": False,
-                "tag_name": "v1.0.1",
+                "tag_name": "receiver-v1.1.0",
             }
         ),
         encoding="utf-8",
@@ -806,7 +813,7 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
         "--notes-file",
         str(RELEASE_NOTES),
         "--tag",
-        "v1.0.1",
+        "receiver-v1.1.0",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -924,7 +931,7 @@ def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  
 
 
 def test_v101_receiver_release_notes_are_versioned_and_actionable() -> None:
-    notes = RELEASE_NOTES.read_text(encoding="utf-8")
+    notes = HISTORICAL_V101_RELEASE_NOTES.read_text(encoding="utf-8")
 
     assert notes.startswith("# Apple Health AI Bridge v1.0.1")
     assert "Receiver-only release" in notes
@@ -1019,11 +1026,11 @@ def test_brand_readme_local_links_resolve_inside_repository() -> None:
         assert target.exists(), destination
 
 
-def test_public_install_commands_are_pinned_to_published_v101() -> None:
+def test_public_install_commands_are_pinned_to_current_receiver_release() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
-    pinned = "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.1"
+    pinned = "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.0"
     assert pinned in readme
     assert pinned in setup
     for content, name in ((readme, "README.md"), (setup, "docs/setup.md")):
@@ -1032,7 +1039,9 @@ def test_public_install_commands_are_pinned_to_published_v101() -> None:
             content,
         )
         assert pins, f"No versioned install pin found in {name}"
-        assert set(pins) == {"v1.0.1"}, f"Found stale install pins in {name}: {pins}"
+        assert set(pins) == {"receiver-v1.1.0"}, (
+            f"Found stale install pins in {name}: {pins}"
+        )
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
     assert unpinned not in readme
     assert unpinned not in setup

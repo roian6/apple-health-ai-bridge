@@ -50,7 +50,9 @@ The current receiver is a **single-user store**. Every active paired device cred
 
 ## Delivery and recovery
 
-Uploads enter a private ordered outbox. A successful HTTP response is required before the corresponding committed progress advances. Failed or interrupted uploads remain queued and retry in order.
+Uploads enter a private ordered outbox. Direct is the default transport. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta, and a Direct failure never causes an automatic transport fallback.
+
+For Direct, a successful HTTP response is required before the corresponding committed progress advances. For mailbox delivery, the app applies application-layer encryption and a sender signature before publishing to the user's iCloud container. The user-owned receiver decrypts and commits accepted batches before publishing an encrypted, receiver-signed ACK; the app advances committed progress only after validating a committed ACK. Failed or interrupted deliveries remain queued and retry in order on their selected transport.
 
 Cursorless automatic reads may send a bounded recent window but do not silently consume the wider foreground backfill. Status surfaces expose cursor metadata and sync outcomes without exposing opaque cursor values.
 
@@ -78,12 +80,13 @@ They do not expose raw SQL, pairing material, bearer tokens, token hashes, opaqu
 
 - Continuous sync away from home requires a stable phone-reachable private HTTPS route to the user-owned receiver.
 - Tailscale Serve is documented for people who already use Tailscale; an agent-assisted private HTTPS ingress is the provider-neutral alternative.
-- Direct LAN access is a deliberate local-only fallback, not the primary continuous-sync path.
+- The Direct transport is the default. Within Direct setup, LAN-only access is a deliberate local-only routing fallback rather than the primary away-from-home path.
 - For private HTTPS routes, keep the receiver on loopback behind the proxy or tunnel. Route C deliberately uses a non-loopback LAN bind and must never be port-forwarded. Do not expose port `8765` or the pairing page directly to the public internet.
 - Plain LAN HTTP exposes health payloads and the device credential to that network while in transit.
 - SQLite is protected by owner-only filesystem permissions, not by an application-level database encryption layer.
 - The project includes no telemetry, advertising, hosted relay, hidden cloud upload, or third-party AI call by default.
+- The developer does not operate or have access to the user's receiver or iCloud container. The App Privacy “Data Not Collected” posture depends on preserving that boundary.
 
 ## Operational limits
 
-`health-bridge setup` prepares the receiver command and private pairing material but does not silently install or enable an operating-system service. Hosted infrastructure remains outside the current scope.
+`health-bridge setup` prepares the receiver command and private pairing material but does not silently install or enable an operating-system service. Users who explicitly select Encrypted iCloud Mailbox (Beta) may separately install its optional per-user macOS LaunchAgent. Hosted infrastructure remains outside the current scope.

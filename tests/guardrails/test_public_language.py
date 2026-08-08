@@ -434,21 +434,23 @@ def test_privacy_docs_explain_manifest_and_app_store_answers_together() -> None:
     assert "“Data Not Collected”" in review_template
 
 
-def test_receiver_patch_and_compatible_ios_release_identities_are_explicit() -> None:
+def test_coordinated_release_identities_are_explicit() -> None:
     pyproject = Path("pyproject.toml").read_text()
     package_init = Path("src/health_bridge/__init__.py").read_text()
     xcode_project = Path(
         "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
     ).read_text()
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    server_manifest = Path("server.json").read_text()
     security = Path("SECURITY.md").read_text()
 
-    assert 'version = "1.0.1"' in pyproject
-    assert '__version__: Final = "1.0.1"' in package_init
-    assert xcode_project.count("MARKETING_VERSION = 1.0.0;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 15;") == 2
-    assert '?? "1.0.0"' in content_view
-    assert '?? "15"' in content_view
+    assert 'version = "1.1.0"' in pyproject
+    assert '__version__: Final = "1.1.0"' in package_init
+    assert '"version": "1.1.0"' in server_manifest
+    assert xcode_project.count("MARKETING_VERSION = 1.1.0;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 16;") == 2
+    assert '?? "1.1.0"' in content_view
+    assert '?? "16"' in content_view
     assert "pre-1.0" not in security
 
 

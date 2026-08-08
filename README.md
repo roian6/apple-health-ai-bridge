@@ -48,7 +48,7 @@ Do not copy a sample hostname, expose receiver port `8765` directly to the publi
 Install the current signed receiver release:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.1"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.0"
 ```
 
 The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configured `/v1/batches` URL. Only then run:
@@ -71,6 +71,12 @@ health-bridge setup \
 A successful local MCP check does not prove receiver readiness or phone reachability. Put the printed receiver command under the host's approved service manager, start it, require `{"status":"ok"}` from the printed local `/health` URL, and then require the same response from the exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C uses HTTP only on the same trusted LAN.
 
 Adding a client creates another process that can read the private health database, so setup never does that automatically. Use an explicit `--configure-client <name>` only after choosing the client.
+
+### Delivery transports
+
+Direct is the default transport, including direct private HTTPS and trusted-LAN setups. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta; a Direct failure never switches transports automatically.
+
+The Beta applies application-layer encryption and signatures before an envelope reaches the user's iCloud container. The user's Mac receiver decrypts and commits accepted batches, then returns an encrypted, signed ACK; the app advances committed local progress only after validating a committed ACK. The iCloud container and receiver remain user-owned, and users may explicitly install the optional per-user macOS LaunchAgent described in the [mailbox service guide](docs/icloud-mailbox-service.md).
 
 ### 4. Pair and sync
 
@@ -116,6 +122,7 @@ It does not expose raw SQL, token material, cursor values, or clinical recommend
 - Device credentials are stored in the iOS Keychain and hashed at rest by the receiver.
 - Logs and agent status omit health values and credentials by default.
 - The receiver is designed for one trusted user, not mutually untrusted tenants.
+- The developer does not operate or have access to the user's receiver or iCloud container. A “Data Not Collected” App Privacy answer remains valid only while that developer-no-access boundary remains true.
 
 Do not expose the receiver's loopback port or pairing page to the public internet. For continuous sync away from home, use an existing private-network HTTPS route such as Tailscale Serve or an agent-assisted private HTTPS ingress reviewed for the receiver paths. LAN-only access is a limited fallback.
 
@@ -141,13 +148,13 @@ The repository contains independently released components. Always include the co
 
 | Surface | Current version | Identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.0.1` | signed historical tag `v1.0.1` |
-| iOS Companion | `1.0.0` | TestFlight build `15` |
+| Receiver/CLI | `1.1.0` | signed tag `receiver-v1.1.0` |
+| iOS Companion | `1.1.0` | TestFlight build `16` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
 
-User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, Git tree, and Batch Protocol together. Existing `v1.0.0` and `v1.0.1` tags remain immutable; future receiver releases use component-scoped tags such as `receiver-v1.0.2`.
+User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, Git tree, and Batch Protocol together. Existing `v1.0.0` and `v1.0.1` tags remain immutable; current and future receiver releases use component-scoped tags such as `receiver-v1.1.0`.
 
 ## Build from source
 
