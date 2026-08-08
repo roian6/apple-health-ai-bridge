@@ -1,6 +1,6 @@
 # Security Policy
 
-The current stable source release is `v1.0.1` for the receiver package, compatible with the unchanged iOS companion `1.0.0 (15)` distributed through public TestFlight. The default deployment model remains local-first and user-owned.
+The current stable source release is `receiver-v1.1.0` for Receiver/CLI `1.1.0`, compatible with iOS Companion `1.1.0 (16)` for public TestFlight distribution and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. The default deployment model remains local-first and user-owned.
 
 ## Sensitive Data
 
@@ -50,3 +50,6 @@ Version 1.0.0 and later receive security fixes on the main branch.
 - The receiver is intended for user-owned local/private-network deployment.
 - MCP and CLI tools are read-only query surfaces over the local store.
 - The project does not intentionally include telemetry, analytics, advertising hooks, hidden cloud upload, or third-party AI calls.
+- Direct is the default transport. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta with application-layer encryption, signed delivery/ACK semantics, and no automatic fallback from Direct.
+- The mailbox path uses a user-owned iCloud container and user-owned receiver; the optional receiver LaunchAgent runs only for the Mac user who explicitly installs it.
+- App Privacy may remain “Data Not Collected” only while the developer and integrated third parties cannot access the user's receiver, iCloud container, or transmitted HealthKit records.

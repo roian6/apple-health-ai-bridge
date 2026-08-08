@@ -1,6 +1,6 @@
 # Apple Health AI Bridge Roadmap
 
-Apple Health AI Bridge is preparing a coordinated stable v1.0.0 release. The exact iOS Build 15 candidate, approved TestFlight Public Link, repository tag, package artifacts, and install site are released as one verified set.
+Apple Health AI Bridge 1.1.0 is a coordinated release of Receiver/CLI `1.1.0` and iOS Companion `1.1.0 (16)` with the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. The exact iOS candidate, approved TestFlight Public Link, receiver tag, package artifacts, and install site are handled as one verified set.
 
 ## Current state
 
@@ -19,6 +19,7 @@ Current operational constraints:
 - receiver setup is aimed at technical users or agent-assisted local setup;
 - background sync is best-effort and controlled by iOS;
 - broad non-quantity HealthKit families are not implemented yet.
+- Encrypted iCloud Mailbox remains an explicit opt-in, Mac-only Beta; Direct remains the default and has no automatic fallback to mailbox delivery.
 
 ## Near term
 
@@ -36,7 +37,7 @@ Current operational constraints:
 - optional hosted or managed relay design, only after a separate privacy/security review;
 - richer onboarding for users who are not already using local agents.
 
-## Non-goals for v1.0.0
+## Non-goals for 1.1.0
 
 - HealthKit write-back;
 - medical decisions, scoring, or emergency use;

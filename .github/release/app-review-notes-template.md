@@ -29,6 +29,14 @@ Apple Health AI Bridge is a local-first companion that turns Apple Health data t
 - Normal v2 pairing uses a short-lived single-use invitation; the app generates the long-lived device credential locally and stores it in Keychain.
 - The App Review demo helper intentionally emits a revocable legacy v1 reviewer credential because Apple's review schedule is longer than the v2 invitation lifetime. That reviewer credential does not expire automatically and must be revoked after review; regenerating the packet at the same setup-page path revokes only the credential recorded by the previous reviewer packet.
 
+## Delivery transports
+
+- Direct is the default transport. A Direct failure never switches to another transport automatically.
+- Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta.
+- The Beta applies application-layer encryption and signatures before using the user's iCloud container. The user-owned receiver commits accepted batches before publishing encrypted, receiver-signed ACKs, and the app advances committed progress only after validating a committed ACK.
+- The optional mailbox receiver service is a per-user macOS LaunchAgent installed only by an explicit user command.
+- Neither the developer nor an integrated third party operates or can access the user's iCloud container or receiver. The “Data Not Collected” answer depends on preserving this boundary.
+
 ## Privacy posture
 
 - No ads, tracking, data brokers, or hidden telemetry.

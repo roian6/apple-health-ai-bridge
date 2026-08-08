@@ -6,8 +6,8 @@ Apple Health AI Bridge contains independently released components. Always includ
 
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.0.1` | Historical release tag `v1.0.1` |
-| iOS Companion | `1.0.0` | TestFlight build `15` |
+| Receiver/CLI | `1.1.0` | Release tag `receiver-v1.1.0` |
+| iOS Companion | `1.1.0` | TestFlight build `16` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 The authoritative machine-readable copy is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
@@ -64,9 +64,9 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.0.1
-Compatible iOS Companion 1.0.0 (build 15)
+Receiver/CLI 1.1.0
+Compatible iOS Companion 1.1.0 (build 16)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```
 
-Avoid an unlabeled phrase such as “Health Bridge v1.0.1” when it could be read as the app, receiver, or protocol version.
+Avoid an unlabeled phrase such as “Health Bridge 1.1.0” when it could be read as the app, receiver, or protocol version.

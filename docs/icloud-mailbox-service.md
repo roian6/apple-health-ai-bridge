@@ -1,13 +1,25 @@
 # Encrypted iCloud Mailbox service (Beta)
 
-The mailbox service keeps the local receiver running for a Mac user who has
-explicitly selected Encrypted iCloud Mailbox (Beta). It runs the supported
-`health-bridge receiver start` command as a per-user macOS LaunchAgent. The
-receiver remains the only owner of mailbox discovery, import, database writes,
-and acknowledgements.
+Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta. Direct remains
+the default transport, and a Direct failure never selects mailbox delivery
+automatically. Before iCloud transfer, the app applies application-layer
+encryption and a sender signature to the unchanged batch bytes. The user-owned
+receiver decrypts and commits accepted batches, then publishes encrypted,
+receiver-signed ACKs; the app advances committed progress only after validating
+a committed ACK.
+
+The mailbox service keeps that local receiver running for the Mac user who
+selected the Beta. It runs the supported `health-bridge receiver start` command
+as an optional per-user macOS LaunchAgent. The receiver remains the only owner
+of mailbox discovery, import, database writes, and acknowledgements.
 
 This service is optional. Direct and Tailscale setups do not install or enable
 it, and `health-bridge setup` never installs it implicitly.
+
+The iCloud container and receiver are owned and operated by the user. The
+project developer does not have access to either endpoint or the transmitted
+HealthKit records. App Store Connect may remain “Data Not Collected” only while
+that developer-no-access boundary remains true.
 
 ## Before installing
 

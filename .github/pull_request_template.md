@@ -13,6 +13,7 @@
 - [ ] No tokens, token hashes, pairing URLs, setup-page contents, deep links, sync cursor values, or local outbox payloads are included.
 - [ ] HealthKit access remains read-only by default.
 - [ ] No telemetry, analytics, advertising hooks, hidden cloud upload, or third-party AI calls were added.
+- [ ] Any “Data Not Collected” posture still has a documented developer-no-access boundary for the user's receiver, iCloud container, and transmitted records.
 - [ ] Any permission, authentication, pairing, deletion, queue/cursor, network, privacy-copy, or App Review impact was discussed in the linked issue.
 
 ## Tests
@@ -30,6 +31,7 @@
 
 - [ ] User-visible change; add the `release-note` label after maintainer triage.
 - [ ] No user-visible release note required.
+- [ ] Release-facing changes name Receiver/CLI, iOS Companion version/build, Batch Protocol, and `release_scope` independently; historical notes remain unchanged.
 
 ## Breaking change
 

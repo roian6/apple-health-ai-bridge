@@ -135,10 +135,12 @@ After setup, use the printed receiver command with the same bind and port. Keep 
 Install the current signed receiver release:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@v1.0.1"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.0"
 ```
 
 After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.
+
+This core setup uses Direct, the default transport. Encrypted iCloud Mailbox is a separate explicit opt-in, Mac-only Beta and is never selected automatically when Direct is unavailable; see the [mailbox service guide](icloud-mailbox-service.md) only if you intentionally choose that transport.
 
 For Route A or Route B, keep the safe loopback bind:
 
