@@ -1,0 +1,47 @@
+{
+  "v": 1,
+  "kind": "mailbox_physical_report",
+  "run_id": "10101010101010101010101010101010",
+  "challenge": "ERERERERERERERERERERERERERERERERERERERERERE",
+  "embedded_commit_sha": "6eb12a4fb29543e691c7e930f385dc4f9964598f",
+  "bundle_identifier_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "app_version": "1.0.0",
+  "build_number": "15",
+  "device_identifier_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "device_model": "SyntheticPhone1,1",
+  "os_version": "18.0-synthetic",
+  "receiver_fingerprint": "1111111111111111",
+  "device_signing_key_fingerprint": "2222222222222222",
+  "connection_generation": 7,
+  "started_at_ms": 1,
+  "finished_at_ms": 4,
+  "scenario_results": [
+    {
+      "name": "persisted_encoder_bytes_encrypted_unchanged",
+      "result": "pass",
+      "started_at_ms": 1,
+      "finished_at_ms": 2,
+      "assertion_count": 3
+    },
+    {
+      "name": "strict_receiver_parse_without_reserialization",
+      "result": "pass",
+      "started_at_ms": 3,
+      "finished_at_ms": 4,
+      "assertion_count": 2
+    }
+  ],
+  "transition_counts": {
+    "collected": 1,
+    "encrypted": 1,
+    "published": 1,
+    "provider_observed": 1,
+    "ack_verified": 1,
+    "committed_finalized": 1,
+    "retryable_failure": 0,
+    "terminal_failure": 0
+  },
+  "receipt_id": 1,
+  "dataset_generation": 1,
+  "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}

@@ -1,0 +1,3 @@
+receipt_kind=installation_validation
+marker=synthetic_installation_validation
+marker=public_neutral_fixture

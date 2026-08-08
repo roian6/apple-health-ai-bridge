@@ -1,0 +1,3 @@
+receipt_kind=archive_provenance
+marker=synthetic_archive_provenance
+marker=public_neutral_fixture

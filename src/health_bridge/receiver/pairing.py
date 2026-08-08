@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import ClassVar, Final, Literal, Self
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from health_bridge.receiver.invitations import create_pairing_invitation
 from health_bridge.receiver.tokens import create_receiver_token
+from health_bridge.receiver.transports import ReceiverTransport
 
 PAIRING_SCHEMA_ID: Final = "health_bridge.receiver_pairing.v1"
 PAIRING_SCHEMA_VERSION: Final = "1.0.0"
@@ -33,6 +34,14 @@ INVALID_URL_HOST_MESSAGE: Final = "Pairing receiver URL must include a host."
 CROSS_ORIGIN_REDEEM_MESSAGE: Final = (
     "Pairing redeem URL must use the same origin as the receiver URL."
 )
+
+
+def _exclude_direct_transport(value: ReceiverTransport) -> bool:
+    return value is ReceiverTransport.DIRECT
+
+
+def _exclude_missing_mailbox_protocol(value: Literal[1] | None) -> bool:
+    return value is None
 
 
 class ReceiverPairingBundleError(ValueError):
@@ -87,9 +96,27 @@ class ReceiverPairingInvitationPayload(BaseModel):
     redeem_url: str
     invitation_secret: str
     expires_at: str
+    transport: ReceiverTransport = Field(
+        default=ReceiverTransport.DIRECT,
+        exclude_if=_exclude_direct_transport,
+    )
+    mailbox_protocol_version: Literal[1] | None = Field(
+        default=None,
+        exclude_if=_exclude_missing_mailbox_protocol,
+    )
+
+    @model_validator(mode="after")
+    def require_consistent_transport(self) -> Self:
+        match self.transport:
+            case ReceiverTransport.DIRECT if self.mailbox_protocol_version is None:
+                return self
+            case ReceiverTransport.MAILBOX if self.mailbox_protocol_version == 1:
+                return self
+            case ReceiverTransport.DIRECT | ReceiverTransport.MAILBOX:
+                raise ReceiverPairingBundleError(INVALID_PAYLOAD_MESSAGE)
 
     @classmethod
-    def build(
+    def build(  # noqa: PLR0913 - wire payload fields remain explicit.
         cls,
         *,
         label: str,
@@ -97,6 +124,7 @@ class ReceiverPairingInvitationPayload(BaseModel):
         redeem_url: str,
         invitation_secret: str,
         expires_at: str,
+        transport: ReceiverTransport = ReceiverTransport.DIRECT,
     ) -> Self:
         _validate_pairing_urls(receiver_url, redeem_url)
         if not invitation_secret.strip():
@@ -107,6 +135,10 @@ class ReceiverPairingInvitationPayload(BaseModel):
             redeem_url=redeem_url,
             invitation_secret=invitation_secret,
             expires_at=expires_at,
+            transport=transport,
+            mailbox_protocol_version=(
+                1 if transport is ReceiverTransport.MAILBOX else None
+            ),
         )
 
 
@@ -125,6 +157,14 @@ class ReceiverPairingInvitationBundle(BaseModel):
     invitation_code: str
     created_at: str
     expires_at: str
+    transport: ReceiverTransport = Field(
+        default=ReceiverTransport.DIRECT,
+        exclude_if=_exclude_direct_transport,
+    )
+    mailbox_protocol_version: Literal[1] | None = Field(
+        default=None,
+        exclude_if=_exclude_missing_mailbox_protocol,
+    )
     warning: str = Field(default=PAIRING_INVITATION_WARNING)
 
     def qr_payload(self) -> ReceiverPairingInvitationPayload:
@@ -134,6 +174,7 @@ class ReceiverPairingInvitationBundle(BaseModel):
             redeem_url=self.redeem_url,
             invitation_secret=self.invitation_secret,
             expires_at=self.expires_at,
+            transport=self.transport,
         )
 
 
@@ -161,6 +202,9 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
     *,
     label: str,
     receiver_url: str,
+    transport: ReceiverTransport | Literal["direct", "mailbox"] = (
+        ReceiverTransport.DIRECT
+    ),
     now: datetime | None = None,
     expires_in: timedelta | None = None,
     invitation_secret: str | None = None,
@@ -171,6 +215,7 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
         db_path,
         label=label,
         receiver_url=receiver_url,
+        transport=transport,
         now=now,
         expires_in=invitation_ttl,
         invitation_secret=invitation_secret,
@@ -185,6 +230,10 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
         invitation_code=issued.invitation_code,
         created_at=issued.created_at,
         expires_at=issued.expires_at,
+        transport=issued.transport,
+        mailbox_protocol_version=(
+            1 if issued.transport is ReceiverTransport.MAILBOX else None
+        ),
     )
 
 
@@ -197,7 +246,7 @@ def pairing_deep_link(
     else:
         payload = bundle
     json_payload = json.dumps(
-        payload.model_dump(mode="json"),
+        payload.model_dump(mode="json", exclude_none=True),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")

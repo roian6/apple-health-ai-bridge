@@ -72,6 +72,27 @@ struct ContentView: View {
                 subtitle: "Scan the private QR with iPhone Camera, open its setup link, or paste it here. After pairing, the secret key stays on this iPhone."
             )
 
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Direct / Tailscale-compatible", systemImage: "network")
+                    .font(.headline)
+                Text("Recommended on Linux and Mac. The receiver setup invitation selects this transport by default.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Label("Encrypted iCloud Mailbox (Beta)", systemImage: "lock.icloud.fill")
+                    .font(.headline)
+                Text("No VPN required • Mac only • Best-effort, eventual delivery")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Text("Custom HTTPS remains a Direct connection. Local same-network-only setup is Advanced / Limited.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(14)
+            .background(Color(.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
             TextField("Paste private setup link", text: $viewModel.pairingImportText, axis: .vertical)
                 .lineLimit(2...4)
                 .textInputAutocapitalization(.never)
@@ -109,15 +130,28 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Pairing Recovery Pending", systemImage: "exclamationmark.shield.fill")
                 .font(.headline)
-            Text("Automatic sync is paused. Retry the saved attempt after fixing the route, or clear it before opening a different setup link.")
+            Text(
+                viewModel.mailboxKeyDiagnosticState == .lost
+                    ? "Automatic sync is paused because the mailbox connection key is lost. Clear this pending pairing before using the dedicated key recovery action."
+                    : "Automatic sync is paused. Retry the saved attempt after fixing the route, or clear it before opening a different setup link."
+            )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Button("Retry Pairing") {
-                Task {
-                    await viewModel.retryPendingPairing()
-                }
+            if let pairingFailure = viewModel.pairingFailurePresentation {
+                InlineNotice(
+                    message: pairingFailure.message,
+                    systemImage: "exclamationmark.triangle.fill",
+                    tint: .orange
+                )
             }
-            .disabled(viewModel.isPairing)
+            if viewModel.mailboxKeyDiagnosticState != .lost {
+                Button("Retry Pairing") {
+                    Task {
+                        await viewModel.retryPendingPairing()
+                    }
+                }
+                .disabled(viewModel.isPairing)
+            }
             Button("Clear Pending Pairing and Disconnect", role: .destructive) {
                 showPendingPairingCancellationConfirmation = true
             }
@@ -331,7 +365,12 @@ struct ContentView: View {
         if viewModel.statusIsError { return userFacingStatusMessage }
         if !viewModel.canSendConnectionTest { return "Connect this iPhone before syncing." }
         if viewModel.setupState == .pairedNeedsHealthPermission { return "Open Apple Health and allow the data you want to sync." }
-        if viewModel.pendingOutboxCount > 0 { return "\(viewModel.pendingOutboxCount) pending sync item(s) will send when Health Bridge is reachable." }
+        if viewModel.pendingOutboxCount > 0 {
+            if viewModel.usesMailboxTransport {
+                return "\(viewModel.pendingOutboxCount) pending secure delivery item(s) are waiting for receiver confirmation."
+            }
+            return "\(viewModel.pendingOutboxCount) pending sync item(s) will send when Health Bridge is reachable."
+        }
         if viewModel.backgroundSyncEnabled { return viewModel.automaticSyncScopeSummary }
         return "Use Sync Now to update your allowed Apple Health data."
     }
@@ -388,6 +427,7 @@ private struct ReceiverSettingsView: View {
     @State private var showDisconnectFailureAlert = false
     @State private var disconnectFailureMessage = ""
     @State private var showClearQueuedUploadsConfirmation = false
+    @State private var showMailboxKeyResetConfirmation = false
 
     var body: some View {
         ScrollView {
@@ -454,6 +494,18 @@ private struct ReceiverSettingsView: View {
         } message: {
             Text("This permanently deletes unsent local Health payloads and resets local sync cursors so the next connection rebuilds receiver history. If the saved connection is unreadable, it is also removed. Apple Health data itself is not deleted.")
         }
+        .confirmationDialog(
+            "Reset lost mailbox connection key?",
+            isPresented: $showMailboxKeyResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Lost Mailbox Connection Key", role: .destructive) {
+                Task { await viewModel.resetLostMailboxConnectionKey() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This resets unreadable mailbox connection key material and pending/saved pairing state only. It does not delete Apple Health data or permissions. Queued uploads and HealthKit sync cursors are not deleted.")
+        }
     }
 
     private var connectionIsReachable: Bool {
@@ -463,6 +515,12 @@ private struct ReceiverSettingsView: View {
                 || message.contains("health bridge connected")
                 || message.contains("local bridge verified")
                 || message.contains("connected to local bridge"))
+    }
+
+    private var mailboxFolderIsReady: Bool {
+        !viewModel.statusIsError
+            && viewModel.usesMailboxTransport
+            && viewModel.statusMessage.contains("Mailbox folder is ready")
     }
 
     private var connectionNotice: String {
@@ -478,6 +536,7 @@ private struct ReceiverSettingsView: View {
             || message.contains("disconnect")
             || message.contains("queued upload")
             || message.contains("private sync")
+            || message.contains("mailbox")
         else {
             return "" }
         return CompanionPrimaryStatusMessage.sanitized(
@@ -490,9 +549,9 @@ private struct ReceiverSettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Label {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(viewModel.canSendConnectionTest ? (connectionIsReachable ? "Server Reachable" : "Connection Saved") : "Not Connected")
+                    Text(viewModel.canSendConnectionTest ? (mailboxFolderIsReady ? "Mailbox Folder Ready" : (connectionIsReachable ? "Server Reachable" : "Connection Saved")) : "Not Connected")
                         .font(.headline)
-                    Text(viewModel.canSendConnectionTest ? (connectionIsReachable ? "Ready to sync." : "Saved on this iPhone.") : "Use a setup link to connect.")
+                    Text(viewModel.canSendConnectionTest ? (mailboxFolderIsReady ? "Receiver delivery not verified." : (connectionIsReachable ? "Ready to sync." : "Saved on this iPhone.")) : "Use a setup link to connect.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -502,9 +561,33 @@ private struct ReceiverSettingsView: View {
                     .foregroundStyle(viewModel.canSendConnectionTest ? (connectionIsReachable ? .green : .blue) : .red)
             }
 
+            Divider()
+
+            LabeledContent("Mailbox connection key") {
+                Text(viewModel.mailboxKeyLifecycleLabel)
+                    .foregroundStyle(
+                        viewModel.mailboxKeyDiagnosticState == .active ? .green : .secondary
+                    )
+            }
+            Text(viewModel.mailboxKeyLifecycleDetail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if viewModel.mailboxKeyDiagnosticState == .lost {
+                Button(role: .destructive) {
+                    showMailboxKeyResetConfirmation = true
+                } label: {
+                    Label("Reset Lost Mailbox Connection Key", systemImage: "key.slash")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(!viewModel.canResetLostMailboxConnectionKey)
+            }
+
             PrimaryButton(
-                title: "Check Connection",
-                subtitle: "Verify Health Bridge is reachable",
+                title: viewModel.usesMailboxTransport ? "Check Mailbox Folder" : "Check Connection",
+                subtitle: viewModel.usesMailboxTransport ? "Verify the encrypted iCloud folder is available" : "Verify Health Bridge is reachable",
                 systemImage: "wifi",
                 tint: .blue,
                 isDisabled: !viewModel.canSendConnectionTest,
@@ -673,6 +756,11 @@ private struct AppDetailsView: View {
                 Text(viewModel.backgroundSyncStatus)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                if !viewModel.mailboxDeliveryDiagnosticLine.isEmpty {
+                    Text(viewModel.mailboxDeliveryDiagnosticLine)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Activity Log") {

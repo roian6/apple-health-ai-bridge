@@ -1,0 +1,3 @@
+receipt_kind=delivery_lifecycle
+marker=synthetic_delivery_lifecycle
+marker=public_neutral_fixture

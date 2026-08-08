@@ -1,0 +1,7 @@
+{
+    "v": 1,
+    "kind": "delivery_v1_self_test",
+    "batch_fixture": "health_bridge_batch_v1.synthetic.json",
+    "mutation": "none",
+    "field": null
+}

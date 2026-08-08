@@ -8,6 +8,7 @@ public enum ReceiverPairingBundleError: Error, Equatable, LocalizedError {
     case emptyInvitationSecret
     case invalidInvitationCode
     case crossOriginRedeemURL
+    case unsupportedTransport
     case invalidDeepLink
     case missingPayload
 
@@ -27,12 +28,19 @@ public enum ReceiverPairingBundleError: Error, Equatable, LocalizedError {
             return "Invitation code must contain fifteen valid letters or numbers."
         case .crossOriginRedeemURL:
             return "Pairing redeem URL must use the same server as the receiver URL."
+        case .unsupportedTransport:
+            return "Pairing transport selection is not supported."
         case .invalidDeepLink:
             return "Pairing link is not a supported Health Bridge link."
         case .missingPayload:
             return "Pairing link is missing its payload."
         }
     }
+}
+
+public enum ReceiverPairingTransport: String, Codable, Equatable, Sendable {
+    case direct
+    case mailbox
 }
 
 public struct ReceiverPairingBundle: Equatable, Sendable {
@@ -105,6 +113,8 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
     public let redeemURLString: String
     public let invitationSecret: String
     public let expiresAt: String
+    public let transport: ReceiverPairingTransport
+    public let mailboxProtocolVersion: Int?
     public let receiverURL: URL
     public let redeemURL: URL
 
@@ -116,9 +126,17 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
             throw ReceiverPairingBundleError.invalidJSON
         }
         guard payload.schemaID == Self.supportedSchemaID,
-              payload.schemaVersion == Self.supportedSchemaVersion
-        else {
+              payload.schemaVersion == Self.supportedSchemaVersion else {
             throw ReceiverPairingBundleError.unsupportedSchema
+        }
+        let transport: ReceiverPairingTransport
+        switch (payload.transport, payload.mailboxProtocolVersion) {
+        case (.some(.direct), nil), (nil, nil):
+            transport = .direct
+        case (.some(.mailbox), 1):
+            transport = .mailbox
+        default:
+            throw ReceiverPairingBundleError.unsupportedTransport
         }
         let receiverURL = try validatedHTTPURL(payload.receiverURL)
         let redeemURL = try validatedHTTPURL(payload.redeemURL)
@@ -135,6 +153,8 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         self.redeemURLString = payload.redeemURL
         self.invitationSecret = payload.invitationSecret
         self.expiresAt = payload.expiresAt
+        self.transport = transport
+        self.mailboxProtocolVersion = payload.mailboxProtocolVersion
         self.receiverURL = receiverURL
         self.redeemURL = redeemURL
     }
@@ -290,6 +310,8 @@ private struct InvitationPairingPayload: Decodable {
     let redeemURL: String
     let invitationSecret: String
     let expiresAt: String
+    let transport: ReceiverPairingTransport?
+    let mailboxProtocolVersion: Int?
 
     enum CodingKeys: String, CodingKey {
         case schemaID = "schema_id"
@@ -299,6 +321,8 @@ private struct InvitationPairingPayload: Decodable {
         case redeemURL = "redeem_url"
         case invitationSecret = "invitation_secret"
         case expiresAt = "expires_at"
+        case transport
+        case mailboxProtocolVersion = "mailbox_protocol_version"
     }
 }
 

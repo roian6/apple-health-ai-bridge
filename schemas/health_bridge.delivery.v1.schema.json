@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/health-bridge/health_bridge.delivery.v1.schema.json",
+  "title": "Health Bridge mailbox delivery V1",
+  "oneOf": [
+    { "$ref": "#/$defs/envelope" },
+    { "$ref": "#/$defs/ack" },
+    { "$ref": "#/$defs/receipt" }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "key_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "binary": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "signed_i64": {
+      "type": "integer",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "nonnegative_i64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "kind",
+        "envelope_id",
+        "receiver_id",
+        "device_id",
+        "connection_generation",
+        "receiver_agreement_key_id",
+        "sender_signing_key_id",
+        "ephemeral_public_key",
+        "nonce",
+        "created_at_ms",
+        "payload_sha256",
+        "content_type",
+        "ciphertext",
+        "signature"
+      ],
+      "properties": {
+        "v": { "const": 1 },
+        "kind": { "const": "delivery" },
+        "envelope_id": { "$ref": "#/$defs/id" },
+        "receiver_id": { "$ref": "#/$defs/id" },
+        "device_id": { "$ref": "#/$defs/id" },
+        "connection_generation": { "$ref": "#/$defs/nonnegative_i64" },
+        "receiver_agreement_key_id": { "$ref": "#/$defs/key_id" },
+        "sender_signing_key_id": { "$ref": "#/$defs/key_id" },
+        "ephemeral_public_key": {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            { "minLength": 43, "maxLength": 43 }
+          ]
+        },
+        "nonce": {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            { "minLength": 16, "maxLength": 16 }
+          ]
+        },
+        "created_at_ms": { "$ref": "#/$defs/signed_i64" },
+        "payload_sha256": { "$ref": "#/$defs/sha256" },
+        "content_type": {
+          "const": "application/vnd.health-bridge.batch-v1+json"
+        },
+        "ciphertext": {
+          "allOf": [{ "$ref": "#/$defs/binary" }, { "minLength": 22 }]
+        },
+        "signature": {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            { "minLength": 86, "maxLength": 86 }
+          ]
+        }
+      }
+    },
+    "ack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "kind",
+        "ack_id",
+        "envelope_id",
+        "receiver_id",
+        "device_id",
+        "connection_generation",
+        "device_agreement_key_id",
+        "receiver_signing_key_id",
+        "nonce",
+        "ciphertext",
+        "signature"
+      ],
+      "properties": {
+        "v": { "const": 1 },
+        "kind": { "const": "ack" },
+        "ack_id": { "$ref": "#/$defs/id" },
+        "envelope_id": { "$ref": "#/$defs/id" },
+        "receiver_id": { "$ref": "#/$defs/id" },
+        "device_id": { "$ref": "#/$defs/id" },
+        "connection_generation": { "$ref": "#/$defs/nonnegative_i64" },
+        "device_agreement_key_id": { "$ref": "#/$defs/key_id" },
+        "receiver_signing_key_id": { "$ref": "#/$defs/key_id" },
+        "nonce": {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            { "minLength": 16, "maxLength": 16 }
+          ]
+        },
+        "ciphertext": {
+          "allOf": [{ "$ref": "#/$defs/binary" }, { "minLength": 22 }]
+        },
+        "signature": {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            { "minLength": 86, "maxLength": 86 }
+          ]
+        }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result",
+        "payload_sha256",
+        "receipt_id",
+        "dataset_generation",
+        "committed_at_ms",
+        "error_code"
+      ],
+      "properties": {
+        "result": { "enum": ["committed", "retryable", "terminal"] },
+        "payload_sha256": { "$ref": "#/$defs/sha256" },
+        "receipt_id": {
+          "oneOf": [{ "$ref": "#/$defs/nonnegative_i64" }, { "type": "null" }]
+        },
+        "dataset_generation": {
+          "oneOf": [{ "$ref": "#/$defs/nonnegative_i64" }, { "type": "null" }]
+        },
+        "committed_at_ms": {
+          "oneOf": [{ "$ref": "#/$defs/nonnegative_i64" }, { "type": "null" }]
+        },
+        "error_code": {
+          "enum": [
+            null,
+            "receiver_busy",
+            "storage_unavailable",
+            "quota_exceeded",
+            "internal_retry",
+            "payload_invalid",
+            "payload_oversize",
+            "duplicate_conflict",
+            "principal_mismatch",
+            "binding_mismatch",
+            "generation_mismatch",
+            "key_revoked"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "result": { "const": "committed" },
+            "receipt_id": { "$ref": "#/$defs/nonnegative_i64" },
+            "dataset_generation": { "$ref": "#/$defs/nonnegative_i64" },
+            "committed_at_ms": { "$ref": "#/$defs/nonnegative_i64" },
+            "error_code": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "result": { "const": "retryable" },
+            "receipt_id": { "type": "null" },
+            "dataset_generation": { "type": "null" },
+            "committed_at_ms": { "type": "null" },
+            "error_code": {
+              "enum": [
+                "receiver_busy",
+                "storage_unavailable",
+                "quota_exceeded",
+                "internal_retry"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "result": { "const": "terminal" },
+            "receipt_id": { "type": "null" },
+            "dataset_generation": { "type": "null" },
+            "committed_at_ms": { "type": "null" },
+            "error_code": {
+              "enum": [
+                "payload_invalid",
+                "payload_oversize",
+                "duplicate_conflict",
+                "principal_mismatch",
+                "binding_mismatch",
+                "generation_mismatch",
+                "key_revoked"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

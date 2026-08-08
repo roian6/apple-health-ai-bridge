@@ -43,6 +43,15 @@ private enum CompanionPrivateStorageError: LocalizedError {
     }
 }
 
+private enum MailboxDeliveryDiagnosticLine {
+    static func failure(for error: Error) -> String {
+        if let phaseError = error as? ProductionMailboxDeliveryPhaseError {
+            return "Mailbox ACK diagnostics failed: phase=\(phaseError.diagnosticCode)."
+        }
+        return "Mailbox ACK diagnostics failed: error=mailbox_delivery_failed."
+    }
+}
+
 private struct ReceiverSyncProgressScope {
     let receiverBindingID: String
     let connectionGeneration: String
@@ -88,6 +97,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             publishedPendingOutboxCount = newValue
         }
     }
+    var usesMailboxTransport: Bool {
+        settingsStore.activeTransport == .mailbox
+    }
     @Published private(set) var hasPendingSleepTransition = false
     @Published private(set) var hasPendingOutboxDeletion = false
     @Published private(set) var hasPendingPrivateStorageRecovery = false
@@ -104,6 +116,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             publishedHasPendingPairing = newValue
         }
     }
+    @Published private(set) var pairingFailurePresentation:
+        CompanionPairingFailurePresentationState?
     @Published var backgroundSyncEnabled: Bool
     @Published private var publishedBackgroundSyncStatus: String
     var backgroundSyncStatus: String {
@@ -123,6 +137,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var healthHistoryDepth: HealthHistoryDepth
     @Published var historicalBackfillState: HealthHistoricalBackfillState
     @Published private(set) var activityLogMessages: [String]
+    @Published private(set) var mailboxKeyDiagnosticState: MailboxKeyDiagnosticState
+    @Published private(set) var mailboxDeliveryDiagnosticLine = ""
 
     private var foregroundCatchUpTask: Task<Void, Never>?
     private var bootstrapTask: Task<Void, Never>?
@@ -171,6 +187,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let settingsStore: ReceiverSettingsStore
     private let pairingStateStore: ReceiverPairingStateStore
     private let pairingCoordinator: ReceiverPairingCoordinator
+    private let mailboxKeyStore: MailboxKeyStore
     private let backgroundSyncStore: BackgroundSyncSettingsStore
     private let healthPermissionRequestStore: CompanionHealthPermissionRequestStore
     private let healthHistoryDepthStore: HealthHistoryDepthSelectionStore
@@ -212,7 +229,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         cursorStoreFileURL: URL? = HealthBridgeCompanionViewModel.defaultCursorStoreFileURL(),
         sleepManifestStore: SleepSyncManifestStoring? = HealthBridgeCompanionViewModel.makeDefaultSleepManifestStore(),
         sleepManifestFileURL: URL? = HealthBridgeCompanionViewModel.defaultSleepManifestFileURL(),
-        sleepResetEpochStore: SleepResetEpochStore = SleepResetEpochStore()
+        sleepResetEpochStore: SleepResetEpochStore = SleepResetEpochStore(),
+        mailboxKeyStore: MailboxKeyStore = MailboxKeyStore(
+            service: HealthBridgeAppIdentity.mailboxKeychainServiceName
+        )
     ) {
         let pendingPairingMayExist: Bool
         do {
@@ -223,10 +243,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.receiverClient = receiverClient
         self.settingsStore = settingsStore
         self.pairingStateStore = pairingStateStore
+        self.mailboxKeyStore = mailboxKeyStore
         self.pairingCoordinator = ReceiverPairingCoordinator(
             client: receiverClient,
             stateStore: pairingStateStore,
-            settingsStore: settingsStore
+            settingsStore: settingsStore,
+            mailboxKeyStore: mailboxKeyStore
         )
         self.backgroundSyncStore = backgroundSyncStore
         self.healthPermissionRequestStore = healthPermissionRequestStore
@@ -340,6 +362,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.healthHistoryDepth = healthHistoryDepthStore.historyDepth
         self.historicalBackfillState = historicalBackfillStateStore.state
         self.activityLogMessages = []
+        self.mailboxKeyDiagnosticState = mailboxKeyStore.diagnosticState()
         self.publishedPendingOutboxCount = (try? outbox?.pendingItems().count) ?? 0
         self.hasPendingSleepTransition = Self.sleepStorageMayNeedRecovery(in: sleepManifestStore)
         self.hasPendingOutboxDeletion = outbox?.clearIntentIsActive ?? true
@@ -434,6 +457,33 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             && !isPairing
             && !manualPairingServer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !manualPairingCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var canResetLostMailboxConnectionKey: Bool {
+        guard mailboxKeyDiagnosticState == .lost,
+              terminalUserActionAdmissionIsOpen,
+              bootstrapTask == nil,
+              pairingTask == nil,
+              foregroundCatchUpTask == nil,
+              backgroundOutboxSchedulingTask == nil,
+              backgroundObserverRetryTask == nil,
+              trackedSyncTasks.isEmpty,
+              directOutboxTransferRequestCount == 0,
+              (try? settingsStore.receiverSettingsAreCleared()) == true,
+              (try? pairingCoordinator.hasPendingPairing()) == false,
+              trustedPendingOutboxCount() == 0,
+              outbox?.clearIntentIsActive == false else {
+            return false
+        }
+        return true
+    }
+
+    var mailboxKeyLifecycleLabel: String {
+        MailboxKeyLifecyclePresentation.label(mailboxKeyDiagnosticState)
+    }
+
+    var mailboxKeyLifecycleDetail: String {
+        MailboxKeyLifecyclePresentation.detail(mailboxKeyDiagnosticState)
     }
 
     var canSyncStepCounts: Bool {
@@ -706,6 +756,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             receiverSettingsSaved = false
             hasPendingPairing = ((try? pairingCoordinator.hasPendingPairing()) ?? false)
                 || cancellationCleanupRecoveryRequired
+            mailboxDeliveryDiagnosticLine = ""
             backgroundSyncStatus = "Automatic sync is off. Sync Now still works."
             refreshPendingOutboxCount()
             if cancellationCleanupRecoveryRequired || transition.postCommitRecoveryRequired {
@@ -738,6 +789,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func checkReceiverHealth() async {
+        if settingsStore.activeTransport == .mailbox {
+            do {
+                statusIsError = false
+                statusMessage = "Checking encrypted iCloud mailbox..."
+                try makeProductionMailboxDelivery().validateAvailability()
+                statusMessage = "Mailbox folder is ready on this iPhone. Receiver delivery has not been verified."
+            } catch {
+                statusIsError = true
+                statusMessage = "Encrypted iCloud mailbox check failed: \(describe(error))"
+            }
+            return
+        }
         guard let url = URL(string: receiverURLString) else {
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
@@ -993,7 +1056,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             try requireCurrentConnectionGeneration(expectedGeneration)
             refreshPendingOutboxCount()
-            if summary.failedCount > 0 {
+            if settingsStore.activeTransport == .mailbox,
+               summary.failedCount == 0 {
+                statusIsError = false
+                statusMessage = "Secure mailbox delivery confirmed \(summary.uploadedCount) item(s). Waiting for receiver confirmation: \(pendingOutboxCount)."
+            } else if summary.failedCount > 0 {
                 statusIsError = true
                 statusMessage = "Some queued uploads did not finish: attempted \(summary.attemptedCount), uploaded \(summary.uploadedCount), failed \(summary.failedCount). \(Self.firstFailureSentence(summary)) Queued uploads: \(pendingOutboxCount)."
             } else {
@@ -1191,10 +1258,90 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     func retryPendingPairing() async {
         guard terminalUserActionAdmissionIsOpen, hasPendingPairing else { return }
+        pairingFailurePresentation = nil
         bootstrapCompleted = false
         statusIsError = false
         statusMessage = "Retrying the pending pairing attempt..."
         await bootstrap()
+    }
+
+    func resetLostMailboxConnectionKey() async {
+        guard canResetLostMailboxConnectionKey else {
+            refreshMailboxKeyDiagnosticState()
+            statusIsError = true
+            statusMessage = "Mailbox connection key recovery was refused because the key is not provably lost or pairing, connection, queued-upload, or sync state is not safely idle."
+            return
+        }
+        do {
+            try await withTerminalTransitionRequestGate { [self] in
+                let privateStorageAdmissionWasReady = privateStorageAdmissionReady
+                beginTerminalTaskUIPublicationSuppression()
+                do {
+                    try await connectionTerminalBarrier.performRecovery(
+                        closeAdmission: {
+                            self.privateStorageAdmissionReady = false
+                            self.automaticSyncActivated = false
+                            self.stopHealthKitBackgroundDelivery()
+                        },
+                        cancelAndAwaitPairing: {
+                            await self.cancelPairingOperationIfNeeded()
+                        },
+                        cancelAndAwaitForegroundPayloads: {
+                            await self.cancelAndAwaitForegroundPayloadTasks()
+                        },
+                        drainBackgroundPayloads: {
+                            await self.drainBackgroundPayloadCancellation()
+                        },
+                        commit: {
+                            let backgroundRunIsActive = await self.backgroundRunGate
+                                .hasActiveRun()
+                            let pendingPairingExists =
+                                (try? self.pairingCoordinator.hasPendingPairing()) ?? true
+                            let terminalTransitionIsPending =
+                                (try? self.pairingCoordinator
+                                    .hasPendingCancellationRecovery()) ?? true
+                            let authorization = MailboxKeyRecoveryAuthorization(
+                                receiverActivationIsUnpaired:
+                                    (try? self.settingsStore.receiverSettingsAreCleared())
+                                    == true,
+                                pendingPairingExists: pendingPairingExists,
+                                terminalTransitionIsPending: terminalTransitionIsPending,
+                                pendingOutboxCount: self.trustedPendingOutboxCount(),
+                                operationIsActive: backgroundRunIsActive
+                                    || self.pairingTask != nil
+                                    || self.foregroundCatchUpTask != nil
+                                    || self.backgroundOutboxSchedulingTask != nil
+                                    || self.backgroundObserverRetryTask != nil
+                                    || !self.trackedSyncTasks.isEmpty
+                                    || self.directOutboxTransferRequestCount != 0
+                            )
+                            try self.settingsStore.clearReceiverSettings(
+                                expectedGeneration:
+                                    self.settingsStore.receiverSettingsGenerationToken
+                            )
+                            try self.pairingStateStore.clearPending()
+                            try self.mailboxKeyStore.resetLostKeyMaterial(
+                                authorization: authorization
+                            )
+                        }
+                    )
+                } catch {
+                    endTerminalTaskUIPublicationSuppression()
+                    privateStorageAdmissionReady = privateStorageAdmissionWasReady
+                    throw error
+                }
+                endTerminalTaskUIPublicationSuppression()
+                privateStorageAdmissionReady = privateStorageAdmissionWasReady
+                refreshMailboxKeyDiagnosticState()
+            }
+            statusIsError = false
+            pairingFailurePresentation = nil
+            statusMessage = "Mailbox connection key reset to not initialized; pending and saved pairing state are clear. | domain=MailboxKeyRecovery | code=mailbox_key_reset_not_initialized"
+        } catch {
+            refreshMailboxKeyDiagnosticState()
+            statusIsError = true
+            statusMessage = "Mailbox connection key recovery failed: \(describe(error))"
+        }
     }
 
     func bootstrap() async {
@@ -1308,7 +1455,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard !Task.isCancelled else { return }
         bootstrapCompleted = true
         activateAutomaticSyncIfReady()
-        if hasPendingPairing {
+        if hasPendingPairing, !statusIsError {
             statusIsError = true
             statusMessage = "Pairing recovery is still pending. Automatic sync remains paused until recovery succeeds or you cancel it."
         }
@@ -1396,11 +1543,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     )
                 }
                 reloadCommittedReceiverSettings()
+                pairingFailurePresentation = nil
                 return
             }
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
-                cancelPairingOperation: false
+                cancelPairingOperation: false,
+                diagnosePairingCommitBarriers: true
             ) { expectedGeneration in
                 try await self.pairingCoordinator.resumePendingPairing(
                     expectedGeneration: expectedGeneration
@@ -1408,6 +1557,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             guard let credential = transition.result else {
                 reloadCommittedReceiverSettings()
+                pairingFailurePresentation = nil
                 return
             }
             try requireCommittedConnectionGenerationWhileHoldingRequestGate(transition.committedGeneration)
@@ -1417,20 +1567,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
         } catch {
             reloadCommittedReceiverSettings()
-            statusIsError = true
-            statusMessage = "Finishing the previous pairing attempt failed: \(describe(error))"
+            publishPairingFailure(
+                "Finishing the previous pairing attempt failed",
+                error: error
+            )
         }
     }
 
     func cancelPendingPairing() async {
         guard terminalUserActionAdmissionIsOpen else { return }
+        pairingFailurePresentation = nil
         do {
             try await withTerminalTransitionRequestGate { [self] in
                 await self.performCancelPendingPairingWhileHoldingRequestGate()
             }
         } catch {
-            statusIsError = true
-            statusMessage = "Pending pairing cancellation was cancelled before it could start."
+            publishPairingFailure(
+                "Pending pairing cancellation was cancelled before it could start."
+            )
         }
     }
 
@@ -1476,8 +1630,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             reloadCommittedReceiverSettings()
             hasPendingPairing = true
             receiverSettingsSaved = false
-            statusIsError = true
-            statusMessage = "Cancelling pending pairing failed: \(describe(error))"
+            publishPairingFailure("Cancelling pending pairing failed", error: error)
         }
     }
 
@@ -1557,6 +1710,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func finishPairingAttempt() {
         refreshPendingPairingState()
+        refreshMailboxKeyDiagnosticState()
         guard !Task.isCancelled else {
             automaticSyncActivated = false
             stopHealthKitBackgroundDelivery()
@@ -1573,6 +1727,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
+    private func refreshMailboxKeyDiagnosticState() {
+        mailboxKeyDiagnosticState = mailboxKeyStore.diagnosticState()
+    }
+
     private func reloadCommittedReceiverSettings() {
         guard !taskUIPublicationIsSuppressed else { return }
         let savedBearerToken = (try? settingsStore.loadBearerToken()) ?? ""
@@ -1586,12 +1744,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func requireTrustedEmptyOutboxForConnectionTransition(
-        outboxIdentityAdmissionWasReady: Bool
+        outboxIdentityAdmissionWasReady: Bool,
+        diagnosePairingCommitBarriers: Bool = false
     ) throws {
         guard let outbox else {
+            if diagnosePairingCommitBarriers {
+                throw ReceiverPairingCommitBarrierError.outboxUnavailable
+            }
             throw CompanionPrivateStorageError.outboxUnavailable
         }
-        let pendingItemCount = try outbox.pendingItems().count
+        let pendingItemCount: Int
+        do {
+            pendingItemCount = try outbox.pendingItems().count
+        } catch {
+            if diagnosePairingCommitBarriers {
+                throw ReceiverPairingCommitBarrierError.outboxUnreadable
+            }
+            throw error
+        }
+        if diagnosePairingCommitBarriers {
+            if let failure = ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
+                outboxIdentityAdmissionReady: outboxIdentityAdmissionWasReady,
+                pendingItemCount: pendingItemCount,
+                clearIntentIsActive: outbox.clearIntentIsActive
+            ) {
+                throw failure
+            }
+            return
+        }
         guard ReceiverConnectionTransitionPolicy.canBegin(
             outboxIdentityAdmissionReady: outboxIdentityAdmissionWasReady,
             pendingItemCount: pendingItemCount,
@@ -1652,6 +1832,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func performTerminalConnectionTransitionWhileHoldingRequestGate<Result>(
         cancelPairingOperation: Bool,
         advanceGeneration: Bool = true,
+        diagnosePairingCommitBarriers: Bool = false,
         commit: @escaping @MainActor (String) async throws -> Result
     ) async throws -> (
         result: Result,
@@ -1675,10 +1856,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 self.stopHealthKitBackgroundDelivery()
             },
             invalidateGeneration: {
-                if advanceGeneration {
-                    return try self.settingsStore.invalidateReceiverSettingsGeneration()
+                do {
+                    if advanceGeneration {
+                        return try self.settingsStore.invalidateReceiverSettingsGeneration()
+                    }
+                    return self.settingsStore.receiverSettingsGenerationToken
+                } catch {
+                    if diagnosePairingCommitBarriers {
+                        throw ReceiverPairingCommitBarrierError.generationInvalidationFailed
+                    }
+                    throw error
                 }
-                return self.settingsStore.receiverSettingsGenerationToken
             },
             cancelAndAwaitPairing: {
                 if cancelPairingOperation {
@@ -1693,7 +1881,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             },
             commit: { expectedGeneration in
                 try self.requireTrustedEmptyOutboxForConnectionTransition(
-                    outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady
+                    outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady,
+                    diagnosePairingCommitBarriers: diagnosePairingCommitBarriers
                 )
                 let result = try await commit(expectedGeneration)
                 let committedBindingID = self.settingsStore.receiverBindingID
@@ -1720,6 +1909,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         } catch {
             endTerminalTaskUIPublicationSuppression()
             restorePrivateStorageAdmissionAfterFailedConnectionTransition()
+            if diagnosePairingCommitBarriers,
+               error as? ReceiverConnectionTerminalBarrierError
+                == .backgroundPayloadCancellationNotFinalized {
+                throw ReceiverPairingCommitBarrierError
+                    .backgroundPayloadCancellationNotFinalized
+            }
             throw error
         }
         endTerminalTaskUIPublicationSuppression()
@@ -1881,6 +2076,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return
         }
         guard !isPairing else { return }
+        pairingFailurePresentation = nil
         let trimmed = pairingImportText.trimmingCharacters(in: .whitespacesAndNewlines)
         isPairing = true
         defer {
@@ -1894,20 +2090,21 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try await applyPairingMaterial(material)
             pairingImportText = ""
         } catch {
-            statusIsError = true
-            statusMessage = "Setup link import failed: \(describe(error))"
+            publishPairingFailure("Setup link import failed", error: error)
         }
     }
 
     func importPairingURL(_ url: URL) async {
         guard !taskUIPublicationIsSuppressed else { return }
+        pairingFailurePresentation = nil
         let pendingPairingExists: Bool
         do {
             pendingPairingExists = try pairingCoordinator.hasPendingPairing()
         } catch {
             hasPendingPairing = true
-            statusIsError = true
-            statusMessage = "Could not read the saved pending pairing. Recover private storage before opening another setup link."
+            publishPairingFailure(
+                "Could not read the saved pending pairing. Recover private storage before opening another setup link."
+            )
             return
         }
         let matchesPendingBootstrapInvitation: Bool
@@ -1932,8 +2129,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             hasPendingPairing = true
             automaticSyncActivated = false
             stopHealthKitBackgroundDelivery()
-            statusIsError = true
-            statusMessage = "A different pairing is already pending. Retry it, or clear the pending pairing and saved connection before opening this setup link again."
+            publishPairingFailure(
+                "A different pairing is already pending. Retry it, or clear the pending pairing and saved connection before opening this setup link again."
+            )
             return
         case .resumeMatchingPending:
             await bootstrap()
@@ -1968,8 +2166,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let material = try ReceiverPairingMaterial(deepLink: url)
             try await applyPairingMaterial(material)
         } catch {
-            statusIsError = true
-            statusMessage = "Setup link failed: \(describe(error))"
+            publishPairingFailure("Setup link failed", error: error)
         }
     }
 
@@ -1990,6 +2187,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return
         }
         guard !isPairing else { return }
+        pairingFailurePresentation = nil
         isPairing = true
         defer {
             if !taskUIPublicationIsSuppressed {
@@ -2007,7 +2205,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             pauseAutomaticSyncForPendingPairing()
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
-                cancelPairingOperation: false
+                cancelPairingOperation: false,
+                diagnosePairingCommitBarriers: true
             ) { expectedGeneration in
                 try await self.pairingCoordinator.pair(
                     manualPairing: manualPairing,
@@ -2023,8 +2222,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             manualPairingServer = ""
             manualPairingCode = ""
         } catch {
-            statusIsError = true
-            statusMessage = "Manual pairing failed: \(describe(error))"
+            publishPairingFailure("Manual pairing failed", error: error)
         }
     }
 
@@ -2036,7 +2234,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
-                cancelPairingOperation: false
+                cancelPairingOperation: false,
+                diagnosePairingCommitBarriers: true
             ) { expectedGeneration in
                 try self.settingsStore.save(
                     receiverURLString: bundle.receiverURLString,
@@ -2059,7 +2258,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             pauseAutomaticSyncForPendingPairing()
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
-                cancelPairingOperation: false
+                cancelPairingOperation: false,
+                diagnosePairingCommitBarriers: true
             ) { expectedGeneration in
                 try await self.pairingCoordinator.pair(
                     invitation: invitation,
@@ -2084,7 +2284,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             receiverURL: credential.receiverURLString,
             token: credential.bearerToken,
             label: credential.label,
-            previousGeneration: previousGeneration
+            previousGeneration: previousGeneration,
+            usesMailbox: credential.mailboxIdentity != nil
         )
         refreshPendingPairingState()
     }
@@ -2093,8 +2294,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         receiverURL: String,
         token: String,
         label: String,
-        previousGeneration: String
+        previousGeneration: String,
+        usesMailbox: Bool = false
     ) {
+        pairingFailurePresentation = nil
         receiverURLString = receiverURL
         bearerToken = token
         receiverSettingsSaved = canSaveReceiverSettings
@@ -2108,7 +2311,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         if outboxIdentityMigrationReady {
             statusIsError = false
-            statusMessage = "Connected: \(label). The device credential is stored securely on this iPhone."
+            statusMessage = usesMailbox
+                ? "Connected: \(label). Encrypted batches use this app's iCloud Public Documents mailbox; keys stay on this iPhone."
+                : "Connected: \(label). The device credential is stored securely on this iPhone."
         } else {
             statusIsError = true
             statusMessage = "Connected: \(label), but uploads remain blocked until you delete the quarantined queued uploads."
@@ -2479,6 +2684,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func reschedulePendingBackgroundOutboxUploadsAfterReceiverChange() {
+        mailboxDeliveryDiagnosticLine = ""
         guard terminalPayloadActionAdmissionIsOpen,
               automaticSyncReady,
               directOutboxTransferRequestCount == 0 else { return }
@@ -2560,6 +2766,35 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               directOutboxTransferRequestCount == 0,
               settingsStore.receiverSettingsGenerationToken == expectedGeneration,
               !Task.isCancelled else {
+            return
+        }
+        if settingsStore.activeTransport == .mailbox {
+            do {
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                let summary = try await makeProductionMailboxDelivery().deliverPending()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                refreshPendingOutboxCount()
+                backgroundSyncStatus = Self.mailboxDeliveryMessage(
+                    summary,
+                    pendingCount: pendingOutboxCount
+                )
+                mailboxDeliveryDiagnosticLine = summary.ackDiagnosticLine
+                if summary.terminalCount > 0 {
+                    statusIsError = true
+                    statusMessage = "Receiver rejected a secure mailbox item. Review the connection before retrying."
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                do {
+                    try requireCurrentConnectionGeneration(expectedGeneration)
+                } catch {
+                    return
+                }
+                let description = describe(error)
+                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed: \(description)"
+            }
             return
         }
         let committedReceiverURLString = settingsStore.receiverURLString
@@ -4872,6 +5107,31 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         expectedGeneration: String
     ) async throws -> FileOutboxFlushSummary {
         try requireCurrentConnectionGeneration(expectedGeneration)
+        if settingsStore.activeTransport == .mailbox {
+            do {
+                let summary = try await makeProductionMailboxDelivery().deliverPending()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                let flushSummary = FileOutboxFlushSummary(
+                    attemptedCount: summary.attemptedCount,
+                    uploadedCount: summary.finalizedCount,
+                    failedItemIDs: summary.terminalCount > 0
+                        ? ["mailbox_terminal_hold"]
+                        : [],
+                    failedDescriptions: summary.terminalCount > 0
+                        ? ["Receiver rejected a secure mailbox item. Review the connection before retrying."]
+                        : [],
+                    mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine
+                )
+                mailboxDeliveryDiagnosticLine = flushSummary.mailboxDeliveryDiagnosticLine
+                return flushSummary
+            } catch let cancellation as CancellationError {
+                throw cancellation
+            } catch {
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                throw error
+            }
+        }
         guard let receiverIdentity = settingsStore.receiverBindingID else {
             throw CancellationError()
         }
@@ -4916,6 +5176,32 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             failedItemIDs: failedItemIDs,
             failedDescriptions: failedDescriptions
         )
+    }
+
+    private func makeProductionMailboxDelivery() throws -> ProductionMailboxDelivery {
+        guard let outbox else {
+            throw CompanionPrivateStorageError.outboxUnavailable
+        }
+        guard let cursorStore else {
+            throw CompanionPrivateStorageError.cursorStoreUnavailable
+        }
+        return ProductionMailboxDelivery(
+            settingsStore: settingsStore,
+            outbox: outbox,
+            cursorStore: cursorStore,
+            proofStore: coreLaneUploadProofStore,
+            sleepStore: sleepManifestStore
+        )
+    }
+
+    private static func mailboxDeliveryMessage(
+        _ summary: ProductionMailboxDeliverySummary,
+        pendingCount: Int
+    ) -> String {
+        if summary.terminalCount > 0 {
+            return "Receiver rejected \(summary.terminalCount) secure mailbox item(s). Review the connection before retrying. Pending: \(pendingCount)."
+        }
+        return "Secure mailbox delivery attempted \(summary.attemptedCount), confirmed \(summary.finalizedCount), waiting for receiver confirmation \(summary.waitingCount)."
     }
 
     private static func sleepStorageMayNeedRecovery(
@@ -5152,6 +5438,67 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func describe(_ error: Error) -> String {
+        if let preflightError = error as? ReceiverPairingPreflightError {
+            switch preflightError {
+            case .mailboxKey(let failure):
+                switch failure {
+                case .keyMaterialLost:
+                    return "Mailbox connection key material is unreadable or incomplete. | domain=ReceiverPairingPreflightError | code=mailbox_key_lost"
+                case .keysRevoked:
+                    return "Mailbox connection key material is revoked. | domain=ReceiverPairingPreflightError | code=mailbox_key_revoked"
+                case .staleIdentity:
+                    return "Mailbox connection key identity is stale. | domain=ReceiverPairingPreflightError | code=mailbox_key_stale_identity"
+                case .malformedState:
+                    return "Mailbox connection key state is malformed. | domain=ReceiverPairingPreflightError | code=mailbox_key_malformed"
+                case .rollbackDetected:
+                    return "Mailbox connection key rollback protection rejected the stored state. | domain=ReceiverPairingPreflightError | code=mailbox_key_rollback_detected"
+                case .keychainLocked:
+                    return "Mailbox connection key is unavailable while this iPhone is locked. | domain=ReceiverPairingPreflightError | code=mailbox_key_locked"
+                case .keychainAccessDenied:
+                    return "Mailbox connection key access was denied. | domain=ReceiverPairingPreflightError | code=mailbox_key_access_denied"
+                case .keychainUnavailable:
+                    return "Mailbox connection key storage is unavailable. | domain=ReceiverPairingPreflightError | code=mailbox_key_unavailable"
+                }
+            }
+        }
+        if let recoveryError = error as? MailboxKeyRecoveryError {
+            switch recoveryError {
+            case .receiverActivationNotUnpaired:
+                return "Recovery requires an unpaired receiver activation."
+            case .pairingOrTerminalTransitionPending:
+                return "Recovery requires pairing and connection transitions to be clear."
+            case .outboxStatusUnavailable:
+                return "Recovery requires readable queued-upload status."
+            case .outboxNotEmpty:
+                return "Recovery requires an empty queued-upload store."
+            case .operationActive:
+                return "Recovery requires pairing and sync operations to be idle."
+            case .lifecycleNotLost:
+                return "Recovery is allowed only when mailbox connection key material is provably lost."
+            }
+        }
+        if let barrierError = error as? ReceiverPairingCommitBarrierError {
+            let detail: String
+            switch barrierError {
+            case .cancelled:
+                detail = "Pairing commit was cancelled."
+            case .generationInvalidationFailed:
+                detail = "Saved connection generation could not be advanced."
+            case .backgroundPayloadCancellationNotFinalized:
+                detail = "Background upload cleanup is incomplete."
+            case .outboxUnavailable:
+                detail = "Queued-upload storage is unavailable."
+            case .outboxUnreadable:
+                detail = "Queued-upload storage could not be read."
+            case .outboxIdentityAdmissionNotReady:
+                detail = "Queued-upload identity admission is not ready."
+            case .outboxNotEmpty:
+                detail = "Queued uploads remain pending."
+            case .outboxClearIntentActive:
+                detail = "Queued-upload deletion is still pending."
+            }
+            return "\(detail) | domain=ReceiverPairingCommitBarrierError | code=\(barrierError.rawValue)"
+        }
         if let receiverError = error as? ReceiverClientError {
             switch receiverError {
             case .emptyBearerToken:
@@ -5250,5 +5597,28 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             details.append("underlying=\(underlying.domain)/\(underlying.code): \(underlying.localizedDescription)")
         }
         return details.joined(separator: " | ")
+    }
+
+    private func describePairingFailure(_ error: Error) -> String {
+        if error is CancellationError {
+            return describe(ReceiverPairingCommitBarrierError.cancelled)
+        }
+        if let redeemError = error as? ReceiverPairingRedeemError {
+            return "\(redeemError.localizedDescription) | domain=ReceiverPairingRedeem | code=\(redeemError.diagnosticCode)"
+        }
+        return describe(error)
+    }
+
+    private func publishPairingFailure(_ message: String) {
+        statusIsError = true
+        statusMessage = message
+        guard hasPendingPairing else { return }
+        pairingFailurePresentation = CompanionPairingFailurePresentationState(
+            rawFailure: message
+        )
+    }
+
+    private func publishPairingFailure(_ prefix: String, error: Error) {
+        publishPairingFailure("\(prefix): \(describePairingFailure(error))")
     }
 }

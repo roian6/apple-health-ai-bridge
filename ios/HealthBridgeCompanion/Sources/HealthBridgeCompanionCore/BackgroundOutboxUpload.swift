@@ -29,6 +29,80 @@ public enum ReceiverUploadRequestFactory {
     }
 }
 
+public struct DeliveryTransportInput: Equatable, Sendable {
+    public let item: FileOutboxItem
+    public let persistedBytes: Data
+
+    public init(item: FileOutboxItem) throws {
+        try self.init(item: item, readPersistedBytes: { try Data(contentsOf: $0) })
+    }
+
+    init(
+        item: FileOutboxItem,
+        readPersistedBytes: (URL) throws -> Data
+    ) throws {
+        self.item = item
+        persistedBytes = try readPersistedBytes(item.fileURL)
+    }
+}
+
+public enum DeliveryTransportResult: CaseIterable, Equatable, Sendable {
+    case collected
+    case published
+    case observed
+    case committed
+    case terminal
+    case retryable
+}
+
+public protocol DeliveryTransport {
+    @discardableResult
+    func deliver(_ input: DeliveryTransportInput) throws -> DeliveryTransportResult
+}
+
+public struct DirectHTTPTransport: DeliveryTransport {
+    public typealias Schedule = (BackgroundOutboxUploadPlan) throws -> Void
+
+    private let receiverURL: URL
+    private let bearerToken: String
+    private let receiverGeneration: String
+    private let receiverBindingID: String
+    private let alreadyScheduledItemIDs: Set<String>
+    private let schedule: Schedule
+
+    public init(
+        receiverURL: URL,
+        bearerToken: String,
+        receiverGeneration: String,
+        receiverBindingID: String,
+        alreadyScheduledItemIDs: Set<String>,
+        schedule: @escaping Schedule
+    ) {
+        self.receiverURL = receiverURL
+        self.bearerToken = bearerToken
+        self.receiverGeneration = receiverGeneration
+        self.receiverBindingID = receiverBindingID
+        self.alreadyScheduledItemIDs = alreadyScheduledItemIDs
+        self.schedule = schedule
+    }
+
+    @discardableResult
+    public func deliver(_ input: DeliveryTransportInput) throws -> DeliveryTransportResult {
+        let plans = try BackgroundOutboxUploadPlanner.plan(
+            pendingItems: [input.item],
+            receiverURL: receiverURL,
+            bearerToken: bearerToken,
+            receiverGeneration: receiverGeneration,
+            receiverBindingID: receiverBindingID,
+            alreadyScheduledItemIDs: alreadyScheduledItemIDs
+        )
+        for plan in plans {
+            try schedule(plan)
+        }
+        return plans.isEmpty ? .collected : .published
+    }
+}
+
 public enum BackgroundOutboxTaskDescriptorError: Error, Equatable, LocalizedError, Sendable {
     case unsafeItemID
     case unsafeReceiverGeneration
@@ -215,6 +289,60 @@ public struct BackgroundUploadTaskCompletion: Codable, Equatable, Sendable {
         self.statusCode = statusCode
         self.hadTransportError = hadTransportError
         self.sleepMinimumResetEpoch = sleepMinimumResetEpoch
+    }
+}
+
+public struct DirectUploadCompletionDescriptor: Equatable, Sendable {
+    public let itemID: String
+    public let receiverGeneration: String
+    public let receiverBindingID: String
+
+    public init(
+        itemID: String,
+        receiverGeneration: String,
+        receiverBindingID: String
+    ) {
+        self.itemID = itemID
+        self.receiverGeneration = receiverGeneration
+        self.receiverBindingID = receiverBindingID
+    }
+}
+
+public enum DirectUploadFinalizationOutcome: Equatable, Sendable {
+    case stale
+    case recovered
+    case retired
+    case retained
+}
+
+public enum DirectUploadFinalizer {
+    public static func finish(
+        descriptor: DirectUploadCompletionDescriptor,
+        completion: BackgroundUploadTaskCompletion,
+        currentReceiverGeneration: String,
+        currentReceiverBindingID: String?,
+        recoverSleepBaseline: (String, UInt64) throws -> Void,
+        retire: (String, String) throws -> Void
+    ) rethrows -> DirectUploadFinalizationOutcome {
+        guard descriptor.receiverGeneration == currentReceiverGeneration,
+              descriptor.receiverBindingID == currentReceiverBindingID else {
+            return .stale
+        }
+
+        if let minimumResetEpoch = completion.sleepMinimumResetEpoch,
+           !completion.hadTransportError,
+           completion.statusCode == 409 {
+            try recoverSleepBaseline(descriptor.itemID, minimumResetEpoch)
+            return .recovered
+        }
+
+        guard !completion.hadTransportError,
+              let statusCode = completion.statusCode,
+              (200 ..< 300).contains(statusCode) else {
+            return .retained
+        }
+        try retire(descriptor.itemID, descriptor.receiverBindingID)
+        return .retired
     }
 }
 

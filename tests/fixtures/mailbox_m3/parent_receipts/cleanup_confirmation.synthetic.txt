@@ -1,0 +1,3 @@
+receipt_kind=cleanup_confirmation
+marker=synthetic_cleanup_confirmation
+marker=public_neutral_fixture

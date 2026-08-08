@@ -26,7 +26,7 @@ from health_bridge.receiver.tokens import (
 )
 from health_bridge.storage.database import connect_database
 
-StoredInvitationRow: TypeAlias = tuple[str, str, str, str, str]
+StoredInvitationRow: TypeAlias = tuple[str, str, str, str, str, str]
 CountRow: TypeAlias = tuple[int]
 AttemptRow: TypeAlias = tuple[int, int]
 RedemptionStateRow: TypeAlias = tuple[str | None, str | None]
@@ -50,7 +50,7 @@ SECOND_INSTALLATION_ID: Final = "00000000-0000-4000-8000-000000000002"
 SECOND_DEVICE_CREDENTIAL: Final = "hb_" + "b" * 64
 STORED_INVITATION_SQL: Final = """
 select invitation_secret_hash, invitation_code_selector,
-       invitation_code_hash, invitation_code_salt, expires_at
+       invitation_code_hash, invitation_code_salt, expires_at, transport
 from pairing_invitations
 """
 ATTEMPT_ROW_SQL: Final = """
@@ -109,6 +109,33 @@ def test_create_invitation_stores_only_hashes_and_expires_in_twenty_minutes(
     assert len(row[3]) == 32
     assert invitation.invitation_secret not in row
     assert invitation.invitation_code not in row
+    assert row[5] == "direct"
+
+
+def test_create_invitation_persists_explicit_mailbox_transport(
+    tmp_path: Path,
+) -> None:
+    # Given
+    db_path = tmp_path / "receiver.sqlite"
+
+    # When
+    invitation = create_pairing_invitation(
+        db_path,
+        label="personal-iphone",
+        receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
+        invitation_secret="hbi_synthetic_secret",
+        invitation_code="ABCDE-FGHJK-MNPQR",
+    )
+
+    # Then
+    assert invitation.transport == "mailbox"
+    with connect_database(db_path) as connection:
+        row = STORED_INVITATION_ROW_ADAPTER.validate_python(
+            connection.execute(STORED_INVITATION_SQL).fetchone()
+        )
+    assert row is not None
+    assert row[5] == "mailbox"
 
 
 def test_generated_invitation_uses_unambiguous_grouped_code_and_high_entropy_secret(

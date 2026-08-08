@@ -1,7 +1,7 @@
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Annotated, Final
+from typing import Annotated, Final, Literal
 
 import typer
 from pydantic import ValidationError
@@ -19,6 +19,7 @@ from health_bridge.cli_dev import (
     watch_event_json,
     watch_sync_run_events,
 )
+from health_bridge.cli_mailbox import mailbox_app
 from health_bridge.cli_mcp import mcp_app
 from health_bridge.cli_query import query_app
 from health_bridge.cli_receiver import receiver_app
@@ -47,6 +48,7 @@ app = typer.Typer(
 app.add_typer(query_app, name="query")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(receiver_app, name="receiver")
+app.add_typer(mailbox_app, name="mailbox")
 dev_app = typer.Typer(
     add_completion=False,
     help="Developer and private-device setup helpers.",
@@ -123,6 +125,30 @@ def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
         str,
         typer.Option("--label", help="Human-readable iPhone label."),
     ] = "iPhone",
+    transport: Annotated[
+        Literal["direct", "icloud-mailbox"],
+        typer.Option(
+            "--transport",
+            help=(
+                "Choose Direct/Tailscale-compatible delivery or explicit "
+                "Encrypted iCloud Mailbox (Beta)."
+            ),
+        ),
+    ] = "direct",
+    mailbox_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--mailbox-root",
+            help="Existing macOS iCloud Documents HealthBridgeMailbox/v1 path.",
+        ),
+    ] = None,
+    icloud_container_identifier: Annotated[
+        str | None,
+        typer.Option(
+            "--icloud-container-identifier",
+            help="Expected iCloud container identifier for the mailbox root.",
+        ),
+    ] = None,
     receiver_host: Annotated[
         str,
         typer.Option("--receiver-host", help="Receiver bind host."),
@@ -174,6 +200,9 @@ def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
                 receiver_port=receiver_port,
                 executable=executable,
                 allow_nonlocal_receiver_address=allow_nonlocal_receiver_address,
+                transport=transport,
+                mailbox_root=mailbox_root,
+                icloud_container_identifier=icloud_container_identifier,
             )
         )
         manifest = verify_local_mcp(manifest)

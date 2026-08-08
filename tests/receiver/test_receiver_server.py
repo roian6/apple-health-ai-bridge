@@ -44,8 +44,18 @@ def test_receiver_holds_lifecycle_lock_while_idle(
 
     @final
     class IdleServer:
-        def __init__(self, *, host: str, port: int, db_path: Path) -> None:
+        def __init__(
+            self,
+            *,
+            host: str,
+            port: int,
+            db_path: Path,
+            mailbox_key_store: object | None = None,
+            mailbox_connection_store: object | None = None,
+        ) -> None:
             del host, port
+            assert mailbox_key_store is None
+            assert mailbox_connection_store is None
             self.db_path = db_path
 
         def __enter__(self) -> Self:

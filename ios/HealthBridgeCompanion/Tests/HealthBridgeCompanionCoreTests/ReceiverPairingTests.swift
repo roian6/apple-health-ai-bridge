@@ -59,6 +59,65 @@ final class ReceiverPairingTests: XCTestCase {
         XCTAssertEqual(invitation.redeemURLString, "https://health-bridge.example.test/v1/pairing/redeem")
         XCTAssertEqual(invitation.invitationSecret, "hbi_synthetic_secret")
         XCTAssertEqual(invitation.expiresAt, "2026-07-12T09:00:00Z")
+        XCTAssertEqual(invitation.transport, .direct)
+        XCTAssertNil(invitation.mailboxProtocolVersion)
+    }
+
+    func testLegacyV2InvitationWithoutTransportRemainsDirect() throws {
+        let invitation = try ReceiverPairingInvitation(
+            jsonData: Data(legacyDirectInvitationJSON.utf8)
+        )
+
+        XCTAssertEqual(invitation.transport, .direct)
+        XCTAssertNil(invitation.mailboxProtocolVersion)
+    }
+
+    func testExplicitMailboxInvitationRequiresMailboxProtocolV1() throws {
+        let invitation = try ReceiverPairingInvitation(
+            jsonData: Data(mailboxInvitationJSON.utf8)
+        )
+
+        XCTAssertEqual(invitation.transport, .mailbox)
+        XCTAssertEqual(invitation.mailboxProtocolVersion, 1)
+    }
+
+    func testMailboxCapabilityWithoutExplicitTransportIsRejected() {
+        let capabilityOnly = legacyDirectInvitationJSON.replacingOccurrences(
+            of: "\n}",
+            with: ",\n  \"mailbox_protocol_version\": 1\n}"
+        )
+
+        XCTAssertThrowsError(
+            try ReceiverPairingInvitation(jsonData: Data(capabilityOnly.utf8))
+        ) { error in
+            XCTAssertEqual(error as? ReceiverPairingBundleError, .unsupportedTransport)
+        }
+    }
+
+    func testAmbiguousDirectMailboxCapabilityIsRejected() {
+        let ambiguous = validInvitationJSON.replacingOccurrences(
+            of: "\n}",
+            with: ",\n  \"mailbox_protocol_version\": 1\n}"
+        )
+
+        XCTAssertThrowsError(
+            try ReceiverPairingInvitation(jsonData: Data(ambiguous.utf8))
+        ) { error in
+            XCTAssertEqual(error as? ReceiverPairingBundleError, .unsupportedTransport)
+        }
+    }
+
+    func testMailboxTransportWithoutRequiredCapabilityIsRejected() {
+        let missingCapability = mailboxInvitationJSON.replacingOccurrences(
+            of: ",\n  \"mailbox_protocol_version\": 1",
+            with: ""
+        )
+
+        XCTAssertThrowsError(
+            try ReceiverPairingInvitation(jsonData: Data(missingCapability.utf8))
+        ) { error in
+            XCTAssertEqual(error as? ReceiverPairingBundleError, .unsupportedTransport)
+        }
     }
 
     func testDecodesV2InvitationFromFutureHTTPSPairLink() throws {
@@ -158,7 +217,34 @@ private let validInvitationJSON = """
   "receiver_url": "https://health-bridge.example.test/v1/batches",
   "redeem_url": "https://health-bridge.example.test/v1/pairing/redeem",
   "invitation_secret": "hbi_synthetic_secret",
+  "expires_at": "2026-07-12T09:00:00Z",
+  "transport": "direct"
+}
+"""
+
+private let legacyDirectInvitationJSON = """
+{
+  "schema_id": "health_bridge.receiver_pairing_invitation.v2",
+  "schema_version": "2.0.0",
+  "label": "maintainer-iphone",
+  "receiver_url": "https://health-bridge.example.test/v1/batches",
+  "redeem_url": "https://health-bridge.example.test/v1/pairing/redeem",
+  "invitation_secret": "hbi_synthetic_secret",
   "expires_at": "2026-07-12T09:00:00Z"
+}
+"""
+
+private let mailboxInvitationJSON = """
+{
+  "schema_id": "health_bridge.receiver_pairing_invitation.v2",
+  "schema_version": "2.0.0",
+  "label": "maintainer-iphone",
+  "receiver_url": "https://health-bridge.example.test/v1/batches",
+  "redeem_url": "https://health-bridge.example.test/v1/pairing/redeem",
+  "invitation_secret": "hbi_synthetic_secret",
+  "expires_at": "2026-07-12T09:00:00Z",
+  "transport": "mailbox",
+  "mailbox_protocol_version": 1
 }
 """
 

@@ -21,6 +21,7 @@ from health_bridge.receiver.pairing import (
 )
 from health_bridge.receiver.pairing_setup_page import render_pairing_setup_page
 from health_bridge.receiver.tokens import revoke_receiver_token
+from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import connect_database, initialize_database
 
 DEFAULT_WATCH_POLL_INTERVAL_SECONDS: Final = 2.0
@@ -182,6 +183,9 @@ class DevDeviceSessionRequest:
     receiver_host: str
     receiver_port: int
     watch_seconds: int
+    transport: ReceiverTransport = ReceiverTransport.DIRECT
+    mailbox_root: Path | None = None
+    icloud_container_identifier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +213,7 @@ def build_dev_device_session_manifest(
         request.db_path,
         label=request.label,
         receiver_url=request.receiver_url,
+        transport=request.transport,
     )
     deep_link = pairing_deep_link(bundle)
     try:
@@ -233,6 +238,15 @@ def build_dev_device_session_manifest(
         "--port",
         str(request.receiver_port),
     ]
+    if request.mailbox_root is not None:
+        receiver_start_command.extend(("--mailbox-root", str(request.mailbox_root)))
+    if request.icloud_container_identifier is not None:
+        receiver_start_command.extend(
+            (
+                "--icloud-container-identifier",
+                request.icloud_container_identifier,
+            )
+        )
     receiver_systemd_command = [
         "uv",
         "run",

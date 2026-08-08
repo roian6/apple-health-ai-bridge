@@ -4,6 +4,9 @@ VIEW_MODEL = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.
 UPLOADER = Path(
     "ios/HealthBridgeCompanion/App/BackgroundURLSessionOutboxUploader.swift"
 )
+BACKGROUND_UPLOAD = Path(
+    "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/BackgroundOutboxUpload.swift"
+)
 
 
 def test_direct_sync_takes_exclusive_outbox_handoff_before_uploading() -> None:
@@ -116,15 +119,29 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
     end = uploader.index("private func appendResponseData", start)
     finish = uploader[start:end]
 
-    generation_field = "descriptor.receiverGeneration"
-    generation_comparison = "== settingsStore.receiverSettingsGenerationToken"
-    generation_fragment = f"{generation_field} {generation_comparison}"
     for fragment in (
-        generation_fragment,
-        "descriptor.receiverBindingID == settingsStore.receiverBindingID",
-        "item.receiverIdentity == descriptor.receiverBindingID",
+        "DirectUploadFinalizer.finish(",
+        "currentReceiverGeneration: settingsStore.receiverSettingsGenerationToken",
+        "currentReceiverBindingID: settingsStore.receiverBindingID",
+        "item.receiverIdentity == receiverBindingID",
     ):
         assert fragment in finish
+
+    core = BACKGROUND_UPLOAD.read_text()
+    finalizer_start = core.index("public enum DirectUploadFinalizer")
+    finalizer_end = core.index(
+        "public struct BackgroundUploadTaskOwnership", finalizer_start
+    )
+    finalizer = core[finalizer_start:finalizer_end]
+    generation_check = "descriptor.receiverGeneration == currentReceiverGeneration"
+    binding_check = "descriptor.receiverBindingID == currentReceiverBindingID"
+    stale_result = "return .stale"
+    retire = "try retire(descriptor.itemID, descriptor.receiverBindingID)"
+    for fragment in (generation_check, binding_check, stale_result, retire):
+        assert fragment in finalizer
+    assert finalizer.index(generation_check) < finalizer.index(stale_result)
+    assert finalizer.index(binding_check) < finalizer.index(stale_result)
+    assert finalizer.index(stale_result) < finalizer.index(retire)
 
 
 def test_background_task_ownership_is_durable_from_resume_through_reconciliation() -> (

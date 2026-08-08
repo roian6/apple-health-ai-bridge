@@ -112,11 +112,37 @@ def test_v2_invitation_bundle_creates_no_receiver_token_before_redeem(
     assert bundle.redeem_url == "https://health.example.test/v1/pairing/redeem"
     assert bundle.invitation_code == "ABCDE-FGHJK-MNPQR"
     assert bundle.expires_at > bundle.created_at
+    assert bundle.transport == "direct"
+    direct_wire = bundle.qr_payload().model_dump_json()
+    assert '"transport"' not in direct_wire
+    assert "mailbox_protocol_version" not in direct_wire
     with connect_database(db_path) as connection:
         count = COUNT_ROW_ADAPTER.validate_python(
             connection.execute("select count(*) from receiver_tokens").fetchone()
         )
     assert count == (0,)
+
+
+def test_explicit_mailbox_invitation_emits_transport_and_protocol_v1(
+    tmp_path: Path,
+) -> None:
+    bundle = create_receiver_pairing_invitation_bundle(
+        tmp_path / "receiver.sqlite",
+        label="ios-companion",
+        receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
+        invitation_secret="hbi_synthetic_secret",
+        invitation_code="ABCDE-FGHJK-MNPQR",
+    )
+
+    payload = bundle.qr_payload()
+    wire = payload.model_dump_json()
+
+    assert bundle.transport == "mailbox"
+    assert payload.transport == "mailbox"
+    assert payload.mailbox_protocol_version == 1
+    assert '"transport":"mailbox"' in wire
+    assert '"mailbox_protocol_version":1' in wire
 
 
 def test_v2_pairing_deep_link_contains_secret_but_not_human_code(

@@ -24,6 +24,7 @@ def test_sdist_excludes_local_private_and_tool_state() -> None:
     assert {
         "/.codegraph",
         "/.hermes",
+        "/.omo",
         "/.tmp",
         "/.public-release-denylist.local",
     }.issubset(excluded)

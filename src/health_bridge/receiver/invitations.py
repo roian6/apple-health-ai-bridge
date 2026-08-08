@@ -2,10 +2,11 @@ import hashlib
 import hmac
 import secrets
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import Final, Literal, TypeAlias
 from urllib.parse import urlparse, urlunparse
 from uuid import UUID, uuid4
 
@@ -15,6 +16,7 @@ from health_bridge.receiver.tokens import (
     create_receiver_token_in_connection,
     hash_receiver_token,
 )
+from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import connect_database, initialize_database
 
 INVITATION_CODE_ALPHABET: Final = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -54,8 +56,9 @@ InvitationLookupRow: TypeAlias = tuple[
     str,
     str | None,
     str | None,
+    str,
 ]
-InvitationResultRow: TypeAlias = tuple[str, str]
+InvitationResultRow: TypeAlias = tuple[str, str, str]
 DeviceIDRow: TypeAlias = tuple[int]
 ReceiverDeviceRow: TypeAlias = tuple[str, str, str, str, str | None]
 INVITATION_LOOKUP_ROW_ADAPTER: Final[TypeAdapter[InvitationLookupRow | None]] = (
@@ -83,12 +86,14 @@ LOOKUP_BY_SECRET_SQL: Final = _sql(
     "select pairing_invitation_id, invitation_label, receiver_url,",
     "invitation_code_hash, invitation_code_salt,",
     "failed_attempt_count, max_failed_attempts, expires_at, redeemed_at, revoked_at",
+    ", transport",
     "from pairing_invitations where invitation_secret_hash = ?",
 )
 LOOKUP_BY_CODE_SELECTOR_SQL: Final = _sql(
     "select pairing_invitation_id, invitation_label, receiver_url,",
     "invitation_code_hash, invitation_code_salt,",
     "failed_attempt_count, max_failed_attempts, expires_at, redeemed_at, revoked_at",
+    ", transport",
     "from pairing_invitations where invitation_code_selector = ?",
 )
 RECORD_FAILED_CODE_ATTEMPT_SQL: Final = _sql(
@@ -103,10 +108,11 @@ CONSUME_INVITATION_SQL: Final = _sql(
     "where pairing_invitation_id = ? and redeemed_at is null",
     "and revoked_at is null and expires_at > ?",
     "and failed_attempt_count < max_failed_attempts",
-    "returning invitation_label, receiver_url",
+    "returning invitation_label, receiver_url, transport",
 )
 IDEMPOTENT_REDEMPTION_SQL: Final = _sql(
-    "select invitation.invitation_label, invitation.receiver_url",
+    "select invitation.invitation_label, invitation.receiver_url,",
+    "invitation.transport",
     "from pairing_invitation_redemptions redemption",
     "join pairing_invitations invitation",
     "on invitation.pairing_invitation_id = redemption.pairing_invitation_id",
@@ -147,12 +153,15 @@ class IssuedPairingInvitation:
     invitation_code: str
     created_at: str
     expires_at: str
+    transport: ReceiverTransport
 
 
 @dataclass(frozen=True, slots=True)
 class PairingRedemptionCompletion:
     label: str
     receiver_url: str
+    installation_id_hash: str
+    transport: ReceiverTransport
 
 
 def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic credentials and time.
@@ -160,12 +169,16 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
     *,
     label: str,
     receiver_url: str,
+    transport: ReceiverTransport | Literal["direct", "mailbox"] = (
+        ReceiverTransport.DIRECT
+    ),
     now: datetime | None = None,
     expires_in: timedelta = INVITATION_DEFAULT_TTL,
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
 ) -> IssuedPairingInvitation:
     normalized_url = _validate_receiver_url(receiver_url)
+    selected_transport = ReceiverTransport(transport)
     issued_at = _normalized_now(now)
     if not INVITATION_MIN_TTL <= expires_in <= INVITATION_MAX_TTL:
         message = "Pairing invitation expiry must be between 10 and 30 minutes."
@@ -208,8 +221,8 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
                         "(pairing_invitation_id, invitation_label, receiver_url,",
                         "invitation_secret_hash, invitation_code_selector,",
                         "invitation_code_hash, invitation_code_salt,",
-                        "created_at, expires_at, max_failed_attempts)",
-                        "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "created_at, expires_at, max_failed_attempts, transport)",
+                        "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     ),
                     (
                         invitation_id,
@@ -222,6 +235,7 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
                         issued_at_text,
                         expires_at_text,
                         INVITATION_MAX_FAILED_ATTEMPTS,
+                        selected_transport.value,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -238,6 +252,7 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
             invitation_code=code,
             created_at=issued_at_text,
             expires_at=expires_at_text,
+            transport=selected_transport,
         )
 
     message = "Could not allocate a unique pairing code. Create a new invitation."
@@ -253,6 +268,7 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
     now: datetime | None = None,
+    before_commit: Callable[[PairingRedemptionCompletion], None] | None = None,
 ) -> PairingRedemptionCompletion:
     if (invitation_secret is None) == (invitation_code is None):
         message = "Provide exactly one pairing invitation credential."
@@ -315,6 +331,7 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
             expires_at,
             redeemed_at,
             revoked_at,
+            _transport,
         ) = lookup
         if redeemed_at is not None:
             completion = INVITATION_RESULT_ROW_ADAPTER.validate_python(
@@ -323,13 +340,16 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
                     (invitation_id, installation_id_hash, device_credential_hash),
                 ).fetchone()
             )
-            connection.commit()
             if completion is None:
+                connection.commit()
                 raise PairingInvitationError(GENERIC_INVITATION_ERROR)
-            return PairingRedemptionCompletion(
-                label=completion[0],
-                receiver_url=completion[1],
+            result = _finish_redemption(
+                completion,
+                installation_id_hash,
+                before_commit,
             )
+            connection.commit()
+            return result
 
         if (
             revoked_at is not None
@@ -383,10 +403,27 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
             """,
             (invitation_id, device_id, issued.token_id, timestamp),
         )
-        return PairingRedemptionCompletion(
-            label=completion[0],
-            receiver_url=completion[1],
+        return _finish_redemption(
+            completion,
+            installation_id_hash,
+            before_commit,
         )
+
+
+def _finish_redemption(
+    completion: InvitationResultRow,
+    installation_id_hash: str,
+    before_commit: Callable[[PairingRedemptionCompletion], None] | None,
+) -> PairingRedemptionCompletion:
+    result = PairingRedemptionCompletion(
+        label=completion[0],
+        receiver_url=completion[1],
+        installation_id_hash=installation_id_hash,
+        transport=ReceiverTransport(completion[2]),
+    )
+    if before_commit is not None:
+        before_commit(result)
+    return result
 
 
 def revoke_pairing_invitation(db_path: Path, invitation_id: str) -> None:

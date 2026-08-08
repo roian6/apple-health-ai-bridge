@@ -9,12 +9,21 @@ fi
 IOS_DIR="$ROOT_DIR/ios/HealthBridgeCompanion"
 : "${DEVICE_ID:?Set DEVICE_ID to the target iPhone device identifier}"
 : "${BUNDLE_ID:?Set BUNDLE_ID to the companion bundle identifier for this build}"
+source_commit="$(git -C "$ROOT_DIR" rev-parse --verify HEAD)"
+if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Unable to derive the full source commit for the signed app build." >&2
+  exit 2
+fi
 DERIVED_DATA="${DERIVED_DATA:-$IOS_DIR/.build/DeviceDerivedData}"
 case "$DERIVED_DATA" in
   /*) ;;
   *) DERIVED_DATA="$ROOT_DIR/$DERIVED_DATA" ;;
 esac
-build_settings=("PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID")
+build_settings=(
+  "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
+  "HEALTH_BRIDGE_SOURCE_COMMIT=$source_commit"
+  "HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER=iCloud.$BUNDLE_ID"
+)
 if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
   build_settings+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
 fi

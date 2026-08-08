@@ -18,13 +18,13 @@ def insert_sync_run(
     fixture_name: str,
     result: IngestResult,
     batch: HealthBridgeBatchV1 | None,
-) -> None:
+) -> int:
     timestamp = _utc_now()
     schema_id = None if batch is None else batch.schema_id
     schema_version = None if batch is None else batch.schema_version
     sync_window_start = None if batch is None else batch.sync.sync_window.start_time
     sync_window_end = None if batch is None else batch.sync.sync_window.end_time
-    _ = connection.execute(
+    cursor = connection.execute(
         INSERT_SYNC_RUN_SQL,
         (
             timestamp,
@@ -45,6 +45,10 @@ def insert_sync_run(
             sync_window_end,
         ),
     )
+    sync_run_id = cursor.lastrowid
+    if sync_run_id is None:
+        raise sqlite3.DatabaseError
+    return sync_run_id
 
 
 def _utc_now() -> str:

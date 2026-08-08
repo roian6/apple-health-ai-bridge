@@ -256,6 +256,132 @@ final class CompanionUXStateTests: XCTestCase {
         )
     }
 
+    func testMailboxPreflightStatusPreservesExactSecretFreeFailureClass() {
+        let cases = [
+            ("mailbox_key_lost", "Mailbox connection key lifecycle: lost. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_revoked", "Mailbox connection key lifecycle: revoked. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_locked", "Mailbox connection key lifecycle is unavailable while this iPhone is locked. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_access_denied", "Mailbox connection key access was denied. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_unavailable", "Mailbox connection key storage is unavailable. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_malformed", "Mailbox connection key state is malformed. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_stale_identity", "Mailbox connection key identity is stale. Pairing stopped before contacting Health Bridge."),
+            ("mailbox_key_rollback_detected", "Mailbox connection key rollback protection stopped pairing before contacting Health Bridge."),
+        ]
+        for (code, expected) in cases {
+            let raw = "Setup link failed: mailbox preflight. | domain=ReceiverPairingPreflightError | code=\(code)"
+            let sanitized = CompanionPrimaryStatusMessage.sanitized(
+                from: raw,
+                isError: true
+            )
+            XCTAssertEqual(sanitized, expected)
+            XCTAssertFalse(sanitized.contains("key_id"))
+            XCTAssertFalse(sanitized.contains("status="))
+            XCTAssertFalse(sanitized.contains("/"))
+        }
+    }
+
+    func testPairingCommitBarrierStatusPreservesExactSecretFreeFailureClass() {
+        let cases = [
+            ("pairing_commit_cancelled", "Pairing commit was cancelled before contacting Health Bridge. Retry pairing."),
+            ("pairing_commit_generation_failed", "Saved connection generation could not be advanced. Pairing stopped before contacting Health Bridge."),
+            ("pairing_commit_background_cleanup_pending", "Background upload cleanup is incomplete. Pairing stopped before contacting Health Bridge; retry after cleanup finishes."),
+            ("pairing_commit_outbox_unavailable", "Queued-upload storage is unavailable. Pairing stopped before contacting Health Bridge."),
+            ("pairing_commit_outbox_unreadable", "Queued-upload storage could not be read. Pairing stopped before contacting Health Bridge."),
+            ("pairing_commit_outbox_identity_not_ready", "Queued-upload identity admission is not ready. Pairing stopped before contacting Health Bridge."),
+            ("pairing_commit_outbox_not_empty", "Queued uploads must be sent or cleared before pairing can contact Health Bridge."),
+            ("pairing_commit_outbox_clear_pending", "Queued-upload deletion is still pending. Pairing stopped before contacting Health Bridge."),
+        ]
+        for (code, expected) in cases {
+            let raw = "Setup link failed before receiver redemption. | domain=ReceiverPairingCommitBarrierError | code=\(code)"
+            let sanitized = CompanionPrimaryStatusMessage.sanitized(
+                from: raw,
+                isError: true
+            )
+            XCTAssertEqual(sanitized, expected)
+            XCTAssertNotEqual(sanitized, "Connection key missing. Reconnect from setup link.")
+            XCTAssertFalse(sanitized.contains("token"))
+            XCTAssertFalse(sanitized.contains("key_id"))
+            XCTAssertFalse(sanitized.contains("/"))
+        }
+    }
+
+    func testPairingFailurePresentationSurvivesGenericStatusOverwriteWithoutRetainingRawDetails() {
+        let rawFailure = """
+            Setup link failed before receiver redemption. \
+            | domain=ReceiverPairingCommitBarrierError \
+            | code=pairing_commit_outbox_not_empty \
+            | url=https://bridge.invalid/private/setup \
+            | invitation=synthetic-invitation \
+            | bearer=synthetic-credential \
+            | key=synthetic-key \
+            | identifier=synthetic-identifier \
+            | details=\(String(repeating: "x", count: 4_096))
+            """
+        let pairingFailure = CompanionPairingFailurePresentationState(
+            rawFailure: rawFailure
+        )
+        var genericStatus = "Redeeming temporary pairing invitation..."
+
+        genericStatus = "ReceiverClientError | code=0"
+
+        XCTAssertEqual(genericStatus, "ReceiverClientError | code=0")
+        XCTAssertEqual(
+            pairingFailure.message,
+            "Queued uploads must be sent or cleared before pairing can contact Health Bridge."
+        )
+        XCTAssertLessThan(pairingFailure.message.utf8.count, 256)
+        XCTAssertFalse(pairingFailure.message.contains("https://"))
+        XCTAssertFalse(pairingFailure.message.contains("synthetic-invitation"))
+        XCTAssertFalse(pairingFailure.message.contains("synthetic-credential"))
+        XCTAssertFalse(pairingFailure.message.contains("synthetic-key"))
+        XCTAssertFalse(pairingFailure.message.contains("synthetic-identifier"))
+        XCTAssertFalse(pairingFailure.message.contains(String(repeating: "x", count: 32)))
+    }
+
+    func testPairingRedeemNonHTTPDiagnosticIsNotMisclassifiedAsMissingConnectionKey() {
+        let presentation = CompanionPairingFailurePresentationState(
+            rawFailure: "Setup link failed: Pairing server returned a non-HTTP response. | domain=ReceiverPairingRedeem | code=pairing_redeem_non_http_response"
+        )
+
+        XCTAssertEqual(
+            presentation.message,
+            "Pairing server returned a non-HTTP response before redemption completed."
+        )
+        XCTAssertNotEqual(
+            presentation.message,
+            "Pairing could not use the connection key. Retry with a fresh setup link."
+        )
+    }
+
+    func testPairingRedeemHTTPDiagnosticPreservesOnlyValidatedStatusCode() {
+        let presentation = CompanionPairingFailurePresentationState(
+            rawFailure: "Pairing invitation could not be redeemed. | code=pairing_redeem_http_429 | url=https://bridge.invalid/private"
+        )
+
+        XCTAssertEqual(
+            presentation.message,
+            "Pairing server rejected the redemption request (HTTP 429)."
+        )
+        XCTAssertFalse(presentation.message.contains("https://"))
+        XCTAssertFalse(presentation.message.contains("private"))
+    }
+
+    func testMailboxLifecyclePresentationContainsNoIdentityMetadata() {
+        XCTAssertEqual(
+            MailboxKeyDiagnosticState.allCases.map(MailboxKeyLifecyclePresentation.label),
+            [
+                "Not initialized", "Active", "Revoked", "Lost", "Malformed",
+                "Rollback detected", "Locked", "Access denied", "Unavailable",
+            ]
+        )
+        for state in MailboxKeyDiagnosticState.allCases {
+            let detail = MailboxKeyLifecyclePresentation.detail(state)
+            XCTAssertFalse(detail.contains("key_id"))
+            XCTAssertFalse(detail.contains("service"))
+            XCTAssertFalse(detail.contains("/"))
+        }
+    }
+
     func testStatusLaneBuilderSummarizesConnectionHealthQueuedUploadsAndAutomaticSync() {
         let snapshot = CompanionSetupSnapshot(
             receiverURLString: "https://receiver.example/v1/batches",

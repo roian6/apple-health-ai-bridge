@@ -110,6 +110,49 @@ public enum CompanionPrimaryStatusMessage {
         guard !trimmed.isEmpty else { return "" }
 
         let message = trimmed.lowercased()
+        let mailboxPreflightMessages = [
+            "mailbox_key_lost": "Mailbox connection key lifecycle: lost. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_revoked": "Mailbox connection key lifecycle: revoked. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_locked": "Mailbox connection key lifecycle is unavailable while this iPhone is locked. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_access_denied": "Mailbox connection key access was denied. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_unavailable": "Mailbox connection key storage is unavailable. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_malformed": "Mailbox connection key state is malformed. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_stale_identity": "Mailbox connection key identity is stale. Pairing stopped before contacting Health Bridge.",
+            "mailbox_key_rollback_detected": "Mailbox connection key rollback protection stopped pairing before contacting Health Bridge.",
+        ]
+        for (code, copy) in mailboxPreflightMessages where message.contains(code) {
+            return copy
+        }
+        if message.contains("mailbox_key_reset_not_initialized") {
+            return "Mailbox connection key lifecycle: not initialized. Pending and saved pairing state are clear."
+        }
+        let pairingCommitBarrierMessages = [
+            "pairing_commit_cancelled": "Pairing commit was cancelled before contacting Health Bridge. Retry pairing.",
+            "pairing_commit_generation_failed": "Saved connection generation could not be advanced. Pairing stopped before contacting Health Bridge.",
+            "pairing_commit_background_cleanup_pending": "Background upload cleanup is incomplete. Pairing stopped before contacting Health Bridge; retry after cleanup finishes.",
+            "pairing_commit_outbox_unavailable": "Queued-upload storage is unavailable. Pairing stopped before contacting Health Bridge.",
+            "pairing_commit_outbox_unreadable": "Queued-upload storage could not be read. Pairing stopped before contacting Health Bridge.",
+            "pairing_commit_outbox_identity_not_ready": "Queued-upload identity admission is not ready. Pairing stopped before contacting Health Bridge.",
+            "pairing_commit_outbox_not_empty": "Queued uploads must be sent or cleared before pairing can contact Health Bridge.",
+            "pairing_commit_outbox_clear_pending": "Queued-upload deletion is still pending. Pairing stopped before contacting Health Bridge.",
+        ]
+        for (code, copy) in pairingCommitBarrierMessages where message.contains(code) {
+            return copy
+        }
+        if let statusCode = pairingRedeemHTTPStatus(from: message) {
+            return "Pairing server rejected the redemption request (HTTP \(statusCode))."
+        }
+        let pairingRedeemMessages = [
+            "pairing_redeem_non_http_response": "Pairing server returned a non-HTTP response before redemption completed.",
+            "pairing_redeem_invitation_invalid": "Pairing invitation is invalid, expired, or already used.",
+            "pairing_redeem_http_error": "Pairing server rejected the redemption request.",
+            "pairing_redeem_invalid_response": "Pairing server returned an invalid credential response.",
+            "pairing_redeem_receiver_url_mismatch": "Pairing server returned credentials for a different receiver.",
+            "pairing_redeem_empty_device_credential": "Pairing completed without a usable device credential.",
+        ]
+        for (code, copy) in pairingRedeemMessages where message.contains(code) {
+            return copy
+        }
         if message.contains("sync complete") {
             return "Sync complete"
         }
@@ -264,6 +307,19 @@ public enum CompanionPrimaryStatusMessage {
         return ""
     }
 
+    private static func pairingRedeemHTTPStatus(from message: String) -> Int? {
+        let nsRange = NSRange(message.startIndex..<message.endIndex, in: message)
+        guard let regex = try? NSRegularExpression(
+            pattern: #"pairing_redeem_http_(\d{3})\b"#
+        ),
+        let match = regex.firstMatch(in: message, range: nsRange),
+        let statusRange = Range(match.range(at: 1), in: message),
+        let statusCode = Int(message[statusRange]),
+        (100...599).contains(statusCode)
+        else { return nil }
+        return statusCode
+    }
+
     private static func isServerReachabilityFailure(_ message: String) -> Bool {
         let failureMarkers = [
             "could not connect to the server",
@@ -298,6 +354,69 @@ public enum CompanionPrimaryStatusMessage {
         if message.contains("sleep") { return "Sleep" }
         if message.contains("optional") || message.contains("quantity") || message.contains("sample") { return "data" }
         return "Health data"
+    }
+}
+
+public struct CompanionPairingFailurePresentationState: Equatable, Sendable {
+    public let message: String
+
+    public init(rawFailure: String) {
+        let normalized = rawFailure.lowercased()
+        let preciseFailureCodes = [
+            "mailbox_key_lost",
+            "mailbox_key_revoked",
+            "mailbox_key_locked",
+            "mailbox_key_access_denied",
+            "mailbox_key_unavailable",
+            "mailbox_key_malformed",
+            "mailbox_key_stale_identity",
+            "mailbox_key_rollback_detected",
+            "pairing_commit_cancelled",
+            "pairing_commit_generation_failed",
+            "pairing_commit_background_cleanup_pending",
+            "pairing_commit_outbox_unavailable",
+            "pairing_commit_outbox_unreadable",
+            "pairing_commit_outbox_identity_not_ready",
+            "pairing_commit_outbox_not_empty",
+            "pairing_commit_outbox_clear_pending",
+            "pairing_redeem_non_http_response",
+            "pairing_redeem_invitation_invalid",
+            "pairing_redeem_http_",
+            "pairing_redeem_invalid_response",
+            "pairing_redeem_receiver_url_mismatch",
+            "pairing_redeem_empty_device_credential",
+        ]
+        if preciseFailureCodes.contains(where: normalized.contains) {
+            message = CompanionPrimaryStatusMessage.sanitized(
+                from: rawFailure,
+                isError: true
+            )
+            return
+        }
+
+        let sanitized = CompanionPrimaryStatusMessage.sanitized(
+            from: rawFailure,
+            isError: true
+        )
+        if sanitized.hasPrefix("Pairing could not reach Health Bridge")
+            || sanitized.hasPrefix("Sync failed: Health Bridge is not reachable")
+        {
+            message = "Pairing could not reach Health Bridge. Check Local Network access, Wi-Fi or VPN routing, and the server, then retry."
+        } else if sanitized.hasPrefix("Bridge URL is invalid") {
+            message = "The pairing server address is invalid. Retry with a fresh setup link."
+        } else if sanitized == "Connection key missing. Reconnect from setup link." {
+            message = "Pairing could not use the connection key. Retry with a fresh setup link."
+        } else if sanitized.hasPrefix("Connection key was rejected")
+            || sanitized.hasPrefix("Connection was refused")
+        {
+            message = "The pairing invitation was rejected. Retry with a fresh setup link."
+        } else if sanitized == "Server response was not valid HTTP. Check Health Bridge, then retry."
+            || sanitized.hasPrefix("Sync failed: Health Bridge returned an error")
+        {
+            message = "Pairing could not finish because Health Bridge returned an invalid response. Check the server, then retry."
+        } else {
+            message = "Pairing failed. Retry the pending attempt or clear it before starting again."
+        }
     }
 }
 

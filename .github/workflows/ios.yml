@@ -41,12 +41,33 @@ jobs:
             -sdk iphonesimulator \
             -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             build
 
       - name: Build unsigned generic iPhone app
         run: |
           xcodebuild -project HealthBridgeCompanion.xcodeproj \
             -target HealthBridgeCompanion \
+            -sdk iphoneos \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Build unsigned Public Documents QA simulator app
+        run: |
+          xcodebuild -project HealthBridgeCompanion.xcodeproj \
+            -target HealthBridgeCompanionPublicDocumentsQA \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Build unsigned Public Documents QA generic iPhone app
+        run: |
+          xcodebuild -project HealthBridgeCompanion.xcodeproj \
+            -target HealthBridgeCompanionPublicDocumentsQA \
             -sdk iphoneos \
             -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
