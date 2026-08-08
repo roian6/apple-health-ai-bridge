@@ -666,6 +666,7 @@ private func writePrivate(_ data: Data, to url: URL) throws {
     )
 }
 
+@MainActor
 private func deviceReportContext(
     configuration: MailboxQAConfiguration
 ) throws -> MailboxQADeviceReportContext {

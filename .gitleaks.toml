@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Cryptography type names are declarations, not credentials"
+regexTarget = "secret"
+regexes = [
+  '''^(?:Curve25519\.(?:KeyAgreement|Signing)\.PrivateKey|(?:Ed25519|X25519)PrivateKey)$''',
+]
