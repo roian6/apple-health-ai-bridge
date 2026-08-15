@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, assert_never, cast, final
 
 from typing_extensions import override
 
-from health_bridge.contract._delivery_common import MAX_ENVELOPE_BYTES
+from health_bridge.contract._delivery_common import MAX_ACK_BYTES, MAX_ENVELOPE_BYTES
 from health_bridge.contract.delivery_v1 import DeliveryProtocolError
 from health_bridge.mailbox.filesystem import (
     FileSnapshot,
+    MailboxDirectoryHandle,
     MailboxFileError,
     MailboxFileErrorCode,
     mailbox_writer_lock,
@@ -45,12 +47,13 @@ from health_bridge.receiver.delivery_acceptance import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from pathlib import Path
     from typing import Literal
 
-    from health_bridge.mailbox.filesystem import MailboxDirectoryHandle
     from health_bridge.receiver.delivery_acceptance import DeliveryTrustedConnection
+
+
+AckPublisher = Callable[[MailboxDirectoryHandle, str, bytes], PublicationState]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +65,7 @@ class MailboxImportConfig:
     clock_ms: Callable[[], int]
     path_replacement_retry_limit: int = 0
     directory: MailboxDirectoryHandle | None = None
+    ack_publisher: AckPublisher | None = None
 
 
 class MailboxBusyError(Exception):
@@ -120,12 +124,10 @@ class MailboxImporter:
                     fault_hook,
                 )
                 directory.validate_attached()
-                publication = publish_final_at(
-                    directory.acks_fd,
-                    accepted.ack_name,
-                    accepted.result.ack_bytes,
+                publication = self._publish_ack(
+                    directory,
+                    accepted,
                     fault_hook,
-                    before_mutation=directory.validate_attached,
                 )
             except MailboxFileError as exc:
                 directory.validate_attached()
@@ -180,6 +182,57 @@ class MailboxImporter:
         )
         directory.validate_attached()
         return aggregate
+
+    def _publish_ack(
+        self,
+        directory: MailboxDirectoryHandle,
+        accepted: _AcceptedDelivery,
+        fault_hook: MailboxImportFaultHook | None,
+    ) -> PublicationState:
+        try:
+            metadata = os.stat(
+                accepted.ack_name,
+                dir_fd=directory.acks_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            raise
+        else:
+            if metadata.st_nlink != 1:
+                existing = None
+            else:
+                try:
+                    existing = read_final_at(
+                        directory.acks_fd,
+                        accepted.ack_name,
+                        maximum_bytes=MAX_ACK_BYTES,
+                    ).content
+                except MailboxFileError as exc:
+                    raise OSError from exc
+        if existing is not None:
+            return (
+                PublicationState.IDENTICAL
+                if existing == accepted.result.ack_bytes
+                else PublicationState.CONFLICT
+            )
+        directory.validate_attached()
+        return (
+            self._config.ack_publisher(
+                directory,
+                accepted.ack_name,
+                accepted.result.ack_bytes,
+            )
+            if self._config.ack_publisher is not None
+            else publish_final_at(
+                directory.acks_fd,
+                accepted.ack_name,
+                accepted.result.ack_bytes,
+                fault_hook,
+                before_mutation=directory.validate_attached,
+            )
+        )
 
     def _accept_with_path_replacement_retry(
         self,
@@ -240,10 +293,21 @@ class MailboxImporter:
             )
         )
         _fault(fault_hook, MailboxImportFaultPoint.AFTER_ACCEPT)
+        receipt_result = cast(
+            "Literal['committed', 'retryable', 'terminal']",
+            result.receipt.result,
+        )
+        match receipt_result:
+            case "committed" | "terminal":
+                ack_identifier = claims.envelope_id
+            case "retryable":
+                ack_identifier = receipt_ack_id(result.receipt, claims.envelope_id)
+            case _:
+                assert_never(receipt_result)
         return _AcceptedDelivery(
             snapshot=snapshot,
             result=result,
-            ack_name=f"{receipt_ack_id(result.receipt, claims.envelope_id).hex()}.hba",
+            ack_name=f"{ack_identifier.hex()}.hba",
         )
 
     def _quarantine(

@@ -51,6 +51,89 @@ def test_receiver_transition_advances_receiver_only(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_coordinated_scope_accepts_staged_same_receiver_with_new_ios_build(
+    tmp_path: Path,
+) -> None:
+    """A public pre-release tree may already reserve the coordinated version/tag."""
+    repo = init_release_repo(tmp_path)
+    write_release_tree(
+        repo,
+        ReleaseTree(
+            receiver_version="1.1.0",
+            release_tag="receiver-v1.1.0",
+            release_scope="coordinated",
+            ios_version="1.1.0",
+            ios_build="16",
+            batch_version="1.0.0",
+        ),
+    )
+    baseline = commit_release_tree(repo, "stage coordinated release identity")
+    write_release_tree(
+        repo,
+        ReleaseTree(
+            receiver_version="1.1.0",
+            release_tag="receiver-v1.1.0",
+            release_scope="coordinated",
+            ios_version="1.1.0",
+            ios_build="39",
+            batch_version="1.0.0",
+        ),
+    )
+    candidate = commit_release_tree(repo, "finalize coordinated release")
+
+    completed = validate_transition(
+        repo,
+        tag="receiver-v1.1.0",
+        tag_target=candidate,
+        default_main=candidate,
+        baseline=baseline,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_same_receiver_version_is_rejected_outside_staged_coordinated_release(
+    tmp_path: Path,
+) -> None:
+    repo = init_release_repo(tmp_path)
+    write_release_tree(
+        repo,
+        ReleaseTree(
+            receiver_version="1.0.2",
+            release_tag="receiver-v1.0.2",
+            release_scope="receiver",
+            ios_version="1.0.0",
+            ios_build="15",
+            batch_version="1.0.0",
+        ),
+    )
+    baseline = commit_release_tree(repo, "published receiver release")
+    write_release_tree(
+        repo,
+        ReleaseTree(
+            receiver_version="1.0.2",
+            release_tag="receiver-v1.0.2",
+            release_scope="receiver",
+            ios_version="1.0.0",
+            ios_build="15",
+            batch_version="1.0.0",
+        ),
+    )
+    _ = (repo / "README.md").write_text("unrelated change\n", encoding="utf-8")
+    candidate = commit_release_tree(repo, "invalid version reuse")
+
+    completed = validate_transition(
+        repo,
+        tag="receiver-v1.0.2",
+        tag_target=candidate,
+        default_main=candidate,
+        baseline=baseline,
+    )
+
+    assert completed.returncode == 1
+    assert "receiver scope must advance Receiver/CLI" in completed.stderr
+
+
 def test_tag_target_must_equal_trusted_default_main(tmp_path: Path) -> None:
     # Given: a self-consistent release commit that is now behind main.
     repo = init_release_repo(tmp_path)

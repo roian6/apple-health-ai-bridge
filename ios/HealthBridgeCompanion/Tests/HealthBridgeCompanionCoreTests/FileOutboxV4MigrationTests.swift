@@ -256,6 +256,98 @@ final class FileOutboxV4MigrationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: envelopeURL), envelope)
     }
 
+    func testClearIntentBlocksMailboxStateMutations() throws {
+        let directory = fileOutboxV4TemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("synthetic-payload".utf8)
+        let outbox = try FileOutbox(directory: directory)
+        let item = try outbox.enqueue(payload, receiverIdentity: "synthetic-binding-v1")
+        try FileOutbox.beginDestructiveRecovery(directory: directory)
+
+        XCTAssertThrowsError(
+            try outbox.finalizeMailboxEnvelope(
+                itemID: item.id,
+                envelope: Data("synthetic-envelope".utf8),
+                expectedPayloadSHA256: outboxSHA256(payload)
+            )
+        ) { error in
+            XCTAssertEqual(error as? FileOutboxClearIntentError, .clearInProgress)
+        }
+        XCTAssertThrowsError(
+            try outbox.compareAndSetDeliveryState(
+                itemID: item.id,
+                expected: nil,
+                updated: .stable(.collected, ownership: nil)
+            )
+        ) { error in
+            XCTAssertEqual(error as? FileOutboxClearIntentError, .clearInProgress)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), payload)
+        XCTAssertTrue(try envelopeArtifacts(in: directory).isEmpty)
+        XCTAssertNil(try outbox.deliveryState(for: item.id))
+    }
+
+    func testTerminalResetRequestBlocksAdmissionWithoutCommittingDeletion() throws {
+        let directory = fileOutboxV4TemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("synthetic-payload".utf8)
+        let outbox = try FileOutbox(directory: directory)
+        let item = try outbox.enqueue(payload, receiverIdentity: "synthetic-binding-v1")
+
+        try FileOutbox.beginTerminalResetRequest(directory: directory)
+
+        XCTAssertTrue(outbox.terminalResetRequestIsActive)
+        XCTAssertFalse(outbox.clearIntentIsActive)
+        XCTAssertThrowsError(
+            try outbox.enqueue(payload, receiverIdentity: "synthetic-binding-v1")
+        ) { error in
+            XCTAssertEqual(error as? FileOutboxClearIntentError, .clearInProgress)
+        }
+        XCTAssertThrowsError(
+            try FileOutbox.completeConfirmedTerminalReset(directory: directory)
+        ) { error in
+            XCTAssertEqual(error as? FileOutboxClearIntentError, .clearIntentRequired)
+        }
+
+        let reopened = try FileOutbox(directory: directory)
+        XCTAssertTrue(reopened.terminalResetRequestIsActive)
+        XCTAssertFalse(reopened.clearIntentIsActive)
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), payload)
+        XCTAssertEqual(try reopened.pendingItems().count, 1)
+    }
+
+    func testConfirmedTerminalResetDeletesMailboxArtifactsOnlyWithDurableIntent() throws {
+        let directory = fileOutboxV4TemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("synthetic-payload".utf8)
+        let envelope = Data("synthetic-envelope".utf8)
+        let outbox = try FileOutbox(directory: directory)
+        let item = try outbox.enqueue(payload, receiverIdentity: "synthetic-binding-v1")
+        _ = try outbox.finalizeMailboxEnvelope(
+            itemID: item.id,
+            envelope: envelope,
+            expectedPayloadSHA256: outboxSHA256(payload)
+        )
+
+        XCTAssertThrowsError(
+            try FileOutbox.completeConfirmedTerminalReset(directory: directory)
+        ) { error in
+            XCTAssertEqual(error as? FileOutboxClearIntentError, .clearIntentRequired)
+        }
+        XCTAssertEqual(try outbox.pendingItems().count, 1)
+        XCTAssertEqual(try envelopeArtifacts(in: directory).count, 1)
+
+        try FileOutbox.beginDestructiveRecovery(directory: directory)
+        let recovery = try FileOutbox.completeConfirmedTerminalReset(directory: directory)
+
+        XCTAssertEqual(recovery.removedPayloadCount, 1)
+        XCTAssertEqual(try recovery.outbox.pendingItems().count, 0)
+        XCTAssertFalse(recovery.outbox.clearIntentIsActive)
+        XCTAssertTrue(try envelopeArtifacts(in: directory).isEmpty)
+        XCTAssertEqual(try recovery.outbox.downgradeReadiness(), .ready)
+    }
+
     func testDowngradeReadinessHoldsForIntentEnvelopeAndV4AndOldReaderRejects() throws {
         let intentDirectory = fileOutboxV4TemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: intentDirectory) }

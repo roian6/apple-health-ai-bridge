@@ -11,6 +11,8 @@ PRODUCT_FILES = (
     "MailboxAckFileReader.swift",
     "MailboxAckOutboxLookup.swift",
     "MailboxAckScanner.swift",
+    "MailboxAckWindowReader.swift",
+    "MailboxAckWindowSupport.swift",
     "MailboxAckClassifier.swift",
     "MailboxAckDeletion.swift",
 )
@@ -37,6 +39,8 @@ def test_ack_scanner_is_product_code_with_focused_swift_tests() -> None:
         "testDuplicateIdenticalAndConflictingValidAcksAreDeterministic",
         "testSymlinkHardlinkAndNonregularFinalsFailClosed",
         "testPathReplacementAfterOpenFailsClosed",
+        "testExactCandidateMissingReturnsEmptyWithoutInspectingLegacyEntries",
+        "testExactCandidateAuthenticatesOnlyEnvelopeNamedFIFOHead",
         "testDeletionRequiresDurableCommittedFinalizationProof",
         "testDeletionAfterValidConflictIsRejectedAndPreservesBothEntries",
     ):
@@ -79,3 +83,17 @@ def test_ack_authentication_precedes_outbox_lookup_and_scanner_is_nonterminal() 
         "Logger(",
     ):
         assert forbidden not in product
+
+
+def test_exact_fifo_head_ack_path_avoids_directory_enumeration() -> None:
+    scanner = (CORE / "MailboxAckScanner.swift").read_text(encoding="utf-8")
+    exact_start = scanner.index("func scanExact(")
+    exact_end = scanner.index("func candidateWindow(", exact_start)
+    exact = scanner[exact_start:exact_end]
+
+    assert "MailboxAckFileReader.read(" in exact
+    assert "requiredEnvelopeID: envelopeID" in exact
+    assert "MailboxAckFileReader.enumerate(" not in exact
+    assert "MailboxAckFileReader.enumerateWindow(" not in exact
+    assert "getdirentriesattr(" not in exact
+    assert "getattrlistbulk(" not in exact

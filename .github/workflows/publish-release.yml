@@ -1,0 +1,257 @@
+name: Continue helper-bound release
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft_release_id:
+        description: Existing helper-pending draft release database ID
+        required: true
+        type: string
+      tag:
+        description: Exact signed receiver release tag
+        required: true
+        type: string
+      helper_sha256:
+        description: SHA-256 printed by the owner staging command
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: continue-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify helper and publish existing draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: github-release
+    permissions:
+      contents: write # zizmor: ignore[undocumented-permissions]
+      id-token: write # zizmor: ignore[undocumented-permissions]
+      attestations: write # zizmor: ignore[undocumented-permissions]
+    env:
+      DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_HELPER_SHA256: ${{ inputs.helper_sha256 }}
+    steps:
+      - name: Bind existing unpublished draft and immutable source
+        id: bind
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$DRAFT_RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^receiver-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          gh api "$release_api" > "$RUNNER_TEMP/release-binding.json"
+          bound_draft="$(jq -r \
+            --arg tag "$RELEASE_TAG" \
+            '.id == ($ENV.DRAFT_RELEASE_ID | tonumber) and .tag_name == $tag and .draft == true and .published_at == null' \
+            "$RUNNER_TEMP/release-binding.json")"
+          test "$bound_draft" = "true"
+          matching_release_ids="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
+          test "$matching_release_ids" = "$DRAFT_RELEASE_ID"
+          tag_object_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '.object.sha')"
+          [[ "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
+          signed_tag_name="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tag')"
+          test "$signed_tag_name" = "$RELEASE_TAG"
+          tag_verified="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.verification.verified == true and .verification.reason == "valid"')"
+          test "$tag_verified" = "true"
+          tag_identity="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tagger.name == "Chanhyo Jung" and (.tagger.email | endswith("@users.noreply.github.com"))')"
+          test "$tag_identity" = "true"
+          target_commit_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.sha')"
+          target_type="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.type')"
+          test "$target_type" = "commit"
+          [[ "$target_commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          commit_verified="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/commits/${target_commit_sha}" \
+            --jq '.commit.verification.verified == true and .commit.verification.reason == "valid"')"
+          test "$commit_verified" = "true"
+          commit_identity="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/commits/${target_commit_sha}" \
+            --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
+          test "$commit_identity" = "true"
+          default_branch="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          default_main_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
+            --jq '.commit.sha')"
+          test "$target_commit_sha" = "$default_main_sha"
+          tree_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/commits/${target_commit_sha}" \
+            --jq '.tree.sha')"
+          [[ "$tree_sha" =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "tag_object_sha=$tag_object_sha"
+            echo "target_commit_sha=$target_commit_sha"
+            echo "tree_sha=$tree_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact bound commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.bind.outputs.target_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.14"
+          enable-cache: false
+
+      - name: Download exact remote helper-pending asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
+          uv sync --all-extras --dev --locked
+          version="$(uv run python scripts/release_tools.py tag-info \
+            --tag "$RELEASE_TAG" | jq -r '.version')"
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
+          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
+          test "$asset_names" = "$expected_assets"
+          mkdir dist
+          IFS=',' read -r -a expected_names <<< "$expected_assets"
+          for asset_name in "${expected_names[@]}"; do
+            asset_id="$(gh api "$release_api" \
+              --jq ".assets[] | select(.name == \"${asset_name}\") | .id")"
+            [[ "$asset_id" =~ ^[0-9]+$ ]]
+            gh api \
+              "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              -H "Accept: application/octet-stream" > "dist/${asset_name}"
+          done
+          actual_helper_sha256="$(sha256sum \
+            "dist/HealthBridgeMailboxAckPublisher-${version}.zip" | cut -d ' ' -f 1)"
+          test "$actual_helper_sha256" = "$EXPECTED_HELPER_SHA256"
+
+      - name: Verify helper source binding and create final checksums
+        env:
+          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
+          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
+          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
+        run: |
+          set -euo pipefail
+          common=(
+            --repo .
+            --dist-dir dist
+            --tag "$RELEASE_TAG"
+            --tag-object "$PINNED_TAG_OBJECT_SHA"
+            --commit "$PINNED_TARGET_COMMIT_SHA"
+            --tree "$PINNED_TREE_SHA"
+            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+          )
+          uv run python scripts/release_tools.py verify-helper "${common[@]}"
+          uv run python scripts/release_tools.py final-checksums \
+            "${common[@]}" --output dist/SHA256SUMS
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+
+      - name: Upload new checksum asset without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
+          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
+          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            dist/SHA256SUMS
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          gh api "$release_api" > "$RUNNER_TEMP/release-final-draft.json"
+          uv run python scripts/release_tools.py verify-final-draft \
+            --repo . \
+            --dist-dir dist \
+            --release-json "$RUNNER_TEMP/release-final-draft.json" \
+            --notes-file ".github/release/notes-${RELEASE_TAG}.md" \
+            --tag "$RELEASE_TAG" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$PINNED_TREE_SHA" \
+            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+
+      - name: Attest owner-produced helper and final checksums
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/HealthBridgeMailboxAckPublisher-*.zip
+            dist/HealthBridgeMailboxAckPublisher-*.manifest.json
+            dist/SHA256SUMS
+
+      - name: Reverify exact draft and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
+          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
+          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
+        run: |
+          set -euo pipefail
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          current_tag_object="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '.object.sha')"
+          test "$current_tag_object" = "$PINNED_TAG_OBJECT_SHA"
+          current_target="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${current_tag_object}" \
+            --jq '.object.sha')"
+          test "$current_target" = "$PINNED_TARGET_COMMIT_SHA"
+          current_default_branch="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          current_default_main="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/branches/${current_default_branch}" \
+            --jq '.commit.sha')"
+          test "$current_target" = "$current_default_main"
+          matching_release_ids="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
+          test "$matching_release_ids" = "$DRAFT_RELEASE_ID"
+          gh api "$release_api" > "$RUNNER_TEMP/release-before-publish.json"
+          uv run python scripts/release_tools.py verify-final-draft \
+            --repo . \
+            --dist-dir dist \
+            --release-json "$RUNNER_TEMP/release-before-publish.json" \
+            --notes-file ".github/release/notes-${RELEASE_TAG}.md" \
+            --tag "$RELEASE_TAG" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$PINNED_TREE_SHA" \
+            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+          gh api "$release_api" > "$RUNNER_TEMP/release-after-publish.json"
+          uv run python scripts/release_tools.py verify-final-published \
+            --repo . \
+            --dist-dir dist \
+            --release-json "$RUNNER_TEMP/release-after-publish.json" \
+            --notes-file ".github/release/notes-${RELEASE_TAG}.md" \
+            --tag "$RELEASE_TAG" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$PINNED_TREE_SHA" \
+            --helper-sha256 "$EXPECTED_HELPER_SHA256"

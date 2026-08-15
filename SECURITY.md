@@ -1,6 +1,6 @@
 # Security Policy
 
-The current stable source release is `receiver-v1.1.0` for Receiver/CLI `1.1.0`, compatible with iOS Companion `1.1.0 (16)` for public TestFlight distribution and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. The default deployment model remains local-first and user-owned.
+The current stable source release is `receiver-v1.1.0` for Receiver/CLI `1.1.0`, compatible with iOS Companion `1.1.0 (39)` for public TestFlight distribution and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. The default deployment model remains local-first and user-owned.
 
 ## Sensitive Data
 

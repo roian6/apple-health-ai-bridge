@@ -57,6 +57,45 @@ public enum AutomaticSyncReason: Equatable, Sendable {
     }
 }
 
+public enum BackgroundSyncWorkLane: Equatable, Sendable {
+    case steps
+    case dailyActivity
+    case workouts
+    case sleep
+    case quantity(typeCode: String)
+
+    public var id: String {
+        switch self {
+        case .steps:
+            return "steps"
+        case .dailyActivity:
+            return "daily_activity"
+        case .workouts:
+            return "workouts"
+        case .sleep:
+            return "sleep"
+        case .quantity(let typeCode):
+            return "quantity:\(typeCode)"
+        }
+    }
+}
+
+public struct BackgroundSyncWorkPlan: Equatable, Sendable {
+    public let lane: BackgroundSyncWorkLane?
+    public let coveredObserverTypeCodes: [String]
+    public let nextScheduledLaneID: String?
+
+    public init(
+        lane: BackgroundSyncWorkLane?,
+        coveredObserverTypeCodes: [String],
+        nextScheduledLaneID: String?
+    ) {
+        self.lane = lane
+        self.coveredObserverTypeCodes = coveredObserverTypeCodes
+        self.nextScheduledLaneID = nextScheduledLaneID
+    }
+}
+
 public enum HealthBridgeSyncExecutionMode: Equatable, Sendable {
     case foreground
     case automatic
@@ -91,6 +130,15 @@ public enum HealthBridgeBackgroundSync {
     public static let defaultMinimumInterval: TimeInterval = 15 * 60
     public static let defaultRunDebounceInterval: TimeInterval = 10 * 60
     public static let defaultObservedHealthTypes: [HealthBridgeHealthType] = [.steps, .workouts, .sleepAnalysis]
+    public static let dailyActivityTypeCodes = [
+        "basal_energy",
+        "distance_walking_running",
+        "energy",
+        "exercise_time",
+        "flights_climbed",
+        "stand_time",
+        "steps",
+    ]
 
     public static var supportedAutomaticQuantityTypeCodes: [String] {
         GenericQuantityCoveragePolicy.supportedQuantityEntries().map(\.typeCode)
@@ -133,6 +181,93 @@ public enum HealthBridgeBackgroundSync {
             typeCodes: selected.sorted(),
             fallbackHistoryDepth: .lastDays(1)
         )
+    }
+
+    public static func workPlan(
+        reason: AutomaticSyncReason,
+        availableQuantityTypeCodes: [String],
+        pendingObserverTypeCodes: [String],
+        continuationLaneID: String?
+    ) -> BackgroundSyncWorkPlan {
+        let availableQuantityTypeCodeSet = Set(
+            GenericQuantityCoveragePolicy.canonicalSupportedTypeCodes(
+                availableQuantityTypeCodes
+            )
+        )
+        let scheduledLanes = scheduledWorkLanes(
+            availableQuantityTypeCodes: Array(availableQuantityTypeCodeSet)
+        )
+        let normalizedPendingTypeCodes = GenericQuantityCoveragePolicy
+            .canonicalTypeCodes(for: pendingObserverTypeCodes)
+
+        switch reason {
+        case .observer, .observerBatch:
+            let triggerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: reason.observerTypeCodes
+            )
+            let selectedLane = scheduledLanes.first { candidate in
+                triggerTypeCodes.contains { typeCode in
+                    workLane(
+                        for: typeCode,
+                        availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
+                    ) == candidate
+                }
+            }
+            let coveredTypeCodes = triggerTypeCodes.filter { typeCode in
+                guard let mappedLane = workLane(
+                    for: typeCode,
+                    availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
+                ) else {
+                    return false
+                }
+                return mappedLane == selectedLane
+            }
+            return BackgroundSyncWorkPlan(
+                lane: selectedLane,
+                coveredObserverTypeCodes: coveredTypeCodes,
+                nextScheduledLaneID: nil
+            )
+        case .scheduledRefresh, .launchCatchUp:
+            let continuationIndex = continuationLaneID.flatMap { laneID in
+                scheduledLanes.firstIndex { $0.id == laneID }
+            } ?? scheduledLanes.startIndex
+            let continuationLane = scheduledLanes[continuationIndex]
+            if !normalizedPendingTypeCodes.isEmpty {
+                let selectedDirtyLane = scheduledLanes.first { candidate in
+                    normalizedPendingTypeCodes.contains { typeCode in
+                        workLane(
+                            for: typeCode,
+                            availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
+                        ) == candidate
+                    }
+                }
+                if let selectedDirtyLane {
+                    let coveredTypeCodes = normalizedPendingTypeCodes.filter { typeCode in
+                        guard let mappedLane = workLane(
+                            for: typeCode,
+                            availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
+                        ) else {
+                            return false
+                        }
+                        return mappedLane == selectedDirtyLane
+                    }
+                    return BackgroundSyncWorkPlan(
+                        lane: selectedDirtyLane,
+                        coveredObserverTypeCodes: coveredTypeCodes,
+                        nextScheduledLaneID: continuationLane.id
+                    )
+                }
+            }
+            let nextIndex = scheduledLanes.index(after: continuationIndex)
+            let nextLane = nextIndex == scheduledLanes.endIndex
+                ? scheduledLanes[scheduledLanes.startIndex]
+                : scheduledLanes[nextIndex]
+            return BackgroundSyncWorkPlan(
+                lane: continuationLane,
+                coveredObserverTypeCodes: [],
+                nextScheduledLaneID: nextLane.id
+            )
+        }
     }
 
     public static var observedHealthTypes: [HealthBridgeHealthType] {
@@ -206,6 +341,41 @@ public enum HealthBridgeBackgroundSync {
             .map(HealthKitTypeCatalog.healthType(from:))
     }
 
+    private static func scheduledWorkLanes(
+        availableQuantityTypeCodes: [String]
+    ) -> [BackgroundSyncWorkLane] {
+        [
+            .steps,
+            .dailyActivity,
+            .workouts,
+            .sleep,
+        ] + availableQuantityTypeCodes.sorted().map {
+            .quantity(typeCode: $0)
+        }
+    }
+
+    private static func workLane(
+        for typeCode: String,
+        availableQuantityTypeCodeSet: Set<String>
+    ) -> BackgroundSyncWorkLane? {
+        switch typeCode {
+        case HealthBridgeHealthType.steps.typeCode:
+            return .steps
+        case HealthBridgeHealthType.workouts.typeCode:
+            return .workouts
+        case HealthBridgeHealthType.sleepAnalysis.typeCode:
+            return .sleep
+        default:
+            if dailyActivityTypeCodes.contains(typeCode) {
+                return .dailyActivity
+            }
+            guard availableQuantityTypeCodeSet.contains(typeCode) else {
+                return nil
+            }
+            return .quantity(typeCode: typeCode)
+        }
+    }
+
     private static func appendUnique(
         _ base: [HealthBridgeHealthType],
         _ additions: [HealthBridgeHealthType]
@@ -272,7 +442,9 @@ public actor BackgroundSyncRunGate {
         reason: AutomaticSyncReason,
         now: Date = Date()
     ) -> BackgroundSyncRunAdmission {
-        let observerTypeCodes = reason.observerTypeCodes
+        let observerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+            for: reason.observerTypeCodes
+        )
         if isRunning {
             pendingObserverTypeCodes.formUnion(observerTypeCodes)
             return .skipped(.alreadyRunning)
@@ -304,6 +476,22 @@ public actor BackgroundSyncRunGate {
             pendingObserverTypeCodes.removeAll()
         }
         return pending
+    }
+
+    public func finishBoundedRun(
+        completedObserverTypeCodes: [String]
+    ) -> [String] {
+        isRunning = false
+        let completedTypeCodes = Set(
+            GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: completedObserverTypeCodes
+            )
+        )
+        pendingObserverTypeCodes.formUnion(
+            activeObserverTypeCodes.subtracting(completedTypeCodes)
+        )
+        activeObserverTypeCodes.removeAll()
+        return pendingObserverTypeCodes.sorted()
     }
 
     public func pendingObserverTypeCodesSnapshot() -> [String] {
@@ -366,6 +554,83 @@ public enum AutomaticSyncPayloadGenerationPolicy {
     ) -> Bool {
         isAutomaticSync && hasDurablyQueuedPayload
     }
+
+    public static func didCreateDurableFIFOHead(
+        pendingBefore: Int?,
+        pendingAfter: Int?
+    ) -> Bool {
+        guard let pendingBefore, let pendingAfter else { return false }
+        return pendingAfter > pendingBefore
+    }
+}
+
+public enum AutomaticSyncMailboxReconciliationPoint: Equatable, Sendable {
+    case beforePayloadGeneration
+    case afterDurableEnqueue
+}
+
+public enum AutomaticSyncMailboxDeliveryPhase: Equatable, Sendable {
+    case advanceOrReconcileFIFOHead
+    case publishFIFOHead
+}
+
+public enum AutomaticSyncBackgroundOpportunityPolicy {
+    public static func deliveryPhase(
+        usesMailboxTransport: Bool,
+        at point: AutomaticSyncMailboxReconciliationPoint
+    ) -> AutomaticSyncMailboxDeliveryPhase? {
+        guard usesMailboxTransport else { return nil }
+        switch point {
+        case .beforePayloadGeneration:
+            return .advanceOrReconcileFIFOHead
+        case .afterDurableEnqueue:
+            return .publishFIFOHead
+        }
+    }
+}
+
+public enum AutomaticSyncMailboxReconciliationResult: Equatable, Sendable {
+    case completed(pendingCount: Int)
+    case terminalHold(pendingCount: Int)
+    case failed
+    case cancelled
+
+    public var lifecycleOutcome: BackgroundSyncRunOutcome {
+        switch self {
+        case .completed:
+            return .completed
+        case .terminalHold, .failed, .cancelled:
+            return .interrupted
+        }
+    }
+
+    public var lifecycleSucceeded: Bool {
+        if case .completed = self { return true }
+        return false
+    }
+
+    public var isTerminalHold: Bool {
+        if case .terminalHold = self { return true }
+        return false
+    }
+
+    public var shouldScheduleRetry: Bool {
+        switch self {
+        case .completed, .failed:
+            return true
+        case .terminalHold, .cancelled:
+            return false
+        }
+    }
+
+    public var pendingCount: Int? {
+        switch self {
+        case .completed(let pendingCount), .terminalHold(let pendingCount):
+            return pendingCount
+        case .failed, .cancelled:
+            return nil
+        }
+    }
 }
 
 @MainActor
@@ -386,23 +651,47 @@ public enum AutomaticSyncDisableCoordinator {
     }
 }
 
+public enum BackgroundSyncRunOutcome: String, Equatable, Sendable {
+    case accepted
+    case skipped
+    case interrupted
+    case completed
+}
+
 public struct BackgroundSyncLastRun: Equatable {
     public let startedAt: String
-    public let finishedAt: String
+    public let finishedAt: String?
+    public let outcome: BackgroundSyncRunOutcome
     public let succeeded: Bool
     public let summary: String
 
-    public init(startedAt: String, finishedAt: String, succeeded: Bool, summary: String) {
+    public init(
+        startedAt: String,
+        finishedAt: String?,
+        succeeded: Bool,
+        summary: String,
+        outcome: BackgroundSyncRunOutcome = .completed
+    ) {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+        self.outcome = outcome
         self.succeeded = succeeded
         self.summary = summary
     }
 
     public var userVisibleSummary: String {
-        succeeded
-            ? "Last background sync completed."
-            : "Last background sync did not complete."
+        switch outcome {
+        case .accepted:
+            return "Last background sync started but did not finish."
+        case .skipped:
+            return "Last background sync was skipped."
+        case .interrupted:
+            return "Last background sync was interrupted."
+        case .completed:
+            return succeeded
+                ? "Last background sync completed."
+                : "Last background sync did not complete."
+        }
     }
 }
 
@@ -636,8 +925,15 @@ public final class BackgroundSyncSettingsStore {
         static let isEnabled = "healthBridge.backgroundSync.enabled"
         static let lastStartedAt = "healthBridge.backgroundSync.lastStartedAt"
         static let lastFinishedAt = "healthBridge.backgroundSync.lastFinishedAt"
+        static let lastOutcome = "healthBridge.backgroundSync.lastOutcome"
         static let lastSucceeded = "healthBridge.backgroundSync.lastSucceeded"
         static let lastSummary = "healthBridge.backgroundSync.lastSummary"
+        static let lastSkippedStartedAt =
+            "healthBridge.backgroundSync.lastSkippedStartedAt"
+        static let lastSkippedFinishedAt =
+            "healthBridge.backgroundSync.lastSkippedFinishedAt"
+        static let lastSkippedSummary =
+            "healthBridge.backgroundSync.lastSkippedSummary"
         static let lastRegistrationAttemptedAt = "healthBridge.backgroundDelivery.lastRegistrationAttemptedAt"
         static let lastRegistrationSucceeded = "healthBridge.backgroundDelivery.lastRegistrationSucceeded"
         static let lastRegistrationSummary = "healthBridge.backgroundDelivery.lastRegistrationSummary"
@@ -649,6 +945,12 @@ public final class BackgroundSyncSettingsStore {
         static let lastWakeSummary = "healthBridge.backgroundWake.lastSummary"
         static let pendingObserverTypeCodeGenerations =
             "healthBridge.backgroundSync.pendingObserverTypeCodeGenerations"
+        static let nextScheduledWorkLaneID =
+            "healthBridge.backgroundSync.nextScheduledWorkLaneID"
+        static let mailboxAckScanCheckpoint =
+            "healthBridge.backgroundSync.mailboxAckScanCheckpoint"
+        static let mailboxAckScanCheckpointGeneration =
+            "healthBridge.backgroundSync.mailboxAckScanCheckpointGeneration"
     }
 
     private let userDefaults: UserDefaults
@@ -696,16 +998,19 @@ public final class BackgroundSyncSettingsStore {
     public var lastRun: BackgroundSyncLastRun? {
         guard
             let startedAt = userDefaults.string(forKey: Key.lastStartedAt),
-            let finishedAt = userDefaults.string(forKey: Key.lastFinishedAt),
             let summary = userDefaults.string(forKey: Key.lastSummary)
         else {
             return nil
         }
+        let outcome = userDefaults.string(forKey: Key.lastOutcome)
+            .flatMap(BackgroundSyncRunOutcome.init(rawValue:))
+            ?? .completed
         return BackgroundSyncLastRun(
             startedAt: startedAt,
-            finishedAt: finishedAt,
+            finishedAt: userDefaults.string(forKey: Key.lastFinishedAt),
             succeeded: userDefaults.bool(forKey: Key.lastSucceeded),
-            summary: summary
+            summary: summary,
+            outcome: outcome
         )
     }
 
@@ -720,6 +1025,23 @@ public final class BackgroundSyncSettingsStore {
             attemptedAt: attemptedAt,
             succeeded: userDefaults.bool(forKey: Key.lastRegistrationSucceeded),
             summary: summary
+        )
+    }
+
+    public var lastSkippedRun: BackgroundSyncLastRun? {
+        guard
+            let startedAt = userDefaults.string(forKey: Key.lastSkippedStartedAt),
+            let finishedAt = userDefaults.string(forKey: Key.lastSkippedFinishedAt),
+            let summary = userDefaults.string(forKey: Key.lastSkippedSummary)
+        else {
+            return nil
+        }
+        return BackgroundSyncLastRun(
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            succeeded: false,
+            summary: summary,
+            outcome: .skipped
         )
     }
 
@@ -789,6 +1111,49 @@ public final class BackgroundSyncSettingsStore {
 
     public var pendingObserverTypeCodes: [String] {
         pendingObserverTypeCodeGenerations.keys.sorted()
+    }
+
+    public var nextScheduledWorkLaneID: String? {
+        userDefaults.string(forKey: Key.nextScheduledWorkLaneID)
+    }
+
+    public func persistNextScheduledWorkLaneID(_ laneID: String?) throws {
+        if let laneID, !laneID.isEmpty {
+            userDefaults.set(laneID, forKey: Key.nextScheduledWorkLaneID)
+        } else {
+            userDefaults.removeObject(forKey: Key.nextScheduledWorkLaneID)
+        }
+        guard userDefaults.synchronize() else {
+            throw BackgroundSyncSettingsStoreError.persistenceFailed
+        }
+    }
+
+    public func resetScheduledWorkContinuation() throws {
+        try persistNextScheduledWorkLaneID(nil)
+    }
+
+    public func mailboxAckScanCheckpoint(
+        receiverGeneration: String
+    ) -> String? {
+        guard userDefaults.string(forKey: Key.mailboxAckScanCheckpointGeneration)
+            == receiverGeneration else {
+            return nil
+        }
+        return userDefaults.string(forKey: Key.mailboxAckScanCheckpoint)
+    }
+
+    public func persistMailboxAckScanCheckpoint(
+        _ checkpoint: String,
+        receiverGeneration: String
+    ) throws {
+        userDefaults.set(checkpoint, forKey: Key.mailboxAckScanCheckpoint)
+        userDefaults.set(
+            receiverGeneration,
+            forKey: Key.mailboxAckScanCheckpointGeneration
+        )
+        guard userDefaults.synchronize() else {
+            throw BackgroundSyncSettingsStoreError.persistenceFailed
+        }
     }
 
     public func markPendingObserverTypeCodes(_ typeCodes: [String]) throws {
@@ -863,11 +1228,57 @@ public final class BackgroundSyncSettingsStore {
         }
     }
 
-    public func recordRun(startedAt: Date, finishedAt: Date, succeeded: Bool, summary: String) {
+    public func recordRunLifecycle(
+        startedAt: Date,
+        finishedAt: Date?,
+        outcome: BackgroundSyncRunOutcome,
+        succeeded: Bool,
+        summary: String
+    ) throws {
+        if outcome == .skipped {
+            let finishedAt = finishedAt ?? startedAt
+            userDefaults.set(
+                dateFormatter.string(from: startedAt),
+                forKey: Key.lastSkippedStartedAt
+            )
+            userDefaults.set(
+                dateFormatter.string(from: finishedAt),
+                forKey: Key.lastSkippedFinishedAt
+            )
+            userDefaults.set(summary, forKey: Key.lastSkippedSummary)
+            guard userDefaults.synchronize() else {
+                throw BackgroundSyncSettingsStoreError.persistenceFailed
+            }
+            return
+        }
         userDefaults.set(dateFormatter.string(from: startedAt), forKey: Key.lastStartedAt)
-        userDefaults.set(dateFormatter.string(from: finishedAt), forKey: Key.lastFinishedAt)
-        userDefaults.set(succeeded, forKey: Key.lastSucceeded)
+        if let finishedAt {
+            userDefaults.set(
+                dateFormatter.string(from: finishedAt),
+                forKey: Key.lastFinishedAt
+            )
+        } else {
+            userDefaults.removeObject(forKey: Key.lastFinishedAt)
+        }
+        userDefaults.set(outcome.rawValue, forKey: Key.lastOutcome)
+        userDefaults.set(
+            outcome == .completed && succeeded,
+            forKey: Key.lastSucceeded
+        )
         userDefaults.set(summary, forKey: Key.lastSummary)
+        guard userDefaults.synchronize() else {
+            throw BackgroundSyncSettingsStoreError.persistenceFailed
+        }
+    }
+
+    public func recordRun(startedAt: Date, finishedAt: Date, succeeded: Bool, summary: String) {
+        try? recordRunLifecycle(
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            outcome: .completed,
+            succeeded: succeeded,
+            summary: summary
+        )
     }
 
     public func recordRegistration(at attemptedAt: Date, succeeded: Bool, summary: String) {

@@ -45,7 +45,7 @@ def test_python_ci_runs_all_release_facing_python_gates() -> None:
 
 def test_ios_ci_runs_swift_tests_and_unsigned_simulator_build() -> None:
     text = IOS_WORKFLOW.read_text()
-    assert "runs-on: macos-15" in text
+    assert "runs-on: macos-26" in text
     assert "swift test" in text
     assert "xcodebuild -project HealthBridgeCompanion.xcodeproj" in text
     assert "-sdk iphonesimulator" in text

@@ -92,15 +92,23 @@ final class CompanionUXStateTests: XCTestCase {
         ])
     }
 
-    func testNewPayloadSkipsNetworkAttemptWhenFIFOAlreadyHasPendingItems() {
+    func testNewPayloadNetworkAttemptIsTransportNativeAndFIFOAware() {
         XCTAssertFalse(
             CompanionPayloadNetworkAttemptPolicy.shouldAttemptNetworkForNewPayload(
-                hasPendingOutbox: true
+                hasPendingOutbox: true,
+                usesMailboxTransport: false
             )
         )
         XCTAssertTrue(
             CompanionPayloadNetworkAttemptPolicy.shouldAttemptNetworkForNewPayload(
-                hasPendingOutbox: false
+                hasPendingOutbox: false,
+                usesMailboxTransport: false
+            )
+        )
+        XCTAssertFalse(
+            CompanionPayloadNetworkAttemptPolicy.shouldAttemptNetworkForNewPayload(
+                hasPendingOutbox: false,
+                usesMailboxTransport: true
             )
         )
     }
@@ -114,6 +122,37 @@ final class CompanionUXStateTests: XCTestCase {
         XCTAssertFalse(
             CompanionPayloadNetworkAttemptPolicy.shouldAttemptNetworkForQueuedPayload(
                 isFIFOHead: false
+            )
+        )
+    }
+
+    func testMailboxCursorCheckpointWaitsForAuthenticatedAcknowledgment() {
+        XCTAssertFalse(
+            CompanionCursorCheckpointFinalizationPolicy.shouldFinalizeLocally(
+                deliveryWasQueued: true,
+                usesMailboxTransport: true
+            )
+        )
+        XCTAssertTrue(
+            CompanionCursorCheckpointFinalizationPolicy.shouldFinalizeLocally(
+                deliveryWasQueued: true,
+                usesMailboxTransport: false
+            )
+        )
+        XCTAssertTrue(
+            CompanionCursorCheckpointFinalizationPolicy.shouldFinalizeLocally(
+                deliveryWasQueued: false,
+                usesMailboxTransport: true
+            )
+        )
+        XCTAssertFalse(
+            CompanionCursorCheckpointFinalizationPolicy.shouldContinueSyncAfterQueuedPayload(
+                usesMailboxTransport: true
+            )
+        )
+        XCTAssertTrue(
+            CompanionCursorCheckpointFinalizationPolicy.shouldContinueSyncAfterQueuedPayload(
+                usesMailboxTransport: false
             )
         )
     }

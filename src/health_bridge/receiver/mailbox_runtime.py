@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import stat
+import time
 from collections.abc import Callable, Iterable
 from enum import StrEnum
 from pathlib import Path
@@ -30,6 +31,9 @@ MAX_RAW_RECEIVER_ENTRIES: Final = 4_096
 MAX_RAW_DEVICE_ENTRIES: Final = 16_384
 MAILBOX_POLL_INTERVAL_SECONDS: Final = 1.0
 MAILBOX_SHUTDOWN_TIMEOUT_SECONDS: Final = 5.0
+MAILBOX_MAINTENANCE_INTERVAL_SECONDS: Final = 300.0
+MAILBOX_INCOMPLETE_RETRY_INTERVAL_SECONDS: Final = 30.0
+MAX_LANE_SIGNATURE_ENTRIES: Final = 16_384
 _OPAQUE_COMPONENT: Final = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -40,6 +44,8 @@ class MailboxImporterProtocol(Protocol):
 MailboxImporterFactory = Callable[
     [Path, Path, MailboxDirectoryHandle], MailboxImporterProtocol
 ]
+MailboxEntrySignature = tuple[str, int, int, int, int, int, int, int, int, int]
+MailboxLaneSignature = tuple[tuple[MailboxEntrySignature, ...], ...]
 
 
 class MailboxDiscoveryErrorCode(StrEnum):
@@ -234,6 +240,54 @@ def _retryable_errors() -> tuple[type[Exception], ...]:
     )
 
 
+def _lane_entries_signature(
+    directory_fd: int,
+) -> tuple[MailboxEntrySignature, ...] | None:
+    entries: list[MailboxEntrySignature] = []
+    try:
+        with os.scandir(directory_fd) as scanned:
+            for count, entry in enumerate(scanned, start=1):
+                if count > MAX_LANE_SIGNATURE_ENTRIES:
+                    return None
+                metadata = os.stat(
+                    entry.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                entries.append(
+                    (
+                        entry.name,
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_nlink,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                        metadata.st_ctime_ns,
+                        metadata.st_uid,
+                        int(getattr(metadata, "st_flags", 0)),
+                    )
+                )
+    except OSError:
+        return None
+    entries.sort()
+    return tuple(entries)
+
+
+def _lane_signature(directory: MailboxDirectoryHandle) -> MailboxLaneSignature | None:
+    signatures = tuple(
+        _lane_entries_signature(directory_fd)
+        for directory_fd in (
+            directory.deliveries_fd,
+            directory.acks_fd,
+            directory.quarantine_fd,
+        )
+    )
+    if any(signature is None for signature in signatures):
+        return None
+    return tuple(signature for signature in signatures if signature is not None)
+
+
 @final
 class MailboxRuntimeWorker:
     def __init__(  # noqa: PLR0913 - explicit bounded worker policy inputs.
@@ -248,8 +302,18 @@ class MailboxRuntimeWorker:
         max_raw_receiver_entries: int = MAX_RAW_RECEIVER_ENTRIES,
         max_raw_device_entries: int = MAX_RAW_DEVICE_ENTRIES,
         shutdown_timeout_seconds: float = MAILBOX_SHUTDOWN_TIMEOUT_SECONDS,
+        maintenance_interval_seconds: float = MAILBOX_MAINTENANCE_INTERVAL_SECONDS,
+        incomplete_retry_interval_seconds: float = (
+            MAILBOX_INCOMPLETE_RETRY_INTERVAL_SECONDS
+        ),
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        if poll_interval_seconds <= 0 or shutdown_timeout_seconds <= 0:
+        if (
+            poll_interval_seconds <= 0
+            or shutdown_timeout_seconds <= 0
+            or maintenance_interval_seconds <= 0
+            or incomplete_retry_interval_seconds <= 0
+        ):
             raise ValueError
         self._db_path = db_path
         self._mailbox_root = mailbox_root
@@ -260,11 +324,15 @@ class MailboxRuntimeWorker:
         self._max_raw_receiver_entries = max_raw_receiver_entries
         self._max_raw_device_entries = max_raw_device_entries
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._maintenance_interval_seconds = maintenance_interval_seconds
+        self._incomplete_retry_interval_seconds = incomplete_retry_interval_seconds
+        self._monotonic = monotonic
         self._stop = Event()
         self._lifecycle_lock = Lock()
         self._thread: Thread | None = None
         self._last_discovery_error: str | None = None
         self._terminal_error: str | None = None
+        self._idle_signatures: dict[Path, tuple[MailboxLaneSignature, float]] = {}
 
     def run_once(self) -> None:
         directories = _discover_mailbox_handles(
@@ -274,26 +342,64 @@ class MailboxRuntimeWorker:
             max_raw_receiver_entries=self._max_raw_receiver_entries,
             max_raw_device_entries=self._max_raw_device_entries,
         )
+        seen: set[Path] = set()
         try:
             for directory in directories:
+                seen.add(directory.path)
                 try:
                     with directory:
                         directory.validate_attached()
+                        before = _lane_signature(directory)
+                        cached = self._idle_signatures.get(directory.path)
+                        now = self._monotonic()
+                        if (
+                            before is not None
+                            and cached is not None
+                            and cached[0] == before
+                            and now < cached[1]
+                        ):
+                            directory.validate_attached()
+                            continue
                         importer = self._importer_factory(
                             self._db_path, directory.path, directory
                         )
                         directory.validate_attached()
-                        _ = importer.import_once()
+                        result = importer.import_once()
                         directory.validate_attached()
+                        after = _lane_signature(directory)
+                        if before is not None and before == after:
+                            complete = (
+                                result.retryable == 0
+                                and result.skipped == 0
+                                and result.conflict == 0
+                            )
+                            retry_interval = (
+                                self._maintenance_interval_seconds
+                                if complete
+                                else self._incomplete_retry_interval_seconds
+                            )
+                            self._idle_signatures[directory.path] = (
+                                before,
+                                self._monotonic() + retry_interval,
+                            )
+                        else:
+                            _ = self._idle_signatures.pop(directory.path, None)
                 except MailboxFileError as exc:
+                    _ = self._idle_signatures.pop(directory.path, None)
                     if exc.code is MailboxFileErrorCode.PATH_REPLACED:
                         raise MailboxDiscoveryError(
                             MailboxDiscoveryErrorCode.NAMESPACE_DETACHED
                         ) from exc
                     continue
                 except _retryable_errors():
+                    _ = self._idle_signatures.pop(directory.path, None)
                     continue
         finally:
+            self._idle_signatures = {
+                path: value
+                for path, value in self._idle_signatures.items()
+                if path in seen
+            }
             _close_handles(directories)
 
     def start(self) -> None:

@@ -13,6 +13,43 @@ public final class FileOutboxMailboxAckLookup: MailboxAckOutboxLookingUp {
         self.deviceSigningPublicKey = deviceSigningPublicKey
     }
 
+    func record(for item: FileOutboxItem) throws -> MailboxAckOutboxRecord {
+        guard let binding = item.mailboxBinding,
+              let receiverBindingID = item.receiverIdentity,
+              binding.envelopeFilename == "\(item.id).hbe" else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        let envelope = try MailboxRegularFileReader.read(
+            outbox.directoryURL.appendingPathComponent(binding.envelopeFilename),
+            maximumBytes: MailboxLayoutV1.maximumDeliveryBytes
+        )
+        guard Self.sha256(envelope) == binding.envelopeSHA256 else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        let claims = try DeliveryProtocolV1.inspectDelivery(
+            envelope,
+            senderSigningPublicKey: deviceSigningPublicKey
+        )
+        let payload = try MailboxRegularFileReader.read(
+            item.fileURL,
+            maximumBytes: Int64(DeliveryProtocolV1.maxPayloadBytes)
+        )
+        guard Self.sha256(payload) == binding.payloadSHA256,
+              claims.payloadSHA256 == binding.payloadSHA256 else {
+            throw FileOutboxMailboxError.finalizationConflict
+        }
+        return MailboxAckOutboxRecord(
+            envelopeID: claims.envelopeID,
+            payloadSHA256: binding.payloadSHA256,
+            receiverID: claims.receiverID,
+            deviceID: claims.deviceID,
+            receiverBindingID: receiverBindingID,
+            connectionGeneration: claims.connectionGeneration,
+            receiverAgreementKeyID: claims.receiverAgreementKeyID,
+            deviceSigningKeyID: claims.senderSigningKeyID
+        )
+    }
+
     public func lookup(envelopeID: Data) throws -> MailboxAckLookupResult {
         var matches: [MailboxAckOutboxRecord] = []
         for item in try outbox.mailboxBoundItemsForAckScanning() {

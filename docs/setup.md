@@ -142,6 +142,8 @@ After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, confi
 
 This core setup uses Direct, the default transport. Encrypted iCloud Mailbox is a separate explicit opt-in, Mac-only Beta and is never selected automatically when Direct is unavailable; see the [mailbox service guide](icloud-mailbox-service.md) only if you intentionally choose that transport.
 
+The mailbox guide uses the existing `health-bridge setup --transport icloud-mailbox` command with an explicit mailbox root and iCloud container identifier. It also requires the separately downloaded, verified, signed ACK helper before service installation. Direct setup commands in this guide never require that helper and never fall back to mailbox delivery.
+
 For Route A or Route B, keep the safe loopback bind:
 
 ```bash

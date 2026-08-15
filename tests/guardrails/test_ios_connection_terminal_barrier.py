@@ -198,7 +198,13 @@ def test_clear_and_disconnect_reactivate_automatic_sync_after_request_release() 
         "private func performClearPendingOutboxWhileHoldingRequestGate()", clear_start
     )
     clear_body = source[clear_start:clear_end]
-    assert "defer { activateAutomaticSyncIfReady() }" in clear_body
+    clear_release_reservation = clear_body.index(
+        "terminalRecoveryRequestIsActive = false"
+    )
+    clear_reactivate = clear_body.index(
+        "activateAutomaticSyncIfReady()", clear_release_reservation
+    )
+    assert clear_release_reservation < clear_reactivate
 
     clear_worker_start = clear_end
     clear_worker_end = source.index(
@@ -233,8 +239,8 @@ def test_pairing_docs_describe_terminal_boundary_without_remote_retraction() -> 
 
 def test_stale_cancellation_is_rejected_before_durable_marker_write() -> None:
     source = RECEIVER_CLIENT.read_text()
-    start = source.index("public func cancelPendingPairing(")
-    end = source.index("public func finishPendingCancellationIfNeeded(", start)
+    start = source.index("public func beginPendingCancellation(")
+    end = source.index("public func cancelPendingPairing(", start)
     body = source[start:end]
 
     assert body.index(
@@ -385,13 +391,21 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
         "func setHealthHistoryDepthOption(_ optionID: String)",
         "func retryPrivateStorage() async",
         "func saveReceiverSettings() async",
-        "func clearPendingOutbox() async",
-        "func cancelPendingPairing() async",
         "func requestHealthPermissions() async",
     ):
         action_start = source.index(action_entry)
         action_body = source[action_start : source.index("\n    }", action_start) + 6]
         assert "terminalUserActionAdmissionIsOpen" in action_body
+
+    clear_start = source.index("func clearPendingOutbox() async")
+    clear_body = source[clear_start : source.index("\n    }", clear_start) + 6]
+    assert "guard !terminalRecoveryRequestIsActive" in clear_body
+    assert "terminalRequestLifecycleSnapshot.admitsUserAction" in clear_body
+
+    cancel_start = source.index("func cancelPendingPairing() async")
+    cancel_body = source[cancel_start : source.index("\n    }", cancel_start) + 6]
+    assert "guard !terminalRecoveryRequestIsActive" in cancel_body
+    assert "terminalRequestLifecycleSnapshot.admitsUserAction" in cancel_body
 
     permission_start = source.index(
         "private func performRequestHealthPermissionsWhileHoldingRequestGate() async"
@@ -490,8 +504,8 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
         "private func performBackgroundRefreshSync(", record_start
     )
     record_body = source[record_start:record_end]
-    assert "guard terminalPayloadActionAdmissionIsOpen else { return }" in record_body
-    assert "backgroundSyncStore.recordRun(" in record_body
+    assert "backgroundSyncStore.recordRunLifecycle(" in record_body
+    assert "backgroundSyncStore.recordRun(" not in record_body
 
     for callback in (
         "private func noteHealthKitBackgroundDeliveryRegistration(",
@@ -608,14 +622,11 @@ def test_automatic_sync_backpressure_and_disable_ordering() -> None:
         "private func performAdmittedBackgroundRefreshSync(", refresh_start
     )
     refresh_body = source[refresh_start:refresh_end]
-    first_backpressure = refresh_body.index(
-        "deferAutomaticSyncForPendingOutboxIfNeeded(startedAt: startedAt)"
-    )
+    before_generation = "mailboxReconciliationPoint: .beforePayloadGeneration"
+    after_durable_enqueue = "mailboxReconciliationPoint: .afterDurableEnqueue"
+    first_backpressure = refresh_body.index(before_generation)
     direct_transfer = refresh_body.index("runWithExclusiveDirectOutboxTransfer")
-    second_backpressure = refresh_body.index(
-        "deferAutomaticSyncForPendingOutboxIfNeeded(startedAt: startedAt)",
-        first_backpressure + 1,
-    )
+    second_backpressure = refresh_body.index(before_generation, first_backpressure + 1)
     policy = refresh_body.index(
         "AutomaticSyncPayloadGenerationPolicy.shouldGenerateNewPayloads("
     )
@@ -643,15 +654,10 @@ def test_automatic_sync_backpressure_and_disable_ordering() -> None:
         "private func stopBackgroundRunIfUnavailable(", admitted_start
     )
     admitted_body = source[admitted_start:admitted_end]
-    follow_up = admitted_body.index("if followUpAdmission.shouldRun")
-    follow_up_backpressure = admitted_body.index(
-        "deferAutomaticSyncForPendingOutboxIfNeeded(startedAt: followUpStartedAt)",
-        follow_up,
-    )
-    recursive_read = admitted_body.index(
-        "await performAdmittedBackgroundRefreshSync(", follow_up
-    )
-    assert follow_up < follow_up_backpressure < recursive_read
+    assert admitted_body.count("switch lane") == 1
+    assert "if followUpAdmission.shouldRun" not in admitted_body
+    assert "await performAdmittedBackgroundRefreshSync(" not in admitted_body
+    post_lane_backpressure = admitted_body.index(after_durable_enqueue)
 
     lane_markers = [
         "await self.syncRecentStepCounts(executionMode: .automatic)",
@@ -662,11 +668,7 @@ def test_automatic_sync_backpressure_and_disable_ordering() -> None:
     ]
     for lane_marker in lane_markers:
         lane = admitted_body.index(lane_marker)
-        checkpoint = admitted_body.index(
-            "deferAutomaticSyncForPendingOutboxIfNeeded(startedAt: startedAt)",
-            lane,
-        )
-        assert lane < checkpoint < follow_up
+        assert lane < post_lane_backpressure
 
     quantity_start = source.index("private func syncQuantityMetrics(")
     quantity_end = source.index("private enum PayloadDeliveryResult", quantity_start)

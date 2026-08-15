@@ -551,15 +551,31 @@ public enum CompanionSyncNowPlan {
 
 public enum CompanionPayloadNetworkAttemptPolicy {
     public static func shouldAttemptNetworkForNewPayload(
-        hasPendingOutbox: Bool
+        hasPendingOutbox: Bool,
+        usesMailboxTransport: Bool
     ) -> Bool {
-        !hasPendingOutbox
+        !usesMailboxTransport && !hasPendingOutbox
     }
 
     public static func shouldAttemptNetworkForQueuedPayload(
         isFIFOHead: Bool
     ) -> Bool {
         isFIFOHead
+    }
+}
+
+public enum CompanionCursorCheckpointFinalizationPolicy {
+    public static func shouldFinalizeLocally(
+        deliveryWasQueued: Bool,
+        usesMailboxTransport: Bool
+    ) -> Bool {
+        !deliveryWasQueued || !usesMailboxTransport
+    }
+
+    public static func shouldContinueSyncAfterQueuedPayload(
+        usesMailboxTransport: Bool
+    ) -> Bool {
+        !usesMailboxTransport
     }
 }
 

@@ -11,6 +11,7 @@ from typing import Final
 import pytest
 from typer.testing import CliRunner
 
+import health_bridge.cli_launchd as cli_launchd_module
 import health_bridge.cli_receiver as cli_receiver_module
 from health_bridge.cli import app
 from health_bridge.launchd import (
@@ -22,6 +23,7 @@ from health_bridge.launchd import (
 from health_bridge.launchd.adapters import LaunchctlResult
 from health_bridge.launchd.models import LAUNCH_AGENT_LABEL
 from health_bridge.mailbox.connections import MailboxConnectionStore
+from health_bridge.mailbox.helper_lifecycle import HelperResult, HelperStatusCode
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
 from tests.launchd.support import service_request
@@ -136,6 +138,27 @@ def test_install_fails_closed_on_linux_without_side_effects(
     assert database.is_file()
 
 
+def test_install_on_macos_refuses_missing_helper_before_service_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, home, database = _service_args(tmp_path)
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    result = CliRunner().invoke(
+        app,
+        ["mailbox", "service", "install", *args, "--json"],
+        env={"HOME": str(home)},
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {"code": "helper_not_ready"}
+    assert not (home / "Library/LaunchAgents").exists()
+    assert not (home / "Library/Application Support/HealthBridge/launchd").exists()
+    assert database.is_file()
+    assert str(home) not in result.output
+
+
 def test_lifecycle_actions_fail_closed_on_linux_with_fixed_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -196,7 +219,7 @@ def test_status_json_survives_missing_obsolete_runtime_targets(
     )
 
     assert result.exit_code == 1
-    assert json.loads(result.stdout) == {"code": "installed_inactive"}
+    assert json.loads(result.stdout) == {"code": "helper_not_ready"}
     assert result.stderr == ""
     assert str(request.home) not in result.output
 
@@ -220,7 +243,15 @@ def test_status_json_emits_fixed_launchctl_error_code(
     def inspect_failure(_adapter: LaunchctlAdapter) -> LaunchctlResult:
         raise LaunchdServiceError(code)
 
+    def ready_helper_status(**_kwargs: object) -> HelperResult:
+        return HelperResult(code=HelperStatusCode.READY)
+
     monkeypatch.setattr(LaunchctlAdapter, "inspect", inspect_failure)
+    monkeypatch.setattr(
+        cli_launchd_module,
+        "read_helper_status",
+        ready_helper_status,
+    )
 
     result = CliRunner().invoke(
         app,

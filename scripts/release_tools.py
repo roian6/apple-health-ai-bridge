@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import plistlib
 import re
 import shutil
 import subprocess
@@ -12,13 +13,18 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, assert_never
+from typing import Any, Final, Literal, assert_never, cast
 
 from release_versions import (
     ReleaseError,
     canonical_receiver_tag,
     parse_receiver_release_tag,
     parse_semantic_version,
+)
+
+from health_bridge.mailbox.helper_lifecycle import (
+    HelperError,
+    validate_helper_release,
 )
 
 HEX_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
@@ -28,6 +34,10 @@ IOS_SOURCE_SETTINGS: Final = Path(
     "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
 COMPONENT_VERSION_INDEX: Final = Path("component-versions.json")
+HELPER_SOURCE: Final = Path("macos/HealthBridgeMailboxAckPublisher")
+HELPER_INFO: Final = HELPER_SOURCE / "Info.plist"
+HELPER_COMPONENT: Final = "HealthBridgeMailboxAckPublisher"
+HELPER_BUILD: Final = "1"
 GIT_EXECUTABLE: Final = shutil.which("git")
 
 
@@ -104,6 +114,24 @@ class DraftVerificationRequest:
     tag_object: str
     commit: str
     tree: str
+
+
+@dataclass(frozen=True, slots=True)
+class HelperVerificationRequest:
+    repo: Path
+    dist: Path
+    tag: str
+    tag_object: str
+    commit: str
+    tree: str
+    helper_sha256: str
+    output: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FinalReleaseVerificationRequest:
+    release: DraftVerificationRequest
+    helper_sha256: str
 
 
 def _project_metadata(repo: Path) -> tuple[str, str]:
@@ -286,6 +314,55 @@ def _batch_contract(repo: Path) -> dict[str, str]:
     return {"schema_id": schema_id, "schema_version": schema_version}
 
 
+def _helper_source_tree(repo: Path) -> str:
+    if GIT_EXECUTABLE is None:
+        message = "git is required to bind the mailbox helper source tree"
+        raise ReleaseError(message)
+    completed = subprocess.run(  # noqa: S603 - fixed git executable, no shell.
+        [
+            GIT_EXECUTABLE,
+            "-C",
+            str(repo),
+            "rev-parse",
+            f"HEAD:{HELPER_SOURCE.as_posix()}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or HEX_SHA_PATTERN.fullmatch(value) is None:
+        message = "mailbox helper source tree identity is unavailable"
+        raise ReleaseError(message)
+    return value
+
+
+def _expected_helper_metadata(repo: Path, version: str) -> dict[str, Any]:
+    try:
+        info = plistlib.loads((repo / HELPER_INFO).read_bytes())
+    except plistlib.InvalidFileException as exc:
+        message = "mailbox helper Info.plist is invalid"
+        raise ReleaseError(message) from exc
+    if (
+        not isinstance(info, dict)
+        or info.get("CFBundleShortVersionString") != version
+        or info.get("CFBundleVersion") != HELPER_BUILD
+    ):
+        message = "mailbox helper version/build must match the receiver release"
+        raise ReleaseError(message)
+    return {
+        "archive_filename": f"{HELPER_COMPONENT}-{version}.zip",
+        "build": HELPER_BUILD,
+        "component": HELPER_COMPONENT,
+        "manifest_filename": f"{HELPER_COMPONENT}-{version}.manifest.json",
+        "source": {
+            "git_tree": _helper_source_tree(repo),
+            "path": HELPER_SOURCE.as_posix(),
+        },
+        "version": version,
+    }
+
+
 def _required_component_string(
     mapping: dict[str, Any],
     key: str,
@@ -450,7 +527,7 @@ def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
 def _component_change_flags(
     candidate: ComponentSnapshot,
     baseline: ComponentSnapshot,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     candidate_receiver = _stable_version_tuple(
         candidate.receiver_version,
         surface="candidate Receiver/CLI version",
@@ -459,9 +536,10 @@ def _component_change_flags(
         baseline.receiver_version,
         surface="baseline Receiver/CLI version",
     )
-    if candidate_receiver <= baseline_receiver:
-        message = "Receiver/CLI version must advance from the baseline"
+    if candidate_receiver < baseline_receiver:
+        message = "Receiver/CLI version must not regress from the baseline"
         raise ReleaseError(message)
+    receiver_advanced = candidate_receiver > baseline_receiver
     candidate_ios = _stable_version_tuple(
         candidate.ios_version,
         surface="candidate iOS Companion version",
@@ -508,20 +586,35 @@ def _component_change_flags(
     if ios_changed and candidate.ios_build <= baseline.ios_build:
         message = "iOS component updates must advance the build number"
         raise ReleaseError(message)
-    return ios_changed, batch_changed
+    return receiver_advanced, ios_changed, batch_changed
 
 
 def _validate_scope_transition(
     candidate: ComponentSnapshot,
+    baseline: ComponentSnapshot,
+    receiver_advanced: bool,
     ios_changed: bool,
     batch_changed: bool,
 ) -> None:
     match candidate.release_scope:
         case "receiver":
+            if not receiver_advanced:
+                message = "receiver scope must advance Receiver/CLI"
+                raise ReleaseError(message)
             if ios_changed or batch_changed:
                 message = "receiver scope must preserve baseline iOS and Batch Protocol"
                 raise ReleaseError(message)
         case "coordinated":
+            if not receiver_advanced and (
+                baseline.release_scope != "coordinated"
+                or candidate.receiver_version != baseline.receiver_version
+                or candidate.receiver_tag != baseline.receiver_tag
+            ):
+                message = (
+                    "coordinated Receiver/CLI version reuse requires the same "
+                    "pre-release scope and tag"
+                )
+                raise ReleaseError(message)
             if not ios_changed and not batch_changed:
                 message = "coordinated scope must advance iOS or Batch Protocol"
                 raise ReleaseError(message)
@@ -534,11 +627,17 @@ def validate_component_transition(
     versions: ReleaseVersions,
 ) -> None:
     baseline = _transition_baseline(request)
-    ios_changed, batch_changed = _component_change_flags(
+    receiver_advanced, ios_changed, batch_changed = _component_change_flags(
         versions.components,
         baseline,
     )
-    _validate_scope_transition(versions.components, ios_changed, batch_changed)
+    _validate_scope_transition(
+        versions.components,
+        baseline,
+        receiver_advanced,
+        ios_changed,
+        batch_changed,
+    )
 
 
 def create_manifest(request: ManifestRequest) -> None:
@@ -567,6 +666,10 @@ def create_manifest(request: ManifestRequest) -> None:
             "source_settings": IOS_SOURCE_SETTINGS.as_posix(),
             "source_settings_sha256": _sha256(request.repo / IOS_SOURCE_SETTINGS),
         },
+        "macos_mailbox_ack_helper": _expected_helper_metadata(
+            request.repo,
+            versions.project_version,
+        ),
         "python": {
             "artifacts": [
                 {
@@ -582,7 +685,7 @@ def create_manifest(request: ManifestRequest) -> None:
         },
         "release_scope": _release_scope(versions),
         "release_version": versions.project_version,
-        "schema_id": "health_bridge.release.v2",
+        "schema_id": "health_bridge.release.v3",
     }
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
     _atomic_write(request.output, encoded)
@@ -669,6 +772,7 @@ def _validate_release_metadata(
         "batch_contract",
         "git",
         "ios",
+        "macos_mailbox_ack_helper",
         "python",
         "release_scope",
         "release_version",
@@ -678,11 +782,13 @@ def _validate_release_metadata(
         message = "release metadata top-level schema is not exact"
         raise ReleaseError(message)
     if (
-        payload.get("schema_id") != "health_bridge.release.v2"
+        payload.get("schema_id") != "health_bridge.release.v3"
         or payload.get("release_scope") != _release_scope(versions)
         or payload.get("release_version") != versions.project_version
         or payload.get("batch_contract") != _batch_contract(repo)
         or payload.get("ios") != _expected_ios_metadata(repo, versions)
+        or payload.get("macos_mailbox_ack_helper")
+        != _expected_helper_metadata(repo, versions.project_version)
         or payload.get("git") != expected_git
     ):
         message = "release metadata version, scope, source, or compatibility is invalid"
@@ -846,6 +952,89 @@ def verify_packet(request: PacketVerificationRequest) -> None:
     _verify_packet_metadata(request, versions, expected_names)
 
 
+def _validate_helper_packet(
+    request: HelperVerificationRequest,
+) -> tuple[set[str], dict[str, tuple[str, int]]]:
+    versions = validate_tag(request.repo, request.tag)
+    expected_git = _expected_git_identity(
+        tag=request.tag,
+        tag_object=request.tag_object,
+        commit=request.commit,
+        tree=request.tree,
+    )
+    metadata_path = request.dist / "release-metadata.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    records = _validate_release_metadata(
+        request.repo,
+        payload,
+        versions,
+        expected_git=expected_git,
+    )
+    helper = _expected_helper_metadata(request.repo, versions.project_version)
+    archive_name = cast("str", helper["archive_filename"])
+    manifest_name = cast("str", helper["manifest_filename"])
+    archive = request.dist / archive_name
+    manifest_path = request.dist / manifest_name
+    source = cast("dict[str, str]", helper["source"])
+    if SHA256_PATTERN.fullmatch(request.helper_sha256) is None:
+        message = "expected helper digest must be lowercase SHA-256"
+        raise ReleaseError(message)
+    try:
+        helper_manifest = validate_helper_release(
+            archive,
+            manifest_path,
+            expected_release=(
+                request.tag,
+                request.tag_object,
+                request.commit,
+                request.tree,
+            ),
+            expected_source_tree=source["git_tree"],
+        )
+    except HelperError as exc:
+        message = "signed mailbox helper release contract is invalid"
+        raise ReleaseError(message) from exc
+    if helper_manifest.artifact.sha256 != request.helper_sha256:
+        message = "signed mailbox helper digest does not match continuation input"
+        raise ReleaseError(message)
+    names = set(records) | {
+        archive_name,
+        manifest_name,
+        metadata_path.name,
+    }
+    present = _exact_regular_file_names(
+        request.dist,
+        excluded_names={request.output.name} if request.output is not None else None,
+    )
+    if present != names:
+        message = "helper continuation packet file set is not exact"
+        raise ReleaseError(message)
+    for name, (digest, size) in records.items():
+        path = request.dist / name
+        if path.stat().st_size != size or _sha256(path) != digest:
+            message = f"release metadata artifact mismatch: {name}"
+            raise ReleaseError(message)
+    return names, records
+
+
+def verify_helper_packet(request: HelperVerificationRequest) -> None:
+    _ = _validate_helper_packet(request)
+
+
+def create_final_checksums(request: HelperVerificationRequest) -> None:
+    if request.output is None:
+        message = "final checksum output is required"
+        raise ReleaseError(message)
+    if request.output.parent.resolve() != request.dist.resolve():
+        message = "final checksum output must be inside dist directory"
+        raise ReleaseError(message)
+    names, _records = _validate_helper_packet(request)
+    lines = "".join(
+        f"{_sha256(request.dist / name)}  {name}\n" for name in sorted(names)
+    )
+    _atomic_write(request.output, lines.encode("utf-8"))
+
+
 def _verify_release_identity(
     payload: dict[str, Any],
     request: DraftVerificationRequest,
@@ -893,6 +1082,89 @@ def _release_asset_records(payload: dict[str, Any]) -> dict[str, tuple[str, int,
             raise ReleaseError(message)
         remote_assets[name] = (digest, size, state)
     return remote_assets
+
+
+def _verify_remote_assets(
+    payload: dict[str, Any],
+    dist: Path,
+    expected_names: set[str],
+) -> None:
+    remote_assets = _release_asset_records(payload)
+    if set(remote_assets) != expected_names:
+        message = "GitHub release asset file set is not exact"
+        raise ReleaseError(message)
+    for name, (digest, size, state) in remote_assets.items():
+        local = dist / name
+        if local.is_symlink() or not local.is_file() or state != "uploaded":
+            message = f"GitHub release asset is not ready: {name}"
+            raise ReleaseError(message)
+        if digest != f"sha256:{_sha256(local)}" or size != local.stat().st_size:
+            message = f"remote asset digest mismatch: {name}"
+            raise ReleaseError(message)
+
+
+def verify_core_draft(request: DraftVerificationRequest) -> None:
+    versions = validate_tag(request.repo, request.tag)
+    payload = json.loads(request.release_json.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        message = "GitHub release response must be an object"
+        raise ReleaseError(message)
+    _verify_release_identity(payload, request, expected_draft=True)
+    metadata_payload = json.loads(
+        (request.dist / "release-metadata.json").read_text(encoding="utf-8")
+    )
+    records = _validate_release_metadata(
+        request.repo,
+        metadata_payload,
+        versions,
+        expected_git=_expected_git_identity(
+            tag=request.tag,
+            tag_object=request.tag_object,
+            commit=request.commit,
+            tree=request.tree,
+        ),
+    )
+    expected_names = set(records) | {"release-metadata.json"}
+    if _exact_regular_file_names(request.dist) != expected_names:
+        message = "helper-pending draft packet file set is not exact"
+        raise ReleaseError(message)
+    for name, (digest, size) in records.items():
+        local = request.dist / name
+        if local.stat().st_size != size or _sha256(local) != digest:
+            message = f"release metadata artifact mismatch: {name}"
+            raise ReleaseError(message)
+    _verify_remote_assets(payload, request.dist, expected_names)
+
+
+def verify_final_release_state(
+    request: FinalReleaseVerificationRequest,
+    *,
+    expected_draft: bool,
+) -> None:
+    release = request.release
+    payload = json.loads(release.release_json.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        message = "GitHub release response must be an object"
+        raise ReleaseError(message)
+    _verify_release_identity(payload, release, expected_draft=expected_draft)
+    checksum_path = release.dist / "SHA256SUMS"
+    helper_request = HelperVerificationRequest(
+        repo=release.repo,
+        dist=release.dist,
+        tag=release.tag,
+        tag_object=release.tag_object,
+        commit=release.commit,
+        tree=release.tree,
+        helper_sha256=request.helper_sha256,
+        output=checksum_path,
+    )
+    names, _records = _validate_helper_packet(helper_request)
+    expected_names = names | {checksum_path.name}
+    if _exact_regular_file_names(release.dist) != expected_names:
+        message = "final release packet file set is not exact"
+        raise ReleaseError(message)
+    _verify_packet_checksums(release.dist, expected_names)
+    _verify_remote_assets(payload, release.dist, expected_names)
 
 
 def verify_release_state(
@@ -947,7 +1219,7 @@ def verify_release_state(
             raise ReleaseError(message)
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser = argparse.ArgumentParser(description="Build exact-tag release metadata.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -979,6 +1251,18 @@ def _parser() -> argparse.ArgumentParser:
     checksums.add_argument("--tree", required=True)
     checksums.add_argument("--output", type=Path, required=True)
 
+    for command in ("verify-helper", "final-checksums"):
+        helper_parser = subparsers.add_parser(command)
+        helper_parser.add_argument("--repo", type=Path, required=True)
+        helper_parser.add_argument("--dist-dir", type=Path, required=True)
+        helper_parser.add_argument("--tag", required=True)
+        helper_parser.add_argument("--tag-object", required=True)
+        helper_parser.add_argument("--commit", required=True)
+        helper_parser.add_argument("--tree", required=True)
+        helper_parser.add_argument("--helper-sha256", required=True)
+        if command == "final-checksums":
+            helper_parser.add_argument("--output", type=Path, required=True)
+
     verify_packet_parser = subparsers.add_parser("verify-packet")
     verify_packet_parser.add_argument("--repo", type=Path, required=True)
     verify_packet_parser.add_argument("--dist-dir", type=Path, required=True)
@@ -996,6 +1280,26 @@ def _parser() -> argparse.ArgumentParser:
         verify_release_parser.add_argument("--tag-object", required=True)
         verify_release_parser.add_argument("--commit", required=True)
         verify_release_parser.add_argument("--tree", required=True)
+    core_draft = subparsers.add_parser("verify-core-draft")
+    core_draft.add_argument("--repo", type=Path, required=True)
+    core_draft.add_argument("--dist-dir", type=Path, required=True)
+    core_draft.add_argument("--release-json", type=Path, required=True)
+    core_draft.add_argument("--notes-file", type=Path, required=True)
+    core_draft.add_argument("--tag", required=True)
+    core_draft.add_argument("--tag-object", required=True)
+    core_draft.add_argument("--commit", required=True)
+    core_draft.add_argument("--tree", required=True)
+    for command in ("verify-final-draft", "verify-final-published"):
+        final_parser = subparsers.add_parser(command)
+        final_parser.add_argument("--repo", type=Path, required=True)
+        final_parser.add_argument("--dist-dir", type=Path, required=True)
+        final_parser.add_argument("--release-json", type=Path, required=True)
+        final_parser.add_argument("--notes-file", type=Path, required=True)
+        final_parser.add_argument("--tag", required=True)
+        final_parser.add_argument("--tag-object", required=True)
+        final_parser.add_argument("--commit", required=True)
+        final_parser.add_argument("--tree", required=True)
+        final_parser.add_argument("--helper-sha256", required=True)
     return parser
 
 
@@ -1018,7 +1322,7 @@ def _transition_request(
             raise ReleaseError(message)
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901, PLR0912
     args = _parser().parse_args()
     try:
         if args.command == "tag-info":
@@ -1092,6 +1396,21 @@ def main() -> int:
                     tree=args.tree,
                 )
             )
+        elif args.command in {"verify-helper", "final-checksums"}:
+            helper_request = HelperVerificationRequest(
+                repo=args.repo,
+                dist=args.dist_dir,
+                tag=args.tag,
+                tag_object=args.tag_object,
+                commit=args.commit,
+                tree=args.tree,
+                helper_sha256=args.helper_sha256,
+                output=(args.output if args.command == "final-checksums" else None),
+            )
+            if args.command == "verify-helper":
+                verify_helper_packet(helper_request)
+            else:
+                create_final_checksums(helper_request)
         elif args.command in {"verify-draft", "verify-published"}:
             verify_release_state(
                 DraftVerificationRequest(
@@ -1105,6 +1424,36 @@ def main() -> int:
                     tree=args.tree,
                 ),
                 expected_draft=args.command == "verify-draft",
+            )
+        elif args.command == "verify-core-draft":
+            verify_core_draft(
+                DraftVerificationRequest(
+                    repo=args.repo,
+                    dist=args.dist_dir,
+                    release_json=args.release_json,
+                    notes_file=args.notes_file,
+                    tag=args.tag,
+                    tag_object=args.tag_object,
+                    commit=args.commit,
+                    tree=args.tree,
+                )
+            )
+        elif args.command in {"verify-final-draft", "verify-final-published"}:
+            verify_final_release_state(
+                FinalReleaseVerificationRequest(
+                    release=DraftVerificationRequest(
+                        repo=args.repo,
+                        dist=args.dist_dir,
+                        release_json=args.release_json,
+                        notes_file=args.notes_file,
+                        tag=args.tag,
+                        tag_object=args.tag_object,
+                        commit=args.commit,
+                        tree=args.tree,
+                    ),
+                    helper_sha256=args.helper_sha256,
+                ),
+                expected_draft=args.command == "verify-final-draft",
             )
     except (
         OSError,

@@ -23,6 +23,8 @@ class LaunchdServiceCode(StrEnum):
     RUNNING_HEALTHY = "running_healthy"
     DEGRADED_RETRYABLE = "degraded_retryable"
     TERMINAL_FAILED = "terminal_failed"
+    HELPER_NOT_READY = "helper_not_ready"
+    HELPER_DRIFT = "helper_drift"
     MANIFEST_DRIFT = "manifest_drift"
     RESTARTED = "restarted"
     RESTART_RECOVERED = "restart_recovered"

@@ -1083,6 +1083,101 @@ final class FileOutboxTests: XCTestCase {
         XCTAssertNotEqual(store.receiverSettingsGenerationToken, cancelledGeneration)
     }
 
+    func testPrivateResetResolvesTerminalIntentForCurrentMailboxReceiver() throws {
+        let suiteName = "HealthBridgeMailboxTerminalResetTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tokenStore = ToggleFailingReceiverTokenStore()
+        let store = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokenStore)
+        try store.saveMailboxPairing(
+            receiverURLString: "https://receiver.example/v1/batches",
+            bearerToken: "synthetic-retained-token",
+            mailboxIdentity: syntheticMailboxConnectionIdentity(),
+            expectedGeneration: store.receiverSettingsGenerationToken
+        )
+        let cancelledGeneration = store.receiverSettingsGenerationToken
+        try store.beginTerminalCancellationIntent(expectedGeneration: cancelledGeneration)
+
+        XCTAssertNoThrow(try store.resolveTerminalCancellationForPrivateReset())
+
+        XCTAssertNil(store.terminalCancellationExpectedGeneration)
+        XCTAssertTrue(try store.receiverSettingsAreCleared())
+        XCTAssertNotEqual(store.receiverSettingsGenerationToken, cancelledGeneration)
+    }
+
+    func testPrivateResetKeepsCurrentMailboxAndIntentWhenUnpairedRecordPersistenceFails() throws {
+        let suiteName = "HealthBridgeMailboxResetRecordFaultTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tokenStore = ToggleFailingReceiverTokenStore()
+        let store = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokenStore)
+        try store.saveMailboxPairing(
+            receiverURLString: "https://receiver.example/v1/batches",
+            bearerToken: "synthetic-retained-token",
+            mailboxIdentity: syntheticMailboxConnectionIdentity(),
+            expectedGeneration: store.receiverSettingsGenerationToken
+        )
+        let pairedRecord = try XCTUnwrap(store.currentConnectionRecordV2())
+        let cancelledGeneration = store.receiverSettingsGenerationToken
+        try store.beginTerminalCancellationIntent(expectedGeneration: cancelledGeneration)
+        tokenStore.shouldFail = true
+
+        XCTAssertThrowsError(try store.resolveTerminalCancellationForPrivateReset()) { error in
+            XCTAssertEqual(error as? SyntheticTokenStoreError, .saveFailed)
+        }
+
+        tokenStore.shouldFail = false
+        XCTAssertEqual(store.terminalCancellationExpectedGeneration, cancelledGeneration)
+        XCTAssertEqual(try store.currentConnectionRecordV2(), pairedRecord)
+        XCTAssertEqual(store.receiverSettingsGenerationToken, cancelledGeneration)
+    }
+
+    func testPrivateResetLeavesUnpairedV2AndIntentPendingWhenMarkerRetirementFails() throws {
+        let suiteName = "HealthBridgeMailboxResetMarkerFaultTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tokenStore = ToggleFailingReceiverTokenStore()
+        var synchronizationCount = 0
+        let store = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: tokenStore,
+            synchronize: {
+                synchronizationCount += 1
+                return synchronizationCount != 2
+            }
+        )
+        try store.saveMailboxPairing(
+            receiverURLString: "https://receiver.example/v1/batches",
+            bearerToken: "synthetic-retained-token",
+            mailboxIdentity: syntheticMailboxConnectionIdentity(),
+            expectedGeneration: store.receiverSettingsGenerationToken
+        )
+        let cancelledGeneration = store.receiverSettingsGenerationToken
+        try store.beginTerminalCancellationIntent(expectedGeneration: cancelledGeneration)
+
+        XCTAssertThrowsError(try store.resolveTerminalCancellationForPrivateReset()) { error in
+            XCTAssertEqual(error as? ReceiverSettingsRecordError, .persistenceFailed)
+        }
+
+        XCTAssertTrue(tokenStore.savedToken.hasPrefix("health-bridge-connection-v2:"))
+        XCTAssertEqual(store.terminalCancellationExpectedGeneration, cancelledGeneration)
+        XCTAssertTrue(try store.receiverSettingsAreCleared())
+        let committedGeneration = store.receiverSettingsGenerationToken
+        XCTAssertNotEqual(committedGeneration, cancelledGeneration)
+
+        let reloaded = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokenStore)
+        let record = try XCTUnwrap(reloaded.currentConnectionRecordV2())
+        XCTAssertEqual(record.activation, .unpaired)
+        XCTAssertTrue(record.transportConfigurations.isEmpty)
+        XCTAssertTrue(record.localScope.bindingID.isEmpty)
+        XCTAssertEqual(reloaded.terminalCancellationExpectedGeneration, cancelledGeneration)
+
+        try reloaded.resolveTerminalCancellationForPrivateReset()
+
+        XCTAssertNil(reloaded.terminalCancellationExpectedGeneration)
+        XCTAssertEqual(reloaded.receiverSettingsGenerationToken, committedGeneration)
+    }
+
     func testPrivateResetDropsStaleTerminalIntentWithoutClearingNewerReceiver() throws {
         let suiteName = "HealthBridgeStaleTerminalResetTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -1322,6 +1417,22 @@ private func legacyReceiverIdentity(
         .joined()
 }
 
+private func syntheticMailboxConnectionIdentity() -> MailboxConnectionIdentityV1 {
+    MailboxConnectionIdentityV1(
+        receiverID: String(repeating: "1", count: 32),
+        deviceID: String(repeating: "2", count: 32),
+        devicePrincipal: "installation:" + String(repeating: "3", count: 64),
+        deviceSigningKeyID: String(repeating: "4", count: 32),
+        deviceAgreementKeyID: String(repeating: "5", count: 32),
+        receiverSigningKeyID: "6c9a98e60055e4d14e5d591d6b7c1104",
+        receiverAgreementKeyID: "cf09eac7ec4fb8e8acc48b7cc1ee77e5",
+        receiverSigningPublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        receiverAgreementPublicKey: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+        opaqueBinding: "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+        connectionGeneration: 1
+    )
+}
+
 private func temporaryOutboxDirectory() -> URL {
     FileManager.default.temporaryDirectory
         .appendingPathComponent("HealthBridgeOutboxTests")
@@ -1354,7 +1465,7 @@ extension FileOutbox {
     }
 }
 
-private enum SyntheticTokenStoreError: Error {
+private enum SyntheticTokenStoreError: Error, Equatable {
     case loadFailed
     case saveFailed
 }

@@ -62,13 +62,14 @@ class PythonReleaseOutput(BaseModel):
 class ReleaseMetadataOutput(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", strict=True)
 
-    schema_id: Literal["health_bridge.release.v2"]
+    schema_id: Literal["health_bridge.release.v3"]
     release_scope: Literal["coordinated"]
     release_version: Literal["1.1.0"]
     git: dict[str, str]
     ios: dict[str, str]
     batch_contract: dict[str, str]
     python: PythonReleaseOutput
+    macos_mailbox_ack_helper: dict[str, object]
 
 
 def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
@@ -281,7 +282,7 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "schema_id": "health_bridge.batch.v1",
             "version": "1.0.0",
         },
-        "ios_companion": {"build": "16", "marketing_version": "1.1.0"},
+        "ios_companion": {"build": "39", "marketing_version": "1.1.0"},
         "receiver_cli": {"release_tag": "receiver-v1.1.0", "version": "1.1.0"},
         "release_scope": "coordinated",
         "schema_id": "health_bridge.component_versions.v1",
@@ -826,7 +827,7 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
     assert "metadata" in completed.stderr.lower()
 
 
-def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  # noqa: PLR0915
+def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  # noqa: PLR0915
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
     assert 'tags: ["receiver-v*"]' in workflow
@@ -862,9 +863,9 @@ def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  
     assert '--tag-object "$tag_object_sha"' in checksum_command
     assert '--commit "$commit_sha"' in checksum_command
     assert '--tree "$tree_sha"' in checksum_command
-    assert workflow.count('--tag-object "$PINNED_TAG_OBJECT_SHA"') == 4
-    assert workflow.count('--commit "$PINNED_TARGET_COMMIT_SHA"') == 3
-    assert workflow.count('--tree "$(git rev-parse') == 3
+    assert workflow.count('--tag-object "$PINNED_TAG_OBJECT_SHA"') >= 2
+    assert workflow.count('--commit "$PINNED_TARGET_COMMIT_SHA"') >= 1
+    assert workflow.count('--tree "$(git rev-parse') >= 1
     assert "rm -f dist/.gitignore" in workflow
     assert "check-jsonschema --builtin-schema vendor.github-workflows" in workflow
     assert "enable-cache: false" in workflow
@@ -896,19 +897,16 @@ def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  
     assert "for _ in {1..10}" in workflow
     assert "releases/${draft_release_id}" in workflow
     assert "releases/${DRAFT_RELEASE_ID}" in workflow
-    assert "gh release edit" in workflow
-    assert "--draft=false" in workflow
+    assert "gh release edit" not in workflow
+    assert "--draft=false" not in workflow
     assert 'test "$asset_names" = "$expected_assets"' in workflow
-    assert workflow.count("git/ref/tags/${GITHUB_REF_NAME}") >= 3
-    assert workflow.index("Create and verify draft release") < workflow.index(
-        "Attest release artifacts"
-    )
-    assert workflow.index("Attest release artifacts") < workflow.index(
-        "Reverify and publish release"
-    )
-    assert "verify-draft" in workflow
-    assert "verify-published" in workflow
-    assert "release-after-publish.json" in workflow
+    assert workflow.count("git/ref/tags/${GITHUB_REF_NAME}") >= 2
+    assert workflow.index(
+        "Create and verify helper-pending draft release"
+    ) < workflow.index("Attest release artifacts")
+    assert "verify-core-draft" in workflow
+    assert "helper-pending" in workflow
+    assert "published_at == null" in workflow
     release_tool = RELEASE_TOOL.read_text(encoding="utf-8")
     assert "remote asset digest mismatch" in release_tool
     assert "release body does not match exact notes" in release_tool
@@ -920,11 +918,15 @@ def test_release_workflow_requires_verified_tag_and_attested_assets() -> None:  
     assert 'if [[ "$prerelease" = "true" ]]' in workflow
     assert 'version="${GITHUB_REF_NAME#receiver-v}"' not in workflow
     assert "release_flags+=(--prerelease)" in workflow
-    assert "--notes-file dist/release-notes.md" in workflow
+    assert '--notes-file ".github/release/notes-${GITHUB_REF_NAME}.md"' in workflow
     assert "--generate-notes" not in workflow
     assert "dist/*.whl" in workflow
     assert "dist/*.tar.gz" in workflow
-    assert "dist/SHA256SUMS" in workflow
+    create_block = workflow.split("gh release create", 1)[1].split(
+        "release_flags[@]",
+        1,
+    )[0]
+    assert "dist/SHA256SUMS" not in create_block
     assert "dist/release-metadata.json" in workflow
     assert "(cd dist && sha256sum --check --strict SHA256SUMS)" in workflow
     assert "pypi" not in workflow.lower()
@@ -979,7 +981,7 @@ def test_public_docs_name_each_version_surface_and_transition() -> None:
         assert label in readme
         assert label in versioning
     assert "receiver-v1.0.2" in versioning
-    assert "ios-v1.1.0-build.16" in versioning
+    assert "ios-v1.1.0-build.39" in versioning
     assert "Existing `v1.0.0` and `v1.0.1` tags remain immutable" in versioning
     assert (
         "Do not bump an unchanged component merely to make the numbers match"

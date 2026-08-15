@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ import typer
 from pydantic import BaseModel, ConfigDict
 
 from health_bridge.cli_launchd import service_app
+from health_bridge.cli_mailbox_helper import helper_app
 from health_bridge.mailbox.connections import (
     MailboxConnectionError,
     MailboxConnectionStore,
@@ -21,6 +23,7 @@ from health_bridge.mailbox.importer import (
     MailboxImporter,
 )
 from health_bridge.mailbox.models import MailboxImportResult
+from health_bridge.mailbox.native_ack_publication import default_native_ack_publisher
 from health_bridge.receiver._mailbox_key_models import (
     MailboxKeyStoreErrorCode,
 )
@@ -44,6 +47,7 @@ keys_app = typer.Typer(
     help="Inspect the local receiver mailbox identity.",
 )
 mailbox_app.add_typer(keys_app, name="keys")
+mailbox_app.add_typer(helper_app, name="helper")
 mailbox_app.add_typer(service_app, name="service")
 
 
@@ -111,6 +115,9 @@ def production_importer(
             connection=connections.load(mailbox),
             clock_ms=lambda: time.time_ns() // 1_000_000,
             directory=directory,
+            ack_publisher=(
+                default_native_ack_publisher() if sys.platform == "darwin" else None
+            ),
         )
     )
 

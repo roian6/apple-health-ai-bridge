@@ -843,6 +843,44 @@ final class ReceiverClientTests: XCTestCase {
     }
 
     @MainActor
+    func testPairingCoordinatorBeginsDurableCancellationWithoutClearingState() throws {
+        let stateStore = ReceiverPairingStateStore(
+            pendingStore: MemoryReceiverTokenStore(),
+            installationIDStore: MemoryReceiverTokenStore(),
+            cancellationStore: MemoryReceiverTokenStore(),
+            installationIDGenerator: { syntheticInstallationID },
+            deviceCredentialGenerator: { syntheticDeviceCredential }
+        )
+        let suiteName = "PairingPreparedCancellationTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore()
+        )
+        try settingsStore.save(
+            receiverURLString: "https://old.example/v1/batches",
+            bearerToken: "old-synthetic-token"
+        )
+        let coordinator = ReceiverPairingCoordinator(
+            client: makeClient(),
+            stateStore: stateStore,
+            settingsStore: settingsStore
+        )
+        let invitation = try ReceiverPairingInvitation(jsonData: Data(validInvitationJSON.utf8))
+        _ = try stateStore.stage(invitation: invitation)
+        let expectedGeneration = settingsStore.receiverSettingsGenerationToken
+
+        try coordinator.beginPendingCancellation(expectedGeneration: expectedGeneration)
+
+        XCTAssertTrue(try stateStore.hasPendingCancellation())
+        XCTAssertEqual(settingsStore.terminalCancellationExpectedGeneration, expectedGeneration)
+        XCTAssertNotNil(try stateStore.loadPending())
+        XCTAssertEqual(settingsStore.receiverURLString, "https://old.example/v1/batches")
+        XCTAssertEqual(try settingsStore.loadBearerToken(), "old-synthetic-token")
+    }
+
+    @MainActor
     func testPairingCoordinatorCompletesCancellationWhenKeychainMarkerWriteFails() throws {
         let cancellationStore = ToggleFailingReceiverTokenStore()
         let stateStore = ReceiverPairingStateStore(

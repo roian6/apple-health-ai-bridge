@@ -197,6 +197,7 @@ def smoke_installed_wheel(wheel: Path, expected_migrations: list[str]) -> None:
         _ = run([str(python), "-c", QA_RUNTIME_IMPORTS], cwd=temp_root)
         cli = venv_executable(venv, "health-bridge")
         _ = run([str(cli), "--help"], cwd=temp_root)
+        _ = run([str(cli), "mailbox", "helper", "--help"], cwd=temp_root)
 
         database = temp_root / "fresh.sqlite"
         _ = run([str(cli), "init", "--db", str(database)], cwd=temp_root)

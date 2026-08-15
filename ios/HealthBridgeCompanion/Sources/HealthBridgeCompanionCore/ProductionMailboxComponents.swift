@@ -6,6 +6,7 @@ struct ProductionMailboxComponents {
     let deviceSigningPublicKey: Curve25519.Signing.PublicKey
     let ackContext: MailboxAckContext
     let transport: MailboxTransport
+    let ackLookup: FileOutboxMailboxAckLookup
     let scanner: MailboxAckScanner
     let locate: () throws -> MailboxResolvedLocatorV1
 
@@ -88,12 +89,13 @@ struct ProductionMailboxComponents {
             },
             observe: ProductionMailboxProviderObserver.observe
         )
+        let ackLookup = FileOutboxMailboxAckLookup(
+            outbox: outbox,
+            deviceSigningPublicKey: deviceSigning
+        )
         let scanner = MailboxAckScanner(
             context: ackContext,
-            lookup: FileOutboxMailboxAckLookup(
-                outbox: outbox,
-                deviceSigningPublicKey: deviceSigning
-            ),
+            lookup: ackLookup,
             locate: locate,
             transientUnsafeRetryLimit: 1
         )
@@ -102,6 +104,7 @@ struct ProductionMailboxComponents {
             deviceSigningPublicKey: deviceSigning,
             ackContext: ackContext,
             transport: transport,
+            ackLookup: ackLookup,
             scanner: scanner,
             locate: locate
         )

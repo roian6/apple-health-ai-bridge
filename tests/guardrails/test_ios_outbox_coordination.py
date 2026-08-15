@@ -20,7 +20,7 @@ def test_direct_sync_takes_exclusive_outbox_handoff_before_uploading() -> None:
         "await BackgroundURLSessionOutboxUploader.shared.cancelPendingUploads()",
         "await directOutboxTransferGate.release()",
         "directOutboxTransferRequestCount == 0",
-        "await self.performClearPendingOutbox(outbox: self.outbox)",
+        "return await self.performClearPendingOutbox()",
         "await self.performSendConnectionTestBatch()",
     ):
         assert required in text

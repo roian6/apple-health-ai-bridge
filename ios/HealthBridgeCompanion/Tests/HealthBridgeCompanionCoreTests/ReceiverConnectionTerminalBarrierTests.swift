@@ -249,6 +249,64 @@ final class ReceiverConnectionTerminalBarrierTests: XCTestCase {
     }
 
     @MainActor
+    func testRecoveryPreparationRunsBeforeCancellationDrains() async throws {
+        let barrier = ReceiverConnectionTerminalBarrier()
+        var events: [String] = []
+
+        let committed = try await barrier.performRecovery(
+            closeAdmission: { events.append("close") },
+            prepareRecovery: { events.append("prepare") },
+            cancelAndAwaitPairing: { events.append("pairing") },
+            cancelAndAwaitForegroundPayloads: { events.append("foreground") },
+            drainBackgroundPayloads: {
+                events.append("background")
+                return true
+            },
+            commit: {
+                events.append("commit")
+                return true
+            }
+        )
+
+        XCTAssertTrue(committed)
+        XCTAssertEqual(
+            events,
+            ["close", "prepare", "pairing", "foreground", "background", "commit"]
+        )
+        XCTAssertTrue(barrier.admissionIsOpen)
+    }
+
+    @MainActor
+    func testRecoveryPreparationFailureSkipsEveryDrainAndCommit() async {
+        let barrier = ReceiverConnectionTerminalBarrier()
+        var events: [String] = []
+
+        do {
+            _ = try await barrier.performRecovery(
+                closeAdmission: { events.append("close") },
+                prepareRecovery: {
+                    events.append("prepare")
+                    throw CancellationError()
+                },
+                cancelAndAwaitPairing: { events.append("pairing") },
+                cancelAndAwaitForegroundPayloads: { events.append("foreground") },
+                drainBackgroundPayloads: {
+                    events.append("background")
+                    return true
+                },
+                commit: { events.append("commit") }
+            )
+            XCTFail("Expected recovery preparation to fail")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        XCTAssertEqual(events, ["close", "prepare"])
+        XCTAssertTrue(barrier.admissionIsOpen)
+    }
+
+    @MainActor
     func testTerminalTransitionClosesAdmissionAndDrainsInOrderBeforeCommit() async throws {
         let barrier = ReceiverConnectionTerminalBarrier()
         var events: [String] = []

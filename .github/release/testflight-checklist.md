@@ -2,7 +2,7 @@
 
 This maintainer checklist helps prepare an official TestFlight beta for Apple Health AI Bridge. Keep account-owned App Store Connect, signing, reviewer, support, and demo receiver material outside the public repository until it is intentionally published.
 
-TestFlight is the primary iPhone distribution path. The repository, GitHub Release, and official install surface remain private or unannounced until the matching build has passed external Beta App Review and its Public Link has been verified anonymously.
+TestFlight is the primary iPhone distribution path. Keep the GitHub Release and official install surface on the previous compatible version until the matching build has passed external Beta App Review and the coordinated release packet is ready. Assign the approved build to the intended external group only at cutover, then verify its Public Link anonymously.
 
 ## What the public repository may contain
 
@@ -29,7 +29,7 @@ TestFlight is the primary iPhone distribution path. The repository, GitHub Relea
 
 - [ ] The candidate is installed on an iPhone running iOS 18 or later.
 - [ ] Xcode 16 or later is used for archive and signing validation.
-- [ ] The coordinated identity is iOS Companion `1.1.0 (16)`, Receiver/CLI `1.1.0` at `receiver-v1.1.0`, and Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
+- [ ] The coordinated identity is iOS Companion `1.1.0 (39)`, Receiver/CLI `1.1.0` at `receiver-v1.1.0`, and Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
 - [ ] Apple Developer Program membership is active.
 - [ ] Individual vs organization seller path is decided.
 - [ ] App Store Connect access is available.
@@ -58,13 +58,14 @@ TestFlight is the primary iPhone distribution path. The repository, GitHub Relea
 - [ ] Receiver disconnect and queued-data handling are understandable.
 - [ ] Direct is described as the default transport with no automatic fallback.
 - [ ] Encrypted iCloud Mailbox is described as an explicit opt-in, Mac-only Beta using application-layer encryption, a user-owned iCloud container and receiver, signed ACK/commit semantics, and an optional per-user macOS LaunchAgent.
+- [ ] Receiver/CLI `1.1.0` remains unpublished until a newly built exact-source signed ACK helper, public manifest, and final helper-inclusive `SHA256SUMS` pass the two-phase release workflow.
 
-### Demo and reviewer access
+### Demo and reviewer access, when Apple requests it
 
 - [ ] `.github/release/app-review-notes-template.md` is used only as a placeholder packet.
-- [ ] Synthetic demo receiver material is generated privately with `dev app-review-demo`.
-- [ ] The emitted legacy reviewer credential is kept reachable for the review window and its lack of automatic expiry is understood.
-- [ ] The emitted `revoke_reviewer_access_command` is retained privately and run immediately after review.
+- [ ] If Apple requests a demonstration receiver, synthetic material is generated privately with `dev app-review-demo`; otherwise no developer-hosted demo receiver is created.
+- [ ] When a demo receiver is required, the emitted legacy reviewer credential is kept reachable only for the review window and its lack of automatic expiry is understood.
+- [ ] When a demo receiver is required, the emitted `revoke_reviewer_access_command` is retained privately and run immediately after review.
 - [ ] Review notes explain what data goes where.
 - [ ] Review notes explain that the app is an Apple Health data bridge for user-owned infrastructure.
 - [ ] No real health values, tokens, setup pages, pairing links, receiver DBs, or private endpoints are pasted into review notes.
@@ -121,6 +122,6 @@ When code changes after an approved beta build, prepare a new candidate rather t
 
 Safe README wording after intentional publication:
 
-> Install iOS Companion `1.1.0 (16)` from the official TestFlight link on the project website. It is coordinated with Receiver/CLI `1.1.0` and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. Self-build remains supported for contributors and developers validating source changes.
+> Install iOS Companion `1.1.0 (39)` from the official TestFlight link on the project website. It is coordinated with Receiver/CLI `1.1.0` and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. Self-build remains supported for contributors and developers validating source changes.
 
 Avoid implying that a source-only preview is publicly launched before the matching TestFlight build is available, or that a future paid/App Store build hides core source code.

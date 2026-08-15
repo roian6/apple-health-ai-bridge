@@ -448,9 +448,9 @@ def test_coordinated_release_identities_are_explicit() -> None:
     assert '__version__: Final = "1.1.0"' in package_init
     assert '"version": "1.1.0"' in server_manifest
     assert xcode_project.count("MARKETING_VERSION = 1.1.0;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 16;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 39;") == 2
     assert '?? "1.1.0"' in content_view
-    assert '?? "16"' in content_view
+    assert '?? "39"' in content_view
     assert "pre-1.0" not in security
 
 

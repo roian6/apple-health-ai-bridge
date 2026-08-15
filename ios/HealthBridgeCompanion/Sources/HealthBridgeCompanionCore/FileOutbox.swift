@@ -515,6 +515,7 @@ public final class FileOutbox {
 
     private static let sequenceFilename = ".fifo-sequence"
     private static let clearIntentFilename = ".clear-intent"
+    private static let terminalResetRequestFilename = ".terminal-reset-request"
     private static let enqueueTransactionFilename = ".enqueue-transaction"
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
@@ -523,6 +524,36 @@ public final class FileOutbox {
     public var directoryURL: URL { directory }
     public var clearIntentIsActive: Bool {
         fileManager.fileExists(atPath: clearIntentURL.path)
+    }
+    public var terminalResetRequestIsActive: Bool {
+        fileManager.fileExists(atPath: terminalResetRequestURL.path)
+    }
+    public var destructiveRecoveryIsRequested: Bool {
+        clearIntentIsActive || terminalResetRequestIsActive
+    }
+
+    public static func beginTerminalResetRequest(
+        directory: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try applySensitiveFileAttributes(to: directory, fileManager: fileManager)
+        let requestURL = directory.appendingPathComponent(terminalResetRequestFilename)
+        if !fileManager.fileExists(atPath: requestURL.path) {
+            try Data("reset".utf8).write(to: requestURL, options: [.atomic])
+        }
+        try applySensitiveFileAttributes(to: requestURL, fileManager: fileManager)
+    }
+
+    public static func destructiveRecoveryIsRequested(
+        directory: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        fileManager.fileExists(
+            atPath: directory.appendingPathComponent(clearIntentFilename).path
+        ) || fileManager.fileExists(
+            atPath: directory.appendingPathComponent(terminalResetRequestFilename).path
+        )
     }
 
     public static func beginDestructiveRecovery(
@@ -542,11 +573,35 @@ public final class FileOutbox {
         directory: URL,
         fileManager: FileManager = .default
     ) throws -> FileOutboxDestructiveRecoveryResult {
+        try completeDestructiveRecovery(
+            directory: directory,
+            fileManager: fileManager,
+            allowsMailboxArtifacts: false
+        )
+    }
+
+    public static func completeConfirmedTerminalReset(
+        directory: URL,
+        fileManager: FileManager = .default
+    ) throws -> FileOutboxDestructiveRecoveryResult {
+        try completeDestructiveRecovery(
+            directory: directory,
+            fileManager: fileManager,
+            allowsMailboxArtifacts: true
+        )
+    }
+
+    private static func completeDestructiveRecovery(
+        directory: URL,
+        fileManager: FileManager,
+        allowsMailboxArtifacts: Bool
+    ) throws -> FileOutboxDestructiveRecoveryResult {
         let intentURL = directory.appendingPathComponent(clearIntentFilename)
         guard fileManager.fileExists(atPath: intentURL.path) else {
             throw FileOutboxClearIntentError.clearIntentRequired
         }
-        guard try downgradeReadiness(directory: directory, fileManager: fileManager) == .ready else {
+        if !allowsMailboxArtifacts,
+           try downgradeReadiness(directory: directory, fileManager: fileManager) != .ready {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let children = try fileManager.contentsOfDirectory(
@@ -577,6 +632,13 @@ public final class FileOutbox {
         if clearIntentIsActive {
             try Self.applySensitiveFileAttributes(to: clearIntentURL, fileManager: fileManager)
         }
+        if terminalResetRequestIsActive {
+            try Self.applySensitiveFileAttributes(
+                to: terminalResetRequestURL,
+                fileManager: fileManager
+            )
+        }
+        if destructiveRecoveryIsRequested { return }
         try recoverMailboxEnvelopeFinalizationIfNeeded()
         _ = try reconciledManifest()
     }
@@ -729,6 +791,7 @@ public final class FileOutbox {
     public func acknowledgeCursorCheckpoint(
         _ checkpoint: FileOutboxCursorCheckpoint
     ) throws {
+        try requireUploadAdmission()
         guard let transaction = try loadEnqueueTransaction(),
               transaction.cursorCheckpoint == checkpoint else {
             throw FileOutboxCursorCheckpointError.checkpointMismatch
@@ -814,8 +877,11 @@ public final class FileOutbox {
         }
         let items = try pendingItems()
         for item in items {
-            try markUploaded(item)
+            if fileManager.fileExists(atPath: item.fileURL.path) {
+                try fileManager.removeItem(at: item.fileURL)
+            }
         }
+        _ = try reconciledManifest()
         return items.count
     }
 
@@ -909,6 +975,7 @@ public final class FileOutbox {
         expected: FileOutboxDeliveryStateV1?,
         updated: FileOutboxDeliveryStateV1
     ) throws -> FileOutboxDeliveryStateV1 {
+        try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), updated.isStructurallyValid else {
             throw FileOutboxMailboxError.invalidDeliveryState
         }
@@ -971,6 +1038,7 @@ public final class FileOutbox {
         committed: FileOutboxDeliveryStateV1,
         fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void = { _ in }
     ) throws -> FileOutboxDeliveryStateV1 {
+        try requireUploadAdmission()
         guard expected.phase == .ackVerified,
               committed.phase == .committedFinalized,
               expected.ownership == committed.ownership,
@@ -1080,6 +1148,7 @@ public final class FileOutbox {
         expectedPayloadSHA256: String,
         stopAfter: FileOutboxEnvelopeFinalizationBoundary?
     ) throws -> FileOutboxMailboxBindingV1 {
+        try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), Self.isSHA256(expectedPayloadSHA256) else {
             throw FileOutboxMailboxError.invalidDigest
         }
@@ -1368,6 +1437,10 @@ public final class FileOutbox {
         directory.appendingPathComponent(Self.clearIntentFilename)
     }
 
+    private var terminalResetRequestURL: URL {
+        directory.appendingPathComponent(Self.terminalResetRequestFilename)
+    }
+
     private var enqueueTransactionURL: URL {
         directory.appendingPathComponent(Self.enqueueTransactionFilename)
     }
@@ -1385,7 +1458,7 @@ public final class FileOutbox {
     }
 
     public func requireUploadAdmission() throws {
-        if clearIntentIsActive {
+        if destructiveRecoveryIsRequested {
             throw FileOutboxClearIntentError.clearInProgress
         }
     }
@@ -3408,14 +3481,48 @@ public final class ReceiverSettingsStore {
         }
     }
 
+    func finishTerminalCancellationIntentAfterCommittedReceiverClear() throws {
+        guard try receiverSettingsAreCleared() else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
+        userDefaults.removeObject(forKey: terminalCancellationGenerationKey)
+        _ = synchronizeUserDefaults()
+    }
+
     public func resolveTerminalCancellationForPrivateReset() throws {
         guard let cancellationGeneration = terminalCancellationExpectedGeneration else {
             return
         }
         if cancellationGeneration == receiverSettingsGenerationToken {
-            try clearReceiverSettings(expectedGeneration: cancellationGeneration)
+            try clearReceiverSettingsForTerminalCancellation(
+                expectedGeneration: cancellationGeneration
+            )
         }
         try finishTerminalCancellationIntent()
+    }
+
+    private func clearReceiverSettingsForTerminalCancellation(
+        expectedGeneration: String
+    ) throws {
+        let previous = try authoritativeRecordForMutation()
+        guard "g\(previous.localScope.generation)" == expectedGeneration else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
+        guard case .paired(activeTransport: .mailbox) = previous.activation else {
+            try clearReceiverSettings(expectedGeneration: expectedGeneration)
+            return
+        }
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: try Self.nextGeneration(after: previous.localScope.generation),
+                bindingID: ""
+            ),
+            mailboxIdentity: .unavailable(.notProvisionedByLegacyHTTPPairing),
+            activation: .unpaired,
+            transportConfigurations: []
+        )
+        try Self.validate(record)
+        try persistV2(record, preservingCurrentV1: true)
     }
 
     private func loadStoredConnectionRecord() throws -> StoredConnectionRecord? {

@@ -7,7 +7,7 @@ Apple Health AI Bridge contains independently released components. Always includ
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
 | Receiver/CLI | `1.1.0` | Release tag `receiver-v1.1.0` |
-| iOS Companion | `1.1.0` | TestFlight build `16` |
+| iOS Companion | `1.1.0` | TestFlight build `39` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 The authoritative machine-readable copy is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
@@ -17,6 +17,8 @@ The authoritative machine-readable copy is [`component-versions.json`](../compon
 ### Receiver/CLI
 
 The Python package, receiver service, CLI, and MCP server share one semantic version from `pyproject.toml`. Receiver-only fixes may advance this version without changing the iOS app.
+
+The signed macOS mailbox ACK helper is a Receiver/CLI release asset. Its public manifest binds the helper component version/build, signed zip digest, exact Receiver/CLI tag object/commit/tree, and canonical helper source tree. It is required only for the explicit Mac-only mailbox Beta; Direct installations do not download, install, or validate it.
 
 Starting with the release after `1.0.1`, receiver release tags use the component-scoped form:
 
@@ -31,13 +33,13 @@ Release notes use the same tag in their filename and install examples.
 The user-visible app version is Xcode `MARKETING_VERSION`. App Store Connect and TestFlight additionally require a monotonically increasing `CURRENT_PROJECT_VERSION` build number. Display both when identifying an installed build:
 
 ```text
-iOS Companion 1.1.0 (build 16)
+iOS Companion 1.1.0 (build 39)
 ```
 
 An iOS source or distribution checkpoint may use a component-scoped tag such as:
 
 ```text
-ios-v1.1.0-build.16
+ios-v1.1.0-build.39
 ```
 
 An iOS tag does not publish Receiver/CLI artifacts. TestFlight/App Store release gates remain authoritative for distributed app builds.
@@ -65,7 +67,7 @@ Use labels such as:
 
 ```text
 Receiver/CLI 1.1.0
-Compatible iOS Companion 1.1.0 (build 16)
+Compatible iOS Companion 1.1.0 (build 39)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```
 

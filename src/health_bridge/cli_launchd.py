@@ -31,6 +31,10 @@ from health_bridge.launchd import (
 )
 from health_bridge.launchd.models import LaunchdServiceErrorCode, service_paths
 from health_bridge.launchd.private_artifacts import path_entry_exists
+from health_bridge.mailbox.helper_lifecycle import (
+    HelperStatusCode,
+    read_helper_status,
+)
 
 LAUNCHCTL_PATH: Final = Path("/bin/launchctl")
 # `kickstart -k` may wait for both launchd throttling and child ExitTimeOut.
@@ -134,6 +138,7 @@ def install_service(
         home=Path.home(),
         uid=os.geteuid(),
     )
+    _require_helper_for_service(request.home, json_output)
     try:
         result = install_launch_agent(request, _launchctl(request.uid))
     except LaunchdServiceError as exc:
@@ -179,6 +184,7 @@ def upgrade_service(
         home=Path.home(),
         uid=os.geteuid(),
     )
+    _require_helper_for_service(desired.home, json_output)
     try:
         current = load_owned_launch_agent_request(service_paths(Path.home()).config)
         result = upgrade_launch_agent(
@@ -217,6 +223,18 @@ def service_status(
             )
             raise typer.Exit(code=1)
         request = load_owned_launch_agent_request(config_path)
+        preliminary = classify_launch_agent_status(
+            request,
+            launchctl_output="",
+            health=None,
+        )
+        if preliminary.code is LaunchdServiceCode.MANIFEST_DRIFT:
+            _emit_result(preliminary, json_output)
+            raise typer.Exit(code=1)
+        helper_result = _helper_service_result(request.home)
+        if helper_result is not None:
+            _emit_result(helper_result, json_output)
+            raise typer.Exit(code=1)
         inspected = _launchctl(request.uid).inspect()
         launchctl_output = inspected.stdout if inspected.returncode == 0 else ""
         health = None
@@ -261,6 +279,7 @@ def restart_service(
     _require_macos(json_output)
     try:
         request = load_owned_launch_agent_request(service_paths(Path.home()).config)
+        _require_helper_for_service(request.home, json_output)
         result = restart_launch_agent(request, _launchctl(request.uid))
     except LaunchdServiceError as exc:
         _exit_with_error(exc, json_output)
@@ -318,6 +337,26 @@ def _require_macos(json_output: bool) -> None:
             LaunchdServiceError(LaunchdServiceErrorCode.UNSUPPORTED_HOST),
             json_output,
         )
+
+
+def _helper_service_result(home: Path) -> LaunchdServiceResult | None:
+    status = read_helper_status(home=home)
+    if status.code is HelperStatusCode.READY:
+        return None
+    code = (
+        LaunchdServiceCode.HELPER_NOT_READY
+        if status.code is HelperStatusCode.NOT_INSTALLED
+        else LaunchdServiceCode.HELPER_DRIFT
+    )
+    return LaunchdServiceResult(code=code)
+
+
+def _require_helper_for_service(home: Path, json_output: bool) -> None:
+    result = _helper_service_result(home)
+    if result is None:
+        return
+    _emit_result(result, json_output)
+    raise typer.Exit(code=1)
 
 
 def _exit_with_error(error: LaunchdServiceError, json_output: bool) -> Never:
