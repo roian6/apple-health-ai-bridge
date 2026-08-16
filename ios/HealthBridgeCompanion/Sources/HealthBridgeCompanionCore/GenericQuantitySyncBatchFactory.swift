@@ -253,15 +253,7 @@ public struct HealthKitDailyActivityAggregate: Equatable, Sendable {
 
 public enum DailyActivityAggregateSyncPolicy {
     public static let cursorKind = "foreground_daily_activity_aggregate_sync"
-    public static let defaultTypeCodes = [
-        "basal_energy",
-        "distance_walking_running",
-        "energy",
-        "exercise_time",
-        "flights_climbed",
-        "stand_time",
-        "steps",
-    ]
+    public static let defaultTypeCodes = HealthBridgeBackgroundSync.dailyActivityTypeCodes
 }
 
 public struct GenericQuantityForegroundSyncPlan: Equatable, Sendable {

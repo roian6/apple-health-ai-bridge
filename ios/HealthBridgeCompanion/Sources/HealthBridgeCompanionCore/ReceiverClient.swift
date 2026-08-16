@@ -193,6 +193,7 @@ public final class ReceiverConnectionTerminalBarrier {
 
     public func performRecovery<Result>(
         closeAdmission: @MainActor () -> Void,
+        prepareRecovery: @MainActor () throws -> Void = {},
         cancelAndAwaitPairing: @MainActor () async -> Void,
         cancelAndAwaitForegroundPayloads: @MainActor () async -> Void,
         drainBackgroundPayloads: @MainActor () async -> Bool,
@@ -204,6 +205,7 @@ public final class ReceiverConnectionTerminalBarrier {
         try Task.checkCancellation()
 
         closeAdmission()
+        try prepareRecovery()
         await cancelAndAwaitPairing()
         await cancelAndAwaitForegroundPayloads()
         guard await drainBackgroundPayloads() else {
@@ -617,10 +619,9 @@ public final class ReceiverPairingCoordinator {
         )
     }
 
-    @discardableResult
-    public func cancelPendingPairing(
+    public func beginPendingCancellation(
         expectedGeneration: String? = nil
-    ) throws -> ReceiverPairingCancellationOutcome {
+    ) throws {
         let expectedGeneration = expectedGeneration ?? settingsStore.receiverSettingsGenerationToken
         guard settingsStore.receiverSettingsGenerationToken == expectedGeneration else {
             throw ReceiverSettingsGenerationError.staleGeneration
@@ -648,6 +649,14 @@ public final class ReceiverPairingCoordinator {
         guard durableMarkerWritten else {
             throw firstPersistenceError ?? ReceiverSettingsRecordError.persistenceFailed
         }
+    }
+
+    @discardableResult
+    public func cancelPendingPairing(
+        expectedGeneration: String? = nil
+    ) throws -> ReceiverPairingCancellationOutcome {
+        let expectedGeneration = expectedGeneration ?? settingsStore.receiverSettingsGenerationToken
+        try beginPendingCancellation(expectedGeneration: expectedGeneration)
         do {
             _ = try finishPendingCancellationIfNeeded(
                 expectedGeneration: expectedGeneration
@@ -674,6 +683,7 @@ public final class ReceiverPairingCoordinator {
         guard let cancellationGeneration = markerGeneration ?? terminalIntentGeneration else {
             throw ReceiverPairingStateError.legacyCancellationRequiresRetry
         }
+        let receiverSettingsWereCleared = try settingsStore.receiverSettingsAreCleared()
         let currentGeneration = settingsStore.receiverSettingsGenerationToken
         if cancellationGeneration != currentGeneration {
             try stateStore.clearPending()
@@ -681,7 +691,12 @@ public final class ReceiverPairingCoordinator {
                 try stateStore.finishPendingCancellation()
             }
             if terminalIntentGeneration != nil {
-                try settingsStore.finishTerminalCancellationIntent()
+                if receiverSettingsWereCleared {
+                    try settingsStore
+                        .finishTerminalCancellationIntentAfterCommittedReceiverClear()
+                } else {
+                    try settingsStore.finishTerminalCancellationIntent()
+                }
             }
             return true
         }
@@ -692,7 +707,11 @@ public final class ReceiverPairingCoordinator {
             try stateStore.finishPendingCancellation()
         }
         if terminalIntentGeneration != nil {
-            try settingsStore.finishTerminalCancellationIntent()
+            if receiverSettingsWereCleared {
+                try settingsStore.finishTerminalCancellationIntentAfterCommittedReceiverClear()
+            } else {
+                try settingsStore.finishTerminalCancellationIntent()
+            }
         }
         return true
     }

@@ -1122,8 +1122,12 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     assert "includeAllSupportedHealthData" not in view_model
     assert "guard includeAllSupportedHealthData else { return [] }" not in view_model
     assert "if includeAllSupportedHealthData {" not in view_model
-    assert "quantityObservationStore.observedTypeCodes" in view_model
-    assert "quantityObservationStore.markObserved" in view_model
+    assert "HealthBridgeBackgroundSync.workPlan(" in view_model
+    assert (
+        "pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys)" in view_model
+    )
+    assert "completedObserverTypeCodes: workPlan.coveredObserverTypeCodes" in view_model
+    assert "typeCodes: [typeCode]" in view_model
     assert (
         "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in view_model
     )
@@ -1534,25 +1538,6 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
     assert "cancelPairingOperation: true" in cancel_body
     assert "await viewModel.cancelPendingPairing()" in content_view
 
-    receiver_client = Path(
-        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/ReceiverClient.swift"
-    ).read_text()
-    coordinator_cancel_start = receiver_client.index(
-        "public func cancelPendingPairing("
-    )
-    coordinator_cancel_end = receiver_client.index(
-        "private func complete(", coordinator_cancel_start
-    )
-    coordinator_cancel_body = receiver_client[
-        coordinator_cancel_start:coordinator_cancel_end
-    ]
-    marker_begin = coordinator_cancel_body.index("stateStore.beginPendingCancellation(")
-    finish_call = coordinator_cancel_body.index("finishPendingCancellationIfNeeded(")
-    active_clear = coordinator_cancel_body.index("settingsStore.clearReceiverSettings(")
-    pending_clear = coordinator_cancel_body.rindex("stateStore.clearPending()")
-    marker_clear = coordinator_cancel_body.rindex("finishPendingCancellation()")
-    assert marker_begin < finish_call < active_clear < pending_clear < marker_clear
-
     terminal_start = view_model.index(TERMINAL_TRANSITION_HELPER)
     terminal_end = view_model.index(
         "private func requireCurrentConnectionGeneration", terminal_start
@@ -1577,16 +1562,34 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
         "private func performBackgroundRefreshSync(reason:"
     )
     background_run_end = view_model.index(
-        "private func stopBackgroundRunIfUnavailable", background_run_start
+        "private func persistScheduledWorkContinuationIfNeeded", background_run_start
     )
     background_run_body = view_model[background_run_start:background_run_end]
-    final_guard = background_run_body.rindex(
-        "guard !hasPendingPairing, !Task.isCancelled"
-    )
     queued_recursion = background_run_body.rindex(
-        "await performAdmittedBackgroundRefreshSync("
+        "await self.performAdmittedBackgroundRefreshSync("
     )
-    assert final_guard < queued_recursion
+    assert (
+        "runWithExclusiveDirectOutboxTransfer" in background_run_body[:queued_recursion]
+    )
+
+    admitted_start = view_model.index(
+        "private func performAdmittedBackgroundRefreshSync("
+    )
+    admitted_end = view_model.index(
+        "private func scheduleDebouncedObserverCatchUp", admitted_start
+    )
+    admitted_body = view_model[admitted_start:admitted_end]
+    final_guard = admitted_body.index("stopBackgroundRunIfUnavailable(")
+    private_storage = admitted_body.index("preparePrivateStorageForUploadAdmission()")
+    assert final_guard < private_storage
+
+    stop_start = view_model.index(
+        "private func stopBackgroundRunIfUnavailable", admitted_end
+    )
+    stop_end = view_model.index("func requestHealthPermissions() async", stop_start)
+    stop_body = view_model[stop_start:stop_end]
+    assert "if hasPendingPairing" in stop_body
+    assert "else if Task.isCancelled" in stop_body
 
     scheduler_start = view_model.index("private func startBackgroundOutboxScheduling(")
     scheduler_end = view_model.index(
@@ -1612,6 +1615,37 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
     first_cancellation = receiver_client.index("try Task.checkCancellation()")
     promotion = receiver_client.index("try settingsStore.save(")
     assert first_cancellation < promotion
+
+
+def test_ios_pairing_cancellation_marker_precedes_receiver_deletion() -> None:
+    receiver_client = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/ReceiverClient.swift"
+    ).read_text()
+    marker_begin_start = receiver_client.index("public func beginPendingCancellation(")
+    coordinator_cancel_start = receiver_client.index(
+        "public func cancelPendingPairing(", marker_begin_start
+    )
+    marker_begin_body = receiver_client[marker_begin_start:coordinator_cancel_start]
+    settings_marker = marker_begin_body.index(
+        "settingsStore.beginTerminalCancellationIntent("
+    )
+    state_marker = marker_begin_body.index("stateStore.beginPendingCancellation(")
+    assert settings_marker < state_marker
+
+    finish_start = receiver_client.index(
+        "public func finishPendingCancellationIfNeeded(", coordinator_cancel_start
+    )
+    coordinator_cancel_body = receiver_client[coordinator_cancel_start:finish_start]
+    marker_begin = coordinator_cancel_body.index("beginPendingCancellation(")
+    finish_call = coordinator_cancel_body.index("finishPendingCancellationIfNeeded(")
+    assert marker_begin < finish_call
+
+    finish_end = receiver_client.index("private func complete(", finish_start)
+    finish_body = receiver_client[finish_start:finish_end]
+    active_clear = finish_body.index("settingsStore.clearReceiverSettings(")
+    pending_clear = finish_body.rindex("stateStore.clearPending()")
+    marker_clear = finish_body.rindex("finishPendingCancellation()")
+    assert active_clear < pending_clear < marker_clear
 
 
 def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> None:

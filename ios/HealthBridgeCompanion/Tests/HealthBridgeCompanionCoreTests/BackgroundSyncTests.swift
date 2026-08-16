@@ -636,6 +636,93 @@ final class BackgroundSyncTests: XCTestCase {
         )
     }
 
+    func testMailboxBackgroundOpportunitySelectsOneBoundedDeliveryPhase() {
+        XCTAssertEqual(
+            AutomaticSyncBackgroundOpportunityPolicy.deliveryPhase(
+                usesMailboxTransport: true,
+                at: .beforePayloadGeneration
+            ),
+            .advanceOrReconcileFIFOHead
+        )
+        XCTAssertEqual(
+            AutomaticSyncBackgroundOpportunityPolicy.deliveryPhase(
+                usesMailboxTransport: true,
+                at: .afterDurableEnqueue
+            ),
+            .publishFIFOHead
+        )
+        XCTAssertNil(
+            AutomaticSyncBackgroundOpportunityPolicy.deliveryPhase(
+                usesMailboxTransport: false,
+                at: .beforePayloadGeneration
+            )
+        )
+        XCTAssertNil(
+            AutomaticSyncBackgroundOpportunityPolicy.deliveryPhase(
+                usesMailboxTransport: false,
+                at: .afterDurableEnqueue
+            )
+        )
+    }
+
+    func testSuccessfulBoundedMailboxPhaseIsCompletedEvenWhenBacklogRemains() {
+        for result in [
+            AutomaticSyncMailboxReconciliationResult.completed(pendingCount: 0),
+            .completed(pendingCount: 3),
+        ] {
+            XCTAssertEqual(result.lifecycleOutcome, .completed)
+            XCTAssertTrue(result.lifecycleSucceeded)
+            XCTAssertFalse(result.isTerminalHold)
+            XCTAssertTrue(result.shouldScheduleRetry)
+        }
+    }
+
+    func testFailedTerminalAndCancelledMailboxPhasesRemainDistinct() {
+        XCTAssertEqual(
+            AutomaticSyncMailboxReconciliationResult.failed.lifecycleOutcome,
+            .interrupted
+        )
+        XCTAssertFalse(AutomaticSyncMailboxReconciliationResult.failed.lifecycleSucceeded)
+        XCTAssertTrue(AutomaticSyncMailboxReconciliationResult.failed.shouldScheduleRetry)
+        XCTAssertTrue(
+            AutomaticSyncMailboxReconciliationResult.terminalHold(pendingCount: 1)
+                .isTerminalHold
+        )
+        XCTAssertEqual(
+            AutomaticSyncMailboxReconciliationResult.cancelled.lifecycleOutcome,
+            .interrupted
+        )
+        XCTAssertFalse(
+            AutomaticSyncMailboxReconciliationResult.cancelled.shouldScheduleRetry
+        )
+    }
+
+    func testMailboxAckScanCheckpointSurvivesRestartAndIsGenerationBound() throws {
+        let suiteName = "BackgroundSyncMailboxAckCheckpointTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let checkpoint = String(repeating: "a", count: 32) + ".hba"
+        let initial = BackgroundSyncSettingsStore(userDefaults: defaults)
+
+        try initial.persistMailboxAckScanCheckpoint(
+            checkpoint,
+            receiverGeneration: "synthetic-generation-a"
+        )
+        let restarted = BackgroundSyncSettingsStore(userDefaults: defaults)
+
+        XCTAssertEqual(
+            restarted.mailboxAckScanCheckpoint(
+                receiverGeneration: "synthetic-generation-a"
+            ),
+            checkpoint
+        )
+        XCTAssertNil(
+            restarted.mailboxAckScanCheckpoint(
+                receiverGeneration: "synthetic-generation-b"
+            )
+        )
+    }
+
     func testRunGateRetainsObserverDirtinessWhenRunDefersForOutbox() async {
         let gate = BackgroundSyncRunGate(minimumSpacing: 0)
         let now = Date(timeIntervalSince1970: 1_780_123_200)
@@ -702,6 +789,33 @@ final class BackgroundSyncTests: XCTestCase {
             AutomaticSyncPayloadGenerationPolicy.shouldStopQuantityLoop(
                 isAutomaticSync: true,
                 hasDurablyQueuedPayload: false
+            )
+        )
+    }
+
+    func testPayloadGenerationPolicyDetectsOnlyTheFirstDurableFIFOHead() {
+        XCTAssertTrue(
+            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
+                pendingBefore: 0,
+                pendingAfter: 1
+            )
+        )
+        XCTAssertFalse(
+            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
+                pendingBefore: 1,
+                pendingAfter: 1
+            )
+        )
+        XCTAssertFalse(
+            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
+                pendingBefore: nil,
+                pendingAfter: 1
+            )
+        )
+        XCTAssertFalse(
+            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
+                pendingBefore: 0,
+                pendingAfter: nil
             )
         )
     }

@@ -2,13 +2,15 @@
 
 Use this checklist before publishing a release or making a public launch announcement.
 
-The first public launch is a coordinated cutover, not a source-only preview. Before the repository, GitHub Release, or official website install surface is announced, the matching signed iOS build must pass external Beta App Review and its official TestFlight public invitation must be verified anonymously. The tagged-release workflow separately validates an annotated GitHub-verified tag and commit, reruns the exact-tag Python and iOS source gates, publishes wheel/sdist/checksum/metadata artifacts, and records GitHub build provenance. Keep every public surface on HOLD until the signed iOS candidate, TestFlight invitation, and final audited one-root tree all pass the cutover checks below.
+A coordinated release is a cutover, not a source-only preview. Before announcing the new GitHub Release or updating the official website install surface, the matching signed iOS build must pass external Beta App Review. The tagged-release workflow separately validates an annotated GitHub-verified tag and commit, reruns the exact-tag Python and iOS source gates, creates an attested helper-pending draft with the wheel, sdist, and source-bound metadata, and deliberately does not publish it. The bound manual continuation publishes only after the owner supplies the newly signed exact-source helper and public manifest. Keep version-specific public surfaces on HOLD until the signed iOS candidate, exact helper, GitHub Release, and coordinated cutover checks below all pass; verify the Public Link anonymously immediately after the approved build is intentionally assigned.
 
-A private TestFlight candidate may be archived, uploaded, assigned to a private tester group, and submitted for external Beta App Review before the public tag only when the private release packet records the exact source commit and tree, signed archive metadata and checksum, complete source/package gates, and real-device smoke evidence. This validation does not authorize a public TestFlight link, App Store submission, or repository launch. Before any public action, verify the final audited one-root snapshot against the reviewed signed candidate, confirm external approval and anonymous Public Link access, then publish the required checksums and provenance.
+A private TestFlight candidate may be archived, uploaded, assigned to a private tester group, and submitted for external Beta App Review before the public tag only when the private release packet records the exact source commit and tree, signed archive metadata and checksum, complete source/package gates, and real-device smoke evidence. This validation does not authorize a public TestFlight link, App Store submission, GitHub Release, or website cutover. Before any version-specific public action, verify the final reviewed snapshot against the approved signed candidate, confirm external approval, publish the required checksums and provenance, and then verify anonymous Public Link access after assignment.
 
 A receiver-only patch may advance the Receiver/CLI version while keeping the last verified iOS Companion version/build and Batch Protocol unchanged. For that scope, maintainers must not upload a new TestFlight build merely to make version numbers match. The exact-tag workflow must still run the iOS source gates, the versioned notes must name the exact compatible iOS Companion and Batch Protocol and state that no TestFlight update is required, and `release-metadata.json` must set `release_scope` to `receiver` while independently recording every component version. A coordinated release must declare `release_scope` as `coordinated`, advance Receiver/CLI plus iOS Companion or Batch Protocol, and name the exact resulting compatibility in its notes. Update `component-versions.json` in the same commit as any authoritative version source; release validation must reject drift between that index, `pyproject.toml`, Xcode settings, and the canonical batch fixture.
 
 For the coordinated 1.1.0 packet, review every public note, checklist, and App Review surface against the same product boundary: Direct is the default and never falls back automatically; Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta with application-layer encryption, signed ACK/commit semantics, a user-owned iCloud container and receiver, and an optional per-user macOS LaunchAgent. Batch Protocol remains `health_bridge.batch.v1 (1.0.0)`. App Store Connect may remain “Data Not Collected” only while neither the developer nor an integrated third party can access the user's receiver, iCloud container, or transmitted HealthKit records.
+
+Mailbox publication is release-blocking for Receiver/CLI `1.1.0`: the release must contain `HealthBridgeMailboxAckPublisher-1.1.0.zip` and `HealthBridgeMailboxAckPublisher-1.1.0.manifest.json`. The helper manifest must bind the archive SHA-256/size, component version/build, exact annotated tag object/commit/tree, and canonical `macos/HealthBridgeMailboxAckPublisher` Git tree. Final `SHA256SUMS` must cover both helper assets as well as the wheel, sdist, and release metadata. A private helper from earlier QA is not acceptable evidence of exact source or distributability.
 
 ## Required checks
 
@@ -64,7 +66,20 @@ Before pushing a release tag, configure and read back these repository-side gate
 3. Create a separate active tag ruleset targeting `refs/tags/receiver-v*`. Enable **Restrict creations**, **Restrict deletions**, and **Restrict updates**. Limit bypass to the release maintainer role needed to create a new signed tag; the workflow token does not need tag mutation permission. Never bypass the ruleset to move or recreate an existing version.
 4. Open GitHub repository **Settings → General → Releases** and select **Enable release immutability**. Read back all four controls immediately before the next tag: the environment name/reviewer and `receiver-v*` deployment rule, the no-bypass legacy `v*` ruleset, the protected `receiver-v*` creation ruleset, and release immutability enabled.
 
-The workflow creates a draft, attaches and attests every asset, and only then publishes it; publication locks the tag and assets. If a draft-stage workflow fails, inspect and remove only that unpublished draft before retrying. Never move or reuse a published version tag.
+The tagged workflow creates one helper-pending draft and attests the core packet; it cannot publish. If that phase fails, inspect and remove only that unpublished draft before retrying. Never move or reuse a published version tag.
+
+On the canonical owner Mac, create a private xcconfig outside the repository with the Apple Developer Team, production helper bundle identifier, matching expected bundle identifier, and iCloud container overrides. Do not commit that overlay or signing material. From a clean checkout at the exact signed tag, stage a new helper:
+
+```bash
+scripts/stage-mailbox-helper-release.sh \
+  --tag "$tag" \
+  --xcconfig "$PRIVATE_HELPER_SIGNING_XCCONFIG" \
+  --output-dir "$PRIVATE_HELPER_RELEASE_DIR"
+```
+
+The staging command verifies the signed annotated tag and clean canonical helper source; builds with hardened runtime; validates strict/deep code signing, bundle identity, version/build, sandbox and required iCloud entitlements; creates the deterministic asset names; structurally revalidates the archive; and prints only public filenames and the helper SHA-256. It emits no Team ID, signing identity, raw entitlement plist, or raw `codesign` output.
+
+Attach the two newly staged helper files to the existing helper-pending draft without replacing any asset. Then manually run **Continue helper-bound release** with the exact draft database ID, tag, and printed helper SHA-256. The continuation must reverify the live signed tag/commit identities, current default-main equality, Git tree, existing unpublished draft ID, exact helper source binding and digest, and exact five-asset pre-checksum set. It creates and uploads a new `SHA256SUMS` without clobbering, attests the helper/manifest/checksum, reverifies the exact six-asset draft, and only then changes that same draft to published. It refuses an already published release and cannot create or replace a release.
 
 GitHub defines the push payload's `after` field as the most recent **commit** on the pushed ref. For an annotated tag, the release workflow therefore binds the peeled target commit to `github.event.after`; it separately binds the live tag ref to the locally fetched annotated tag object, verifies the signed tag's internal name, and relies on the active tag ruleset to prevent creation/update/deletion races.
 
@@ -88,7 +103,7 @@ test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)"
 git push origin "refs/tags/$tag"
 ```
 
-Do not create a lightweight tag or manually create/replace the GitHub Release. The tagged-release workflow verifies the annotated tag and target commit through GitHub, then creates the release from the exact-tag artifacts. A failed workflow is a release blocker; fix the source or workflow and use a new version rather than replacing published assets.
+Do not create a lightweight tag or manually create/replace the GitHub Release. The tagged-release workflow verifies the annotated tag and target commit through GitHub, then creates the helper-pending draft from exact-tag core artifacts. The continuation may publish only that bound draft. A failed workflow is a release blocker; fix the source or workflow and use a new version rather than replacing published assets.
 
 The strict audit also rejects unreviewed RFC1918 addresses, user-specific macOS or
 Linux home paths, account-linked email addresses, signing team IDs, non-neutral

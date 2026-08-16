@@ -143,6 +143,7 @@ public final class MailboxTransport: DeliveryTransport {
         _ input: DeliveryTransportInput
     ) throws -> FinalizedEnvelope {
         try checkCancellation()
+        try outbox.requireUploadAdmission()
         try validateContext()
         guard let item = try outbox.pendingItem(id: input.item.id),
               item.fileURL.standardizedFileURL == input.item.fileURL.standardizedFileURL,
@@ -189,6 +190,7 @@ public final class MailboxTransport: DeliveryTransport {
     private func publish(_ finalized: FinalizedEnvelope) throws -> MailboxPublishedEnvelope? {
         try checkCancellation()
         guard let locator = try resolvedLocator() else { return nil }
+        try outbox.requireUploadAdmission()
         let publishedURL: URL
         do {
             publishedURL = try publisher.publish(

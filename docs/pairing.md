@@ -248,6 +248,13 @@ Arbitrary self-hosted receiver domains cannot all become app Universal Link doma
 
 ## User handoff checklist
 
+For Encrypted iCloud Mailbox, first run the explicit mailbox setup command and
+signed-helper lifecycle in
+[`icloud-mailbox-service.md`](icloud-mailbox-service.md). The public pairing
+command remains `health-bridge setup --transport icloud-mailbox`; there is no
+separate hidden mailbox pairing command. Direct remains the default and never
+falls back to mailbox delivery.
+
 1. Keep the receiver running.
 2. Verify `/health` using the exact base URL the iPhone will reach.
 3. Generate a fresh invitation setup page.

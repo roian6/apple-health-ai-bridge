@@ -6,18 +6,74 @@ import XCTest
 #endif
 
 final class MailboxAckHydrationTests: XCTestCase {
-    func testOneBoundedPassRequestsAll37PlaceholdersBeforeWaiting() async throws {
-        let result = try await runThirtySevenPlaceholderScenario()
+    func testExplicitMissingCandidateIsSkippedWithoutWeakeningReplacementSafety() {
+        XCTAssertEqual(
+            ProductionMailboxAckHydration.identityFailureDisposition(
+                .unavailable,
+                explicitCandidate: true
+            ),
+            .skipCandidate
+        )
+        XCTAssertEqual(
+            ProductionMailboxAckHydration.identityFailureDisposition(
+                .unavailable,
+                explicitCandidate: false
+            ),
+            .unsafeMailbox
+        )
+        XCTAssertEqual(
+            ProductionMailboxAckHydration.identityFailureDisposition(
+                .replaced,
+                explicitCandidate: true
+            ),
+            .unsafeMailbox
+        )
+    }
 
-        XCTAssertEqual(result.requestedCountBeforeFirstWait, 37)
-        XCTAssertEqual(result.requestedURLs.count, 37)
-        XCTAssertEqual(Set(result.requestedURLs).count, 37)
+    @MainActor
+    func testDirectAcknowledgmentHitDoesNotInvokeBoundedFallback() async throws {
+        var fallbackCalls = 0
+
+        let selected = try await ProductionMailboxDelivery.preferDirectAcknowledgment(
+            direct: { "direct" },
+            boundedFallback: {
+                fallbackCalls += 1
+                return "fallback"
+            }
+        )
+
+        XCTAssertEqual(selected, "direct")
+        XCTAssertEqual(fallbackCalls, 0)
+    }
+
+    @MainActor
+    func testAbsentOrUnusableDirectAcknowledgmentFallsBackInSameOpportunity() async throws {
+        var fallbackCalls = 0
+
+        let selected = try await ProductionMailboxDelivery.preferDirectAcknowledgment(
+            direct: { nil as String? },
+            boundedFallback: {
+                fallbackCalls += 1
+                return "checkpoint-window"
+            }
+        )
+
+        XCTAssertEqual(selected, "checkpoint-window")
+        XCTAssertEqual(fallbackCalls, 1)
+    }
+
+    func testBackgroundPassRequestsOnlyItsBoundedPlaceholderWindow() async throws {
+        let result = try await runThirtySevenPlaceholderScenario(maximumCandidates: 8)
+
+        XCTAssertEqual(result.requestedCountBeforeFirstWait, 8)
+        XCTAssertEqual(result.requestedURLs.count, 8)
+        XCTAssertEqual(Set(result.requestedURLs).count, 8)
         XCTAssertEqual(result.waitCount, 1)
         XCTAssertEqual(
             result.report,
             MailboxAckHydrationReport(
-                eligibleCandidateCount: 37,
-                requestedDownloadCount: 37,
+                eligibleCandidateCount: 8,
+                requestedDownloadCount: 8,
                 remainingUnavailableCount: 0,
                 skippedUnverifiableIdentityCount: 0
             )
@@ -72,6 +128,7 @@ final class MailboxAckHydrationTests: XCTestCase {
             finalizedCount: 3,
             waitingCount: 2,
             terminalCount: 0,
+            ackCleanupFailureCount: 1,
             hydration: MailboxAckHydrationReport(
                 eligibleCandidateCount: 7,
                 requestedDownloadCount: 6,
@@ -88,9 +145,82 @@ final class MailboxAckHydrationTests: XCTestCase {
             summary.ackDiagnosticLine,
             "Mailbox ACK diagnostics: hydration eligible=7, downloadRequests=6, "
                 + "remainingUnavailable=2, skippedUnverifiableIdentity=1; scan finalCount=4, "
-                + "byteCount=2048, ignoredTemporaryCount=3; quarantine invalidName=1, "
+                + "byteCount=2048, ignoredTemporaryCount=3; cleanupFailures=1; quarantine invalidName=1, "
                 + "unsafeEntry=0, oversize=0, authenticationFailed=2, unknownEnvelope=0, "
                 + "stale=1, bindingConflict=0, suppressed=0."
+        )
+    }
+
+    func testDurablyCommittedAckCleanupFailureIsBestEffort() {
+        var cleanupCalls = 0
+
+        let deleted = ProductionMailboxDelivery.deleteAcknowledgmentAfterDurableCommit {
+            cleanupCalls += 1
+            throw SyntheticAckCleanupError.providerRejectedDeletion
+        }
+
+        XCTAssertFalse(deleted)
+        XCTAssertEqual(cleanupCalls, 1)
+    }
+
+    func testDurablyCommittedAckCleanupSuccessIsReported() {
+        var cleanupCalls = 0
+
+        let deleted = ProductionMailboxDelivery.deleteAcknowledgmentAfterDurableCommit {
+            cleanupCalls += 1
+        }
+
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(cleanupCalls, 1)
+    }
+
+    func testAcknowledgmentsAreOrderedByPendingFIFOThenStaleCleanup() {
+        let order = ProductionMailboxDelivery.orderedAcknowledgmentIndices(
+            itemIDs: ["later", "stale-a", "first", "middle", "stale-b"],
+            pendingItemIDs: ["first", "middle", "later"]
+        )
+
+        XCTAssertEqual(order, [2, 3, 0, 1, 4])
+    }
+
+    func testBackgroundAcknowledgmentSelectionReturnsOnlyTheFIFOHead() {
+        let head = Data(repeating: 1, count: 16)
+        let later = Data(repeating: 2, count: 16)
+        XCTAssertEqual(
+            ProductionMailboxDelivery.acknowledgmentIndexForPendingFIFOHead(
+                eventEnvelopeIDs: [later, head, head],
+                pendingFIFOHeadEnvelopeID: head
+            ),
+            1
+        )
+        XCTAssertNil(
+            ProductionMailboxDelivery.acknowledgmentIndexForPendingFIFOHead(
+                eventEnvelopeIDs: [later],
+                pendingFIFOHeadEnvelopeID: head
+            )
+        )
+    }
+
+    func testBackgroundPhaseNeverCombinesPublishAndAcknowledgmentWork() {
+        XCTAssertEqual(
+            ProductionMailboxDelivery.backgroundPhase(for: .collected),
+            .publishFIFOHead
+        )
+        XCTAssertEqual(
+            ProductionMailboxDelivery.backgroundPhase(for: .published),
+            .reconcileFIFOHeadAcknowledgment
+        )
+        XCTAssertEqual(
+            ProductionMailboxDelivery.backgroundPhase(for: .providerObserved),
+            .reconcileFIFOHeadAcknowledgment
+        )
+        XCTAssertEqual(
+            ProductionMailboxDelivery.backgroundPhase(for: .ackVerified),
+            .reconcileFIFOHeadAcknowledgment
+        )
+        XCTAssertEqual(
+            ProductionMailboxDelivery.backgroundPhase(for: .terminalFailure),
+            .none
         )
     }
 
@@ -108,6 +238,10 @@ final class MailboxAckHydrationTests: XCTestCase {
         XCTAssertTrue(result.cancelled)
         XCTAssertEqual(result.requestedCount, 5)
     }
+}
+
+private enum SyntheticAckCleanupError: Error {
+    case providerRejectedDeletion
 }
 
 private struct MailboxAckHydrationScenarioResult {
@@ -212,7 +346,7 @@ private func runMidSweepCancellationScenario() async -> MailboxAckCancellationSc
     }.value
 }
 
-private func runThirtySevenPlaceholderScenario() async throws
+private func runThirtySevenPlaceholderScenario(maximumCandidates: Int) async throws
     -> MailboxAckHydrationScenarioResult
 {
     let candidates = (0 ..< 37).map {
@@ -238,7 +372,8 @@ private func runThirtySevenPlaceholderScenario() async throws
             }
             downloaded.formUnion(requested)
         },
-        maximumWaits: 2
+        maximumWaits: 2,
+        maximumCandidates: maximumCandidates
     )
 
     let report = try await hydrator.hydrate()
@@ -258,10 +393,10 @@ private enum MailboxAckHydrationRegressionFailure: Error {
 @main
 private enum MailboxAckHydrationRegressionRunner {
     static func main() async throws {
-        let result = try await runThirtySevenPlaceholderScenario()
-        guard result.requestedCountBeforeFirstWait == 37,
-              result.requestedURLs.count == 37,
-              Set(result.requestedURLs).count == 37,
+        let result = try await runThirtySevenPlaceholderScenario(maximumCandidates: 8)
+        guard result.requestedCountBeforeFirstWait == 8,
+              result.requestedURLs.count == 8,
+              Set(result.requestedURLs).count == 8,
               result.waitCount == 1 else {
             throw MailboxAckHydrationRegressionFailure.unexpectedResult
         }
@@ -276,7 +411,7 @@ private enum MailboxAckHydrationRegressionRunner {
               midSweep.requestedCount == 5 else {
             throw MailboxAckHydrationRegressionFailure.unexpectedResult
         }
-        print("ACK hydration regression passed: requested=37 waits=1 cancellation=pre+mid")
+        print("ACK hydration regression passed: requested=8 waits=1 cancellation=pre+mid")
     }
 }
 #endif

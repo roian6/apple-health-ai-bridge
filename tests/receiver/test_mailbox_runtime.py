@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from threading import Event, Thread
@@ -166,8 +167,247 @@ def test_runtime_retries_errors_and_discovers_newly_paired_devices(
     worker.run_once()
     worker.run_once()
 
-    assert calls.count(first) == 4
+    assert calls.count(first) == 2
     assert calls.count(second) == 2
+
+
+def test_runtime_skips_unchanged_mailbox_until_lane_changes(tmp_path: Path) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+
+    worker.run_once()
+    worker.run_once()
+    _ = (mailbox / "deliveries" / ("01" * 16 + ".hbd")).write_bytes(b"new")
+    worker.run_once()
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_runtime_ack_deletion_invalidates_idle_gate(tmp_path: Path) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    ack = mailbox / "acks" / ("01" * 16 + ".hba")
+    _ = ack.write_bytes(b"ack")
+    calls: list[Path] = []
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+    worker.run_once()
+    worker.run_once()
+    ack.unlink()
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_runtime_same_size_in_place_rewrite_invalidates_idle_gate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    delivery = mailbox / "deliveries" / ("01" * 16 + ".hbd")
+    _ = delivery.write_bytes(b"first")
+    calls: list[Path] = []
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+    worker.run_once()
+    worker.run_once()
+    _ = delivery.write_bytes(b"other")
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_lane_signature_changes_when_dataless_flag_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    _ = (mailbox / "deliveries" / ("01" * 16 + ".hbd")).write_bytes(b"payload")
+    calls: list[Path] = []
+    original_stat = os.stat
+    flags = 0x40000000
+
+    @final
+    class StatWithFlags:
+        def __init__(self, metadata: object) -> None:
+            self._metadata: object = metadata
+            self.st_flags: int = flags
+
+        def __getattr__(self, name: str) -> object:
+            return cast("object", getattr(self._metadata, name))
+
+    def stat_with_flags(*args: object, **kwargs: object) -> StatWithFlags:
+        return StatWithFlags(
+            original_stat(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        )
+
+    monkeypatch.setattr(os, "stat", stat_with_flags)
+
+    class IncompleteImporter:
+        def import_once(self) -> MailboxImportResult:
+            calls.append(mailbox)
+            return MailboxImportResult(retryable=1)
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, _path, _directory: IncompleteImporter(),
+        incomplete_retry_interval_seconds=30,
+    )
+    worker.run_once()
+    worker.run_once()
+    flags = 0
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_runtime_backs_off_unchanged_incomplete_result(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+    now = 10.0
+
+    class IncompleteImporter:
+        def import_once(self) -> MailboxImportResult:
+            calls.append(mailbox)
+            return MailboxImportResult(retryable=1, skipped=1, conflict=1)
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, _path, _directory: IncompleteImporter(),
+        incomplete_retry_interval_seconds=30,
+        monotonic=lambda: now,
+    )
+    worker.run_once()
+    worker.run_once()
+    now += 29
+    worker.run_once()
+    now += 1
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_runtime_incomplete_backoff_starts_after_import_finishes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+    now = 10.0
+
+    class SlowIncompleteImporter:
+        def import_once(self) -> MailboxImportResult:
+            nonlocal now
+            calls.append(mailbox)
+            now += 40
+            return MailboxImportResult(retryable=1)
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, _path, _directory: SlowIncompleteImporter(),
+        incomplete_retry_interval_seconds=30,
+        monotonic=lambda: now,
+    )
+    worker.run_once()
+    worker.run_once()
+
+    assert calls == [mailbox]
+
+
+def test_runtime_lane_mutation_bypasses_incomplete_result_backoff(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+
+    class IncompleteImporter:
+        def import_once(self) -> MailboxImportResult:
+            calls.append(mailbox)
+            return MailboxImportResult(retryable=1)
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, _path, _directory: IncompleteImporter(),
+        incomplete_retry_interval_seconds=30,
+    )
+    worker.run_once()
+    worker.run_once()
+    _ = (mailbox / "deliveries" / ("03" * 16 + ".hbd")).write_bytes(b"new")
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_runtime_retries_when_lane_changes_during_import(tmp_path: Path) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+    mutated = False
+
+    class MutatingImporter:
+        def import_once(self) -> MailboxImportResult:
+            nonlocal mutated
+            calls.append(mailbox)
+            if not mutated:
+                mutated = True
+                _ = (mailbox / "acks" / ("02" * 16 + ".hba")).write_bytes(b"ack")
+            return MailboxImportResult(imported=1)
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, _path, _directory: MutatingImporter(),
+    )
+    worker.run_once()
+    worker.run_once()
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
+
+
+def test_runtime_periodically_rechecks_unchanged_mailbox(tmp_path: Path) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+    now = 10.0
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+        maintenance_interval_seconds=300,
+        monotonic=lambda: now,
+    )
+    worker.run_once()
+    worker.run_once()
+    now += 301
+    worker.run_once()
+
+    assert calls == [mailbox, mailbox]
 
 
 def test_runtime_worker_stops_promptly_after_background_start(tmp_path: Path) -> None:
@@ -341,12 +581,12 @@ def test_mailbox_worker_failure_makes_server_health_non_ok(
 
     importer_factory: runtime_module.MailboxImporterFactory = recording_factory
 
-    worker_kwargs: dict[str, int] = {}
+    max_raw_receiver_entries = runtime_module.MAX_RAW_RECEIVER_ENTRIES
     if failure == "raw-budget":
         root.mkdir()
         for index in range(3):
             (root / f"unknown-{index}").mkdir()
-        worker_kwargs["max_raw_receiver_entries"] = 2
+        max_raw_receiver_entries = 2
     elif failure == "terminal":
         _ = _mailbox(root)
 
@@ -365,7 +605,7 @@ def test_mailbox_worker_failure_makes_server_health_non_ok(
         mailbox_root=root,
         importer_factory=importer_factory,
         poll_interval_seconds=0.01,
-        **worker_kwargs,
+        max_raw_receiver_entries=max_raw_receiver_entries,
     )
     server = server_module.ReceiverHTTPServer(
         "127.0.0.1",

@@ -108,6 +108,31 @@ final class MailboxTransportTests: XCTestCase {
         }
     }
 
+    func testClearIntentRaisedDuringLocatorResolutionBlocksPublication() throws {
+        let fixture = try MailboxTransportFixture()
+        let sealer = try CountingMailboxEnvelopeSealer(fixture)
+        let input = try DeliveryTransportInput(item: fixture.item)
+
+        XCTAssertThrowsError(
+            try fixture.transport(
+                sealer: sealer,
+                locate: {
+                    try FileOutbox.beginTerminalResetRequest(
+                        directory: fixture.outboxDirectory
+                    )
+                    return fixture.locator
+                }
+            ).deliver(input)
+        ) { error in
+            XCTAssertEqual(error as? FileOutboxClearIntentError, .clearInProgress)
+        }
+
+        XCTAssertTrue(fixture.outbox.terminalResetRequestIsActive)
+        XCTAssertFalse(fixture.outbox.clearIntentIsActive)
+        XCTAssertTrue(try fixture.deliveries().isEmpty)
+        XCTAssertNotNil(try fixture.outbox.mailboxBinding(for: fixture.item.id))
+    }
+
     func testProductionSealerUsesNonexportingMailboxKeyStoreSigningPath() throws {
         let fixture = try MailboxTransportFixture()
         let keyStore = MailboxKeyStore(

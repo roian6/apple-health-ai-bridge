@@ -64,7 +64,7 @@ def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> No
 def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     start = source.index("func clearPendingOutbox()")
-    end = source.index("\n    func bootstrap()", start)
+    end = source.index("\n    private func resetPrivateSyncProgressForClear", start)
     operation = source[start:end]
     expected_capture = "".join(  # noqa: FLY002
         (
@@ -73,31 +73,39 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
         )
     )
     expected_generation = operation.index(expected_capture)
-    begin = operation.index("try outbox.beginClearIntent()")
+    request = operation.index("try FileOutbox.beginTerminalResetRequest(")
     stop = operation.index("automaticSyncActivated = false")
     stop_healthkit = operation.index("stopHealthKitBackgroundDelivery()")
     cancel = operation.index("await self.cancelAndAwaitForegroundPayloadTasks()")
+    drain = operation.index("await self.drainTerminalBackgroundPayloadCancellation()")
     exclusive = operation.index("runWithExclusiveDirectOutboxTransfer")
-    generation = operation.index(
+    preparation_generation = operation.index(
         "try self.requireUnchangedConnectionGenerationDuringRecovery("
     )
-    assert "try self.requireCurrentConnectionGeneration(" not in operation[:begin]
-    assert "expectedConnectionGeneration" in operation[generation:begin]
+    commit_generation = operation.index(
+        "try self.requireUnchangedConnectionGenerationDuringRecovery(", exclusive
+    )
+    assert "try self.requireCurrentConnectionGeneration(" not in operation[:request]
+    assert "expectedConnectionGeneration" in operation[preparation_generation:exclusive]
     assert "sleepManifestStore?.resetSynchronizationState()" not in operation
     assert (
         expected_generation
         < stop
         < stop_healthkit
+        < preparation_generation
+        < request
         < cancel
+        < drain
         < exclusive
-        < generation
-        < begin
+        < commit_generation
     )
-    perform = operation[operation.index("private func performClearPendingOutbox(") :]
+    perform_start = source.index("private func performClearPendingOutbox()", end)
+    perform_end = source.index("\n    func retryPrivateStorage()", perform_start)
+    perform = source[perform_start:perform_end]
     perform_reset = perform.index("try resetPrivateSyncProgressForClear()")
-    outbox_clear = perform.index("try outbox.clearPendingWhileIntentIsActive()")
-    finish = perform.index("try outbox.finishClearIntent()")
-    assert perform_reset < outbox_clear < finish
+    destructive_intent = perform.index("try FileOutbox.beginDestructiveRecovery(")
+    finish = perform.index("try FileOutbox.completeConfirmedTerminalReset(")
+    assert perform_reset < destructive_intent < finish
     assert "activateAutomaticSyncIfReady()" in operation
 
     pairing = (ROOT / "docs/pairing.md").read_text(encoding="utf-8")
@@ -118,7 +126,7 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
     )
     recovery = source[recovery_start:recovery_end]
     recovery_reset = recovery.index("try resetPrivateSyncProgressForClear()")
-    recovery_finish = recovery.index("try outbox.finishClearIntent()")
+    recovery_finish = recovery.index("try FileOutbox.completeConfirmedTerminalReset(")
     assert recovery_reset < recovery_finish
     assert "hasPendingPrivateStorageRecovery = false" in recovery
     assert "hasTransientPrivateStorageFailure = false" in recovery
@@ -249,7 +257,7 @@ def test_transient_installation_identity_and_bootstrap_failures_are_retryable() 
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionApp.swift"
     ).read_text(encoding="utf-8")
     active_start = app_source.index("if newPhase == .active")
-    active_end = app_source.index("} else if newPhase == .background", active_start)
+    active_end = app_source.index("} else {", active_start)
     assert "await viewModel.bootstrap()" in app_source[active_start:active_end]
 
 
@@ -270,7 +278,7 @@ def test_private_store_retry_recovery_and_manifest_probe_are_explicit() -> None:
     assert "private var sleepManifestStore: SleepSyncManifestStoring?" in source
     assert "retryPrivateStoreInitialization()" in source
     assert "FileOutbox.beginDestructiveRecovery" in source
-    assert "FileOutbox.completeDestructiveRecovery" in source
+    assert "FileOutbox.completeConfirmedTerminalReset" in source
 
     probe_start = source.index("private static func sleepStorageMayNeedRecovery(")
     probe_end = source.index(
@@ -289,19 +297,21 @@ def test_private_store_retry_recovery_and_manifest_probe_are_explicit() -> None:
     assert "hasPendingOutboxDeletion = true" in refresh
 
 
-def test_clear_intent_is_persisted_only_after_transfer_cancellation() -> None:
+def test_destructive_intent_is_persisted_only_after_transfer_cancellation() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     start = source.index("func clearPendingOutbox()")
     end = source.index("\n    private func resetPrivateSyncProgressForClear", start)
     operation = source[start:end]
     exclusive = operation.index("runWithExclusiveDirectOutboxTransfer")
     cancel_foreground = operation.index("cancelAndAwaitForegroundPayloadTasks")
-    begin_intent = min(
-        index
-        for marker in ("beginClearIntent()", "beginDestructiveRecovery")
-        if (index := operation.find(marker)) >= 0
+    terminal_request = operation.index("beginTerminalResetRequest")
+    assert terminal_request < cancel_foreground < exclusive
+    perform_start = source.index("private func performClearPendingOutbox()", start)
+    perform_end = source.index("\n    func retryPrivateStorage()", perform_start)
+    perform = source[perform_start:perform_end]
+    assert perform.index("resetPrivateSyncProgressForClear()") < perform.index(
+        "beginDestructiveRecovery"
     )
-    assert cancel_foreground < exclusive < begin_intent
 
 
 def test_swift_sources_do_not_contain_compile_placeholder_tokens() -> None:
@@ -323,7 +333,9 @@ def test_bootstrap_single_flight_keeps_attempt_identity() -> None:
     assert "bootstrapWaiters[waiterID] = continuation" in bootstrap
     assert "cancelBootstrapWaiter(waiterID, attemptID: attemptID)" in bootstrap
     assert "let attemptTask: Task<Void, Never>" in bootstrap
-    assert "if attemptTask.isCancelled, !Task.isCancelled" in bootstrap
+    assert "if attemptTask.isCancelled," in bootstrap
+    assert "!Task.isCancelled," in bootstrap
+    assert "capturedRetryGeneration == bootstrapRetryGeneration" in bootstrap
     assert "await attemptTask.value" in bootstrap
 
     perform_start = source.index("private func performBootstrap()")
@@ -611,7 +623,7 @@ def test_destructive_recovery_resets_all_progress_and_unreadable_connection() ->
 
     assert "connectionTerminalBarrier.performRecovery(" in recovery
     assert "drainBackgroundPayloads:" in recovery
-    assert "await self.drainBackgroundPayloadCancellation()" in recovery
+    assert "await self.drainTerminalBackgroundPayloadCancellation()" in recovery
     assert "try resetPrivateSyncProgressForClear()" in clear
     assert "try settingsStore.resolveTerminalCancellationForPrivateReset()" in reset
     assert "try pairingStateStore.resetPrivatePairingState()" in reset

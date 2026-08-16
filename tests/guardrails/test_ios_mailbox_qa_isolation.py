@@ -35,6 +35,8 @@ CURATED_CORE = {
     "MailboxAckModels.swift",
     "MailboxAckOutboxLookup.swift",
     "MailboxAckScanner.swift",
+    "MailboxAckWindowReader.swift",
+    "MailboxAckWindowSupport.swift",
     "MailboxAtomicPublisher.swift",
     "MailboxEnvelopeSealer.swift",
     "MailboxKeyIdentity.swift",

@@ -1,4 +1,5 @@
 import json
+import plistlib
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -102,6 +103,16 @@ def write_release_tree(
     _ = (repo / "component-versions.json").write_text(
         json.dumps(component_index, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+    )
+    helper_info = repo / "macos/HealthBridgeMailboxAckPublisher/Info.plist"
+    helper_info.parent.mkdir(parents=True, exist_ok=True)
+    _ = helper_info.write_bytes(
+        plistlib.dumps(
+            {
+                "CFBundleShortVersionString": release.receiver_version,
+                "CFBundleVersion": "1",
+            }
+        )
     )
     notes = repo / ".github/release" / f"notes-{release.release_tag}.md"
     notes.parent.mkdir(parents=True, exist_ok=True)

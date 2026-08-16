@@ -2,7 +2,7 @@
 
 This maintainer checklist helps prepare an official TestFlight beta for Apple Health AI Bridge. Keep account-owned App Store Connect, signing, reviewer, support, and demo receiver material outside the public repository until it is intentionally published.
 
-For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (16)` candidate must pass external Beta App Review and its Public Link must be anonymously verified before the matching Receiver/CLI `receiver-v1.1.0` release and install surface are announced. Batch Protocol remains `health_bridge.batch.v1 (1.0.0)`. Self-build remains supported, but it does not bypass this release-order gate for the official surfaces.
+For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (39)` candidate must pass external Beta App Review and its Public Link must be anonymously verified before the matching Receiver/CLI `receiver-v1.1.0` release and install surface are announced. Batch Protocol remains `health_bridge.batch.v1 (1.0.0)`. Self-build remains supported, but it does not bypass this release-order gate for the official surfaces.
 
 ## What the public repository may contain
 
@@ -27,7 +27,7 @@ For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (16)` candidat
 
 ### Account and identity
 
-- [ ] The coordinated identity is iOS Companion `1.1.0 (16)`, Receiver/CLI `1.1.0` at `receiver-v1.1.0`, and Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
+- [ ] The coordinated identity is iOS Companion `1.1.0 (39)`, Receiver/CLI `1.1.0` at `receiver-v1.1.0`, and Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
 - [ ] Apple Developer Program membership is active.
 - [ ] Individual vs organization seller path is decided.
 - [ ] App Store Connect access is available.
@@ -56,6 +56,7 @@ For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (16)` candidat
 - [ ] Receiver disconnect and queued-data handling are understandable.
 - [ ] Direct is described as the default transport with no automatic fallback.
 - [ ] Encrypted iCloud Mailbox is described as an explicit opt-in, Mac-only Beta using application-layer encryption, a user-owned iCloud container and receiver, signed ACK/commit semantics, and an optional per-user macOS LaunchAgent.
+- [ ] Receiver/CLI `1.1.0` remains unpublished until a newly built exact-source signed ACK helper, public manifest, and final helper-inclusive `SHA256SUMS` pass the two-phase release workflow.
 
 ### Demo and reviewer access
 

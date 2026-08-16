@@ -628,7 +628,8 @@ private struct ReceiverSettingsView: View {
             if viewModel.pendingOutboxCount > 0
                 || viewModel.hasPendingSleepTransition
                 || viewModel.hasPendingOutboxDeletion
-                || viewModel.hasPendingPrivateStorageRecovery {
+                || viewModel.hasPendingPrivateStorageRecovery
+                || viewModel.hasPendingPairing {
                 Button(role: .destructive) {
                     showClearQueuedUploadsConfirmation = true
                 } label: {
@@ -783,7 +784,7 @@ private struct AppDetailsView: View {
 
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.0"
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "16"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "39"
         return "\(version) (\(build))"
     }
 }

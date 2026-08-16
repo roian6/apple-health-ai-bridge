@@ -4,20 +4,31 @@ import errno
 import hashlib
 import os
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Never
 
 import pytest
 
 from health_bridge.mailbox import filesystem as mailbox_files
 from health_bridge.mailbox.filesystem import (
+    MailboxDirectoryHandle,
     MailboxFileError,
     file_identity,
     open_directory,
     unlink_same_at,
 )
-from health_bridge.mailbox.importer import MailboxBusyError
+from health_bridge.mailbox.importer import (
+    MailboxBusyError,
+    MailboxImportConfig,
+    MailboxImporter,
+)
 from health_bridge.mailbox.models import MailboxImportFaultPoint
-from health_bridge.mailbox.publication import cleanup_quarantine, publish_final_at
+from health_bridge.mailbox.publication import (
+    PublicationState,
+    cleanup_quarantine,
+    publish_final_at,
+)
+from health_bridge.receiver._delivery_acceptance_crypto import receipt_ack_id
+from health_bridge.storage.database import connect_database
 from tests.contract.delivery_v1_support import authenticated_oversize_envelope
 from tests.mailbox.importer_support import (
     DAY_MS,
@@ -36,7 +47,7 @@ from tests.mailbox.importer_support import (
     scan_size_cap,
     write_delivery,
 )
-from tests.receiver.delivery_acceptance_support import NOW_MS
+from tests.receiver.delivery_acceptance_support import NOW_MS, connection
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,6 +71,201 @@ def test_imports_exact_plaintext_bytes_and_replays_idempotently(
     ack = next(value.acks.glob("*.hba"))
     assert ack_is_deterministic(value, ack)
     assert delivery.exists()
+
+
+def test_committed_ack_uses_envelope_id_as_final_basename(tmp_path: Path) -> None:
+    # Given
+    value = environment(tmp_path)
+    _ = write_delivery(value, envelope_byte=4)
+
+    # When
+    result = import_once(value)
+
+    # Then
+    assert result.imported == 1
+    assert {path.name for path in value.acks.glob("*.hba")} == {"04" * 16 + ".hba"}
+
+
+def test_terminal_ack_uses_envelope_id_as_final_basename(tmp_path: Path) -> None:
+    # Given
+    value = environment(tmp_path)
+    _ = write_delivery(value, payload=b"\xff", envelope_byte=5)
+
+    # When
+    result = import_once(value)
+
+    # Then
+    ack_path = value.acks / ("05" * 16 + ".hba")
+    assert result.quarantined == 1
+    assert ack_path.is_file()
+    assert opened_receipt(ack_path, envelope_byte=5).result == "terminal"
+    first_bytes = ack_path.read_bytes()
+
+    replay = import_once(value)
+
+    assert replay.quarantined == 1
+    assert replay.conflict == 0
+    assert ack_path.read_bytes() == first_bytes
+    assert list(value.acks.glob("*.hba")) == [ack_path]
+
+
+def test_retryable_ack_keeps_ack_id_as_final_basename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    value = environment(tmp_path)
+    _ = write_delivery(value, envelope_byte=6)
+
+    def unavailable(_db_path: Path) -> Never:
+        raise OSError
+
+    monkeypatch.setattr(
+        "health_bridge.receiver.delivery_acceptance.connect_database",
+        unavailable,
+    )
+
+    # When
+    result = import_once(value)
+
+    # Then
+    ack_path = next(value.acks.glob("*.hba"))
+    receipt = opened_receipt(ack_path, envelope_byte=6)
+    expected_name = receipt_ack_id(receipt, bytes([6]) * 16).hex() + ".hba"
+    assert result.retryable == 1
+    assert receipt.result == "retryable"
+    assert ack_path.name == expected_name
+
+
+def test_retryable_then_committed_publishes_distinct_envelope_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    value = environment(tmp_path)
+    _ = write_delivery(value, envelope_byte=7)
+
+    def unavailable(_db_path: Path) -> Never:
+        raise OSError
+
+    monkeypatch.setattr(
+        "health_bridge.receiver.delivery_acceptance.connect_database",
+        unavailable,
+    )
+    retryable = import_once(value)
+    retryable_path = next(value.acks.glob("*.hba"))
+    retryable_bytes = retryable_path.read_bytes()
+    monkeypatch.setattr(
+        "health_bridge.receiver.delivery_acceptance.connect_database",
+        connect_database,
+    )
+
+    # When
+    committed = import_once(value)
+
+    # Then
+    committed_path = value.acks / ("07" * 16 + ".hba")
+    assert retryable.retryable == 1
+    assert committed.imported == 1
+    assert committed.conflict == 0
+    assert retryable_path.read_bytes() == retryable_bytes
+    assert committed_path.is_file()
+    assert {path.name for path in value.acks.glob("*.hba")} == {
+        retryable_path.name,
+        committed_path.name,
+    }
+
+
+def test_duplicate_committed_replay_skips_external_publisher_for_identical_ack(
+    tmp_path: Path,
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value, envelope_byte=8)
+    calls = 0
+
+    def counting_publisher(
+        directory: MailboxDirectoryHandle,
+        final_name: str,
+        content: bytes,
+    ) -> PublicationState:
+        nonlocal calls
+        calls += 1
+        return publish_final_at(directory.acks_fd, final_name, content)
+
+    importer = MailboxImporter(
+        MailboxImportConfig(
+            db_path=value.db_path,
+            mailbox_path=value.mailbox_path,
+            lock_path=value.lock_path,
+            connection=connection(),
+            clock_ms=lambda: NOW_MS,
+            ack_publisher=counting_publisher,
+        )
+    )
+
+    first = importer.import_once()
+    replay = importer.import_once()
+
+    assert first.imported == 1
+    assert replay.idempotent == 1
+    assert replay.conflict == 0
+    assert calls == 1
+
+
+def test_committed_replay_republishes_when_ack_is_missing(tmp_path: Path) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value, envelope_byte=9)
+    calls = 0
+
+    def counting_publisher(
+        directory: MailboxDirectoryHandle,
+        final_name: str,
+        content: bytes,
+    ) -> PublicationState:
+        nonlocal calls
+        calls += 1
+        return publish_final_at(directory.acks_fd, final_name, content)
+
+    importer = MailboxImporter(
+        MailboxImportConfig(
+            db_path=value.db_path,
+            mailbox_path=value.mailbox_path,
+            lock_path=value.lock_path,
+            connection=connection(),
+            clock_ms=lambda: NOW_MS,
+            ack_publisher=counting_publisher,
+        )
+    )
+    _ = importer.import_once()
+    next(value.acks.glob("*.hba")).unlink()
+
+    replay = importer.import_once()
+
+    assert replay.idempotent == 1
+    assert replay.conflict == 0
+    assert calls == 2
+    assert len(list(value.acks.glob("*.hba"))) == 1
+
+
+def test_duplicate_committed_replay_keeps_one_envelope_named_final(
+    tmp_path: Path,
+) -> None:
+    # Given
+    value = environment(tmp_path)
+    _ = write_delivery(value, envelope_byte=8)
+    first = import_once(value)
+    ack_path = value.acks / ("08" * 16 + ".hba")
+    first_bytes = ack_path.read_bytes()
+
+    # When
+    replay = import_once(value)
+
+    # Then
+    assert first.imported == 1
+    assert replay.idempotent == 1
+    assert replay.conflict == 0
+    assert ack_path.read_bytes() == first_bytes
+    assert list(value.acks.glob("*.hba")) == [ack_path]
 
 
 def test_one_shot_importer_rejects_replaced_device_without_external_write(

@@ -81,8 +81,10 @@ def test_view_model_registers_and_syncs_unified_automatic_coverage() -> None:
     assert "optionalTypeCodes: []" not in source
     assert "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in source
     assert "func runBackgroundRefreshSync(reason: AutomaticSyncReason" in source
-    assert "automaticQuantitySyncPlan(" in source
-    assert "historyDepth: quantityPlan.fallbackHistoryDepth" in source
+    assert "HealthBridgeBackgroundSync.workPlan(" in source
+    assert "pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys)" in source
+    assert "typeCodes: [typeCode]" in source
+    assert "historyDepth: .lastDays(1)" in source
 
 
 def test_new_payload_queues_behind_existing_fifo_without_repeated_network_attempt() -> (

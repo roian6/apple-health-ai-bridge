@@ -69,6 +69,8 @@ QA_SOURCE_MEMBERS: Final = frozenset(
         "MailboxAckModels.swift",
         "MailboxAckOutboxLookup.swift",
         "MailboxAckScanner.swift",
+        "MailboxAckWindowReader.swift",
+        "MailboxAckWindowSupport.swift",
         "MailboxAtomicPublisher.swift",
         "MailboxEnvelopeSealer.swift",
         "MailboxKeyIdentity.swift",

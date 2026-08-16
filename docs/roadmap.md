@@ -1,6 +1,6 @@
 # Apple Health AI Bridge Roadmap
 
-Apple Health AI Bridge 1.1.0 is a coordinated release of Receiver/CLI `1.1.0` and iOS Companion `1.1.0 (16)` with the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. The exact iOS candidate, approved TestFlight Public Link, receiver tag, package artifacts, and install site are handled as one verified set.
+Apple Health AI Bridge 1.1.0 is a coordinated release of Receiver/CLI `1.1.0` and iOS Companion `1.1.0 (39)` with the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`. The exact iOS candidate, approved TestFlight Public Link, receiver tag, package artifacts, and install site are handled as one verified set.
 
 ## Current state
 

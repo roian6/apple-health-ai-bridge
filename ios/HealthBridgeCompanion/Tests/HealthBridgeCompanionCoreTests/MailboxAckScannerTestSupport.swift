@@ -56,13 +56,15 @@ final class MailboxAckScannerFixture {
     func scanner(
         lookup selectedLookup: (any MailboxAckOutboxLookingUp)? = nil,
         transientUnsafeRetryLimit: Int = 0,
-        fault: @escaping (MailboxAckScanBoundary) throws -> Void = { _ in }
+        fault: @escaping (MailboxAckScanBoundary) throws -> Void = { _ in },
+        prepareCandidate: @escaping (URL) -> Bool = { _ in true }
     ) -> MailboxAckScanner {
         MailboxAckScanner(
             context: context,
             lookup: selectedLookup ?? lookup,
             locate: { self.transport.locator },
             fault: fault,
+            prepareCandidate: prepareCandidate,
             transientUnsafeRetryLimit: transientUnsafeRetryLimit
         )
     }

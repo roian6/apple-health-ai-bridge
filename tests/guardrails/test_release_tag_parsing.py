@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.guardrails.release_version_fixtures import ReleaseTree, write_release_tree
+from tests.guardrails.release_version_fixtures import (
+    ReleaseTree,
+    commit_release_tree,
+    init_release_repo,
+    write_release_tree,
+)
 
 ROOT = Path(__file__).parents[2]
 RELEASE_TOOL = ROOT / "scripts/release_tools.py"
@@ -76,8 +81,7 @@ def _release_state_fixture(
     *,
     prerelease: bool,
 ) -> tuple[Path, Path, Path]:
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = init_release_repo(tmp_path)
     write_release_tree(
         repo,
         ReleaseTree(
@@ -89,6 +93,7 @@ def _release_state_fixture(
             batch_version="1.0.0",
         ),
     )
+    _ = commit_release_tree(repo, "synthetic receiver v0 release")
     dist = tmp_path / "dist"
     dist.mkdir()
     wheel = dist / "apple_health_ai_bridge-0.1.0-py3-none-any.whl"

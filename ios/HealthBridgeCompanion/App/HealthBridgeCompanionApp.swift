@@ -23,16 +23,22 @@ struct HealthBridgeCompanionApp: App {
                 }
                 .task {
                     await viewModel.bootstrap()
+                    guard !Task.isCancelled, scenePhase == .active else { return }
+                    viewModel.runForegroundMailboxReconciliationIfNeeded()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     if newPhase == .active {
                         Task { @MainActor in
                             await viewModel.bootstrap()
+                            guard !Task.isCancelled, scenePhase == .active else { return }
                             viewModel.runForegroundCatchUpIfNeeded()
                         }
-                    } else if newPhase == .background {
-                        viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
-                        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+                    } else {
+                        viewModel.noteSceneLeftActive()
+                        if newPhase == .background {
+                            viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
+                            BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+                        }
                     }
                 }
         }

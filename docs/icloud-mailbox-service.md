@@ -13,15 +13,92 @@ selected the Beta. It runs the supported `health-bridge receiver start` command
 as an optional per-user macOS LaunchAgent. The receiver remains the only owner
 of mailbox discovery, import, database writes, and acknowledgements.
 
-This service is optional. Direct and Tailscale setups do not install or enable
-it, and `health-bridge setup` never installs it implicitly.
+This service and its signed ACK helper are optional. Direct and Tailscale setups
+do not download, install, validate, or enable either component, and
+`health-bridge setup` never installs them implicitly.
 
 The iCloud container and receiver are owned and operated by the user. The
 project developer does not have access to either endpoint or the transmitted
 HealthKit records. App Store Connect may remain “Data Not Collected” only while
 that developer-no-access boundary remains true.
 
-## Before installing
+## Install and verify the signed helper
+
+Use the Receiver/CLI `1.1.0` GitHub Release assets. Download these files with a
+browser into one private local directory; Health Bridge does not silently
+download them:
+
+- `apple_health_ai_bridge-1.1.0-py3-none-any.whl`;
+- `HealthBridgeMailboxAckPublisher-1.1.0.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.0.manifest.json`;
+- `release-metadata.json`;
+- `SHA256SUMS`.
+
+Do not extract the helper zip yourself. From that directory, verify the exact
+release asset set, install the wheel, structurally validate the helper, and then
+explicitly install it:
+
+```bash
+shasum -a 256 -c SHA256SUMS
+uv tool install ./apple_health_ai_bridge-1.1.0-py3-none-any.whl
+health-bridge mailbox helper verify \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.0.manifest.json \
+  --json
+health-bridge mailbox helper install \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.0.manifest.json \
+  --json
+health-bridge mailbox helper status --json
+```
+
+The expected final result is `{"code": "ready"}`. Structural `verify` is
+available on non-macOS hosts for synthetic or downloaded packets. Installation
+and removal are macOS-only. On macOS, installation additionally checks the
+strict/deep code signature, bundle identity and version/build, required iCloud
+and sandbox entitlements, and hardened runtime without exposing raw `codesign`
+or plist output.
+
+The installer accepts one bounded zip root and rejects traversal, absolute
+paths, links, special files, duplicate names, extra roots, and size/count limit
+violations. It uses a private sibling staging generation and one no-clobber
+directory rename at `~/Library/Application Support/HealthBridge/helpers`, so the
+helper app, manifest, and ownership record become visible together. It never
+overwrites a foreign or drifted app.
+
+Helper status uses fixed, path-free codes:
+
+| Code | Meaning |
+| --- | --- |
+| `ready` | The exact owned generation and platform signature checks pass. |
+| `not_installed` | No helper generation is installed. |
+| `foreign_helper` | The fixed location is partial or has no matching ownership record. |
+| `helper_drift` | Owned metadata, app bytes, identity, permissions, or signature changed. |
+| `unsupported_host` | Installed-helper inspection is unavailable on this host. |
+
+## Create mailbox pairing material
+
+Set the exact values for the user-selected iCloud container and the already
+configured private receiver route. Then run the existing public setup command:
+
+```bash
+: "${HEALTH_BRIDGE_RECEIVER_URL:?Set the exact private /v1/batches URL}"
+: "${HEALTH_BRIDGE_MAILBOX_ROOT:?Set the existing HealthBridgeMailbox/v1 path}"
+: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the selected container identifier}"
+health-bridge setup \
+  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --transport icloud-mailbox \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER"
+```
+
+This creates the private database, temporary single-use pairing page, and
+mailbox-aware receiver command. Keep the setup page and its pairing link out of
+chat, logs, Git, and web servers. Pair only after the private redemption route
+and local receiver health check work. iCloud mailbox delivery remains
+best-effort and may be delayed by iCloud and iOS scheduling.
+
+## Before installing the service
 
 Complete mailbox setup first. You need these existing paths:
 
@@ -115,6 +192,8 @@ Status returns one fixed code:
 | `running_healthy` | launchd reports a running service and the local receiver health check is healthy. |
 | `degraded_retryable` | The service is running but local mailbox health is temporarily unavailable or retryable. |
 | `terminal_failed` | The local receiver reports a terminal mailbox failure. |
+| `helper_not_ready` | The owned service exists, but the signed helper is not installed. |
+| `helper_drift` | The helper location, ownership record, bytes, identity, or signature drifted. |
 | `manifest_drift` | Service ownership, contents, topology, or permissions no longer match. |
 
 Only `running_healthy` exits with status 0. Other status states exit 1 so scripts
@@ -157,6 +236,22 @@ untouched for manual inspection.
 Uninstall verifies only the owned service artifacts. It still works if the
 saved executable, receiver database, or mailbox directory was moved or deleted;
 it never recreates or deletes those receiver-data locations.
+
+After uninstalling the service, retire the helper only if its exact owned
+generation still verifies:
+
+```bash
+health-bridge mailbox helper uninstall --json
+```
+
+The result is `uninstalled` or `already_uninstalled`. Uninstall atomically
+removes the verified generation from the active `helpers` path and preserves it
+under a private `.helpers-retired-*` quarantine name; it never recursively
+deletes helper bytes automatically. Foreign or drifted content is not deleted.
+The helper command does not delete the receiver database, mailbox contents,
+keys, pairing state, or Apple Health data. Quarantined generations may be
+reviewed and removed manually only after the user confirms no concurrent process
+owns them.
 
 ## Synthetic structural check
 

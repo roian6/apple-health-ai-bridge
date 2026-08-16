@@ -4,6 +4,173 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 extension MailboxAckScannerTests {
+    func testExactCandidateMissingReturnsEmptyWithoutInspectingLegacyEntries() throws {
+        let fixture = try MailboxAckScannerFixture()
+        _ = try fixture.publish(
+            fixture.pythonAck(),
+            identifier: String(repeating: "f", count: 32)
+        )
+
+        let report = try fixture.scanner().scanExact(
+            envelopeID: fixture.transport.sealContext.envelopeID
+        )
+
+        XCTAssertTrue(report.events.isEmpty)
+        XCTAssertEqual(report.scannedFinalCount, 0)
+        XCTAssertEqual(report.scannedByteCount, 0)
+        XCTAssertTrue(report.quarantine.records.isEmpty)
+    }
+
+    func testExactCandidateAuthenticatesOnlyEnvelopeNamedFIFOHead() throws {
+        let fixture = try MailboxAckScannerFixture()
+        let envelopeID = fixture.transport.sealContext.envelopeID
+        _ = try fixture.publish(
+            fixture.pythonAck(),
+            identifier: envelopeID.hexV1
+        )
+        _ = try fixture.publish(
+            fixture.pythonAck(),
+            identifier: String(repeating: "f", count: 32)
+        )
+
+        let report = try fixture.scanner().scanExact(envelopeID: envelopeID)
+
+        XCTAssertEqual(report.events.map(\.envelopeID), [envelopeID])
+        XCTAssertEqual(report.scannedFinalCount, 1)
+        XCTAssertEqual(report.quarantine.records, [])
+    }
+
+    func testExactCandidateRequestsMaterializationWithoutOpeningPlaceholder() throws {
+        let fixture = try MailboxAckScannerFixture()
+        let envelopeID = fixture.transport.sealContext.envelopeID
+        _ = try fixture.publish(
+            fixture.pythonAck(),
+            identifier: envelopeID.hexV1
+        )
+        var openBoundaryCount = 0
+        let scanner = fixture.scanner(
+            fault: { boundary in
+                if boundary == .beforeCandidateOpen {
+                    openBoundaryCount += 1
+                }
+            },
+            prepareCandidate: { _ in false }
+        )
+
+        let report = try scanner.scanExact(envelopeID: envelopeID)
+
+        XCTAssertTrue(report.events.isEmpty)
+        XCTAssertEqual(report.scannedFinalCount, 0)
+        XCTAssertEqual(openBoundaryCount, 0)
+    }
+
+    func testExactFIFOHeadRecordDoesNotInvokeGenericOutboxLookup() throws {
+        let fixture = try MailboxAckScannerFixture()
+        let envelopeID = fixture.transport.sealContext.envelopeID
+        _ = try fixture.publish(
+            fixture.pythonAck(),
+            identifier: envelopeID.hexV1
+        )
+        let genericLookup = SpyMailboxAckLookup(.conflict)
+        let scanner = fixture.scanner(lookup: genericLookup)
+        let record = MailboxAckOutboxRecord(
+            envelopeID: envelopeID,
+            payloadSHA256: mailboxSHA256(fixture.transport.payload),
+            receiverID: fixture.context.receiverID,
+            deviceID: fixture.context.deviceID,
+            receiverBindingID: fixture.context.receiverBindingID,
+            connectionGeneration: fixture.context.connectionGeneration,
+            receiverAgreementKeyID: fixture.context.receiverAgreementKeyID,
+            deviceSigningKeyID: fixture.context.deviceSigningKeyID
+        )
+
+        let report = try scanner.scanExact(record: record)
+
+        XCTAssertEqual(report.events.map(\.envelopeID), [envelopeID])
+        XCTAssertEqual(report.events.map(\.classification), [.committed])
+        XCTAssertEqual(genericLookup.callCount, 0)
+    }
+
+    func testDirectRecordReadsOnlySelectedFIFOHeadArtifacts() throws {
+        let fixture = try MailboxAckScannerFixture()
+        let unrelatedPayload = Data("unrelated-payload".utf8)
+        let unrelated = try fixture.transport.outbox.enqueue(
+            unrelatedPayload,
+            receiverIdentity: MailboxTransportFixture.bindingID
+        )
+        _ = try fixture.transport.outbox.finalizeMailboxEnvelope(
+            itemID: unrelated.id,
+            envelope: Data("invalid-unrelated-envelope".utf8),
+            expectedPayloadSHA256: mailboxSHA256(unrelatedPayload)
+        )
+        let lookup = FileOutboxMailboxAckLookup(
+            outbox: fixture.transport.outbox,
+            deviceSigningPublicKey: fixture.context.deviceSigningPublicKey
+        )
+
+        let head = try XCTUnwrap(
+            try fixture.transport.outbox.pendingItem(id: fixture.transport.item.id)
+        )
+        let record = try lookup.record(for: head)
+
+        XCTAssertEqual(record.envelopeID, fixture.transport.sealContext.envelopeID)
+        XCTAssertEqual(record.payloadSHA256, mailboxSHA256(fixture.transport.payload))
+    }
+
+    func testBackgroundCandidateTraversalIsBoundedAndRestartableAfterReopen() throws {
+        let fixture = try MailboxAckScannerFixture()
+        for index in 0 ..< 32 {
+            try Data("synthetic".utf8).write(
+                to: fixture.ackLane.appendingPathComponent(
+                    String(format: "%032x.hba", index)
+                )
+            )
+        }
+
+        let first = try fixture.scanner().candidateWindow(
+            maximumEntries: 8,
+            afterCheckpoint: nil
+        )
+        let restarted = try fixture.scanner().candidateWindow(
+            maximumEntries: 8,
+            afterCheckpoint: try XCTUnwrap(first.nextCheckpoint)
+        )
+
+        XCTAssertLessThanOrEqual(first.inspectedEntryCount, 8)
+        XCTAssertLessThanOrEqual(restarted.inspectedEntryCount, 8)
+        XCTAssertFalse(first.fileNames.isEmpty)
+        XCTAssertFalse(restarted.fileNames.isEmpty)
+        XCTAssertFalse(Set(restarted.fileNames).subtracting(first.fileNames).isEmpty)
+    }
+
+    func testBackgroundCandidateTraversalFallbackIsBoundedAndRestartable() throws {
+        let fixture = try MailboxAckScannerFixture()
+        for index in 0 ..< 32 {
+            try Data("synthetic".utf8).write(
+                to: fixture.ackLane.appendingPathComponent(
+                    String(format: "%032x.hba", index)
+                )
+            )
+        }
+
+        let first = try fixture.scanner().candidateWindow(
+            maximumEntries: 8,
+            afterCheckpoint: nil,
+            strategy: .forceAttributeUnsupported
+        )
+        let restarted = try fixture.scanner().candidateWindow(
+            maximumEntries: 8,
+            afterCheckpoint: try XCTUnwrap(first.nextCheckpoint),
+            strategy: .forceAttributeUnsupported
+        )
+
+        XCTAssertLessThanOrEqual(first.inspectedEntryCount, 8)
+        XCTAssertLessThanOrEqual(restarted.inspectedEntryCount, 8)
+        XCTAssertFalse(first.fileNames.isEmpty)
+        XCTAssertFalse(restarted.fileNames.isEmpty)
+        XCTAssertFalse(Set(restarted.fileNames).subtracting(first.fileNames).isEmpty)
+    }
+
     func testFinalNameOnlyScanIsDeterministicAndBounded() throws {
         let fixture = try MailboxAckScannerFixture()
         let ack = try fixture.pythonAck()
