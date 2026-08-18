@@ -24,13 +24,13 @@ that developer-no-access boundary remains true.
 
 ## Install and verify the signed helper
 
-Use the Receiver/CLI `1.1.0` GitHub Release assets. Download these files with a
+Use the Receiver/CLI `1.1.1` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.0-py3-none-any.whl`;
-- `HealthBridgeMailboxAckPublisher-1.1.0.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.0.manifest.json`;
+- `apple_health_ai_bridge-1.1.1-py3-none-any.whl`;
+- `HealthBridgeMailboxAckPublisher-1.1.1.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.1.manifest.json`;
 - `release-metadata.json`;
 - `SHA256SUMS`.
 
@@ -40,14 +40,14 @@ explicitly install it:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-uv tool install ./apple_health_ai_bridge-1.1.0-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.1.1-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.0.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.0.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.1.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.1.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.0.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.0.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.1.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.1.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```
@@ -56,8 +56,9 @@ The expected final result is `{"code": "ready"}`. Structural `verify` is
 available on non-macOS hosts for synthetic or downloaded packets. Installation
 and removal are macOS-only. On macOS, installation additionally checks the
 strict/deep code signature, bundle identity and version/build, required iCloud
-and sandbox entitlements, and hardened runtime without exposing raw `codesign`
-or plist output.
+and sandbox entitlements, Developer ID publisher and Team ID, a non-device-limited
+provisioning profile, secure timestamp, hardened runtime, and fail-closed
+Gatekeeper acceptance without exposing raw signing or profile output.
 
 The installer accepts one bounded zip root and rejects traversal, absolute
 paths, links, special files, duplicate names, extra roots, and size/count limit

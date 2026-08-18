@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import plistlib
 import subprocess
@@ -16,11 +15,14 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from health_bridge.mailbox.helper_distribution_verifier import (
+        DistributionVerificationRequest,
+    )
+
 from health_bridge.cli import app
 from health_bridge.mailbox import helper_lifecycle
 from health_bridge.mailbox.helper_lifecycle import (
     HELPER_APP_NAME,
-    HELPER_COMPONENT,
     HELPER_EXECUTABLE_NAME,
     HelperError,
     HelperErrorCode,
@@ -32,10 +34,38 @@ from health_bridge.mailbox.helper_lifecycle import (
     validate_helper_release,
     verify_macos_helper,
 )
+from tests.mailbox.test_helper_distribution_contract import manifest_payload
+
+
+@pytest.fixture(autouse=True)
+def allow_synthetic_distribution_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def allow(
+        *,
+        signing_authority: str,
+        team_identifier: str,
+        bundle_identifier: str,
+        icloud_container_identifier: str,
+    ) -> None:
+        del (
+            signing_authority,
+            team_identifier,
+            bundle_identifier,
+            icloud_container_identifier,
+        )
+
+    monkeypatch.setattr(
+        helper_lifecycle,
+        "require_approved_helper_distribution",
+        allow,
+        raising=False,
+    )
+
 
 BUNDLE_ID = "com.example.HealthBridgeMailboxAckPublisher"
 CONTAINER_ID = "iCloud.com.example.HealthBridgeMailboxAckPublisher"
-TAG = "receiver-v1.1.0"
+TAG = "receiver-v1.1.1"
 TAG_OBJECT = "1" * 40
 COMMIT = "2" * 40
 TREE = "3" * 40
@@ -65,7 +95,7 @@ def _write_archive(
             "CFBundleExecutable": HELPER_EXECUTABLE_NAME,
             "CFBundleIdentifier": BUNDLE_ID,
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "1.1.0",
+            "CFBundleShortVersionString": "1.1.1",
             "CFBundleVersion": "1",
             "HealthBridgeExpectedBundleIdentifier": BUNDLE_ID,
             "HealthBridgeICloudContainerIdentifier": CONTAINER_ID,
@@ -96,32 +126,7 @@ def _write_archive(
 
 
 def _write_manifest(path: Path, archive: Path, **updates: object) -> None:
-    payload: dict[str, object] = {
-        "schema_id": "health_bridge.mailbox_ack_helper.release.v1",
-        "schema_version": 1,
-        "component": HELPER_COMPONENT,
-        "artifact": {
-            "bytes": archive.stat().st_size,
-            "filename": "HealthBridgeMailboxAckPublisher-1.1.0.zip",
-            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-        },
-        "bundle": {
-            "build": "1",
-            "identifier": BUNDLE_ID,
-            "icloud_container_identifier": CONTAINER_ID,
-            "version": "1.1.0",
-        },
-        "release": {
-            "commit": COMMIT,
-            "tag": TAG,
-            "tag_object": TAG_OBJECT,
-            "tree": TREE,
-        },
-        "source": {
-            "git_tree": SOURCE_TREE,
-            "path": "macos/HealthBridgeMailboxAckPublisher",
-        },
-    }
+    payload = manifest_payload(archive, schema_version=2)
     payload.update(updates)
     _ = path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -130,11 +135,50 @@ def _write_manifest(path: Path, archive: Path, **updates: object) -> None:
 
 
 def _release(tmp_path: Path) -> tuple[Path, Path]:
-    archive = tmp_path / "HealthBridgeMailboxAckPublisher-1.1.0.zip"
-    manifest = tmp_path / "HealthBridgeMailboxAckPublisher-1.1.0.manifest.json"
+    archive = tmp_path / "HealthBridgeMailboxAckPublisher-1.1.1.zip"
+    manifest = tmp_path / "HealthBridgeMailboxAckPublisher-1.1.1.manifest.json"
     _write_archive(archive)
     _write_manifest(manifest, archive)
     return archive, manifest
+
+
+def test_distribution_lifecycle_routes_to_consumer_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a v2 release manifest and distinct consumer and release verifiers.
+    archive, manifest_path = _release(tmp_path)
+    home = tmp_path / "synthetic-home"
+    consumer_calls: list[Path] = []
+
+    def verify_consumer(request: DistributionVerificationRequest) -> None:
+        consumer_calls.append(request.app)
+
+    def reject_release(_request: DistributionVerificationRequest) -> None:
+        pytest.fail("lifecycle requested publisher-only release verification")
+
+    monkeypatch.setattr(
+        helper_lifecycle,
+        "verify_macos_distribution",
+        verify_consumer,
+    )
+    monkeypatch.setattr(
+        helper_lifecycle,
+        "verify_macos_release_distribution",
+        reject_release,
+    )
+
+    # When: lifecycle verifies an app without an injected test verifier.
+    _ = install_helper(
+        archive,
+        manifest_path,
+        home=home,
+        platform="darwin",
+    )
+
+    # Then: only the base-macOS consumer verifier is selected.
+    assert len(consumer_calls) == 1
+    assert consumer_calls[0].name == HELPER_APP_NAME
 
 
 def test_macos_verifier_ignores_diagnostics_after_complete_entitlements_plist(
@@ -255,7 +299,7 @@ def _verifier(calls: list[Path]) -> PlatformVerifier:
         icloud_container_identifier: str,
     ) -> None:
         assert bundle_identifier == BUNDLE_ID
-        assert bundle_version == "1.1.0"
+        assert bundle_version == "1.1.1"
         assert bundle_build == "1"
         assert icloud_container_identifier == CONTAINER_ID
         assert app.name == HELPER_APP_NAME

@@ -6,7 +6,7 @@ Apple Health AI Bridge contains independently released components. Always includ
 
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.0` | Release tag `receiver-v1.1.0` |
+| Receiver/CLI | `1.1.1` | Release tag `receiver-v1.1.1` |
 | iOS Companion | `1.1.0` | TestFlight build `39` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
@@ -18,7 +18,7 @@ The authoritative machine-readable copy is [`component-versions.json`](../compon
 
 The Python package, receiver service, CLI, and MCP server share one semantic version from `pyproject.toml`. Receiver-only fixes may advance this version without changing the iOS app.
 
-The signed macOS mailbox ACK helper is a Receiver/CLI release asset. Its public manifest binds the helper component version/build, signed zip digest, exact Receiver/CLI tag object/commit/tree, and canonical helper source tree. It is required only for the explicit Mac-only mailbox Beta; Direct installations do not download, install, or validate it.
+The signed macOS mailbox ACK helper is a Receiver/CLI release asset. Its public manifest binds the helper component version/build, signed zip digest, exact Receiver/CLI tag object/commit/tree, canonical helper source tree, Developer ID publisher and Team ID, non-device-limited provisioning profile, secure timestamp, hardened runtime, notarization, stapled ticket, and Gatekeeper assessment. It is required only for the explicit Mac-only mailbox Beta; Direct installations do not download, install, or validate it.
 
 Starting with the release after `1.0.1`, receiver release tags use the component-scoped form:
 
@@ -66,7 +66,7 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.1.0
+Receiver/CLI 1.1.1
 Compatible iOS Companion 1.1.0 (build 39)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```

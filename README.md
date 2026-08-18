@@ -48,7 +48,7 @@ Do not copy a sample hostname, expose receiver port `8765` directly to the publi
 Install the current signed receiver release:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.0"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.1"
 ```
 
 The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configured `/v1/batches` URL. Only then run:
@@ -76,7 +76,7 @@ Adding a client creates another process that can read the private health databas
 
 Direct is the default transport, including direct private HTTPS and trusted-LAN setups. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta; a Direct failure never switches transports automatically.
 
-The Beta applies application-layer encryption and signatures before an envelope reaches the user's iCloud container. The user's Mac receiver decrypts and commits accepted batches, then returns an encrypted, signed ACK; the app advances committed local progress only after validating a committed ACK. The iCloud container and receiver remain user-owned. Mailbox ACK publication also requires the exact signed macOS helper published with Receiver/CLI `1.1.0`; users verify and explicitly install it before the optional per-user LaunchAgent. Follow the [mailbox service guide](docs/icloud-mailbox-service.md).
+The Beta applies application-layer encryption and signatures before an envelope reaches the user's iCloud container. The user's Mac receiver decrypts and commits accepted batches, then returns an encrypted, signed ACK; the app advances committed local progress only after validating a committed ACK. The iCloud container and receiver remain user-owned. Mailbox ACK publication also requires the exact signed, notarized macOS helper published with Receiver/CLI `1.1.1`; users verify and explicitly install it before the optional per-user LaunchAgent. Follow the [mailbox service guide](docs/icloud-mailbox-service.md).
 
 ### 4. Pair and sync
 
@@ -148,13 +148,13 @@ The repository contains independently released components. Always include the co
 
 | Surface | Current version | Identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.0` | signed tag `receiver-v1.1.0` |
+| Receiver/CLI | `1.1.1` | signed tag `receiver-v1.1.1` |
 | iOS Companion | `1.1.0` | TestFlight build `39` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
 
-User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with the signed mailbox helper and its public manifest, SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, helper source tree, Git tree, and Batch Protocol together. Existing `v1.0.0` and `v1.0.1` tags remain immutable; current and future receiver releases use component-scoped tags such as `receiver-v1.1.0`.
+User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with the signed mailbox helper and its public manifest, SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, helper source tree, Git tree, and Batch Protocol together. Existing `v1.0.0`, `v1.0.1`, and `receiver-v1.1.0` releases remain immutable; current and future receiver releases use component-scoped tags such as `receiver-v1.1.1`.
 
 ## Build from source
 
