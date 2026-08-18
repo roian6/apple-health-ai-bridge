@@ -12,7 +12,11 @@ on:
         required: true
         type: string
       helper_sha256:
-        description: SHA-256 printed by the owner staging command
+        description: Helper archive SHA-256 printed by the owner staging command
+        required: true
+        type: string
+      helper_manifest_sha256:
+        description: Helper manifest SHA-256 printed by the owner staging command
         required: true
         type: string
 
@@ -24,8 +28,139 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify_helper_on_macos:
+    name: Verify exact draft helper on clean macOS
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_HELPER_SHA256: ${{ inputs.helper_sha256 }}
+      EXPECTED_HELPER_MANIFEST_SHA256: ${{ inputs.helper_manifest_sha256 }}
+    steps:
+      - name: Bind exact unpublished draft and immutable source
+        id: bind
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$DRAFT_RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^receiver-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_HELPER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          gh api "$release_api" > "$RUNNER_TEMP/helper-release-binding.json"
+          test "$(jq -r \
+            --arg tag "$RELEASE_TAG" \
+            '.id == ($ENV.DRAFT_RELEASE_ID | tonumber) and .tag_name == $tag and .draft == true and .published_at == null' \
+            "$RUNNER_TEMP/helper-release-binding.json")" = "true"
+          matching_release_ids="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
+          test "$matching_release_ids" = "$DRAFT_RELEASE_ID"
+          tag_object_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '.object.sha')"
+          [[ "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.verification.verified == true and .verification.reason == "valid"')" = "true"
+          target_commit_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.sha')"
+          [[ "$target_commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          default_branch="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          default_main_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
+            --jq '.commit.sha')"
+          test "$target_commit_sha" = "$default_main_sha"
+          tree_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/commits/${target_commit_sha}" \
+            --jq '.tree.sha')"
+          [[ "$tree_sha" =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "tag_object_sha=$tag_object_sha"
+            echo "target_commit_sha=$target_commit_sha"
+            echo "tree_sha=$tree_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact helper-bound commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ steps.bind.outputs.target_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        with:
+          version: "0.11.14"
+          enable-cache: false
+
+      - name: Download exact bound draft helper assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
+          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
+          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
+          uv sync --all-extras --dev --locked
+          version="${RELEASE_TAG#receiver-v}"
+          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
+          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
+          test "$(gh api "$release_api" \
+            --jq '[.assets[].name] | sort | join(",")')" = "$expected_assets"
+          mkdir dist
+          IFS=',' read -r -a expected_names <<< "$expected_assets"
+          for asset_name in "${expected_names[@]}"; do
+            asset_id="$(gh api "$release_api" \
+              --jq ".assets[] | select(.name == \"${asset_name}\") | .id")"
+            [[ "$asset_id" =~ ^[0-9]+$ ]]
+            gh api "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              -H "Accept: application/octet-stream" > "dist/${asset_name}"
+          done
+          archive="dist/HealthBridgeMailboxAckPublisher-${version}.zip"
+          manifest="dist/HealthBridgeMailboxAckPublisher-${version}.manifest.json"
+          test "$(shasum -a 256 "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_HELPER_SHA256"
+          actual_manifest_sha256="$(shasum -a 256 "$manifest" | cut -d ' ' -f 1)"
+          test "$actual_manifest_sha256" = "$EXPECTED_HELPER_MANIFEST_SHA256"
+          common=(
+            --repo .
+            --dist-dir dist
+            --tag "$RELEASE_TAG"
+            --tag-object "$PINNED_TAG_OBJECT_SHA"
+            --commit "$PINNED_TARGET_COMMIT_SHA"
+            --tree "$PINNED_TREE_SHA"
+            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
+          )
+          uv run python scripts/release_tools.py verify-helper "${common[@]}"
+          mkdir "$RUNNER_TEMP/helper-app"
+          ditto -x -k "$archive" "$RUNNER_TEMP/helper-app"
+          helper_executable="$RUNNER_TEMP/helper-app/HealthBridgeMailboxAckPublisher.app/Contents/MacOS/HealthBridgeMailboxAckPublisher"
+          test -f "$helper_executable"
+          helper_architectures="$(/usr/bin/lipo -archs "$helper_executable")"
+          if [[ "$helper_architectures" != "arm64 x86_64" && "$helper_architectures" != "x86_64 arm64" ]]; then
+            echo "helper executable is not universal2" >&2
+            exit 1
+          fi
+          uv run python scripts/verify_helper_distribution.py \
+            --archive "$archive" \
+            --manifest "$manifest" \
+            --app "$RUNNER_TEMP/helper-app/HealthBridgeMailboxAckPublisher.app"
+
   publish:
     name: Verify helper and publish existing draft
+    needs: verify_helper_on_macos
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: github-release
@@ -37,6 +172,7 @@ jobs:
       DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
       RELEASE_TAG: ${{ inputs.tag }}
       EXPECTED_HELPER_SHA256: ${{ inputs.helper_sha256 }}
+      EXPECTED_HELPER_MANIFEST_SHA256: ${{ inputs.helper_manifest_sha256 }}
     steps:
       - name: Bind existing unpublished draft and immutable source
         id: bind
@@ -47,6 +183,7 @@ jobs:
           [[ "$DRAFT_RELEASE_ID" =~ ^[0-9]+$ ]]
           [[ "$RELEASE_TAG" =~ ^receiver-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
           [[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_HELPER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
           gh api "$release_api" > "$RUNNER_TEMP/release-binding.json"
           bound_draft="$(jq -r \
@@ -150,6 +287,9 @@ jobs:
           actual_helper_sha256="$(sha256sum \
             "dist/HealthBridgeMailboxAckPublisher-${version}.zip" | cut -d ' ' -f 1)"
           test "$actual_helper_sha256" = "$EXPECTED_HELPER_SHA256"
+          actual_manifest_sha256="$(sha256sum \
+            "dist/HealthBridgeMailboxAckPublisher-${version}.manifest.json" | cut -d ' ' -f 1)"
+          test "$actual_manifest_sha256" = "$EXPECTED_HELPER_MANIFEST_SHA256"
 
       - name: Verify helper source binding and create final checksums
         env:
@@ -166,6 +306,7 @@ jobs:
             --commit "$PINNED_TARGET_COMMIT_SHA"
             --tree "$PINNED_TREE_SHA"
             --helper-sha256 "$EXPECTED_HELPER_SHA256"
+            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
           )
           uv run python scripts/release_tools.py verify-helper "${common[@]}"
           uv run python scripts/release_tools.py final-checksums \
@@ -194,7 +335,8 @@ jobs:
             --tag-object "$PINNED_TAG_OBJECT_SHA" \
             --commit "$PINNED_TARGET_COMMIT_SHA" \
             --tree "$PINNED_TREE_SHA" \
-            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
+            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
 
       - name: Attest owner-produced helper and final checksums
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -240,7 +382,8 @@ jobs:
             --tag-object "$PINNED_TAG_OBJECT_SHA" \
             --commit "$PINNED_TARGET_COMMIT_SHA" \
             --tree "$PINNED_TREE_SHA" \
-            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
+            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
           gh release edit "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false
@@ -254,4 +397,5 @@ jobs:
             --tag-object "$PINNED_TAG_OBJECT_SHA" \
             --commit "$PINNED_TARGET_COMMIT_SHA" \
             --tree "$PINNED_TREE_SHA" \
-            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
+            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"

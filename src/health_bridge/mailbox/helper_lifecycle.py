@@ -16,21 +16,50 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum, unique
 from pathlib import Path, PurePosixPath
-from typing import ClassVar, Final, Literal, Protocol, cast
-from xml.parsers.expat import ExpatError
+from typing import Final, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
-from typing_extensions import override
+from pydantic import ValidationError
 
 from health_bridge import __version__
 from health_bridge.launchd.exclusive_rename import exclusive_rename
 from health_bridge.launchd.models import LaunchdServiceError
+from health_bridge.mailbox.helper_distribution_contract import (
+    HELPER_COMPONENT as _HELPER_COMPONENT,
+)
+from health_bridge.mailbox.helper_distribution_contract import (
+    HELPER_RELEASE_MANIFEST_ADAPTER,
+    ExactModel,
+    HelperReleaseManifest,
+    require_approved_helper_distribution,
+)
+from health_bridge.mailbox.helper_distribution_contract import (
+    HELPER_SOURCE_PATH as DISTRIBUTION_HELPER_SOURCE_PATH,
+)
+from health_bridge.mailbox.helper_distribution_contract import (
+    HelperError as _HelperError,
+)
+from health_bridge.mailbox.helper_distribution_contract import (
+    HelperErrorCode as _HelperErrorCode,
+)
+from health_bridge.mailbox.helper_distribution_contract import (
+    HelperOwnership as _HelperOwnership,
+)
+from health_bridge.mailbox.helper_distribution_verifier import (
+    DistributionVerificationRequest,
+    LegacyVerificationRequest,
+    verify_general_distribution,
+    verify_legacy_signature,
+    verify_release_distribution,
+)
 from health_bridge.private_files import ensure_private_directory
 
-HELPER_COMPONENT: Final = "HealthBridgeMailboxAckPublisher"
+HELPER_COMPONENT: Final = _HELPER_COMPONENT
+HelperError = _HelperError
+HelperErrorCode = _HelperErrorCode
+HelperOwnership = _HelperOwnership
 HELPER_APP_NAME: Final = f"{HELPER_COMPONENT}.app"
 HELPER_EXECUTABLE_NAME: Final = HELPER_COMPONENT
-HELPER_SOURCE_PATH: Final = "macos/HealthBridgeMailboxAckPublisher"
+HELPER_SOURCE_PATH: Final = DISTRIBUTION_HELPER_SOURCE_PATH
 HELPER_RELATIVE_DIR: Final = Path("Library/Application Support/HealthBridge/helpers")
 HELPER_MANIFEST_NAME: Final = f"{HELPER_COMPONENT}.manifest.json"
 HELPER_OWNERSHIP_NAME: Final = f".{HELPER_COMPONENT}.ownership.json"
@@ -44,6 +73,7 @@ MAX_CODESIGN_OUTPUT_BYTES: Final = 1024 * 1024
 _CODESIGN_TIMEOUT_SECONDS: Final = 30.0
 _SHA256_LENGTH: Final = 64
 _GIT_SHA_LENGTH: Final = 40
+_LEGACY_V1_INSTALL_VERSIONS: Final = frozenset({"1.1.0"})
 
 
 @unique
@@ -60,104 +90,7 @@ class HelperStatusCode(StrEnum):
     VALID = "valid"
 
 
-@unique
-class HelperErrorCode(StrEnum):
-    UNSUPPORTED_HOST = "unsupported_host"
-    INVALID_MANIFEST = "invalid_manifest"
-    UNSAFE_ARCHIVE = "unsafe_archive"
-    ARTIFACT_MISMATCH = "artifact_mismatch"
-    SOURCE_MISMATCH = "source_mismatch"
-    SIGNATURE_INVALID = "signature_invalid"
-    ENTITLEMENTS_INVALID = "entitlements_invalid"
-    FOREIGN_HELPER = "foreign_helper"
-    HELPER_DRIFT = "helper_drift"
-    UNSAFE_FILESYSTEM = "unsafe_filesystem"
-
-
-_ERROR_MESSAGES: Final[dict[HelperErrorCode, str]] = {
-    HelperErrorCode.UNSUPPORTED_HOST: (
-        "Mailbox helper lifecycle is unavailable on this host."
-    ),
-    HelperErrorCode.INVALID_MANIFEST: "Mailbox helper manifest is invalid.",
-    HelperErrorCode.UNSAFE_ARCHIVE: "Mailbox helper archive is unsafe.",
-    HelperErrorCode.ARTIFACT_MISMATCH: (
-        "Mailbox helper artifact does not match its manifest."
-    ),
-    HelperErrorCode.SOURCE_MISMATCH: (
-        "Mailbox helper source identity does not match this release."
-    ),
-    HelperErrorCode.SIGNATURE_INVALID: "Mailbox helper signature is invalid.",
-    HelperErrorCode.ENTITLEMENTS_INVALID: "Mailbox helper entitlements are invalid.",
-    HelperErrorCode.FOREIGN_HELPER: "Mailbox helper location contains unowned content.",
-    HelperErrorCode.HELPER_DRIFT: "Installed mailbox helper has drifted.",
-    HelperErrorCode.UNSAFE_FILESYSTEM: "Mailbox helper filesystem is unsafe.",
-}
-
-
-class HelperError(Exception):
-    def __init__(self, code: HelperErrorCode) -> None:
-        super().__init__()
-        self.code: HelperErrorCode = code
-
-    @override
-    def __str__(self) -> str:
-        return _ERROR_MESSAGES[self.code]
-
-
-class _ExactModel(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        strict=True,
-    )
-
-
-class HelperArtifact(_ExactModel):
-    bytes: int
-    filename: str
-    sha256: str
-
-
-class HelperBundle(_ExactModel):
-    build: str
-    identifier: str
-    icloud_container_identifier: str
-    version: str
-
-
-class HelperReleaseIdentity(_ExactModel):
-    commit: str
-    tag: str
-    tag_object: str
-    tree: str
-
-
-class HelperSourceIdentity(_ExactModel):
-    git_tree: str
-    path: Literal["macos/HealthBridgeMailboxAckPublisher"]
-
-
-class HelperReleaseManifest(_ExactModel):
-    schema_id: Literal["health_bridge.mailbox_ack_helper.release.v1"]
-    schema_version: Literal[1]
-    component: Literal["HealthBridgeMailboxAckPublisher"]
-    artifact: HelperArtifact
-    bundle: HelperBundle
-    release: HelperReleaseIdentity
-    source: HelperSourceIdentity
-
-
-class HelperOwnership(_ExactModel):
-    schema_id: Literal["health_bridge.mailbox_ack_helper.ownership.v1"]
-    schema_version: Literal[1]
-    app_tree_sha256: str
-    artifact_sha256: str
-    manifest_sha256: str
-    release_commit: str
-    source_git_tree: str
-
-
-class HelperResult(_ExactModel):
+class HelperResult(ExactModel):
     code: HelperStatusCode
 
 
@@ -203,7 +136,7 @@ def _validate_helper_release_snapshot(
     raw_manifest = _read_regular_bounded(manifest_path, MAX_MANIFEST_BYTES)
     raw_archive = _read_regular_bounded(archive, MAX_ARCHIVE_BYTES)
     try:
-        manifest = HelperReleaseManifest.model_validate_json(raw_manifest)
+        manifest = HELPER_RELEASE_MANIFEST_ADAPTER.validate_json(raw_manifest)
     except ValidationError as exc:
         raise HelperError(HelperErrorCode.INVALID_MANIFEST) from exc
     _validate_manifest_scalars(manifest)
@@ -255,6 +188,25 @@ def validate_helper_release(
     return manifest
 
 
+def validate_general_distribution_helper_release(
+    archive: Path,
+    manifest_path: Path,
+    *,
+    expected_release: tuple[str, str, str, str] | None = None,
+    expected_source_tree: str | None = None,
+    expected_version: str | None = None,
+) -> HelperReleaseManifest:
+    manifest, _, _ = _validate_helper_release_snapshot(
+        archive,
+        manifest_path,
+        expected_release=expected_release,
+        expected_source_tree=expected_source_tree,
+        expected_version=expected_version,
+    )
+    _require_approved_manifest_distribution(manifest)
+    return manifest
+
+
 def install_helper(
     archive: Path,
     manifest_path: Path,
@@ -269,9 +221,14 @@ def install_helper(
         manifest_path,
         expected_version=__version__,
     )
+    if manifest.distribution_identity is None:
+        if __version__ not in _LEGACY_V1_INSTALL_VERSIONS:
+            raise HelperError(HelperErrorCode.INVALID_MANIFEST)
+    else:
+        _require_approved_manifest_distribution(manifest)
     paths = HelperPaths.production(home)
     existing = _entry_presence(paths)
-    selected_verifier = verifier or verify_macos_helper
+    selected_verifier = verifier
     if any(existing):
         status = read_helper_status(
             home=home,
@@ -346,21 +303,34 @@ def read_helper_status(
         _require_private_regular(paths.ownership)
         raw_manifest = _read_regular_bounded(paths.manifest, MAX_MANIFEST_BYTES)
         raw_ownership = _read_regular_bounded(paths.ownership, MAX_MANIFEST_BYTES)
-        manifest = HelperReleaseManifest.model_validate_json(raw_manifest)
+        manifest = HELPER_RELEASE_MANIFEST_ADAPTER.validate_json(raw_manifest)
         ownership = HelperOwnership.model_validate_json(raw_ownership)
         _validate_manifest_scalars(manifest)
-        if (
-            hashlib.sha256(raw_manifest).hexdigest() != ownership.manifest_sha256
-            or manifest.artifact.sha256 != ownership.artifact_sha256
-            or manifest.release.commit != ownership.release_commit
-            or manifest.source.git_tree != ownership.source_git_tree
-            or _tree_digest(paths.app) != ownership.app_tree_sha256
-        ):
-            return HelperResult(code=HelperStatusCode.HELPER_DRIFT)
-        _verify_staged_app(paths.app, manifest, verifier or verify_macos_helper)
+        if manifest.distribution_identity is not None:
+            _require_approved_manifest_distribution(manifest)
+        manifest_is_supported = (
+            manifest.distribution_identity is not None
+            or __version__ in _LEGACY_V1_INSTALL_VERSIONS
+        )
+        if manifest_is_supported:
+            if (
+                hashlib.sha256(raw_manifest).hexdigest() != ownership.manifest_sha256
+                or manifest.artifact.sha256 != ownership.artifact_sha256
+                or manifest.release.commit != ownership.release_commit
+                or manifest.source.git_tree != ownership.source_git_tree
+                or _tree_digest(paths.app) != ownership.app_tree_sha256
+            ):
+                return HelperResult(code=HelperStatusCode.HELPER_DRIFT)
+            _verify_staged_app(paths.app, manifest, verifier)
     except (HelperError, OSError, ValidationError):
         return HelperResult(code=HelperStatusCode.HELPER_DRIFT)
-    return HelperResult(code=HelperStatusCode.READY)
+    return HelperResult(
+        code=(
+            HelperStatusCode.READY
+            if manifest_is_supported
+            else HelperStatusCode.HELPER_DRIFT
+        )
+    )
 
 
 def require_ready_helper(
@@ -390,7 +360,7 @@ def uninstall_helper(
     status = read_helper_status(
         home=home,
         platform="darwin",
-        verifier=verifier or verify_macos_helper,
+        verifier=verifier,
     )
     if status.code is not HelperStatusCode.READY:
         code = (
@@ -445,45 +415,50 @@ def verify_macos_helper(
         bundle_build=bundle_build,
         icloud_container_identifier=icloud_container_identifier,
     )
-    verified = _run_codesign(["--verify", "--strict", "--deep", str(app)])
-    if verified.returncode != 0:
-        raise HelperError(HelperErrorCode.SIGNATURE_INVALID)
-    entitlements_result = _run_codesign(["-d", "--entitlements", ":-", str(app)])
-    if entitlements_result.returncode != 0:
-        raise HelperError(HelperErrorCode.ENTITLEMENTS_INVALID)
-    entitlements = _parse_codesign_plist(
-        entitlements_result.stdout + entitlements_result.stderr
+    verify_legacy_signature(
+        LegacyVerificationRequest(
+            app=app,
+            bundle_identifier=bundle_identifier,
+            icloud_container_identifier=icloud_container_identifier,
+        ),
+        _run_codesign,
     )
-    required = {
-        "com.apple.security.app-sandbox": True,
-        "com.apple.developer.icloud-container-identifiers": [
-            icloud_container_identifier
-        ],
-        "com.apple.developer.ubiquity-container-identifiers": [
-            icloud_container_identifier
-        ],
-        "com.apple.developer.icloud-services": ["CloudDocuments"],
-    }
-    if any(entitlements.get(key) != value for key, value in required.items()):
-        raise HelperError(HelperErrorCode.ENTITLEMENTS_INVALID)
-    details = _run_codesign(["-d", "--verbose=4", str(app)])
-    combined = details.stdout + details.stderr
-    if (
-        details.returncode != 0
-        or re.search(
-            rb"^.*flags=.*\bruntime\b.*$",
-            combined,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        is None
-    ):
-        raise HelperError(HelperErrorCode.SIGNATURE_INVALID)
+
+
+def verify_macos_distribution(request: DistributionVerificationRequest) -> None:
+    _validate_distribution_bundle(request)
+    verify_general_distribution(request, _run_codesign, _run_platform_command)
+
+
+def verify_macos_release_distribution(
+    request: DistributionVerificationRequest,
+) -> None:
+    _validate_distribution_bundle(request)
+    verify_release_distribution(request, _run_codesign, _run_platform_command)
+
+
+def _validate_distribution_bundle(request: DistributionVerificationRequest) -> None:
+    _validate_bundle_info(
+        _read_regular_bounded(request.app / "Contents/Info.plist", MAX_PLIST_BYTES),
+        bundle_identifier=request.bundle_identifier,
+        bundle_version=request.bundle_version,
+        bundle_build=request.bundle_build,
+        icloud_container_identifier=request.icloud_container_identifier,
+    )
 
 
 def _run_codesign(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return _run_bounded_command(["/usr/bin/codesign", *arguments])
+
+
+def _run_platform_command(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return _run_bounded_command(arguments)
+
+
+def _run_bounded_command(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
     try:
         completed = subprocess.run(  # noqa: S603  # nosec B603
-            ["/usr/bin/codesign", *arguments],
+            arguments,
             check=False,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -498,22 +473,6 @@ def _run_codesign(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
     ):
         raise HelperError(HelperErrorCode.SIGNATURE_INVALID)
     return completed
-
-
-def _parse_codesign_plist(raw: bytes) -> dict[str, object]:
-    start = raw.find(b"<?xml")
-    if start < 0:
-        start = raw.find(b"<plist")
-    end = raw.find(b"</plist>", start)
-    if start < 0 or end < 0:
-        raise HelperError(HelperErrorCode.ENTITLEMENTS_INVALID)
-    try:
-        payload = cast("object", plistlib.loads(raw[start : end + len(b"</plist>")]))
-    except (ExpatError, plistlib.InvalidFileException) as exc:
-        raise HelperError(HelperErrorCode.ENTITLEMENTS_INVALID) from exc
-    if not isinstance(payload, dict):
-        raise HelperError(HelperErrorCode.ENTITLEMENTS_INVALID)
-    return cast("dict[str, object]", payload)
 
 
 def _validate_manifest_scalars(manifest: HelperReleaseManifest) -> None:
@@ -542,6 +501,30 @@ def _validate_manifest_scalars(manifest: HelperReleaseManifest) -> None:
         is None
         or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", manifest.bundle.version) is None
         or not manifest.bundle.build.isdecimal()
+    ):
+        raise HelperError(HelperErrorCode.INVALID_MANIFEST)
+    distribution = manifest.distribution_identity
+    if distribution is None:
+        return
+    profile = distribution.provisioning_profile
+    team_identifier = distribution.team_identifier
+    expected_application = f"{team_identifier}.{manifest.bundle.identifier}"
+    expected_containers = (manifest.bundle.icloud_container_identifier,)
+    authority_prefix = "Developer ID Application: "
+    if (
+        re.fullmatch(r"[A-Z0-9]{10}", team_identifier) is None
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            distribution.notarization.submission_id,
+        )
+        is None
+        or not distribution.signing_authority.startswith(authority_prefix)
+        or distribution.signing_authority == authority_prefix
+        or not distribution.signing_authority.endswith(f" ({team_identifier})")
+        or profile.team_identifier != team_identifier
+        or profile.application_identifier != expected_application
+        or profile.icloud_container_identifiers != expected_containers
+        or profile.ubiquity_container_identifiers != expected_containers
     ):
         raise HelperError(HelperErrorCode.INVALID_MANIFEST)
 
@@ -743,13 +726,44 @@ def _write_new_private(path: Path, content: bytes) -> None:
 def _verify_staged_app(
     app: Path,
     manifest: HelperReleaseManifest,
-    verifier: PlatformVerifier,
+    verifier: PlatformVerifier | None,
 ) -> None:
-    verifier(
-        app,
+    arguments = {
+        "bundle_identifier": manifest.bundle.identifier,
+        "bundle_version": manifest.bundle.version,
+        "bundle_build": manifest.bundle.build,
+        "icloud_container_identifier": manifest.bundle.icloud_container_identifier,
+    }
+    if verifier is not None:
+        verifier(app, **arguments)
+        return
+    distribution = manifest.distribution_identity
+    if distribution is None:
+        verify_macos_helper(app, **arguments)
+        return
+    _require_approved_manifest_distribution(manifest)
+    verify_macos_distribution(
+        DistributionVerificationRequest(
+            app=app,
+            bundle_identifier=manifest.bundle.identifier,
+            icloud_container_identifier=manifest.bundle.icloud_container_identifier,
+            bundle_version=manifest.bundle.version,
+            bundle_build=manifest.bundle.build,
+            distribution=distribution,
+        )
+    )
+
+
+def _require_approved_manifest_distribution(
+    manifest: HelperReleaseManifest,
+) -> None:
+    distribution = manifest.distribution_identity
+    if distribution is None:
+        raise HelperError(HelperErrorCode.INVALID_MANIFEST)
+    require_approved_helper_distribution(
+        signing_authority=distribution.signing_authority,
+        team_identifier=distribution.team_identifier,
         bundle_identifier=manifest.bundle.identifier,
-        bundle_version=manifest.bundle.version,
-        bundle_build=manifest.bundle.build,
         icloud_container_identifier=manifest.bundle.icloud_container_identifier,
     )
 

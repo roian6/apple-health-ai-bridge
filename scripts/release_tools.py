@@ -24,7 +24,7 @@ from release_versions import (
 
 from health_bridge.mailbox.helper_lifecycle import (
     HelperError,
-    validate_helper_release,
+    validate_general_distribution_helper_release,
 )
 
 HEX_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
@@ -125,6 +125,7 @@ class HelperVerificationRequest:
     commit: str
     tree: str
     helper_sha256: str
+    helper_manifest_sha256: str
     output: Path | None = None
 
 
@@ -132,6 +133,7 @@ class HelperVerificationRequest:
 class FinalReleaseVerificationRequest:
     release: DraftVerificationRequest
     helper_sha256: str
+    helper_manifest_sha256: str
 
 
 def _project_metadata(repo: Path) -> tuple[str, str]:
@@ -955,6 +957,12 @@ def verify_packet(request: PacketVerificationRequest) -> None:
 def _validate_helper_packet(
     request: HelperVerificationRequest,
 ) -> tuple[set[str], dict[str, tuple[str, int]]]:
+    if SHA256_PATTERN.fullmatch(request.helper_sha256) is None:
+        message = "expected helper digest must be lowercase SHA-256"
+        raise ReleaseError(message)
+    if SHA256_PATTERN.fullmatch(request.helper_manifest_sha256) is None:
+        message = "expected helper manifest digest must be lowercase SHA-256"
+        raise ReleaseError(message)
     versions = validate_tag(request.repo, request.tag)
     expected_git = _expected_git_identity(
         tag=request.tag,
@@ -962,6 +970,15 @@ def _validate_helper_packet(
         commit=request.commit,
         tree=request.tree,
     )
+    helper = _expected_helper_metadata(request.repo, versions.project_version)
+    archive_name = cast("str", helper["archive_filename"])
+    manifest_name = cast("str", helper["manifest_filename"])
+    archive = request.dist / archive_name
+    manifest_path = request.dist / manifest_name
+    source = cast("dict[str, str]", helper["source"])
+    if _sha256(manifest_path) != request.helper_manifest_sha256:
+        message = "helper manifest digest does not match continuation input"
+        raise ReleaseError(message)
     metadata_path = request.dist / "release-metadata.json"
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     records = _validate_release_metadata(
@@ -970,17 +987,8 @@ def _validate_helper_packet(
         versions,
         expected_git=expected_git,
     )
-    helper = _expected_helper_metadata(request.repo, versions.project_version)
-    archive_name = cast("str", helper["archive_filename"])
-    manifest_name = cast("str", helper["manifest_filename"])
-    archive = request.dist / archive_name
-    manifest_path = request.dist / manifest_name
-    source = cast("dict[str, str]", helper["source"])
-    if SHA256_PATTERN.fullmatch(request.helper_sha256) is None:
-        message = "expected helper digest must be lowercase SHA-256"
-        raise ReleaseError(message)
     try:
-        helper_manifest = validate_helper_release(
+        helper_manifest = validate_general_distribution_helper_release(
             archive,
             manifest_path,
             expected_release=(
@@ -1156,6 +1164,7 @@ def verify_final_release_state(
         commit=release.commit,
         tree=release.tree,
         helper_sha256=request.helper_sha256,
+        helper_manifest_sha256=request.helper_manifest_sha256,
         output=checksum_path,
     )
     names, _records = _validate_helper_packet(helper_request)
@@ -1260,6 +1269,7 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         helper_parser.add_argument("--commit", required=True)
         helper_parser.add_argument("--tree", required=True)
         helper_parser.add_argument("--helper-sha256", required=True)
+        helper_parser.add_argument("--helper-manifest-sha256", required=True)
         if command == "final-checksums":
             helper_parser.add_argument("--output", type=Path, required=True)
 
@@ -1300,6 +1310,7 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         final_parser.add_argument("--commit", required=True)
         final_parser.add_argument("--tree", required=True)
         final_parser.add_argument("--helper-sha256", required=True)
+        final_parser.add_argument("--helper-manifest-sha256", required=True)
     return parser
 
 
@@ -1405,6 +1416,7 @@ def main() -> int:  # noqa: C901, PLR0912
                 commit=args.commit,
                 tree=args.tree,
                 helper_sha256=args.helper_sha256,
+                helper_manifest_sha256=args.helper_manifest_sha256,
                 output=(args.output if args.command == "final-checksums" else None),
             )
             if args.command == "verify-helper":
@@ -1452,6 +1464,7 @@ def main() -> int:  # noqa: C901, PLR0912
                         tree=args.tree,
                     ),
                     helper_sha256=args.helper_sha256,
+                    helper_manifest_sha256=args.helper_manifest_sha256,
                 ),
                 expected_draft=args.command == "verify-final-draft",
             )
