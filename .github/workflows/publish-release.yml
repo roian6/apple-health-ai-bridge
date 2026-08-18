@@ -32,8 +32,10 @@ jobs:
     name: Verify exact draft helper on clean macOS
     runs-on: macos-15
     timeout-minutes: 20
+    # GitHub's API requires contents:write to read unpublished draft assets.
+    # This job never uploads, edits, or publishes release content.
     permissions:
-      contents: read
+      contents: write
     env:
       DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
       RELEASE_TAG: ${{ inputs.tag }}
