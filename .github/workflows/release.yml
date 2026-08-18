@@ -23,7 +23,7 @@ jobs:
       baseline_commit_sha: ${{ steps.pin.outputs.baseline_commit_sha }}
     steps:
       - name: Check out release ref
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -102,7 +102,7 @@ jobs:
       PINNED_BASELINE_COMMIT_SHA: ${{ needs.verify.outputs.baseline_commit_sha }}
     steps:
       - name: Check out exact tag target
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.target_commit_sha }}
           fetch-depth: 0
@@ -213,7 +213,7 @@ jobs:
         working-directory: ios/HealthBridgeCompanion
     steps:
       - name: Check out exact tag target
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.target_commit_sha }}
           fetch-depth: 0
@@ -281,7 +281,7 @@ jobs:
           fi
 
       - name: Check out exact tag target
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.target_commit_sha }}
           fetch-depth: 0
