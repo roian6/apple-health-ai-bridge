@@ -53,10 +53,14 @@ def test_ios_ci_runs_swift_tests_and_unsigned_simulator_build() -> None:
     assert "CODE_SIGNING_ALLOWED=NO" in text
 
 
-def test_dependabot_monitors_python_and_github_actions_dependencies() -> None:
+def test_dependabot_monitors_and_batches_version_updates() -> None:
     text = DEPENDABOT_CONFIG.read_text()
 
     assert "version: 2" in text
     assert 'package-ecosystem: "pip"' in text
     assert 'package-ecosystem: "github-actions"' in text
-    assert text.count('interval: "weekly"') == 2
+    assert text.count('interval: "monthly"') == 2
+    assert text.count("open-pull-requests-limit: 1") == 2
+    assert text.count("default-days: 14") == 2
+    assert text.count("applies-to: version-updates") == 2
+    assert text.count('- "*"') == 2
