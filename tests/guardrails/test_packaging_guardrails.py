@@ -62,6 +62,7 @@ def test_isolated_build_constraints_are_complete_exact_hashed_pins() -> None:
         "packaging",
         "pathspec",
         "pluggy",
+        "tomlkit",
         "trove-classifiers",
     }
     assert build_requires == [f"hatchling=={pins['hatchling']}"]
