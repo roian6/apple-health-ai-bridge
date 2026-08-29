@@ -42,6 +42,8 @@ A type can produce records only when the companion implements its reader and pay
 
 `Sync Now` attempts the complete runtime-supported set and may perform historical catch-up. Automatic paths prioritize recent changes and use bounded fallback windows where no cursor exists. iOS controls whether and when background execution occurs, so automatic delivery is eventually complete rather than guaranteed to be immediate. Force-quitting the iOS app may suspend background delivery until the user opens it again.
 
+Daily activity aggregates remain an internal derived projection. They use HealthKit statistics for completed local-day totals such as steps, distance, energy, exercise time, stand time, flights, and basal energy. In-progress local-day statistics are not published as daily totals; current-day raw, source-attributed samples remain separate. These aggregates are not a second user-selectable sync scope.
+
 ## Pairing and authorization boundary
 
 Pairing invitations are temporary and single-use. Redemption produces a device credential stored in the iOS Keychain and hashed by the receiver.

@@ -401,6 +401,7 @@ public final class HealthKitGenericQuantityReader: @unchecked Sendable {
                         dayStart: statistics.startDate,
                         dayEnd: min(statistics.endDate, end),
                         value: value,
+                        isComplete: statistics.endDate <= end,
                         calendarDay: calendarDay,
                         timeZoneIdentifier: calendar.timeZone.identifier
                     ))

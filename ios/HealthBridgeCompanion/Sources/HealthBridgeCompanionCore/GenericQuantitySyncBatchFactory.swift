@@ -233,12 +233,14 @@ public struct HealthKitDailyActivityAggregate: Equatable, Sendable {
     public let value: Double
     public let calendarDay: String?
     public let timeZoneIdentifier: String?
+    public let isComplete: Bool
 
     public init(
         typeCode: String,
         dayStart: Date,
         dayEnd: Date,
         value: Double,
+        isComplete: Bool = true,
         calendarDay: String? = nil,
         timeZoneIdentifier: String? = nil
     ) {
@@ -246,6 +248,7 @@ public struct HealthKitDailyActivityAggregate: Equatable, Sendable {
         self.dayStart = dayStart
         self.dayEnd = dayEnd
         self.value = value
+        self.isComplete = isComplete
         self.calendarDay = calendarDay
         self.timeZoneIdentifier = timeZoneIdentifier
     }
@@ -756,6 +759,7 @@ public enum DailyActivityAggregateSyncBatchFactory {
             .compactMap { aggregate -> HealthBridgeSample? in
                 let canonicalTypeCode = GenericQuantityCoveragePolicy.canonicalTypeCode(for: aggregate.typeCode)
                 guard let entry = entriesByTypeCode[canonicalTypeCode],
+                      aggregate.isComplete,
                       aggregate.dayStart < aggregate.dayEnd,
                       aggregate.value > 0,
                       aggregate.value.isFinite
@@ -764,6 +768,7 @@ public enum DailyActivityAggregateSyncBatchFactory {
                 }
                 var metadata = [
                     "aggregation": "daily_sum",
+                    "aggregation_completeness": "complete",
                     "daily_activity_semantics": "healthkit_statistics_collection",
                     "healthkit_identifier": entry.healthKitIdentifier,
                     "healthkit_object_kind": entry.objectKind.rawValue,
