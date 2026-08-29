@@ -132,6 +132,46 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             publishedBackgroundSyncStatus = newValue
         }
     }
+    var automaticSyncRegistrationLine: String {
+        guard let registration = backgroundSyncStore.lastRegistration else {
+            return "No background-delivery registration attempt recorded."
+        }
+        return registration.succeeded
+            ? "Background delivery registration completed."
+            : "Background delivery registration is pending or has failures."
+    }
+    var automaticSyncScheduleLine: String {
+        guard let schedule = backgroundSyncStore.lastTaskSchedule else {
+            return "No BG app refresh request recorded."
+        }
+        switch schedule.status {
+        case "submitted":
+            return "BG app refresh request submitted."
+        case "skipped":
+            return "BG app refresh request was not submitted."
+        case "failed":
+            return "BG app refresh request submission failed."
+        default:
+            return "BG app refresh request status is unavailable."
+        }
+    }
+    var automaticSyncWakeLine: String {
+        guard let wake = backgroundSyncStore.lastWakeEvent else {
+            return "No automatic-sync wake recorded."
+        }
+        switch wake.source {
+        case "healthkit_observer":
+            return "HealthKit observer wake recorded."
+        case "bg_app_refresh":
+            return "BG app refresh wake recorded."
+        default:
+            return "Automatic-sync wake recorded."
+        }
+    }
+    var automaticSyncRunLine: String {
+        backgroundSyncStore.lastRun?.userVisibleSummary
+            ?? "No completed or interrupted automatic-sync run recorded."
+    }
     @Published var healthPermissionsRequested: Bool
 
     @Published var healthPermissionNotice = ""
@@ -144,6 +184,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published private(set) var activityLogMessages: [String]
     @Published private(set) var mailboxKeyDiagnosticState: MailboxKeyDiagnosticState
     @Published private(set) var mailboxDeliveryDiagnosticLine = ""
+    @Published private(set) var automaticSyncLaneDiagnosticLine: String
 
     private var foregroundCatchUpTask: Task<Void, Never>?
     private var foregroundMailboxOpportunityConsumed = false
@@ -200,6 +241,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let pairingCoordinator: ReceiverPairingCoordinator
     private let mailboxKeyStore: MailboxKeyStore
     private let backgroundSyncStore: BackgroundSyncSettingsStore
+    private let automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore
     private let healthPermissionRequestStore: CompanionHealthPermissionRequestStore
     private let healthHistoryDepthStore: HealthHistoryDepthSelectionStore
     private let historicalBackfillStateStore: HealthHistoricalBackfillStateStore
@@ -232,6 +274,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         settingsStore: ReceiverSettingsStore = ReceiverSettingsStore(),
         pairingStateStore: ReceiverPairingStateStore = ReceiverPairingStateStore(),
         backgroundSyncStore: BackgroundSyncSettingsStore = BackgroundSyncSettingsStore(),
+        automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore(),
         healthPermissionRequestStore: CompanionHealthPermissionRequestStore = CompanionHealthPermissionRequestStore(),
         healthHistoryDepthStore: HealthHistoryDepthSelectionStore = HealthHistoryDepthSelectionStore(),
         historicalBackfillStateStore: HealthHistoricalBackfillStateStore = HealthHistoricalBackfillStateStore(),
@@ -270,6 +313,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             mailboxKeyStore: mailboxKeyStore
         )
         self.backgroundSyncStore = backgroundSyncStore
+        self.automaticSyncDiagnosticStore = automaticSyncDiagnosticStore
         self.healthPermissionRequestStore = healthPermissionRequestStore
         #if canImport(HealthKit)
         let currentRuntimePermissionTypeCodes = HealthKitReadTypeCatalog.availableTypeCodes(
@@ -388,6 +432,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.historicalBackfillState = historicalBackfillStateStore.state
         self.activityLogMessages = []
         self.mailboxKeyDiagnosticState = mailboxKeyStore.diagnosticState()
+        self.automaticSyncLaneDiagnosticLine = automaticSyncDiagnosticStore.latestRecord?
+            .latestLaneSummary ?? "No automatic-sync lane diagnostic recorded."
         self.publishedPendingOutboxCount = (try? outbox?.pendingItems().count) ?? 0
         self.hasPendingSleepTransition = Self.sleepStorageMayNeedRecovery(in: sleepManifestStore)
         self.hasPendingOutboxDeletion = outbox?.destructiveRecoveryIsRequested ?? true
@@ -2708,6 +2754,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     succeeded: succeeded,
                     errorDescription: errorDescription
                 )
+            },
+            observerCompletionHandler: { [weak self] latency in
+                self?.noteAutomaticSyncObserverCompletion(latency: latency)
             }
         ) { [weak self] typeCode in
             guard let self else { return }
@@ -2723,7 +2772,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
                 return
             }
-            guard self.terminalPayloadActionAdmissionIsOpen else { return }
+            guard self.terminalPayloadActionAdmissionIsOpen else {
+                self.recordUnavailableAutomaticSyncDiagnostic(reason: .observer(typeCode: typeCode))
+                return
+            }
             self.noteBackgroundRefreshHandlerStarted(source: "healthkit_observer")
             self.backgroundSyncStatus = "Apple Health reported a change; running read-only sync."
             await self.runBackgroundRefreshSync(reason: .observer(typeCode: typeCode))
@@ -2778,6 +2830,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
     #endif
+
+    private func noteAutomaticSyncObserverCompletion(latency: TimeInterval) {
+        automaticSyncDiagnosticStore.noteObserverCompletionLatency(latency)
+        automaticSyncLaneDiagnosticLine = automaticSyncDiagnosticStore.latestRecord?
+            .latestLaneSummary ?? "No automatic-sync lane diagnostic recorded."
+    }
 
     private func stopHealthKitBackgroundDelivery() {
         #if canImport(HealthKit)
@@ -3181,7 +3239,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     func runBackgroundRefreshSync(reason: AutomaticSyncReason) async {
-        guard terminalPayloadActionAdmissionIsOpen else { return }
+        guard terminalPayloadActionAdmissionIsOpen else {
+            recordUnavailableAutomaticSyncDiagnostic(reason: reason)
+            return
+        }
         let taskID = UUID()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -3194,6 +3255,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             task.cancel()
         }
         trackedSyncTasks.removeValue(forKey: taskID)
+    }
+
+    private func recordUnavailableAutomaticSyncDiagnostic(
+        reason: AutomaticSyncReason
+    ) {
+        let diagnostic = AutomaticSyncDiagnosticDraft(reason: reason)
+        diagnostic.notePrerequisitesUnavailable()
+        if let pendingGenerations = try? backgroundSyncStore
+            .loadPendingObserverTypeCodeGenerations() {
+            diagnostic.notePending(
+                automaticSyncDiagnosticStore.pendingSnapshot(
+                    pendingTypeCodes: Array(pendingGenerations.keys)
+                )
+            )
+        }
+        automaticSyncDiagnosticStore.record(diagnostic.record)
+        automaticSyncLaneDiagnosticLine = automaticSyncDiagnosticStore.latestRecord?
+            .latestLaneSummary ?? "No automatic-sync lane diagnostic recorded."
     }
 
     @discardableResult
@@ -3221,7 +3300,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func performBackgroundRefreshSync(reason: AutomaticSyncReason) async {
         let startedAt = Date()
+        let diagnostic = AutomaticSyncDiagnosticDraft(reason: reason)
+        defer {
+            automaticSyncDiagnosticStore.record(diagnostic.record)
+            automaticSyncLaneDiagnosticLine = automaticSyncDiagnosticStore.latestRecord?
+                .latestLaneSummary ?? "No automatic-sync lane diagnostic recorded."
+        }
         guard automaticSyncReady else {
+            diagnostic.notePrerequisitesUnavailable()
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3233,6 +3319,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return
         }
         guard backgroundSyncEnabled else {
+            diagnostic.notePrerequisitesUnavailable()
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3245,6 +3332,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
 
         guard canSendConnectionTest else {
+            diagnostic.notePrerequisitesUnavailable()
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3261,6 +3349,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             observerGenerationSnapshot = try backgroundSyncStore
                 .loadPendingObserverTypeCodeGenerations()
         } catch {
+            diagnostic.noteDurableStateUnavailable()
             await backgroundRunGate.retainObserverTypeCodes(reason.observerTypeCodes)
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
@@ -3277,7 +3366,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
             return
         }
+        diagnostic.notePending(
+            automaticSyncDiagnosticStore.pendingSnapshot(
+                pendingTypeCodes: Array(observerGenerationSnapshot.keys),
+                now: startedAt
+            )
+        )
         let admission = await backgroundRunGate.beginRun(reason: reason, now: startedAt)
+        diagnostic.noteAdmission(admission)
         guard admission.shouldRun else {
             if admission.skipReason == .debounced,
                !reason.observerTypeCodes.isEmpty {
@@ -3303,6 +3399,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys),
             continuationLaneID: backgroundSyncStore.nextScheduledWorkLaneID
         )
+        diagnostic.noteSelection(workPlan.lane)
         guard recordBackgroundSyncRunIfAllowed(
             startedAt: startedAt,
             finishedAt: nil,
@@ -3320,14 +3417,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             await performAdmittedBackgroundRefreshSync(
                 workPlan: workPlan,
                 startedAt: startedAt,
-                observerGenerationSnapshot: observerGenerationSnapshot
+                observerGenerationSnapshot: observerGenerationSnapshot,
+                diagnostic: diagnostic
             )
             return
         }
         if settingsStore.activeTransport != .mailbox,
            await deferAutomaticSyncForPendingOutboxIfNeeded(
             startedAt: startedAt,
-            mailboxReconciliationPoint: .beforePayloadGeneration
+            mailboxReconciliationPoint: .beforePayloadGeneration,
+            diagnostic: diagnostic
            ) {
             return
         }
@@ -3335,7 +3434,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try await runWithExclusiveDirectOutboxTransfer {
                 if await self.deferAutomaticSyncForPendingOutboxIfNeeded(
                     startedAt: startedAt,
-                    mailboxReconciliationPoint: .beforePayloadGeneration
+                    mailboxReconciliationPoint: .beforePayloadGeneration,
+                    diagnostic: diagnostic
                 ) {
                     return
                 }
@@ -3348,7 +3448,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 await self.performAdmittedBackgroundRefreshSync(
                     workPlan: workPlan,
                     startedAt: startedAt,
-                    observerGenerationSnapshot: observerGenerationSnapshot
+                    observerGenerationSnapshot: observerGenerationSnapshot,
+                    diagnostic: diagnostic
                 )
             }
         } catch is CancellationError {
@@ -3429,7 +3530,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func deferAutomaticSyncForPendingOutboxIfNeeded(
         startedAt: Date,
-        mailboxReconciliationPoint: AutomaticSyncMailboxReconciliationPoint
+        mailboxReconciliationPoint: AutomaticSyncMailboxReconciliationPoint,
+        diagnostic: AutomaticSyncDiagnosticDraft
     ) async -> Bool {
         let trustedPendingOutboxCount = trustedPendingOutboxCount()
         guard AutomaticSyncPayloadGenerationPolicy.shouldGenerateNewPayloads(
@@ -3452,6 +3554,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     )
                 }
                 if Task.isCancelled || reconciliationResult == .cancelled {
+                    diagnostic.noteCompletion(.interrupted)
                     recordBackgroundSyncRunIfAllowed(
                         startedAt: startedAt,
                         finishedAt: Date(),
@@ -3490,6 +3593,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 summary = "Background refresh stopped because queued-upload status is unavailable."
                 reconciliationResult = .failed
             }
+            diagnostic.noteCompletion(
+                reconciliationResult.lifecycleOutcome == .completed
+                    ? .completed
+                    : .interrupted
+            )
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3537,7 +3645,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func performAdmittedBackgroundRefreshSync(
         workPlan: BackgroundSyncWorkPlan,
         startedAt: Date,
-        observerGenerationSnapshot: [String: Int]
+        observerGenerationSnapshot: [String: Int],
+        diagnostic: AutomaticSyncDiagnosticDraft
     ) async {
         if await stopBackgroundRunIfUnavailable(startedAt: startedAt) {
             return
@@ -3607,7 +3716,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             if await deferAutomaticSyncForPendingOutboxIfNeeded(
                 startedAt: startedAt,
-                mailboxReconciliationPoint: .afterDurableEnqueue
+                mailboxReconciliationPoint: .afterDurableEnqueue,
+                diagnostic: diagnostic
             ) {
                 return
             }
@@ -3671,6 +3781,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let succeeded = laneSucceeded && cleanupSucceeded
         let laneID = workPlan.lane?.id ?? "no_op"
         let summary = "Background refresh \(succeeded ? "completed" : "finished with errors"): lane=\(laneID), pending_outbox=\(pendingOutboxCount)."
+        diagnostic.noteCompletion(
+            .completed,
+            remainingPendingSnapshot: automaticSyncDiagnosticStore.pendingSnapshot(
+                pendingTypeCodes: pendingObserverTypeCodes
+            )
+        )
         recordBackgroundSyncRunIfAllowed(
             startedAt: startedAt,
             finishedAt: Date(),

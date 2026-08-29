@@ -910,7 +910,8 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     )
     assert 'Section("Automatic Sync")' in content_view
     assert "viewModel.automaticSyncCoverageDetail" in content_view
-    assert "viewModel.backgroundSyncStatus" in content_view
+    assert "viewModel.backgroundSyncStatus" not in content_view
+    assert "viewModel.automaticSyncLaneDiagnosticLine" in content_view
     assert "Review Health permissions in Settings" not in ux_state
     assert "diagnosticCode(from:" in ux_state
     assert "NSURLErrorDomain -1004" in ux_state or "domain=([^|]+)" in ux_state

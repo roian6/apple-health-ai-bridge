@@ -754,7 +754,13 @@ private struct AppDetailsView: View {
                 Text(viewModel.automaticSyncCoverageDetail)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                Text(viewModel.backgroundSyncStatus)
+                Group {
+                    LabeledContent("Registration", value: viewModel.automaticSyncRegistrationLine)
+                    LabeledContent("BG request", value: viewModel.automaticSyncScheduleLine)
+                    LabeledContent("Last wake", value: viewModel.automaticSyncWakeLine)
+                    LabeledContent("Last run", value: viewModel.automaticSyncRunLine)
+                    LabeledContent("Latest lane", value: viewModel.automaticSyncLaneDiagnosticLine)
+                }
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 if !viewModel.mailboxDeliveryDiagnosticLine.isEmpty {
