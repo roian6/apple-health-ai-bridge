@@ -128,8 +128,8 @@ public final class HealthKitBackgroundDeliveryCoordinator {
     public func start(
         healthTypes: [HealthBridgeHealthType] = HealthBridgeBackgroundSync.observedHealthTypes,
         registrationHandler: @escaping @MainActor (_ typeIdentifier: String, _ succeeded: Bool, _ errorDescription: String?) -> Void = { _, _, _ in },
-        observerCompletionHandler: @escaping @MainActor (_ latency: TimeInterval) -> Void = { _ in },
-        eventHandler: @escaping @MainActor (_ typeCode: String) async -> Void
+        observerCompletionHandler: @escaping @MainActor (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void = { _, _ in },
+        eventHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncDiagnosticDraft?
     ) {
         callbackGeneration &+= 1
         let expectedCallbackGeneration = callbackGeneration
@@ -156,11 +156,15 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                         completion.call()
                         return
                     }
-                    await eventHandler(healthType.typeCode)
-                    observerCompletionHandler(
-                        Date().timeIntervalSince(observerStartedAt)
+                    let runID = UUID()
+                    await AutomaticSyncObserverEventLifecycle.process(
+                        startedAt: observerStartedAt,
+                        eventHandler: {
+                            await eventHandler(healthType.typeCode, runID)
+                        },
+                        acknowledge: completion.call,
+                        persistDiagnostic: observerCompletionHandler
                     )
-                    completion.call()
                 }
             }
             healthStore.execute(observer)

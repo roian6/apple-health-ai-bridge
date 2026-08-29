@@ -78,8 +78,11 @@ public enum AutomaticSyncDiagnosticAdmissionResult: String, Codable, Equatable, 
 }
 
 public enum AutomaticSyncDiagnosticRunOutcome: String, Codable, Equatable, Sendable {
+    case accepted
+    case deferred
     case skipped
     case interrupted
+    case failed
     case completed
 }
 
@@ -137,7 +140,25 @@ public struct AutomaticSyncPendingSnapshot: Equatable, Sendable {
     )
 }
 
+@MainActor
+enum AutomaticSyncObserverEventLifecycle {
+    static func process(
+        startedAt: Date,
+        now: () -> Date = Date.init,
+        eventHandler: () async -> AutomaticSyncDiagnosticDraft?,
+        acknowledge: () -> Void,
+        persistDiagnostic: (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void
+    ) async {
+        let diagnostic = await eventHandler()
+        let completionLatency = now().timeIntervalSince(startedAt)
+        acknowledge()
+        guard let diagnostic else { return }
+        persistDiagnostic(diagnostic, completionLatency)
+    }
+}
+
 public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
+    public let runID: UUID
     public let wakeSource: AutomaticSyncDiagnosticWakeSource
     public let triggerReason: AutomaticSyncDiagnosticTriggerReason
     public let triggerLane: AutomaticSyncDiagnosticLane?
@@ -151,6 +172,7 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
     public let remainingPendingLaneCount: Int
 
     public init(
+        runID: UUID,
         wakeSource: AutomaticSyncDiagnosticWakeSource,
         triggerReason: AutomaticSyncDiagnosticTriggerReason,
         triggerLane: AutomaticSyncDiagnosticLane?,
@@ -163,6 +185,7 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
         observerCompletionLatencyBucket: AutomaticSyncObserverCompletionLatencyBucket,
         remainingPendingLaneCount: Int
     ) {
+        self.runID = runID
         self.wakeSource = wakeSource
         self.triggerReason = triggerReason
         self.triggerLane = triggerLane
@@ -180,7 +203,10 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
         let trigger = triggerLane.map { "\(triggerReason.rawValue)/\($0.displayName)" }
             ?? triggerReason.rawValue
         let oldest = oldestPendingLane.map {
-            "\($0.displayName) (\(oldestPendingLaneAgeBucket.rawValue))"
+            let observedAge = oldestPendingLaneAgeBucket == .unknown
+                ? "observed pending age unknown"
+                : "observed pending \(oldestPendingLaneAgeBucket.rawValue)"
+            return "\($0.displayName) (\(observedAge))"
         } ?? "none"
         return "trigger=\(trigger); admission=\(admissionResult.rawValue); "
             + "selected=\(selectedLane.displayName); pending=\(pendingLaneCount); "
@@ -189,10 +215,30 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
             + observerCompletionLatencyBucket.rawValue
     }
 
+    func replacingRunOutcome(
+        _ outcome: AutomaticSyncDiagnosticRunOutcome
+    ) -> Self {
+        AutomaticSyncDiagnosticRecord(
+            runID: runID,
+            wakeSource: wakeSource,
+            triggerReason: triggerReason,
+            triggerLane: triggerLane,
+            admissionResult: admissionResult,
+            selectedLane: selectedLane,
+            pendingLaneCount: pendingLaneCount,
+            oldestPendingLane: oldestPendingLane,
+            oldestPendingLaneAgeBucket: oldestPendingLaneAgeBucket,
+            runOutcome: outcome,
+            observerCompletionLatencyBucket: observerCompletionLatencyBucket,
+            remainingPendingLaneCount: remainingPendingLaneCount
+        )
+    }
+
     func replacingObserverCompletionLatency(
         _ bucket: AutomaticSyncObserverCompletionLatencyBucket
     ) -> Self {
         AutomaticSyncDiagnosticRecord(
+            runID: runID,
             wakeSource: wakeSource,
             triggerReason: triggerReason,
             triggerLane: triggerLane,

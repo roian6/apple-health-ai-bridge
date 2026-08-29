@@ -1,6 +1,7 @@
 import Foundation
 
 public final class AutomaticSyncDiagnosticDraft {
+    public let runID: UUID
     private let wakeSource: AutomaticSyncDiagnosticWakeSource
     private let triggerReason: AutomaticSyncDiagnosticTriggerReason
     private let triggerLane: AutomaticSyncDiagnosticLane?
@@ -10,8 +11,14 @@ public final class AutomaticSyncDiagnosticDraft {
     private var runOutcome: AutomaticSyncDiagnosticRunOutcome = .interrupted
     private var observerCompletionLatencyBucket: AutomaticSyncObserverCompletionLatencyBucket
     private var remainingPendingLaneCount = 0
+    private var pendingTypeCodesForDeferredPersistence: [String]?
+    private var remainingPendingTypeCodesForDeferredPersistence: [String]?
 
-    public init(reason: AutomaticSyncReason) {
+    public init(
+        reason: AutomaticSyncReason,
+        runID: UUID = UUID()
+    ) {
+        self.runID = runID
         switch reason {
         case .observer(let typeCode):
             wakeSource = .healthKitObserver
@@ -51,6 +58,10 @@ public final class AutomaticSyncDiagnosticDraft {
         remainingPendingLaneCount = snapshot.pendingLaneCount
     }
 
+    func notePendingForDeferredPersistence(typeCodes: [String]) {
+        pendingTypeCodesForDeferredPersistence = typeCodes
+    }
+
     public func noteAdmission(_ admission: BackgroundSyncRunAdmission) {
         if admission.shouldRun {
             admissionResult = .accepted
@@ -71,6 +82,10 @@ public final class AutomaticSyncDiagnosticDraft {
         selectedLane = AutomaticSyncDiagnosticLane(workLane: lane)
     }
 
+    public func noteRunAccepted() {
+        runOutcome = .accepted
+    }
+
     public func noteCompletion(
         _ outcome: AutomaticSyncDiagnosticRunOutcome
     ) {
@@ -85,8 +100,43 @@ public final class AutomaticSyncDiagnosticDraft {
         remainingPendingLaneCount = remainingPendingSnapshot.pendingLaneCount
     }
 
+    func noteCompletionForDeferredPersistence(
+        _ outcome: AutomaticSyncDiagnosticRunOutcome,
+        remainingPendingTypeCodes: [String]
+    ) {
+        runOutcome = outcome
+        remainingPendingTypeCodesForDeferredPersistence = remainingPendingTypeCodes
+    }
+
+    func prepareDeferredPendingSnapshots(
+        using store: AutomaticSyncDiagnosticStore
+    ) {
+        if let pendingTypeCodesForDeferredPersistence {
+            notePending(
+                store.pendingSnapshot(
+                    pendingTypeCodes: pendingTypeCodesForDeferredPersistence
+                )
+            )
+        }
+        if let remainingPendingTypeCodesForDeferredPersistence {
+            remainingPendingLaneCount = store.pendingSnapshot(
+                pendingTypeCodes: remainingPendingTypeCodesForDeferredPersistence
+            ).pendingLaneCount
+        }
+    }
+
+    func noteObserverCompletionLatency(_ latency: TimeInterval) {
+        guard wakeSource == .healthKitObserver else { return }
+        observerCompletionLatencyBucket = .bucket(for: latency)
+    }
+
+    var defersPersistenceUntilObserverAcknowledgement: Bool {
+        wakeSource == .healthKitObserver
+    }
+
     public var record: AutomaticSyncDiagnosticRecord {
         AutomaticSyncDiagnosticRecord(
+            runID: runID,
             wakeSource: wakeSource,
             triggerReason: triggerReason,
             triggerLane: triggerLane,

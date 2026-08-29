@@ -755,6 +755,7 @@ private struct AppDetailsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Group {
+                    LabeledContent("Current status", value: viewModel.backgroundSyncStatus)
                     LabeledContent("Registration", value: viewModel.automaticSyncRegistrationLine)
                     LabeledContent("BG request", value: viewModel.automaticSyncScheduleLine)
                     LabeledContent("Last wake", value: viewModel.automaticSyncWakeLine)

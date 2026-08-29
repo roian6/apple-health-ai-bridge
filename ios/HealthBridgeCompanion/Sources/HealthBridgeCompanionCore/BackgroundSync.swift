@@ -928,6 +928,7 @@ public final class BackgroundSyncSettingsStore {
         static let lastOutcome = "healthBridge.backgroundSync.lastOutcome"
         static let lastSucceeded = "healthBridge.backgroundSync.lastSucceeded"
         static let lastSummary = "healthBridge.backgroundSync.lastSummary"
+        static let lastSelectedLane = "healthBridge.backgroundSync.lastSelectedLane"
         static let lastSkippedStartedAt =
             "healthBridge.backgroundSync.lastSkippedStartedAt"
         static let lastSkippedFinishedAt =
@@ -1012,6 +1013,11 @@ public final class BackgroundSyncSettingsStore {
             summary: summary,
             outcome: outcome
         )
+    }
+
+    var lastSelectedLane: AutomaticSyncDiagnosticLane? {
+        userDefaults.string(forKey: Key.lastSelectedLane)
+            .flatMap(AutomaticSyncDiagnosticLane.init(rawValue:))
     }
 
     public var lastRegistration: BackgroundDeliveryRegistrationStatus? {
@@ -1235,6 +1241,24 @@ public final class BackgroundSyncSettingsStore {
         succeeded: Bool,
         summary: String
     ) throws {
+        try recordRunLifecycle(
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            outcome: outcome,
+            succeeded: succeeded,
+            summary: summary,
+            selectedLane: nil
+        )
+    }
+
+    func recordRunLifecycle(
+        startedAt: Date,
+        finishedAt: Date?,
+        outcome: BackgroundSyncRunOutcome,
+        succeeded: Bool,
+        summary: String,
+        selectedLane: AutomaticSyncDiagnosticLane?
+    ) throws {
         if outcome == .skipped {
             let finishedAt = finishedAt ?? startedAt
             userDefaults.set(
@@ -1266,6 +1290,11 @@ public final class BackgroundSyncSettingsStore {
             forKey: Key.lastSucceeded
         )
         userDefaults.set(summary, forKey: Key.lastSummary)
+        if outcome == .accepted, let selectedLane {
+            userDefaults.set(selectedLane.rawValue, forKey: Key.lastSelectedLane)
+        } else {
+            userDefaults.removeObject(forKey: Key.lastSelectedLane)
+        }
         guard userDefaults.synchronize() else {
             throw BackgroundSyncSettingsStoreError.persistenceFailed
         }

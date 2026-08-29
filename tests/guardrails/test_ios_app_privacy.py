@@ -910,7 +910,7 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     )
     assert 'Section("Automatic Sync")' in content_view
     assert "viewModel.automaticSyncCoverageDetail" in content_view
-    assert "viewModel.backgroundSyncStatus" not in content_view
+    assert "viewModel.backgroundSyncStatus" in content_view
     assert "viewModel.automaticSyncLaneDiagnosticLine" in content_view
     assert "Review Health permissions in Settings" not in ux_state
     assert "diagnosticCode(from:" in ux_state
@@ -1560,7 +1560,7 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
     assert "guard !hasPendingPairing, !Task.isCancelled" in upload_body
 
     background_run_start = view_model.index(
-        "private func performBackgroundRefreshSync(reason:"
+        "private func performBackgroundRefreshSync("
     )
     background_run_end = view_model.index(
         "private func persistScheduledWorkContinuationIfNeeded", background_run_start

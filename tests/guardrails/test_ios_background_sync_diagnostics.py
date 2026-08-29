@@ -48,6 +48,9 @@ def test_private_automatic_sync_diagnostic_store_is_bounded_and_recoverable() ->
     # Then: it is bounded, atomic, private, backup-excluded, and fail-open on damage.
     assert "maximumRecordCount = 32" in source
     assert ".suffix(maximumRecordCount)" in source
+    assert "recordAccepted" in source
+    assert "recordFinal" in source
+    assert "record.runID" in source
     assert ".atomic" in source
     assert ".posixPermissions: 0o700" in source
     assert ".posixPermissions: 0o600" in source
@@ -55,8 +58,14 @@ def test_private_automatic_sync_diagnostic_store_is_bounded_and_recoverable() ->
     assert ".protectionKey" in source
     assert "completeUntilFirstUserAuthentication" in source
     assert "automatic-sync-diagnostics.json" in source
+    assert "diagnostic-write-" in source
+    assert "replaceItemAt" in source
     assert "recoveringSnapshot" in source
     assert "pendingSinceBucketByLane" in source
+    assert "pendingLaneKeys" in source
+    assert "Self.pendingLaneKeys.contains($0.key)" in source
+    assert "privacyPreservingPendingKey" not in source
+    assert 'return "quantity:' not in source
     assert "[String: Date]" not in source
 
 
@@ -64,6 +73,7 @@ def test_diagnostic_record_contains_only_bounded_operational_metadata() -> None:
     # Given: the diagnostic record declaration.
     source = DIAGNOSTICS.read_text(encoding="utf-8")
     assert "case unknown" in source
+    assert "observed pending" in source
     record = source.split("public struct AutomaticSyncDiagnosticRecord", 1)[1].split(
         "public init", 1
     )[0]
@@ -79,6 +89,7 @@ def test_diagnostic_record_contains_only_bounded_operational_metadata() -> None:
         "oldestPendingLaneAgeBucket",
         "pendingLaneCount",
         "remainingPendingLaneCount",
+        "runID",
         "runOutcome",
         "selectedLane",
         "triggerLane",
@@ -107,6 +118,7 @@ def test_settings_render_distinct_read_only_automatic_sync_evidence_lines() -> N
 
     # When: the read-only diagnostic labels and values are inspected.
     labels = {
+        "Current status": "backgroundSyncStatus",
         "Registration": "automaticSyncRegistrationLine",
         "BG request": "automaticSyncScheduleLine",
         "Last wake": "automaticSyncWakeLine",
@@ -114,14 +126,17 @@ def test_settings_render_distinct_read_only_automatic_sync_evidence_lines() -> N
         "Latest lane": "automaticSyncLaneDiagnosticLine",
     }
 
-    # Then: each evidence class has its own line instead of one mutable status string.
+    # Then: each evidence class has its own line without removing the current status.
     for label, property_name in labels.items():
         assert f'LabeledContent("{label}", value: viewModel.{property_name})' in content
         assert f"var {property_name}: String" in view_model
     automatic_sync_section = content.split('Section("Automatic Sync")', 1)[1].split(
         'Section("Activity Log")', 1
     )[0]
-    assert "viewModel.backgroundSyncStatus" not in automatic_sync_section
+    assert (
+        'LabeledContent("Current status", value: viewModel.backgroundSyncStatus)'
+        in automatic_sync_section
+    )
 
 
 def test_sync_wiring_preserves_observer_completion_order() -> None:
@@ -131,23 +146,69 @@ def test_sync_wiring_preserves_observer_completion_order() -> None:
 
     # When: diagnostic calls and observer ACK are inspected.
     required_view_model_fragments = (
-        "AutomaticSyncDiagnosticDraft(reason: reason)",
+        "AutomaticSyncDiagnosticDraft(",
+        "runID: diagnosticRunID",
         "diagnostic.noteAdmission(admission)",
         "diagnostic.noteSelection(workPlan.lane)",
+        "diagnostic.noteRunAccepted()",
+        "persistAcceptedAutomaticSyncDiagnostic(diagnostic)",
         "diagnostic.noteCompletion(",
-        "automaticSyncDiagnosticStore.record(diagnostic.record)",
-        "automaticSyncDiagnosticStore.noteObserverCompletionLatency(",
-        "recordUnavailableAutomaticSyncDiagnostic(reason: .observer(",
+        "automaticSyncDiagnosticStore.recordFinal(diagnostic.record)",
+        "diagnostic.noteObserverCompletionLatency(latency)",
+        "recordUnavailableAutomaticSyncDiagnostic(",
+        "durableStateUnavailable: true",
     )
 
-    # Then: every required liveness point is represented and completion stays last.
+    # Then: every liveness point exists and HealthKit ACK precedes file I/O.
     for fragment in required_view_model_fragments:
         assert fragment in view_model
     assert "observerCompletionHandler:" in catalog
-    event = catalog.split("await eventHandler(healthType.typeCode)", 1)[1].split(
-        "healthStore.execute(observer)", 1
-    )[0]
-    assert event.index("observerCompletionHandler(") < event.index("completion.call()")
+    assert "AutomaticSyncObserverEventLifecycle.process(" in catalog
+    assert "AutomaticSyncDiagnosticDraft?" in catalog
+    assert "let runID = UUID()" in catalog
+    assert "acknowledge: completion.call" in catalog
+    assert "persistDiagnostic: observerCompletionHandler" in catalog
+    assert "completedDraft, latency in" in view_model
+    assert "persistCompletedObserverAutomaticSyncDiagnostic(" in view_model
+    assert "if !diagnostic.defersPersistenceUntilObserverAcknowledgement" in view_model
+    assert "backgroundSyncStore.lastSelectedLane" in view_model
+
+
+def test_observer_diagnostic_persistence_seam_has_executable_boundary_coverage() -> (
+    None
+):
+    diagnostics = DIAGNOSTICS.read_text(encoding="utf-8")
+    tests = SWIFT_TESTS.read_text(encoding="utf-8")
+
+    assert "enum AutomaticSyncObserverEventLifecycle" in diagnostics
+    assert "let diagnostic = await eventHandler()" in diagnostics
+    assert "acknowledge()" in diagnostics
+    assert "persistDiagnostic(diagnostic, completionLatency)" in diagnostics
+    assert "testObserverDiagnosticPersistenceBeginsOnlyAfterAcknowledgement" in tests
+    assert "FileManager.default.fileExists(atPath: fileURL.path)" in tests
+    assert "store.recordFinal(completedDraft.record)" in tests
+
+
+def test_diagnostic_lifecycle_distinguishes_accepted_failed_and_completed() -> None:
+    diagnostics = DIAGNOSTICS.read_text(encoding="utf-8")
+    draft = (
+        ROOT
+        / (
+            "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/"
+            "AutomaticSyncDiagnosticDraft.swift"
+        )
+    ).read_text(encoding="utf-8")
+    view_model = VIEW_MODEL.read_text(encoding="utf-8")
+
+    assert "case accepted" in diagnostics
+    assert "case deferred" in diagnostics
+    assert "case failed" in diagnostics
+    assert "func noteRunAccepted()" in draft
+    assert "succeeded ? .completed : .failed" in view_model
+    assert "mailboxReconciliationPoint == .beforePayloadGeneration" in view_model
+    assert "case .failed:" in view_model
+    assert "diagnostic.noteCompletion(.failed)" in view_model
+    assert "automaticSyncDiagnosticStore.recordFinal(diagnostic.record)" in view_model
 
 
 def test_diagnostic_types_are_not_connected_to_upload_or_public_status_surfaces() -> (
@@ -211,8 +272,16 @@ def test_swift_model_store_rendering_tests_and_xcode_membership_are_present() ->
     cases = (
         "testHistoryEvictsOldestRecordsAtBound",
         "testMissingAndCorruptFilesRecoverWithoutThrowing",
-        "testPendingLaneAgeUsesCoarseBuckets",
+        "testPendingLaneAgeUsesCoarseObservedDurationBuckets",
+        "testQuantityPendingAgeTracksOnlyTheCoarseLane",
+        "testRecoveryScrubsLegacyNonLanePendingKeysFromDisk",
+        "testObserverDiagnosticPersistenceBeginsOnlyAfterAcknowledgement",
         "testLatestLaneRenderingOmitsPrivateValuesAndIdentifiers",
+        "testObserverCompletionLatencyUpdatesOnlyTheMatchingRun",
+        "testAcceptedDeferredAndFailedOutcomesRemainDistinct",
+        "testFinalRecordReplacesOnlyItsDurableAcceptedCheckpoint",
+        "testSkippedAttemptCannotReplaceAnotherRunsAcceptedCheckpoint",
+        "testBoundedHistoryPreservesTheActiveAcceptedCheckpoint",
     )
 
     # Then: all cases and the new production source are available to later Mac builds.

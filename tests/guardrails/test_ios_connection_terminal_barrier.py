@@ -381,11 +381,23 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
         "func checkConnection() async",
         "func performPrimaryAction() async",
         "func syncAllNow() async",
-        "func runBackgroundRefreshSync(reason: AutomaticSyncReason) async",
     ):
         action_start = source.index(action_entry)
         action_body = source[action_start : source.index("\n    }", action_start) + 6]
         assert "terminalPayloadActionAdmissionIsOpen" in action_body
+
+    background_start = source.index("func runBackgroundRefreshSync(")
+    background_body = source[
+        background_start : source.index("\n    }", background_start) + 6
+    ]
+    assert "runBackgroundRefreshSyncCollectingDiagnostic(" in background_body
+    collecting_start = source.index(
+        "private func runBackgroundRefreshSyncCollectingDiagnostic("
+    )
+    collecting_body = source[
+        collecting_start : source.index("\n    }", collecting_start) + 6
+    ]
+    assert "terminalPayloadActionAdmissionIsOpen" in collecting_body
 
     for action_entry in (
         "func setHealthHistoryDepthOption(_ optionID: String)",

@@ -41,7 +41,7 @@ def test_background_refresh_coalesces_observer_admission_before_transfer_handoff
     None
 ):
     text = VIEW_MODEL.read_text()
-    start = text.index("private func performBackgroundRefreshSync(reason:")
+    start = text.index("private func performBackgroundRefreshSync(")
     end = text.index("private func performAdmittedBackgroundRefreshSync(", start)
     admission_body = text[start:end]
 
