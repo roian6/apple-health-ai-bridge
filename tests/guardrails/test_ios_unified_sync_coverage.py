@@ -34,6 +34,30 @@ UX_STATE = (
     / "HealthBridgeCompanionCore"
     / "CompanionUXState.swift"
 )
+GENERIC_QUANTITY_READER = (
+    ROOT
+    / "ios"
+    / "HealthBridgeCompanion"
+    / "Sources"
+    / "HealthBridgeCompanionCore"
+    / "HealthKitGenericQuantityReader.swift"
+)
+GENERIC_QUANTITY_BATCH_FACTORY = (
+    ROOT
+    / "ios"
+    / "HealthBridgeCompanion"
+    / "Sources"
+    / "HealthBridgeCompanionCore"
+    / "GenericQuantitySyncBatchFactory.swift"
+)
+GENERIC_QUANTITY_BATCH_FACTORY_TESTS = (
+    ROOT
+    / "ios"
+    / "HealthBridgeCompanion"
+    / "Tests"
+    / "HealthBridgeCompanionCoreTests"
+    / "GenericQuantitySyncBatchFactoryTests.swift"
+)
 
 
 def test_background_sync_defines_unified_supported_quantity_planner() -> None:
@@ -167,6 +191,24 @@ def test_automatic_core_sync_uses_one_day_fallback_without_authorization() -> No
     assert (
         source.count("clampStoredBootstrapToLookback: executionMode == .automatic") == 2
     )
+
+
+def test_ios_daily_aggregate_finalization_contract() -> None:
+    reader = GENERIC_QUANTITY_READER.read_text()
+    factory = GENERIC_QUANTITY_BATCH_FACTORY.read_text()
+    regression_tests = GENERIC_QUANTITY_BATCH_FACTORY_TESTS.read_text()
+
+    assert "public let isComplete: Bool" in factory
+    assert "isComplete: Bool = true" in factory
+    assert "isComplete: statistics.endDate <= end" in reader
+    assert "aggregate.isComplete," in factory
+    assert '"aggregation_completeness": "complete"' in factory
+    assert (
+        "testDailyActivityAggregateFactoryPublishesOnlyCompletedLocalDays"
+        in regression_tests
+    )
+    assert "isComplete: false" in regression_tests
+    assert "isComplete: true" in regression_tests
 
 
 def test_cursorless_automatic_sync_cannot_commit_shared_foreground_progress() -> None:

@@ -90,6 +90,7 @@ final class StepCountSyncBatchFactoryTests: XCTestCase {
             dayStart: try date("2026-06-24T15:00:00Z"),
             dayEnd: try date("2026-06-25T15:00:00Z"),
             value: 9684,
+            isComplete: true,
             calendarDay: "2026-06-25",
             timeZoneIdentifier: "Asia/Tokyo"
         )

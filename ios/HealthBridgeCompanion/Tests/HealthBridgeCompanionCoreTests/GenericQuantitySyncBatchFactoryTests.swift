@@ -222,19 +222,22 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
                     typeCode: "steps",
                     dayStart: try date("2026-06-28T00:00:00Z"),
                     dayEnd: try date("2026-06-29T00:00:00Z"),
-                    value: 11824
+                    value: 11824,
+                    isComplete: true
                 ),
                 HealthKitDailyActivityAggregate(
                     typeCode: "active_energy",
                     dayStart: try date("2026-06-28T00:00:00Z"),
                     dayEnd: try date("2026-06-29T00:00:00Z"),
-                    value: 533
+                    value: 533,
+                    isComplete: true
                 ),
                 HealthKitDailyActivityAggregate(
                     typeCode: "heart_rate",
                     dayStart: try date("2026-06-28T00:00:00Z"),
                     dayEnd: try date("2026-06-29T00:00:00Z"),
-                    value: 67
+                    value: 67,
+                    isComplete: true
                 ),
             ],
             windowStart: try date("2026-06-28T00:00:00Z"),
@@ -262,6 +265,52 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
                 cursorValue: "2026-06-29T00:00:00Z"
             )
         ])
+    }
+
+    func testDailyActivityAggregateFactoryPublishesOnlyCompletedLocalDays() throws {
+        let partialBatch = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            aggregates: [
+                HealthKitDailyActivityAggregate(
+                    typeCode: "steps",
+                    dayStart: try date("2026-06-29T00:00:00Z"),
+                    dayEnd: try date("2026-06-29T12:00:00Z"),
+                    value: 4200,
+                    isComplete: false,
+                    calendarDay: "2026-06-29",
+                    timeZoneIdentifier: "Etc/UTC"
+                ),
+            ],
+            typeCodes: ["steps"],
+            windowStart: try date("2026-06-29T00:00:00Z"),
+            windowEnd: try date("2026-06-29T12:00:00Z"),
+            generatedAt: try date("2026-06-29T12:00:00Z")
+        ))
+
+        XCTAssertTrue(partialBatch.samples.isEmpty)
+
+        let completedReplayBatch = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            aggregates: [
+                HealthKitDailyActivityAggregate(
+                    typeCode: "steps",
+                    dayStart: try date("2026-06-29T00:00:00Z"),
+                    dayEnd: try date("2026-06-30T00:00:00Z"),
+                    value: 8400,
+                    isComplete: true,
+                    calendarDay: "2026-06-29",
+                    timeZoneIdentifier: "Etc/UTC"
+                ),
+            ],
+            typeCodes: ["steps"],
+            windowStart: try date("2026-06-29T00:00:00Z"),
+            windowEnd: try date("2026-06-30T00:00:00Z"),
+            generatedAt: try date("2026-06-30T00:01:00Z")
+        ))
+
+        let completedSample = try XCTUnwrap(completedReplayBatch.samples.first)
+        XCTAssertEqual(completedReplayBatch.samples.count, 1)
+        XCTAssertEqual(completedSample.clientRecordID, "hk-daily-activity-steps-20260629")
+        XCTAssertEqual(completedSample.metadata["aggregation"], "daily_sum")
+        XCTAssertEqual(completedSample.metadata["aggregation_completeness"], "complete")
     }
 
     func testDailyActivityAggregateFactoryReturnsNilWhenNoAggregateTypesAreValid() throws {
