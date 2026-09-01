@@ -669,7 +669,7 @@ def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> Non
     bootstrap_start = source.index("func bootstrap() async")
     bootstrap_end = source.index("private func performBootstrap()", bootstrap_start)
     bootstrap = source[bootstrap_start:bootstrap_end]
-    sync_start = source.index("func runBackgroundRefreshSync(reason:")
+    sync_start = source.index("func runBackgroundRefreshSync(")
     sync_end = source.index("private func performBackgroundRefreshSync", sync_start)
     sync = source[sync_start:sync_end]
 

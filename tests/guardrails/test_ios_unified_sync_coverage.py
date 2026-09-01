@@ -82,11 +82,12 @@ def test_background_delivery_plan_accepts_all_automatic_quantity_types() -> None
 def test_healthkit_observer_reports_the_triggering_type_code() -> None:
     source = READ_TYPE_CATALOG.read_text()
 
-    assert (
-        "eventHandler: @escaping @MainActor (_ typeCode: String) async -> Void"
-        in source
+    handler_arguments = (
+        "(_ typeCode: String, _ runID: UUID) async -> AutomaticSyncDiagnosticDraft?"
     )
-    assert "await eventHandler(healthType.typeCode)" in source
+    event_handler_signature = f"eventHandler: @escaping @MainActor {handler_arguments}"
+    assert event_handler_signature in source
+    assert "await eventHandler(healthType.typeCode, runID)" in source
 
 
 def test_healthkit_observer_restart_does_not_race_disable_against_enable() -> None:
@@ -104,7 +105,9 @@ def test_view_model_registers_and_syncs_unified_automatic_coverage() -> None:
 
     assert "optionalTypeCodes: []" not in source
     assert "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in source
-    assert "func runBackgroundRefreshSync(reason: AutomaticSyncReason" in source
+    assert "func runBackgroundRefreshSync(" in source
+    assert "reason: AutomaticSyncReason" in source
+    assert "diagnosticRunID: UUID = UUID()" in source
     assert "HealthBridgeBackgroundSync.workPlan(" in source
     assert "pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys)" in source
     assert "typeCodes: [typeCode]" in source
@@ -172,9 +175,11 @@ def test_background_entry_points_pass_explicit_sync_reasons() -> None:
     view_model = VIEW_MODEL.read_text()
     app = APP.read_text()
 
-    assert (
-        "runBackgroundRefreshSync(reason: .observer(typeCode: typeCode))" in view_model
-    )
+    observer_entry = view_model.split(
+        'self.noteBackgroundRefreshHandlerStarted(source: "healthkit_observer")', 1
+    )[1].split("BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded", 1)[0]
+    assert "reason: .observer(typeCode: typeCode)" in observer_entry
+    assert "diagnosticRunID: diagnosticRunID" in observer_entry
     assert "runBackgroundRefreshSync(reason: .launchCatchUp)" in view_model
     assert "runBackgroundRefreshSync(reason: .scheduledRefresh)" in app
 

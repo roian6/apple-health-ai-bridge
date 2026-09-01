@@ -15,7 +15,8 @@ final class BackgroundSyncRunLifecycleTests: XCTestCase {
             finishedAt: nil,
             outcome: .accepted,
             succeeded: false,
-            summary: "Background refresh accepted."
+            summary: "Background refresh accepted.",
+            selectedLane: .quantity
         )
 
         let accepted = try XCTUnwrap(
@@ -25,6 +26,10 @@ final class BackgroundSyncRunLifecycleTests: XCTestCase {
         XCTAssertNil(accepted.finishedAt)
         XCTAssertEqual(accepted.outcome, .accepted)
         XCTAssertFalse(accepted.succeeded)
+        XCTAssertEqual(
+            BackgroundSyncSettingsStore(userDefaults: defaults).lastSelectedLane,
+            .quantity
+        )
     }
 
     func testLifecycleOutcomesRemainDistinctAcrossReload() throws {
