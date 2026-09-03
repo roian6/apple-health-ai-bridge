@@ -2,7 +2,7 @@
   <img src="assets/brand/health-bridge-lockup.png" alt="Health Bridge for AI" width="520">
   <p><strong>Your Apple Health data, continuously available to your own AI agent.</strong></p>
   <p>
-    <a href="https://healthbridge.chanhyo.dev/install/">Install the iPhone app</a> ·
+    <a href="https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806">Download on the App Store</a> ·
     <a href="docs/setup.md">Set up your bridge</a> ·
     <a href="docs/supported-health-data.md">Supported health data</a> ·
     <a href="https://healthbridge.chanhyo.dev/">Website</a>
@@ -31,7 +31,7 @@ You need:
 
 ### 1. Install the iPhone app
 
-Open the [official TestFlight install page](https://healthbridge.chanhyo.dev/install/) on your iPhone and tap the verified public invitation.
+Download [Health Bridge for AI from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) on your iPhone. TestFlight remains available for beta builds and prerelease testing through the [official install page](https://healthbridge.chanhyo.dev/install/).
 
 ### 2. Prepare the receiver route
 
@@ -158,7 +158,7 @@ User installs are pinned to a signed Receiver/CLI release tag instead of the mov
 
 ## Build from source
 
-TestFlight is the normal iPhone installation path. Contributors and advanced users can build with Xcode 16 or later by following [docs/self-build.md](docs/self-build.md).
+The App Store is the normal iPhone installation path. TestFlight is reserved for beta builds. Contributors and advanced users can build with Xcode 16 or later by following [docs/self-build.md](docs/self-build.md).
 
 ## Documentation
 

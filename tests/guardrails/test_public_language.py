@@ -262,7 +262,7 @@ def test_package_metadata_connects_distribution_to_public_surfaces() -> None:
     assert '"serverInfo": {"name": "health-bridge"' in server
 
 
-def test_readme_makes_testflight_primary_without_exposing_maintainer_operations() -> (
+def test_readme_makes_app_store_primary_without_exposing_maintainer_operations() -> (
     None
 ):
     readme = Path("README.md").read_text()
@@ -270,8 +270,13 @@ def test_readme_makes_testflight_primary_without_exposing_maintainer_operations(
     primary_navigation = readme.split("</div>", maxsplit=1)[0]
     docs_section = readme.split("## Documentation", maxsplit=1)[1]
 
-    assert "Install the iPhone app" in primary_navigation
+    app_store_url = "https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806"
+    assert "Download on the App Store" in primary_navigation
+    assert app_store_url in primary_navigation
     assert "Install the iPhone beta" not in primary_navigation
+    assert "official TestFlight install page" not in readme
+    assert "Download [Health Bridge for AI from the App Store]" in readme
+    assert "TestFlight remains available for beta builds" in readme
     assert "docs/maintainers/" not in readme
     assert "App Review" not in docs_section
     assert "Public source preview" not in readme
