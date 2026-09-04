@@ -25,6 +25,8 @@ def test_ios_checkpoint_tags_run_pinned_transition_and_source_gates() -> None:
         'git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}"',
         'test "$tag_ref_sha" = "$event_tag_object_sha"',
         '.verification.verified == true and .verification.reason == "valid"',
+        'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"',
+        'test "$tagger_email" = "$expected_tagger_email"',
         'test "$target_sha" = "$default_main_sha"',
         'baseline_sha="$(git rev-parse "${target_sha}^1")"',
         "uv run python scripts/release_tools.py validate",
@@ -36,6 +38,7 @@ def test_ios_checkpoint_tags_run_pinned_transition_and_source_gates() -> None:
         assert marker in python
 
     assert "fetch-depth: 0" in python
+    assert 'endswith("@users.noreply.github.com")' not in python
     assert "Run Swift package tests" in ios
     assert "Build unsigned iPhone simulator app" in ios
     assert "Build unsigned generic iPhone app" in ios
@@ -48,6 +51,11 @@ def test_ios_checkpoint_tags_do_not_enter_receiver_release_publication() -> None
 
     assert 'tags: ["receiver-v*"]' in receiver
     assert '"ios-v*"' not in receiver
+    assert (
+        'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"' in receiver
+    )
+    assert 'test "$tagger_email" = "$expected_tagger_email"' in receiver
+    assert 'endswith("@users.noreply.github.com")' not in receiver
 
 
 def test_ios_checkpoint_policy_requires_read_only_checks_and_tag_protection() -> None:

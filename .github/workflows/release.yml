@@ -53,10 +53,15 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
             --jq '.verification.verified == true and .verification.reason == "valid"')"
           test "$tag_verified" = "true"
-          tag_identity="$(gh api \
+          expected_tagger_email="23256775+roian6"@"users.noreply.github.com"
+          tagger_name="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.tagger.name == "Chanhyo Jung" and (.tagger.email | endswith("@users.noreply.github.com"))')"
-          test "$tag_identity" = "true"
+            --jq '.tagger.name')"
+          tagger_email="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tagger.email')"
+          test "$tagger_name" = "Chanhyo Jung"
+          test "$tagger_email" = "$expected_tagger_email"
           target_sha="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
             --jq '.object.sha')"

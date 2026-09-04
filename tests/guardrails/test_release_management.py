@@ -932,7 +932,11 @@ def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  #
     assert '.commit.committer.name == "GitHub"' in workflow
     assert '.commit.committer.email == ("noreply" + "@" + "github.com")' in workflow
     assert ".commit.author.email | endswith" not in workflow
-    assert 'endswith("@users.noreply.github.com")' in workflow
+    assert (
+        'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"' in workflow
+    )
+    assert 'test "$tagger_email" = "$expected_tagger_email"' in workflow
+    assert 'endswith("@users.noreply.github.com")' not in workflow
     assert (
         "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
         in workflow
