@@ -41,7 +41,7 @@ HELPER_BUILD: Final = "1"
 GIT_EXECUTABLE: Final = shutil.which("git")
 
 
-ReleaseScope = Literal["receiver", "coordinated"]
+ReleaseScope = Literal["receiver", "ios", "coordinated"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +234,9 @@ def _validate_release_notes(
         case "receiver":
             required = ("Receiver-only release", "No TestFlight update is required")
             forbidden = ("Coordinated release",)
+        case "ios":
+            message = "receiver release validation does not accept ios scope"
+            raise ReleaseError(message)
         case "coordinated":
             required = ("Coordinated release",)
             forbidden = ("Receiver-only release", "No TestFlight update is required")
@@ -266,6 +269,28 @@ def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
         raise ReleaseError(message)
     _validate_release_notes(versions, tag, notes)
     return versions
+
+
+def validate_source_checkpoint(repo: Path, tag: str) -> ReleaseVersions:
+    versions = read_versions(repo)
+    match versions.components.release_scope:
+        case "ios":
+            expected = (
+                f"ios-v{versions.ios_marketing_version}-build.{versions.ios_build}"
+            )
+            if tag != expected:
+                message = f"iOS release tag must be {expected}"
+                raise ReleaseError(message)
+            _validate_component_version_index(
+                repo,
+                versions,
+                release_tag=versions.components.receiver_tag,
+            )
+            return versions
+        case "receiver" | "coordinated":
+            return validate_tag(repo, tag)
+        case unreachable:
+            assert_never(unreachable)
 
 
 def _sha256(path: Path) -> str:
@@ -413,7 +438,7 @@ def _read_component_snapshot(raw: str, *, surface: str) -> ComponentSnapshot:
         message = f"{surface} schema is not exact"
         raise ReleaseError(message)
     match scope:
-        case "receiver" | "coordinated":
+        case "receiver" | "ios" | "coordinated":
             release_scope: ReleaseScope = scope
         case _:
             message = "component version index release_scope must be explicit"
@@ -605,6 +630,15 @@ def _validate_scope_transition(
                 raise ReleaseError(message)
             if ios_changed or batch_changed:
                 message = "receiver scope must preserve baseline iOS and Batch Protocol"
+                raise ReleaseError(message)
+        case "ios":
+            if receiver_advanced or batch_changed:
+                message = (
+                    "ios scope must preserve baseline Receiver/CLI and Batch Protocol"
+                )
+                raise ReleaseError(message)
+            if not ios_changed:
+                message = "ios scope must advance iOS Companion version or build"
                 raise ReleaseError(message)
         case "coordinated":
             if not receiver_advanced and (
@@ -1350,7 +1384,7 @@ def main() -> int:  # noqa: C901, PLR0912
                 + "\n"
             )
         elif args.command == "validate":
-            versions = validate_tag(args.repo, args.tag)
+            versions = validate_source_checkpoint(args.repo, args.tag)
             transition_commits = (
                 args.tag_target_commit,
                 args.default_main_commit,

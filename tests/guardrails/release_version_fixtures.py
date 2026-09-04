@@ -17,12 +17,12 @@ XCODE_PROJECT = Path(
 class ReleaseTree:
     receiver_version: str
     release_tag: str
-    release_scope: Literal["receiver", "coordinated"] | None
+    release_scope: Literal["receiver", "ios", "coordinated"] | None
     ios_version: str
     ios_build: str
     batch_version: str
     include_batch_compatibility: bool = True
-    notes_scope: Literal["receiver", "coordinated"] | None = None
+    notes_scope: Literal["receiver", "ios", "coordinated"] | None = None
 
 
 def git_output(repo: Path, *args: str) -> str:
@@ -114,6 +114,8 @@ def write_release_tree(
             }
         )
     )
+    if release.release_scope == "ios":
+        return
     notes = repo / ".github/release" / f"notes-{release.release_tag}.md"
     notes.parent.mkdir(parents=True, exist_ok=True)
     effective_notes_scope = release.notes_scope or release.release_scope

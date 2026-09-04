@@ -38,7 +38,7 @@ class ValidateOutput(BaseModel):
     ios_build: str
     ios_marketing_version: str
     project_version: str
-    release_scope: Literal["receiver", "coordinated"]
+    release_scope: Literal["receiver", "ios", "coordinated"]
     tag: str
 
 
@@ -83,12 +83,12 @@ def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _packet_verify_args(
-    *, dist: Path, tag_object: str, commit: str, tree: str
+    *, repo: Path, dist: Path, tag_object: str, commit: str, tree: str
 ) -> tuple[str, ...]:
     return (
         "verify-packet",
         "--repo",
-        str(ROOT),
+        str(repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -102,11 +102,11 @@ def _packet_verify_args(
     )
 
 
-def _checksum_args(*, dist: Path, output: Path) -> tuple[str, ...]:
+def _checksum_args(*, repo: Path, dist: Path, output: Path) -> tuple[str, ...]:
     return (
         "checksums",
         "--repo",
-        str(ROOT),
+        str(repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -122,7 +122,7 @@ def _checksum_args(*, dist: Path, output: Path) -> tuple[str, ...]:
     )
 
 
-def _create_manifest_fixture(dist: Path) -> Path:
+def _create_manifest_fixture(repo: Path, dist: Path) -> Path:
     dist.mkdir(parents=True, exist_ok=True)
     _ = (dist / "apple_health_ai_bridge-1.1.1-py3-none-any.whl").write_bytes(
         b"wheel fixture\n"
@@ -132,7 +132,7 @@ def _create_manifest_fixture(dist: Path) -> Path:
     completed = _run_release_tool(
         "manifest",
         "--repo",
-        str(ROOT),
+        str(repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -257,17 +257,17 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "--repo",
         str(ROOT),
         "--tag",
-        "receiver-v1.1.1",
+        "ios-v1.1.1-build.41",
     )
 
     assert completed.returncode == 0, completed.stderr
     output = ValidateOutput.model_validate_json(completed.stdout)
     assert output.model_dump() == {
         "ios_build": _current_ios_build(),
-        "ios_marketing_version": "1.1.0",
+        "ios_marketing_version": "1.1.1",
         "project_version": "1.1.1",
-        "release_scope": "receiver",
-        "tag": "receiver-v1.1.1",
+        "release_scope": "ios",
+        "tag": "ios-v1.1.1-build.41",
     }
 
 
@@ -282,9 +282,9 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "schema_id": "health_bridge.batch.v1",
             "version": "1.0.0",
         },
-        "ios_companion": {"build": "39", "marketing_version": "1.1.0"},
+        "ios_companion": {"build": "41", "marketing_version": "1.1.1"},
         "receiver_cli": {"release_tag": "receiver-v1.1.1", "version": "1.1.1"},
-        "release_scope": "receiver",
+        "release_scope": "ios",
         "schema_id": "health_bridge.component_versions.v1",
     }
 
@@ -340,16 +340,13 @@ def test_release_validate_rejects_component_version_index_drift(
     assert "component version index" in completed.stderr
 
 
-@pytest.mark.parametrize("tag", ["1.1.0", "v1.0.0", "receiver-v1.1.1-beta.1", "main"])
+@pytest.mark.parametrize("tag", ["1.1.0", "v1.0.0", "receiver-v1.1.1", "main"])
 def test_release_validate_rejects_noncanonical_or_mismatched_tag(tag: str) -> None:
     completed = _run_release_tool("validate", "--repo", str(ROOT), "--tag", tag)
 
     assert completed.returncode == 1
     assert completed.stdout == ""
-    assert (
-        "receiver release tag must exactly match package version: receiver-v1.1.1"
-        in completed.stderr
-    )
+    assert "iOS release tag must be ios-v1.1.1-build.41" in completed.stderr
 
 
 def test_receiver_and_ios_semver_order_does_not_define_compatibility(
@@ -378,7 +375,10 @@ def test_receiver_and_ios_semver_order_does_not_define_compatibility(
     assert output.ios_marketing_version == "1.1.0"
 
 
-def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> None:
+def test_release_metadata_and_checksums_are_deterministic(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     wheel = dist / "apple_health_ai_bridge-1.1.1-py3-none-any.whl"
@@ -394,7 +394,7 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
     manifest_args = (
         "manifest",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -424,13 +424,13 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
         "tree": tree,
     }
     assert payload.ios == {
-        "build": _current_ios_build(),
+        "build": "39",
         "marketing_version": "1.1.0",
         "source_settings": (
             "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
         ),
         "source_settings_sha256": hashlib.sha256(
-            XCODE_PROJECT.read_bytes()
+            (receiver_release_repo / XCODE_PROJECT.relative_to(ROOT)).read_bytes()
         ).hexdigest(),
     }
     assert payload.batch_contract == {
@@ -446,8 +446,14 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
         == hashlib.sha256(wheel.read_bytes()).hexdigest()
     )
 
-    _ = (dist / "release-notes.md").write_bytes(RELEASE_NOTES.read_bytes())
-    checksum_result = _run_release_tool(*_checksum_args(dist=dist, output=checksums))
+    _ = (dist / "release-notes.md").write_bytes(
+        (
+            receiver_release_repo / ".github/release/notes-receiver-v1.1.1.md"
+        ).read_bytes()
+    )
+    checksum_result = _run_release_tool(
+        *_checksum_args(repo=receiver_release_repo, dist=dist, output=checksums)
+    )
     assert checksum_result.returncode == 0, checksum_result.stderr
     lines = checksums.read_text(encoding="utf-8").splitlines()
     assert [line.split("  ", 1)[1] for line in lines] == [
@@ -457,13 +463,25 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
     ]
 
     verify_result = _run_release_tool(
-        *_packet_verify_args(dist=dist, tag_object=tag_object, commit=commit, tree=tree)
+        *_packet_verify_args(
+            repo=receiver_release_repo,
+            dist=dist,
+            tag_object=tag_object,
+            commit=commit,
+            tree=tree,
+        )
     )
     assert verify_result.returncode == 0, verify_result.stderr
 
     _ = wheel.write_bytes(b"tampered after download")
     tampered = _run_release_tool(
-        *_packet_verify_args(dist=dist, tag_object=tag_object, commit=commit, tree=tree)
+        *_packet_verify_args(
+            repo=receiver_release_repo,
+            dist=dist,
+            tag_object=tag_object,
+            commit=commit,
+            tree=tree,
+        )
     )
     assert tampered.returncode == 1
     assert "checksum" in tampered.stderr.lower()
@@ -475,7 +493,9 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
         json.dumps(metadata_payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    refreshed = _run_release_tool(*_checksum_args(dist=dist, output=checksums))
+    refreshed = _run_release_tool(
+        *_checksum_args(repo=receiver_release_repo, dist=dist, output=checksums)
+    )
     assert refreshed.returncode == 1
     assert "metadata" in refreshed.stderr.lower()
 
@@ -485,7 +505,9 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
         json.dumps(artifact_payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    extra_key = _run_release_tool(*_checksum_args(dist=dist, output=checksums))
+    extra_key = _run_release_tool(
+        *_checksum_args(repo=receiver_release_repo, dist=dist, output=checksums)
+    )
     assert extra_key.returncode == 1
     assert "invalid artifact record" in extra_key.stderr
 
@@ -505,10 +527,11 @@ def test_release_metadata_and_checksums_are_deterministic(tmp_path: Path) -> Non
 )
 def test_checksums_reject_nonexact_release_metadata(
     tmp_path: Path,
+    receiver_release_repo: Path,
     mutation: str,
 ) -> None:
     dist = tmp_path / "dist"
-    metadata = _create_manifest_fixture(dist)
+    metadata = _create_manifest_fixture(receiver_release_repo, dist)
     _ = (dist / "release-notes.md").write_bytes(RELEASE_NOTES.read_bytes())
     payload = ReleaseMetadataOutput.model_validate_json(
         metadata.read_bytes()
@@ -520,7 +543,11 @@ def test_checksums_reject_nonexact_release_metadata(
     )
 
     completed = _run_release_tool(
-        *_checksum_args(dist=dist, output=dist / "SHA256SUMS")
+        *_checksum_args(
+            repo=receiver_release_repo,
+            dist=dist,
+            output=dist / "SHA256SUMS",
+        )
     )
 
     assert completed.returncode == 1
@@ -529,6 +556,7 @@ def test_checksums_reject_nonexact_release_metadata(
 
 def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
     tmp_path: Path,
+    receiver_release_repo: Path,
 ) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -538,7 +566,7 @@ def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
     completed = _run_release_tool(
         "manifest",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -560,7 +588,10 @@ def test_release_manifest_rejects_wrong_or_extra_python_artifacts(
     assert not (dist / "release-metadata.json").exists()
 
 
-def test_checksums_reject_artifact_changed_after_manifest(tmp_path: Path) -> None:
+def test_checksums_reject_artifact_changed_after_manifest(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     wheel = dist / "apple_health_ai_bridge-1.1.1-py3-none-any.whl"
@@ -573,7 +604,7 @@ def test_checksums_reject_artifact_changed_after_manifest(tmp_path: Path) -> Non
     manifest = _run_release_tool(
         "manifest",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -591,7 +622,9 @@ def test_checksums_reject_artifact_changed_after_manifest(tmp_path: Path) -> Non
     _ = (dist / "release-notes.md").write_bytes(RELEASE_NOTES.read_bytes())
     _ = wheel.write_bytes(b"mutated wheel")
 
-    completed = _run_release_tool(*_checksum_args(dist=dist, output=checksums))
+    completed = _run_release_tool(
+        *_checksum_args(repo=receiver_release_repo, dist=dist, output=checksums)
+    )
 
     assert completed.returncode == 1
     assert "artifact no longer matches release metadata" in completed.stderr
@@ -600,6 +633,7 @@ def test_checksums_reject_artifact_changed_after_manifest(tmp_path: Path) -> Non
 
 def test_release_packet_rejects_directories_nested_files_and_symlinks(
     tmp_path: Path,
+    receiver_release_repo: Path,
 ) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -615,7 +649,7 @@ def test_release_packet_rejects_directories_nested_files_and_symlinks(
     manifest = _run_release_tool(
         "manifest",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -635,17 +669,27 @@ def test_release_packet_rejects_directories_nested_files_and_symlinks(
     nested = dist / "nested"
     nested.mkdir()
     _ = (nested / "undeclared.bin").write_bytes(b"extra")
-    nested_result = _run_release_tool(*_checksum_args(dist=dist, output=checksums))
+    nested_result = _run_release_tool(
+        *_checksum_args(repo=receiver_release_repo, dist=dist, output=checksums)
+    )
     assert nested_result.returncode == 1
     assert "file set" in nested_result.stderr.lower()
     (nested / "undeclared.bin").unlink()
     nested.rmdir()
 
-    created = _run_release_tool(*_checksum_args(dist=dist, output=checksums))
+    created = _run_release_tool(
+        *_checksum_args(repo=receiver_release_repo, dist=dist, output=checksums)
+    )
     assert created.returncode == 0, created.stderr
     (dist / "undeclared-link").symlink_to(wheel.name)
     symlink_result = _run_release_tool(
-        *_packet_verify_args(dist=dist, tag_object=tag_object, commit=commit, tree=tree)
+        *_packet_verify_args(
+            repo=receiver_release_repo,
+            dist=dist,
+            tag_object=tag_object,
+            commit=commit,
+            tree=tree,
+        )
     )
     assert symlink_result.returncode == 1
     assert "file set" in symlink_result.stderr.lower()
@@ -653,9 +697,10 @@ def test_release_packet_rejects_directories_nested_files_and_symlinks(
 
 def test_draft_release_verifier_checks_metadata_body_and_remote_digests(
     tmp_path: Path,
+    receiver_release_repo: Path,
 ) -> None:
     dist = tmp_path / "dist"
-    _ = _create_manifest_fixture(dist)
+    _ = _create_manifest_fixture(receiver_release_repo, dist)
     names = (
         "apple_health_ai_bridge-1.1.1-py3-none-any.whl",
         "apple_health_ai_bridge-1.1.1.tar.gz",
@@ -688,7 +733,7 @@ def test_draft_release_verifier_checks_metadata_body_and_remote_digests(
     args = (
         "verify-draft",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--release-json",
@@ -755,12 +800,13 @@ def test_draft_release_verifier_checks_metadata_body_and_remote_digests(
 )
 def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
     tmp_path: Path,
+    receiver_release_repo: Path,
     command: str,
     draft: bool,
     mutation: str,
 ) -> None:
     dist = tmp_path / "dist"
-    metadata = _create_manifest_fixture(dist)
+    metadata = _create_manifest_fixture(receiver_release_repo, dist)
     _ = (dist / "SHA256SUMS").write_bytes(b"checksum fixture\n")
     metadata_payload = ReleaseMetadataOutput.model_validate_json(
         metadata.read_bytes()
@@ -806,7 +852,7 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
     completed = _run_release_tool(
         command,
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--release-json",
@@ -886,7 +932,11 @@ def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  #
     assert '.commit.committer.name == "GitHub"' in workflow
     assert '.commit.committer.email == ("noreply" + "@" + "github.com")' in workflow
     assert ".commit.author.email | endswith" not in workflow
-    assert 'endswith("@users.noreply.github.com")' in workflow
+    assert (
+        'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"' in workflow
+    )
+    assert 'test "$tagger_email" = "$expected_tagger_email"' in workflow
+    assert 'endswith("@users.noreply.github.com")' not in workflow
     assert (
         "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
         in workflow
@@ -981,7 +1031,7 @@ def test_public_docs_name_each_version_surface_and_transition() -> None:
         assert label in readme
         assert label in versioning
     assert "receiver-v1.0.2" in versioning
-    assert "ios-v1.1.0-build.39" in versioning
+    assert "ios-v1.1.1-build.41" in versioning
     assert "Existing `v1.0.0` and `v1.0.1` tags remain immutable" in versioning
     assert (
         "Do not bump an unchanged component merely to make the numbers match"
