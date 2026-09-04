@@ -42,7 +42,7 @@ final class BackgroundSyncWorkPlanTests: XCTestCase {
         }
     }
 
-    func testObserverBatchSelectsOneBoundedLaneAndLeavesOtherCodesDirty() {
+    func testObserverBatchScansFromContinuationAndSelectsOneDirtyLane() {
         let plan = HealthBridgeBackgroundSync.workPlan(
             reason: .observerBatch(
                 typeCodes: [
@@ -61,15 +61,18 @@ final class BackgroundSyncWorkPlanTests: XCTestCase {
                 "active_energy",
                 "unsupported_metric",
             ],
-            continuationLaneID: nil
+            continuationLaneID: BackgroundSyncWorkLane.sleep.id
         )
 
-        XCTAssertEqual(plan.lane, .steps)
+        XCTAssertEqual(plan.lane, .sleep)
         XCTAssertEqual(
             plan.coveredObserverTypeCodes,
-            ["steps"]
+            ["sleep_analysis"]
         )
-        XCTAssertNil(plan.nextScheduledLaneID)
+        XCTAssertEqual(
+            plan.nextScheduledLaneID,
+            BackgroundSyncWorkLane.quantity(typeCode: "energy").id
+        )
     }
 
     func testScheduledPlanMakesRoundRobinProgressAcrossEveryProcessReload() throws {
@@ -108,7 +111,7 @@ final class BackgroundSyncWorkPlanTests: XCTestCase {
         )
     }
 
-    func testScheduledPlanPrioritizesDurableObserverDirtinessWithoutAdvancingCatchUp() {
+    func testScheduledPlanScansToDirtyLaneAndAdvancesCatchUp() {
         let dirtyPlan = HealthBridgeBackgroundSync.workPlan(
             reason: .scheduledRefresh,
             availableQuantityTypeCodes: ["heart_rate"],
@@ -120,7 +123,7 @@ final class BackgroundSyncWorkPlanTests: XCTestCase {
         XCTAssertEqual(dirtyPlan.coveredObserverTypeCodes, ["sleep_analysis"])
         XCTAssertEqual(
             dirtyPlan.nextScheduledLaneID,
-            BackgroundSyncWorkLane.steps.id
+            BackgroundSyncWorkLane.quantity(typeCode: "heart_rate").id
         )
 
         let unknownPlan = HealthBridgeBackgroundSync.workPlan(
@@ -135,6 +138,71 @@ final class BackgroundSyncWorkPlanTests: XCTestCase {
         XCTAssertEqual(
             unknownPlan.nextScheduledLaneID,
             BackgroundSyncWorkLane.workouts.id
+        )
+    }
+
+    func testDirtyCursorRotatesAcrossBatchScheduledAndLaunchWithoutStarvation() throws {
+        let dirtyTypeCodes = [
+            "steps",
+            "active_energy",
+            "workout",
+            "sleep_analysis",
+            "oxygen_saturation",
+            "body_mass",
+            "unsupported_metric",
+        ]
+        let reasons: [AutomaticSyncReason] = [
+            .observerBatch(typeCodes: dirtyTypeCodes),
+            .scheduledRefresh,
+            .launchCatchUp,
+            .observerBatch(typeCodes: dirtyTypeCodes),
+            .scheduledRefresh,
+            .launchCatchUp,
+            .observerBatch(typeCodes: dirtyTypeCodes),
+        ]
+        var continuationLaneID: String? = BackgroundSyncWorkLane.steps.id
+        var attemptedLanes: [BackgroundSyncWorkLane] = []
+        var coveredTypeCodes: [[String]] = []
+
+        for reason in reasons {
+            let plan = HealthBridgeBackgroundSync.workPlan(
+                reason: reason,
+                availableQuantityTypeCodes: ["weight", "oxygen_saturation"],
+                pendingObserverTypeCodes: dirtyTypeCodes,
+                continuationLaneID: continuationLaneID
+            )
+            attemptedLanes.append(try XCTUnwrap(plan.lane))
+            coveredTypeCodes.append(plan.coveredObserverTypeCodes)
+            continuationLaneID = try XCTUnwrap(plan.nextScheduledLaneID)
+        }
+
+        XCTAssertEqual(
+            attemptedLanes,
+            [
+                .steps,
+                .dailyActivity,
+                .workouts,
+                .sleep,
+                .quantity(typeCode: "oxygen_saturation"),
+                .quantity(typeCode: "weight"),
+                .steps,
+            ]
+        )
+        XCTAssertEqual(
+            coveredTypeCodes,
+            [
+                ["steps"],
+                ["energy"],
+                ["workout"],
+                ["sleep_analysis"],
+                ["oxygen_saturation"],
+                ["weight"],
+                ["steps"],
+            ]
+        )
+        XCTAssertEqual(
+            continuationLaneID,
+            BackgroundSyncWorkLane.dailyActivity.id
         )
     }
 
@@ -283,9 +351,10 @@ final class BackgroundSyncWorkPlanTests: XCTestCase {
 extension BackgroundSyncWorkPlanTests {
     static let allTests = [
         ("testObserverReasonsMapToOneCorrectLaneAndUnknownFailsClosed", testObserverReasonsMapToOneCorrectLaneAndUnknownFailsClosed),
-        ("testObserverBatchSelectsOneBoundedLaneAndLeavesOtherCodesDirty", testObserverBatchSelectsOneBoundedLaneAndLeavesOtherCodesDirty),
+        ("testObserverBatchScansFromContinuationAndSelectsOneDirtyLane", testObserverBatchScansFromContinuationAndSelectsOneDirtyLane),
         ("testScheduledPlanMakesRoundRobinProgressAcrossEveryProcessReload", testScheduledPlanMakesRoundRobinProgressAcrossEveryProcessReload),
-        ("testScheduledPlanPrioritizesDurableObserverDirtinessWithoutAdvancingCatchUp", testScheduledPlanPrioritizesDurableObserverDirtinessWithoutAdvancingCatchUp),
+        ("testScheduledPlanScansToDirtyLaneAndAdvancesCatchUp", testScheduledPlanScansToDirtyLaneAndAdvancesCatchUp),
+        ("testDirtyCursorRotatesAcrossBatchScheduledAndLaunchWithoutStarvation", testDirtyCursorRotatesAcrossBatchScheduledAndLaunchWithoutStarvation),
         ("testBoundedRunGateRetainsObserverTypesOutsideCompletedLane", testBoundedRunGateRetainsObserverTypesOutsideCompletedLane),
         ("testBoundedRunGateClearsCanonicalAliasAfterItsLaneCompletes", testBoundedRunGateClearsCanonicalAliasAfterItsLaneCompletes),
         ("testUnknownPersistedContinuationResetsToFirstBoundedLane", testUnknownPersistedContinuationResetsToFirstBoundedLane),
