@@ -201,7 +201,7 @@ public enum HealthBridgeBackgroundSync {
             .canonicalTypeCodes(for: pendingObserverTypeCodes)
 
         switch reason {
-        case .observer, .observerBatch:
+        case .observer:
             let triggerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
                 for: reason.observerTypeCodes
             )
@@ -227,36 +227,35 @@ public enum HealthBridgeBackgroundSync {
                 coveredObserverTypeCodes: coveredTypeCodes,
                 nextScheduledLaneID: nil
             )
+        case .observerBatch:
+            let triggerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: reason.observerTypeCodes
+            )
+            let dirtyTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: triggerTypeCodes + normalizedPendingTypeCodes
+            )
+            return circularDirtyWorkPlan(
+                scheduledLanes: scheduledLanes,
+                dirtyTypeCodes: dirtyTypeCodes,
+                availableQuantityTypeCodeSet: availableQuantityTypeCodeSet,
+                continuationLaneID: continuationLaneID
+            ) ?? BackgroundSyncWorkPlan(
+                lane: nil,
+                coveredObserverTypeCodes: [],
+                nextScheduledLaneID: nil
+            )
         case .scheduledRefresh, .launchCatchUp:
             let continuationIndex = continuationLaneID.flatMap { laneID in
                 scheduledLanes.firstIndex { $0.id == laneID }
             } ?? scheduledLanes.startIndex
             let continuationLane = scheduledLanes[continuationIndex]
-            if !normalizedPendingTypeCodes.isEmpty {
-                let selectedDirtyLane = scheduledLanes.first { candidate in
-                    normalizedPendingTypeCodes.contains { typeCode in
-                        workLane(
-                            for: typeCode,
-                            availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
-                        ) == candidate
-                    }
-                }
-                if let selectedDirtyLane {
-                    let coveredTypeCodes = normalizedPendingTypeCodes.filter { typeCode in
-                        guard let mappedLane = workLane(
-                            for: typeCode,
-                            availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
-                        ) else {
-                            return false
-                        }
-                        return mappedLane == selectedDirtyLane
-                    }
-                    return BackgroundSyncWorkPlan(
-                        lane: selectedDirtyLane,
-                        coveredObserverTypeCodes: coveredTypeCodes,
-                        nextScheduledLaneID: continuationLane.id
-                    )
-                }
+            if let dirtyPlan = circularDirtyWorkPlan(
+                scheduledLanes: scheduledLanes,
+                dirtyTypeCodes: normalizedPendingTypeCodes,
+                availableQuantityTypeCodeSet: availableQuantityTypeCodeSet,
+                continuationLaneID: continuationLaneID
+            ) {
+                return dirtyPlan
             }
             let nextIndex = scheduledLanes.index(after: continuationIndex)
             let nextLane = nextIndex == scheduledLanes.endIndex
@@ -268,6 +267,37 @@ public enum HealthBridgeBackgroundSync {
                 nextScheduledLaneID: nextLane.id
             )
         }
+    }
+
+    private static func circularDirtyWorkPlan(
+        scheduledLanes: [BackgroundSyncWorkLane],
+        dirtyTypeCodes: [String],
+        availableQuantityTypeCodeSet: Set<String>,
+        continuationLaneID: String?
+    ) -> BackgroundSyncWorkPlan? {
+        let continuationIndex = continuationLaneID.flatMap { laneID in
+            scheduledLanes.firstIndex { $0.id == laneID }
+        } ?? scheduledLanes.startIndex
+
+        for offset in scheduledLanes.indices {
+            let candidateIndex = (continuationIndex + offset) % scheduledLanes.count
+            let candidateLane = scheduledLanes[candidateIndex]
+            let coveredTypeCodes = dirtyTypeCodes.filter { typeCode in
+                workLane(
+                    for: typeCode,
+                    availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
+                ) == candidateLane
+            }
+            guard !coveredTypeCodes.isEmpty else { continue }
+
+            let successorIndex = (candidateIndex + 1) % scheduledLanes.count
+            return BackgroundSyncWorkPlan(
+                lane: candidateLane,
+                coveredObserverTypeCodes: coveredTypeCodes,
+                nextScheduledLaneID: scheduledLanes[successorIndex].id
+            )
+        }
+        return nil
     }
 
     public static var observedHealthTypes: [HealthBridgeHealthType] {

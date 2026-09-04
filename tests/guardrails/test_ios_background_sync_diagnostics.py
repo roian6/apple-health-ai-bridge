@@ -33,7 +33,7 @@ PROJECT: Final = (
     ROOT / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
 WORK_PLAN_SHA256: Final = (
-    "33193a42d4425697bdba69784a7a9c0f4c6bb60d6c7ec0cade904ab7479ec7d1"
+    "980f24413eba8203b7a35fe53df7ed665dd044b5b3423b154fe0fda8e2a18b05"
 )
 
 
