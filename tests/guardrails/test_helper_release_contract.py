@@ -31,6 +31,7 @@ def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _helper_verification_args(
+    repo: Path,
     dist: Path,
     *,
     helper_sha256: str,
@@ -38,7 +39,7 @@ def _helper_verification_args(
 ) -> tuple[str, ...]:
     return (
         "--repo",
-        str(ROOT),
+        str(repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -58,6 +59,7 @@ def _helper_verification_args(
 
 def test_helper_verification_rejects_malformed_expected_manifest_digest(
     tmp_path: Path,
+    receiver_release_repo: Path,
 ) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -65,6 +67,7 @@ def test_helper_verification_rejects_malformed_expected_manifest_digest(
     completed = _run_release_tool(
         "verify-helper",
         *_helper_verification_args(
+            receiver_release_repo,
             dist,
             helper_sha256="0" * 64,
             manifest_sha256="INVALID",
@@ -79,6 +82,7 @@ def test_helper_verification_rejects_malformed_expected_manifest_digest(
 
 def test_helper_verification_rejects_manifest_digest_mismatch(
     tmp_path: Path,
+    receiver_release_repo: Path,
 ) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -88,6 +92,7 @@ def test_helper_verification_rejects_manifest_digest_mismatch(
     completed = _run_release_tool(
         "verify-helper",
         *_helper_verification_args(
+            receiver_release_repo,
             dist,
             helper_sha256="0" * 64,
             manifest_sha256="0" * 64,
@@ -100,7 +105,10 @@ def test_helper_verification_rejects_manifest_digest_mismatch(
     )
 
 
-def test_release_metadata_binds_expected_exact_source_helper(tmp_path: Path) -> None:
+def test_release_metadata_binds_expected_exact_source_helper(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     _ = (dist / "apple_health_ai_bridge-1.1.1-py3-none-any.whl").write_bytes(
@@ -112,7 +120,7 @@ def test_release_metadata_binds_expected_exact_source_helper(tmp_path: Path) -> 
     completed = _run_release_tool(
         "manifest",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -144,7 +152,10 @@ def test_release_metadata_binds_expected_exact_source_helper(tmp_path: Path) -> 
     assert len(source["git_tree"]) == 40
 
 
-def test_final_checksums_bind_helper_digest_and_exact_asset_set(tmp_path: Path) -> None:
+def test_final_checksums_bind_helper_digest_and_exact_asset_set(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     wheel = dist / "apple_health_ai_bridge-1.1.1-py3-none-any.whl"
@@ -155,7 +166,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(tmp_path: Path) 
     created = _run_release_tool(
         "manifest",
         "--repo",
-        str(ROOT),
+        str(receiver_release_repo),
         "--dist-dir",
         str(dist),
         "--tag",
@@ -268,6 +279,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(tmp_path: Path) 
         encoding="utf-8",
     )
     common = _helper_verification_args(
+        receiver_release_repo,
         dist,
         helper_sha256=helper_digest,
         manifest_sha256=hashlib.sha256(helper_manifest.read_bytes()).hexdigest(),

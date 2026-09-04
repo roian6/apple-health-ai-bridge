@@ -71,7 +71,7 @@ Version each component independently:
 - iOS source or distribution checkpoints use `ios-v<marketing-version>-build.<build>`;
 - Batch Protocol versions change only when the wire contract changes.
 
-Set `release_scope` explicitly in `component-versions.json`. Use `receiver` only when Receiver/CLI advances while the compatible iOS Companion and Batch Protocol remain identical to the predecessor baseline. Use `coordinated` when Receiver/CLI and at least one other component advance together; version equality never determines scope.
+Set `release_scope` explicitly in `component-versions.json`. Use `receiver` only when Receiver/CLI advances while the compatible iOS Companion and Batch Protocol remain identical to the predecessor baseline. Use `ios` only when the iOS Companion version and/or build advances while Receiver/CLI and Batch Protocol remain identical to the predecessor baseline. Use `coordinated` when Receiver/CLI and at least one other component advance together; version equality never determines scope.
 
 Before release:
 

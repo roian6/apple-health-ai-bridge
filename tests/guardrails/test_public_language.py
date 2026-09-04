@@ -439,7 +439,7 @@ def test_privacy_docs_explain_manifest_and_app_store_answers_together() -> None:
     assert "“Data Not Collected”" in review_template
 
 
-def test_coordinated_release_identities_are_explicit() -> None:
+def test_current_component_identities_are_explicit() -> None:
     pyproject = Path("pyproject.toml").read_text()
     package_init = Path("src/health_bridge/__init__.py").read_text()
     xcode_project = Path(
@@ -452,10 +452,10 @@ def test_coordinated_release_identities_are_explicit() -> None:
     assert 'version = "1.1.1"' in pyproject
     assert '__version__: Final = "1.1.1"' in package_init
     assert '"version": "1.1.1"' in server_manifest
-    assert xcode_project.count("MARKETING_VERSION = 1.1.0;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 39;") == 2
-    assert '?? "1.1.0"' in content_view
-    assert '?? "39"' in content_view
+    assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 41;") == 2
+    assert '?? "1.1.1"' in content_view
+    assert '?? "41"' in content_view
     assert "pre-1.0" not in security
 
 

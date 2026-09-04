@@ -149,7 +149,7 @@ The repository contains independently released components. Always include the co
 | Surface | Current version | Identifier |
 | --- | --- | --- |
 | Receiver/CLI | `1.1.1` | signed tag `receiver-v1.1.1` |
-| iOS Companion | `1.1.0` | TestFlight build `39` |
+| iOS Companion | `1.1.1` | source candidate build `41` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).

@@ -7,7 +7,7 @@ Apple Health AI Bridge contains independently released components. Always includ
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
 | Receiver/CLI | `1.1.1` | Release tag `receiver-v1.1.1` |
-| iOS Companion | `1.1.0` | TestFlight build `39` |
+| iOS Companion | `1.1.1` | Source candidate build `41` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 The authoritative machine-readable copy is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
@@ -33,13 +33,13 @@ Release notes use the same tag in their filename and install examples.
 The user-visible app version is Xcode `MARKETING_VERSION`. App Store Connect and TestFlight additionally require a monotonically increasing `CURRENT_PROJECT_VERSION` build number. Display both when identifying an installed build:
 
 ```text
-iOS Companion 1.1.0 (build 39)
+iOS Companion 1.1.1 (build 41)
 ```
 
 An iOS source or distribution checkpoint may use a component-scoped tag such as:
 
 ```text
-ios-v1.1.0-build.39
+ios-v1.1.1-build.41
 ```
 
 An iOS tag does not publish Receiver/CLI artifacts. TestFlight/App Store release gates remain authoritative for distributed app builds.
@@ -56,6 +56,7 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 - `component-versions.json` must change in the same commit as any authoritative version source.
 - Receiver-only releases still run the iOS source gates and record the compatible app build.
 - Receiver-only transitions keep iOS Companion and Batch Protocol values identical to the predecessor baseline while Receiver/CLI advances.
+- iOS-only transitions declare `release_scope` as `ios`, keep Receiver/CLI and Batch Protocol identical to the predecessor baseline, and advance the iOS marketing version and/or build with a higher build number.
 - Coordinated transitions declare `release_scope` as `coordinated`, advance Receiver/CLI plus at least one other component, and must not regress any component.
 - App-only releases verify compatibility with the published receiver before TestFlight or App Store promotion.
 - Existing `v1.0.0` and `v1.0.1` tags remain immutable. They are historical receiver release tags and are not renamed.
@@ -67,7 +68,7 @@ Use labels such as:
 
 ```text
 Receiver/CLI 1.1.1
-Compatible iOS Companion 1.1.0 (build 39)
+Compatible iOS Companion 1.1.1 (build 41)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```
 
