@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "ios-v*"
   pull_request:
   workflow_dispatch:
 
@@ -53,6 +55,67 @@ jobs:
 
       - name: Install locked dependencies
         run: uv sync --all-extras --dev --locked
+
+      - name: Verify iOS checkpoint tag
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG_OBJECT_SHA: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          event_tag_object_sha="$EVENT_TAG_OBJECT_SHA"
+          [[ "$event_tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
+          tag_ref_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')"
+          [[ "$tag_ref_sha" =~ ^[0-9a-f]{40}$ ]]
+          tag_object_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")"
+          test "$tag_ref_sha" = "$tag_object_sha"
+          test "$tag_ref_sha" = "$event_tag_object_sha"
+          signed_tag_name="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tag')"
+          test "$signed_tag_name" = "$GITHUB_REF_NAME"
+          tag_verified="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.verification.verified == true and .verification.reason == "valid"')"
+          test "$tag_verified" = "true"
+          tag_identity="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.tagger.name == "Chanhyo Jung" and (.tagger.email | endswith("@users.noreply.github.com"))')"
+          test "$tag_identity" = "true"
+          target_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.sha')"
+          target_type="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            --jq '.object.type')"
+          test "$target_type" = "commit"
+          test "$target_sha" = "$(git rev-parse HEAD)"
+          commit_verified="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
+            --jq '.commit.verification.verified == true and .commit.verification.reason == "valid"')"
+          test "$commit_verified" = "true"
+          commit_identity="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
+            --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
+          test "$commit_identity" = "true"
+          default_branch="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}" \
+            --jq '.default_branch')"
+          default_main_sha="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
+            --jq '.commit.sha')"
+          [[ "$default_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$target_sha" = "$default_main_sha"
+          baseline_sha="$(git rev-parse "${target_sha}^1")"
+          [[ "$baseline_sha" =~ ^[0-9a-f]{40}$ ]]
+          uv run python scripts/release_tools.py validate \
+            --repo . \
+            --tag "$GITHUB_REF_NAME" \
+            --tag-target-commit "$target_sha" \
+            --default-main-commit "$default_main_sha" \
+            --baseline-commit "$baseline_sha"
 
       - name: Run public release audit
         run: uv run python scripts/public-release-audit.py --strict
