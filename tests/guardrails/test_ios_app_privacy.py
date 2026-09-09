@@ -1127,7 +1127,9 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     assert (
         "pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys)" in view_model
     )
-    assert "completedObserverTypeCodes: workPlan.coveredObserverTypeCodes" in view_model
+    assert "completedObserverTypeCodes: completedObserverTypeCodes" in view_model
+    assert "typeCodes: attempt.coveredObserverTypeCodes" in view_model
+    assert "BackgroundSyncWorkExecutor.execute(" in view_model
     assert "typeCodes: [typeCode]" in view_model
     assert (
         "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in view_model
@@ -1478,11 +1480,15 @@ def test_ios_pairing_bootstrap_precedes_all_automatic_sync_entrypoints() -> None
     ).read_text()
 
     background_task = app.index(".backgroundTask(")
-    background_bootstrap = app.index("await viewModel.bootstrap()", background_task)
-    background_sync = app.index(
-        "await viewModel.runBackgroundRefreshSync", background_task
+    assert "await viewModel.handleBackgroundRefresh()" in app[background_task:]
+    handler = view_model.split("func handleBackgroundRefresh() async", 1)[1].split(
+        "private func runBackgroundRefreshSyncCollectingDiagnostic", 1
+    )[0]
+    assert "bootstrapBeforeRun: true" in handler
+    lifecycle = view_model.split("private func performBackgroundRefreshSync(", 1)[1]
+    assert lifecycle.index("await self.bootstrap()") < lifecycle.index(
+        "await self.performBackgroundRefreshWork("
     )
-    assert background_bootstrap < background_sync
 
     init_start = view_model.index("    init(")
     init_end = view_model.index("    var canSaveReceiverSettings", init_start)
@@ -1563,7 +1569,8 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
         "private func performBackgroundRefreshSync("
     )
     background_run_end = view_model.index(
-        "private func persistScheduledWorkContinuationIfNeeded", background_run_start
+        "private func finishBackgroundRunPreservingObserverDirtiness",
+        background_run_start,
     )
     background_run_body = view_model[background_run_start:background_run_end]
     queued_recursion = background_run_body.rindex(
@@ -1589,8 +1596,15 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
     )
     stop_end = view_model.index("func requestHealthPermissions() async", stop_start)
     stop_body = view_model[stop_start:stop_end]
-    assert "if hasPendingPairing" in stop_body
-    assert "else if Task.isCancelled" in stop_body
+    assert all(
+        check in stop_body
+        for check in (
+            "if hasPendingPairing",
+            "if Task.isCancelled",
+            "settingsStore.receiverSettingsGenerationToken != expectedGeneration",
+            "isCancellation: true",
+        )
+    )
 
     scheduler_start = view_model.index("private func startBackgroundOutboxScheduling(")
     scheduler_end = view_model.index(

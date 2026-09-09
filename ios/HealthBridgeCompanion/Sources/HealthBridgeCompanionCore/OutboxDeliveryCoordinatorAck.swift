@@ -55,11 +55,20 @@ extension OutboxDeliveryCoordinator {
     public func finalizeCommitted(itemID: String) throws -> FileOutboxDeliveryStateV1 {
         try validateCurrentOwnership()
         let current = try ownedState(itemID: itemID)
-        if current.phase == .committedFinalized { return current }
+        if current.phase == .committedFinalized {
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)
+            #endif
+            return current
+        }
         guard current.phase == .ackVerified,
               let receipt = current.committedReceipt else {
             throw OutboxDeliveryCoordinatorError.commitProofRequired
         }
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        // Replay can follow a crash between the authenticated ACK write and diagnostics.
+        outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)
+        #endif
         let context = OutboxDeliveryFinalizationContext(
             itemID: itemID,
             ownership: ownership

@@ -590,6 +590,146 @@ final class BackgroundSyncTests: XCTestCase {
         XCTAssertEqual(pendingSnapshot, ["heart_rate"])
     }
 
+    func testFailedScheduledRunReconcilesFreshGateWithDurableBacklog() {
+        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
+            admittedPendingTypeCodes: ["sleep_analysis"],
+            gatePendingTypeCodes: [],
+            durablePendingState: .available(typeCodes: ["sleep_analysis"]),
+            retryRequested: true,
+            automaticSyncReady: true,
+            backgroundSyncEnabled: true,
+            payloadAdmissionOpen: true
+        )
+
+        XCTAssertEqual(recovery.pendingTypeCodes, ["sleep_analysis"])
+        XCTAssertTrue(recovery.durableStateAvailable)
+        XCTAssertTrue(recovery.shouldScheduleRetry)
+    }
+
+    func testAdmittedScheduledInjectedLaneFailureRetainsDurableWorkInFreshGate() async throws {
+        let suiteName = "HealthBridgeInjectedFailureTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = BackgroundSyncSettingsStore(userDefaults: defaults)
+        let gate = BackgroundSyncRunGate(minimumSpacing: 0)
+        try store.markPendingObserverTypeCodes(["sleep_analysis"])
+        let admittedSnapshot = try store.loadPendingObserverTypeCodeGenerations()
+        let admission = await gate.beginRun(reason: .scheduledRefresh)
+        XCTAssertTrue(admission.shouldRun)
+
+        do {
+            throw SyntheticBackgroundLaneFailure.injected
+        } catch SyntheticBackgroundLaneFailure.injected {
+            let gatePending = await gate.finishRun(.interrupted)
+            let durablePending = try store.loadPendingObserverTypeCodeGenerations()
+            let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
+                admittedPendingTypeCodes: Array(admittedSnapshot.keys),
+                gatePendingTypeCodes: gatePending,
+                durablePendingState: .available(typeCodes: Array(durablePending.keys)),
+                retryRequested: true,
+                automaticSyncReady: true,
+                backgroundSyncEnabled: true,
+                payloadAdmissionOpen: true
+            )
+            await gate.retainObserverTypeCodes(recovery.pendingTypeCodes)
+            let retainedByGate = await gate.pendingObserverTypeCodesSnapshot()
+
+            XCTAssertEqual(recovery.pendingTypeCodes, ["sleep_analysis"])
+            XCTAssertEqual(retainedByGate, ["sleep_analysis"])
+            XCTAssertEqual(durablePending, admittedSnapshot)
+            XCTAssertTrue(recovery.shouldScheduleRetry)
+        }
+    }
+
+    func testFailedLaunchRunKeepsSnapshotWhenDurableReloadIsUnavailable() {
+        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
+            admittedPendingTypeCodes: ["heart_rate"],
+            gatePendingTypeCodes: ["step_count"],
+            durablePendingState: .unavailable,
+            retryRequested: true,
+            automaticSyncReady: true,
+            backgroundSyncEnabled: true,
+            payloadAdmissionOpen: true
+        )
+
+        XCTAssertEqual(recovery.pendingTypeCodes, ["heart_rate", "step_count"])
+        XCTAssertFalse(recovery.durableStateAvailable)
+        XCTAssertTrue(recovery.shouldScheduleRetry)
+    }
+
+    func testFailedRunDistinguishesGenuinelyEmptyDurableState() {
+        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
+            admittedPendingTypeCodes: [],
+            gatePendingTypeCodes: [],
+            durablePendingState: .available(typeCodes: []),
+            retryRequested: true,
+            automaticSyncReady: true,
+            backgroundSyncEnabled: true,
+            payloadAdmissionOpen: true
+        )
+
+        XCTAssertEqual(recovery.pendingTypeCodes, [])
+        XCTAssertTrue(recovery.durableStateAvailable)
+        XCTAssertFalse(recovery.shouldScheduleRetry)
+    }
+
+    func testFailedRunUnionsConcurrentObserverWorkWithoutClearingGenerations() throws {
+        let suiteName = "HealthBridgeFailureRecoveryTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try store.markPendingObserverTypeCodes(["sleep_analysis"])
+        let admitted = try store.loadPendingObserverTypeCodeGenerations()
+        try store.markPendingObserverTypeCodes(["sleep_analysis", "heart_rate"])
+        let concurrent = try store.loadPendingObserverTypeCodeGenerations()
+
+        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
+            admittedPendingTypeCodes: Array(admitted.keys),
+            gatePendingTypeCodes: ["heart_rate"],
+            durablePendingState: .available(typeCodes: Array(concurrent.keys)),
+            retryRequested: true,
+            automaticSyncReady: true,
+            backgroundSyncEnabled: true,
+            payloadAdmissionOpen: true
+        )
+
+        XCTAssertEqual(recovery.pendingTypeCodes, ["heart_rate", "sleep_analysis"])
+        XCTAssertEqual(
+            try store.loadPendingObserverTypeCodeGenerations(),
+            concurrent,
+            "Failure planning must not clear or overwrite a newer observer generation."
+        )
+        XCTAssertGreaterThan(
+            try XCTUnwrap(concurrent["sleep_analysis"]),
+            try XCTUnwrap(admitted["sleep_analysis"])
+        )
+    }
+
+    func testFailedRunRetryRemainsBoundedByCancellationDisableAndConnectionFence() {
+        func shouldRetry(
+            retryRequested: Bool = true,
+            ready: Bool = true,
+            enabled: Bool = true,
+            admissionOpen: Bool = true
+        ) -> Bool {
+            BackgroundSyncFailureRecoveryPolicy.plan(
+                admittedPendingTypeCodes: ["heart_rate"],
+                gatePendingTypeCodes: [],
+                durablePendingState: .available(typeCodes: ["heart_rate"]),
+                retryRequested: retryRequested,
+                automaticSyncReady: ready,
+                backgroundSyncEnabled: enabled,
+                payloadAdmissionOpen: admissionOpen
+            ).shouldScheduleRetry
+        }
+
+        XCTAssertTrue(shouldRetry())
+        XCTAssertFalse(shouldRetry(retryRequested: false))
+        XCTAssertFalse(shouldRetry(ready: false))
+        XCTAssertFalse(shouldRetry(enabled: false))
+        XCTAssertFalse(shouldRetry(admissionOpen: false))
+    }
+
     func testCancellationCertificationFailsClosedForEveryUncertainSignal() {
         func certify(
             barrier: Bool = true,
@@ -913,4 +1053,8 @@ private final class FailingObserverDirtinessStore: BackgroundObserverDirtinessSt
         _ = generations
         throw BackgroundSyncSettingsStoreError.persistenceFailed
     }
+}
+
+private enum SyntheticBackgroundLaneFailure: Error {
+    case injected
 }

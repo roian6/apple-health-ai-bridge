@@ -521,6 +521,24 @@ public final class FileOutbox {
     private let directory: URL
     private let fileManager: FileManager
 
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    public weak var automaticSyncDiagnosticDraft: AutomaticSyncDiagnosticDraft?
+    public var automaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore()
+
+    public func noteDiagnosticEnqueue(_ items: [FileOutboxItem], complete: Bool) {
+        guard let draft = automaticSyncDiagnosticDraft else { return }
+        draft.noteQueued(itemIDs: items.compactMap { UUID(uuidString: String($0.id.suffix(36))) }, complete: complete)
+        draft.checkpoint(using: automaticSyncDiagnosticStore)
+    }
+
+    public func noteDiagnosticDelivery(itemID: String, outcome: AutomaticSyncDeliveryOutcome) {
+        guard let localID = UUID(uuidString: String(itemID.suffix(36))) else { return }
+        automaticSyncDiagnosticDraft?.noteDelivery(itemID: localID, outcome: outcome)
+        guard automaticSyncDiagnosticDraft?.defersPersistenceUntilObserverAcknowledgement != true else { return }
+        _ = automaticSyncDiagnosticStore.noteDelivery(itemID: localID, outcome: outcome)
+    }
+    #endif
+
     public var directoryURL: URL { directory }
     public var clearIntentIsActive: Bool {
         fileManager.fileExists(atPath: clearIntentURL.path)
@@ -667,12 +685,16 @@ public final class FileOutbox {
         try persistManifest(manifest)
         try payload.write(to: fileURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(to: fileURL, fileManager: fileManager)
-        return FileOutboxItem(
+        let item = FileOutboxItem(
             id: id,
             fileURL: fileURL,
             receiverIdentity: receiverIdentity,
             deliveryState: nil
         )
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        noteDiagnosticEnqueue([item], complete: true)
+        #endif
+        return item
     }
 
     public func enqueueSequence(
@@ -687,10 +709,14 @@ public final class FileOutbox {
             cursorCheckpoint: cursorCheckpoint,
             stagedPayloadCount: payloads.count
         )
-        return try commitEnqueueTransaction(
+        let items = try commitEnqueueTransaction(
             prepared.transaction,
             manifest: prepared.manifest
         )
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        noteDiagnosticEnqueue(items, complete: true)
+        #endif
+        return items
     }
 
     func stageEnqueueSequenceForTesting(
@@ -915,8 +941,14 @@ public final class FileOutbox {
                 let payload = try Data(contentsOf: item.fileURL)
                 try await upload(item, payload)
                 try markUploaded(item)
+                #if !HEALTH_BRIDGE_MAILBOX_QA
+                noteDiagnosticDelivery(itemID: item.id, outcome: .accepted)
+                #endif
                 uploadedCount += 1
             } catch {
+                #if !HEALTH_BRIDGE_MAILBOX_QA
+                noteDiagnosticDelivery(itemID: item.id, outcome: error is CancellationError ? .cancelled : .failed)
+                #endif
                 failedItemIDs.append(item.id)
                 failedDescriptions.append(error.localizedDescription)
                 break
@@ -1005,6 +1037,20 @@ public final class FileOutbox {
         manifest.entries[index].deliveryState = updated
         manifest.version = SequenceManifest.mailboxVersion
         try persistManifest(manifest)
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        switch updated.phase {
+        case .published, .providerObserved:
+            noteDiagnosticDelivery(itemID: itemID, outcome: .mailboxAckPending)
+        case .ackVerified, .committedFinalized:
+            noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)
+        case .retryableFailure:
+            noteDiagnosticDelivery(itemID: itemID, outcome: .failed)
+        case .terminalFailure:
+            noteDiagnosticDelivery(itemID: itemID, outcome: .rejected)
+        case .collected, .encrypted:
+            break
+        }
+        #endif
         return updated
     }
 
@@ -2282,6 +2328,9 @@ public enum SleepBaselineRejectionRecovery {
         matchingItems = try matchingOutboxItems(rejectedTransition, in: outbox)
         for item in matchingItems {
             try outbox.markUploaded(item)
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .rejected)
+            #endif
         }
         try manifestStore.resetSynchronizationState()
     }

@@ -679,7 +679,14 @@ def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> Non
     assert "withTaskCancellationHandler" in sync
     assert "task.cancel()" in sync
     background_task = app[app.index(".backgroundTask(") :]
-    assert background_task.count("guard !Task.isCancelled else { return }") >= 2
+    # Executable cancellation-boundary tests cover the shared lifecycle owner.
+    # SwiftUI must await that owner rather than returning before its finalizer.
+    assert "await viewModel.handleBackgroundRefresh()" in background_task
+    assert "guard !Task.isCancelled" not in background_task
+    lifecycle = source.split("private func performBackgroundRefreshSync(", 1)[1]
+    assert "await finalization.run" in lifecycle
+    assert "await self.finalizeBackgroundRefresh(" in lifecycle
+    assert "BackgroundRefreshFinalizationPolicy.shouldScheduleNextRefresh(" in lifecycle
 
 
 def test_healthkit_queries_and_exclusive_gate_are_cancellation_aware() -> None:

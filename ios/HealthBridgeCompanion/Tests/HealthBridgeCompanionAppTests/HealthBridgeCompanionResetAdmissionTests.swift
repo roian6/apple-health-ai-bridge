@@ -6,6 +6,98 @@ import XCTest
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
+        let manager = FileManager.default
+        let applicationSupport = try XCTUnwrap(
+            manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        )
+        for (label, base) in [
+            ("temporary", manager.temporaryDirectory),
+            ("application-support", applicationSupport),
+        ] {
+            let root = base
+                .appendingPathComponent("HealthBridgeCompanionAppTests", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? manager.removeItem(at: root) }
+            let store = AutomaticSyncDiagnosticStore(
+                fileURL: root.appendingPathComponent("diagnostics.json")
+            )
+            let draft = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
+            draft.noteFailure(.classified(stage: .unknown, isCancellation: true))
+            draft.noteCompletion(.interrupted)
+
+            XCTAssertTrue(store.recordFinal(draft.record), label)
+            XCTAssertEqual(store.latestRecord?.failure?.category, .cancellation, label)
+        }
+    }
+
+    func testCancelledBackgroundHandlerFinalizesWithoutBootstrapOrMutatingFIFOAndCursors() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "BackgroundHandlerCancellation.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = ReceiverSettingsStore(
+            userDefaults: defaults, tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(), synchronize: { true }
+        )
+        try settings.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-cancellation-credential", rotateBindingID: true
+        )
+        let binding = try XCTUnwrap(settings.receiverBindingID)
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        try enqueueSyntheticItems(count: 3, in: outbox, receiverBindingID: binding)
+        let before = try outbox.pendingItems()
+        let payloads = try before.map { try Data(contentsOf: $0.fileURL) }
+        let cursors = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
+        try cursors.saveCursorValue("synthetic-progress", receiverBindingID: binding, sourceKey: "steps", cursorKind: "anchor")
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
+        try background.persistNextScheduledWorkLaneID("daily_activity")
+        let generations = try background.loadPendingObserverTypeCodeGenerations()
+        let diagnostics = AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json"))
+        let viewModel = try makeViewModel(
+            root: root, defaults: defaults, settingsStore: settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: outbox,
+            automaticSyncDiagnosticStore: diagnostics,
+            cancelInheritedLegacyUploads: {
+                XCTFail("An already expired handler must not start bootstrap payload cleanup")
+                return BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
+            }
+        )
+        let entered = expectation(description: "before real background handler")
+        let returned = expectation(description: "real handler returned after cancellation finalization")
+        var resume: CheckedContinuation<Void, Never>?
+        let task = Task { @MainActor in
+            await withCheckedContinuation { resume = $0; entered.fulfill() }
+            await viewModel.handleBackgroundRefresh()
+            XCTAssertEqual(background.lastRun?.outcome, .interrupted)
+            XCTAssertEqual(diagnostics.latestRecord?.failure?.category, .cancellation)
+            returned.fulfill()
+        }
+        let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(entry, .completed)
+        guard entry == .completed else { task.cancel(); return }
+        task.cancel()
+        resume?.resume()
+        let exit = await XCTWaiter.fulfillment(of: [returned], timeout: 2)
+        XCTAssertEqual(exit, .completed)
+        guard exit == .completed else { return }
+        await task.value
+        XCTAssertEqual(try outbox.pendingItems(), before)
+        XCTAssertEqual(try before.map { try Data(contentsOf: $0.fileURL) }, payloads)
+        XCTAssertEqual(try cursors.cursorValue(receiverBindingID: binding, sourceKey: "steps", cursorKind: "anchor"), "synthetic-progress")
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), generations)
+        XCTAssertEqual(background.nextScheduledWorkLaneID, "daily_activity")
+        XCTAssertNil(background.lastTaskSchedule, "Disabled automatic sync must not submit a request")
+    }
+
     func testConfirmedResetDuringPairingTerminalRequestWaitsThenDeletes() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)
@@ -711,6 +803,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         pairingStateStore: ReceiverPairingStateStore,
         outbox: FileOutbox,
         receiverClient: ReceiverClient = ReceiverClient(),
+        automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore(),
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
         },
@@ -722,6 +815,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             settingsStore: settingsStore,
             pairingStateStore: pairingStateStore,
             backgroundSyncStore: BackgroundSyncSettingsStore(userDefaults: defaults),
+            automaticSyncDiagnosticStore: automaticSyncDiagnosticStore,
             healthPermissionRequestStore: CompanionHealthPermissionRequestStore(
                 userDefaults: defaults
             ),

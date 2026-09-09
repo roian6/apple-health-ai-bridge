@@ -752,7 +752,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         do {
             let outbox = try FileOutbox(directory: outboxDirectory)
             let settingsStore = ReceiverSettingsStore()
-            _ = try DirectUploadFinalizer.finish(
+            let outcome = try DirectUploadFinalizer.finish(
                 descriptor: descriptor,
                 completion: completion,
                 currentReceiverGeneration: settingsStore.receiverSettingsGenerationToken,
@@ -776,8 +776,13 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                        item.receiverIdentity == receiverBindingID {
                         try outbox.markUploaded(item)
                     }
+                    // A replayed successful callback may follow durable payload retirement.
+                    outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)
                 }
             )
+            if outcome == .retained {
+                outbox.noteDiagnosticDelivery(itemID: descriptor.itemID, outcome: .failed)
+            }
             return true
         } catch {
             // Keep ownership durable until a later launch can replay reconciliation.

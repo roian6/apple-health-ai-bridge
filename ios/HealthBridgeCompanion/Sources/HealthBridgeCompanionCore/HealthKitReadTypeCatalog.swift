@@ -99,26 +99,24 @@ public final class HealthStoreAuthorizer {
     }
 }
 
-private final class HealthKitObserverCompletion: @unchecked Sendable {
-    private let completionHandler: () -> Void
-
-    init(_ completionHandler: @escaping () -> Void) {
-        self.completionHandler = completionHandler
-    }
-
-    func call() {
-        completionHandler()
-    }
-}
-
 @MainActor
 public final class HealthKitBackgroundDeliveryCoordinator {
     private let healthStore: HKHealthStore
     private var activeObserverQueries: [HKObserverQuery] = []
     private var callbackGeneration: UInt64 = 0
+    private let recovery: BackgroundDeliveryFailureRecovery
+    private var registrationTypes: [String: HKSampleType] = [:]
+    private var registrationRetryTask: Task<Void, Never>?
+    private var registrationHandler: @MainActor (String, Bool) -> Void = { _, _ in }
+    private var recoveryReadbackHandler: @MainActor (BackgroundDeliveryRecoveryReadback) -> Void = { _ in }
+    private var isCurrent: @MainActor () -> Bool = { false }
 
-    public init(healthStore: HKHealthStore = HKHealthStore()) {
+    public init(
+        healthStore: HKHealthStore = HKHealthStore(),
+        recovery: BackgroundDeliveryFailureRecovery
+    ) {
         self.healthStore = healthStore
+        self.recovery = recovery
     }
 
     public var activeObserverCount: Int {
@@ -127,38 +125,70 @@ public final class HealthKitBackgroundDeliveryCoordinator {
 
     public func start(
         healthTypes: [HealthBridgeHealthType] = HealthBridgeBackgroundSync.observedHealthTypes,
-        registrationHandler: @escaping @MainActor (_ typeIdentifier: String, _ succeeded: Bool, _ errorDescription: String?) -> Void = { _, _, _ in },
+        registrationHandler: @escaping @MainActor (_ typeCode: String, _ succeeded: Bool) -> Void = { _, _ in },
+        recoveryReadbackHandler: @escaping @MainActor (BackgroundDeliveryRecoveryReadback) -> Void = { _ in },
+        observerFailureHandler: @escaping @MainActor (BackgroundObserverFailureHandoff) -> Void = { _ in },
+        isCurrent: @escaping @MainActor () -> Bool,
+        observerAdmissionHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncObserverEventAdmission,
         observerCompletionHandler: @escaping @MainActor (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void = { _, _ in },
         eventHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncDiagnosticDraft?
     ) {
         callbackGeneration &+= 1
         let expectedCallbackGeneration = callbackGeneration
-        guard HKHealthStore.isHealthDataAvailable() else {
-            stopActiveObserverQueries()
-            registrationHandler("healthkit", false, "Health data is unavailable on this device.")
-            return
-        }
+        registrationRetryTask?.cancel()
+        registrationRetryTask = nil
+        self.registrationHandler = registrationHandler
+        self.recoveryReadbackHandler = recoveryReadbackHandler
+        self.isCurrent = isCurrent
+        registrationTypes = [:]
         stopActiveObserverQueries()
+        guard HKHealthStore.isHealthDataAvailable(), isCurrent() else { return }
+        recovery.activate(generation: expectedCallbackGeneration)
 
         for healthType in healthTypes {
             guard let sampleType = HealthKitReadTypeCatalog.sampleTypes(for: [healthType]).first else {
                 continue
             }
+            registrationTypes[healthType.typeCode] = sampleType
             let observer = HKObserverQuery(sampleType: sampleType, predicate: nil) { _, completionHandler, error in
+                let completion = BackgroundObserverAcknowledgement(completionHandler)
+                let observerStartedAt = Date()
                 guard error == nil else {
-                    completionHandler()
+                    let completionLatency = Date().timeIntervalSince(observerStartedAt)
+                    let runID = UUID()
+                    Task { @MainActor [weak self] in
+                        guard let self, self.callbackGeneration == expectedCallbackGeneration,
+                              self.isCurrent() else {
+                            completion.call()
+                            return
+                        }
+                        guard let handoff = self.recovery.observerFailureHandoff(
+                            typeCode: healthType.typeCode,
+                            generation: expectedCallbackGeneration,
+                            runID: runID,
+                            completionLatency: completionLatency,
+                            acknowledge: completion.call
+                        ) else { return }
+                        handoff.diagnostic.noteObserverCompletionLatency(
+                            Date().timeIntervalSince(observerStartedAt)
+                        )
+                        observerFailureHandler(handoff)
+                        self.recoveryReadbackHandler(self.recovery.readback)
+                    }
                     return
                 }
-                let observerStartedAt = Date()
-                let completion = HealthKitObserverCompletion(completionHandler)
                 Task { @MainActor [weak self] in
-                    guard self?.callbackGeneration == expectedCallbackGeneration else {
+                    guard let self, self.callbackGeneration == expectedCallbackGeneration,
+                          self.isCurrent() else {
                         completion.call()
                         return
                     }
                     let runID = UUID()
                     await AutomaticSyncObserverEventLifecycle.process(
                         startedAt: observerStartedAt,
+                        admissionHandler: {
+                            await observerAdmissionHandler(healthType.typeCode, runID)
+                        },
                         eventHandler: {
                             await eventHandler(healthType.typeCode, runID)
                         },
@@ -169,14 +199,60 @@ public final class HealthKitBackgroundDeliveryCoordinator {
             }
             healthStore.execute(observer)
             activeObserverQueries.append(observer)
-            healthStore.enableBackgroundDelivery(for: sampleType, frequency: .immediate) { succeeded, error in
-                let typeIdentifier = sampleType.identifier
-                let errorDescription = error.map { String(describing: $0) }
-                Task { @MainActor [weak self] in
-                    guard self?.callbackGeneration == expectedCallbackGeneration else { return }
-                    registrationHandler(typeIdentifier, succeeded, errorDescription)
+        }
+        reconcileRegistrations()
+    }
+
+    public func reconcileRegistrations() {
+        guard isCurrent() else { return }
+        registrationRetryTask?.cancel()
+        registrationRetryTask = nil
+        let expectedGeneration = callbackGeneration
+        do {
+            let attempts = try recovery.claimRegistrations(
+                typeCodes: Array(registrationTypes.keys), generation: expectedGeneration
+            )
+            for attempt in attempts {
+                guard let sampleType = registrationTypes[attempt.typeCode] else { continue }
+                healthStore.enableBackgroundDelivery(for: sampleType, frequency: .immediate) { succeeded, error in
+                    let enabled = succeeded && error == nil
+                    Task { @MainActor [weak self] in
+                        guard let self, self.callbackGeneration == expectedGeneration,
+                              self.isCurrent() else { return }
+                        do {
+                            guard try self.recovery.completeRegistration(attempt, succeeded: enabled) else { return }
+                        } catch {
+                            self.recoveryReadbackHandler(self.recovery.readback)
+                            return
+                        }
+                        self.registrationHandler(attempt.typeCode, enabled)
+                        self.recoveryReadbackHandler(self.recovery.readback)
+                        self.scheduleRegistrationRetry()
+                    }
                 }
             }
+        } catch {
+            recoveryReadbackHandler(recovery.readback)
+            return
+        }
+        recoveryReadbackHandler(recovery.readback)
+        scheduleRegistrationRetry()
+    }
+
+    private func scheduleRegistrationRetry() {
+        guard registrationRetryTask == nil, isCurrent(),
+              let deadline = recovery.nextRegistrationRetryAt else { return }
+        let expectedGeneration = callbackGeneration
+        registrationRetryTask = Task { @MainActor [weak self] in
+            do {
+                let delay = min(BackgroundDeliveryFailureRecovery.maximumRetryInterval, max(0, deadline.timeIntervalSinceNow))
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                try Task.checkCancellation()
+            } catch { return } // Cancellation is the stop/connection fence, not a retry failure.
+            guard let self, self.callbackGeneration == expectedGeneration,
+                  self.isCurrent() else { return }
+            self.registrationRetryTask = nil
+            self.reconcileRegistrations()
         }
     }
 
@@ -184,6 +260,11 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         healthTypes: [HealthBridgeHealthType] = HealthBridgeBackgroundSync.observedHealthTypes
     ) {
         callbackGeneration &+= 1
+        registrationRetryTask?.cancel()
+        registrationRetryTask = nil
+        isCurrent = { false }
+        registrationTypes = [:]
+        recovery.stop()
         guard HKHealthStore.isHealthDataAvailable() else {
             activeObserverQueries.removeAll()
             return

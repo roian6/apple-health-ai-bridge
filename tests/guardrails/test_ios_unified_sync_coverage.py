@@ -181,7 +181,11 @@ def test_background_entry_points_pass_explicit_sync_reasons() -> None:
     assert "reason: .observer(typeCode: typeCode)" in observer_entry
     assert "diagnosticRunID: diagnosticRunID" in observer_entry
     assert "runBackgroundRefreshSync(reason: .launchCatchUp)" in view_model
-    assert "runBackgroundRefreshSync(reason: .scheduledRefresh)" in app
+    assert "await viewModel.handleBackgroundRefresh()" in app
+    handler = view_model.split("func handleBackgroundRefresh() async", 1)[1].split(
+        "private func runBackgroundRefreshSyncCollectingDiagnostic", 1
+    )[0]
+    assert "reason: .scheduledRefresh" in handler
 
 
 def test_automatic_core_sync_uses_one_day_fallback_without_authorization() -> None:

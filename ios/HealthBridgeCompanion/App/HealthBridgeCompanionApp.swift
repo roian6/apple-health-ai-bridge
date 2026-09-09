@@ -43,17 +43,7 @@ struct HealthBridgeCompanionApp: App {
                 }
         }
         .backgroundTask(.appRefresh(HealthBridgeBackgroundSync.appRefreshIdentifier)) {
-            await viewModel.bootstrap()
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                viewModel.noteBackgroundRefreshHandlerStarted(source: "bg_app_refresh")
-            }
-            await viewModel.runBackgroundRefreshSync(reason: .scheduledRefresh)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
-                BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
-            }
+            await viewModel.handleBackgroundRefresh()
         }
     }
 }

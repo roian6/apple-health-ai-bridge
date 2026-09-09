@@ -3,7 +3,7 @@ import XCTest
 
 final class AutomaticSyncDiagnosticsTests: XCTestCase {
     @MainActor
-    func testObserverDiagnosticPersistenceBeginsOnlyAfterAcknowledgement() async {
+    func testObserverAcknowledgesAfterAdmissionBeforeBlockedContinuation() async {
         let fileURL = temporaryFileURL()
         defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
         let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
@@ -13,34 +13,69 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
         draft.noteRunAccepted()
         draft.noteCompletion(.completed)
         var events: [String] = []
+        var resumeContinuation: CheckedContinuation<Void, Never>?
         let startedAt = Date(timeIntervalSince1970: 1_788_000_000)
 
-        await AutomaticSyncObserverEventLifecycle.process(
-            startedAt: startedAt,
-            now: { startedAt.addingTimeInterval(7) },
-            eventHandler: {
-                events.append("event")
-                return draft
-            },
-            acknowledge: {
-                events.append("acknowledge")
-                XCTAssertFalse(
-                    FileManager.default.fileExists(atPath: fileURL.path),
-                    "Diagnostic persistence must not begin before HealthKit is acknowledged."
-                )
-            },
-            persistDiagnostic: { completedDraft, latency in
-                events.append("persist")
-                completedDraft.noteObserverCompletionLatency(latency)
-                XCTAssertTrue(store.recordFinal(completedDraft.record))
-            }
-        )
+        let processing = Task { @MainActor in
+            await AutomaticSyncObserverEventLifecycle.process(
+                startedAt: startedAt,
+                now: { startedAt.addingTimeInterval(0.25) },
+                admissionHandler: {
+                    events.append("admission")
+                    return .continueProcessing
+                },
+                eventHandler: {
+                    events.append("continuation")
+                    await withCheckedContinuation { continuation in
+                        resumeContinuation = continuation
+                    }
+                    return draft
+                },
+                acknowledge: {
+                    events.append("acknowledge")
+                    XCTAssertFalse(
+                        FileManager.default.fileExists(atPath: fileURL.path),
+                        "Diagnostic persistence must not begin before HealthKit is acknowledged."
+                    )
+                },
+                persistDiagnostic: { completedDraft, latency in
+                    events.append("persist")
+                    completedDraft.noteObserverCompletionLatency(latency)
+                    XCTAssertTrue(store.recordFinal(completedDraft.record))
+                }
+            )
+        }
 
-        XCTAssertEqual(events, ["event", "acknowledge", "persist"])
-        XCTAssertEqual(
-            store.latestRecord?.observerCompletionLatencyBucket,
-            .fiveToThirtySeconds
+        while resumeContinuation == nil { await Task.yield() }
+        XCTAssertEqual(events, ["admission", "acknowledge", "continuation"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        resumeContinuation?.resume()
+        await processing.value
+
+        XCTAssertEqual(events, ["admission", "acknowledge", "continuation", "persist"])
+        XCTAssertEqual(store.latestRecord?.observerCompletionLatencyBucket, .underOneSecond)
+    }
+
+    @MainActor
+    func testObserverAdmissionCanFinishWithoutStartingContinuation() async {
+        let draft = AutomaticSyncDiagnosticDraft(
+            reason: .observer(typeCode: HealthBridgeHealthType.sleepAnalysis.typeCode)
         )
+        var events: [String] = []
+        await AutomaticSyncObserverEventLifecycle.process(
+            startedAt: Date(timeIntervalSince1970: 1_788_000_000),
+            admissionHandler: {
+                events.append("admission")
+                return .complete(draft)
+            },
+            eventHandler: {
+                events.append("continuation")
+                return nil
+            },
+            acknowledge: { events.append("acknowledge") },
+            persistDiagnostic: { _, _ in events.append("persist") }
+        )
+        XCTAssertEqual(events, ["admission", "acknowledge", "persist"])
     }
 
     func testHistoryEvictsOldestRecordsAtBound() {
@@ -102,6 +137,35 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
         XCTAssertEqual(aged.pendingLaneCount, 1)
         XCTAssertEqual(aged.oldestPendingLane, .sleep)
         XCTAssertEqual(aged.oldestPendingLaneAgeBucket, .oneToThreeDays)
+    }
+
+    func testFailureRecoveryKeepsPendingAgeWhenDurableReloadIsUnavailable() {
+        let fileURL = temporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
+        let firstSeen = Date(timeIntervalSince1970: 1_788_000_000)
+        _ = store.pendingSnapshot(
+            pendingTypeCodes: ["sleep_analysis"],
+            now: firstSeen
+        )
+        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
+            admittedPendingTypeCodes: ["sleep_analysis"],
+            gatePendingTypeCodes: [],
+            durablePendingState: .unavailable,
+            retryRequested: true,
+            automaticSyncReady: true,
+            backgroundSyncEnabled: true,
+            payloadAdmissionOpen: true
+        )
+
+        let remaining = store.pendingSnapshot(
+            pendingTypeCodes: recovery.pendingTypeCodes,
+            now: firstSeen.addingTimeInterval(25 * 60 * 60)
+        )
+
+        XCTAssertEqual(remaining.pendingLaneCount, 1)
+        XCTAssertEqual(remaining.oldestPendingLane, .sleep)
+        XCTAssertEqual(remaining.oldestPendingLaneAgeBucket, .oneToThreeDays)
     }
 
     func testQuantityPendingAgeTracksOnlyTheCoarseLane() {
@@ -215,6 +279,179 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
 
         draft.noteCompletion(.failed)
         XCTAssertEqual(draft.record.runOutcome, .failed)
+        XCTAssertEqual(draft.record.failure, .unknown)
+    }
+
+    func testFailureClassificationSeparatesStageCategoryAndCancellation() {
+        for stage in [
+            AutomaticSyncDiagnosticFailureStage.read,
+            .store,
+            .encoding,
+            .transport,
+        ] {
+            XCTAssertEqual(
+                AutomaticSyncDiagnosticFailure.classified(
+                    stage: stage,
+                    isCancellation: false
+                ),
+                AutomaticSyncDiagnosticFailure(
+                    stage: stage,
+                    category: .operationFailed
+                )
+            )
+        }
+        XCTAssertEqual(
+            AutomaticSyncDiagnosticFailure.classified(
+                stage: .transport,
+                isCancellation: true
+            ),
+            AutomaticSyncDiagnosticFailure(
+                stage: .transport,
+                category: .cancellation
+            )
+        )
+        XCTAssertEqual(
+            AutomaticSyncDiagnosticFailure.classified(
+                stage: .unknown,
+                isCancellation: false
+            ),
+            .unknown
+        )
+    }
+
+    func testTypedFailureRoundTripsWithoutAnArbitraryErrorStringField() throws {
+        let rawPrivateError = "https://private.invalid/path Bearer synthetic-secret"
+        let record = makeRecord(
+            failure: AutomaticSyncDiagnosticFailure(
+                stage: .encoding,
+                category: .operationFailed
+            ),
+            remainingPendingLaneCount: 1
+        )
+
+        let data = try JSONEncoder().encode(record)
+        let decoded = try JSONDecoder().decode(
+            AutomaticSyncDiagnosticRecord.self,
+            from: data
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let failure = try XCTUnwrap(object["failure"] as? [String: String])
+
+        XCTAssertEqual(decoded.failure, record.failure)
+        XCTAssertEqual(failure, ["category": "operation_failed", "stage": "encoding"])
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains(rawPrivateError))
+    }
+
+    func testLatestLaneRenderingIncludesOnlyBoundedFailureMetadata() {
+        let record = makeRecord(
+            failure: AutomaticSyncDiagnosticFailure(
+                stage: .read,
+                category: .operationFailed
+            ),
+            remainingPendingLaneCount: 1
+        )
+
+        XCTAssertTrue(record.latestLaneSummary.contains("failure=read/operation_failed"))
+        XCTAssertFalse(record.latestLaneSummary.contains("NSError"))
+        XCTAssertFalse(record.latestLaneSummary.contains("http"))
+    }
+
+    func testUnknownFutureFailureEnumsDecodeAsUnknownWithoutDroppingRecord() throws {
+        let fileURL = temporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let baseData = try JSONEncoder().encode(
+            makeRecord(remainingPendingLaneCount: 1)
+        )
+        var record = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: baseData) as? [String: Any]
+        )
+        record["failure"] = [
+            "category": "future_failure_category",
+            "stage": "future_failure_stage",
+        ]
+        let snapshot: [String: Any] = [
+            "pendingSinceBucketByLane": [:],
+            "records": [record],
+            "version": 1,
+        ]
+        try JSONSerialization.data(withJSONObject: snapshot)
+            .write(to: fileURL, options: .atomic)
+
+        let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
+
+        XCTAssertEqual(store.history.count, 1)
+        XCTAssertEqual(store.latestRecord?.failure, .unknown)
+    }
+
+    func testLegacyJSONWithoutFailureMetadataRetainsItsRecord() throws {
+        let fileURL = temporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let legacyRecordData = try JSONEncoder().encode(
+            makeRecord(remainingPendingLaneCount: 1)
+        )
+        var legacyRecord = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: legacyRecordData) as? [String: Any]
+        )
+        legacyRecord.removeValue(forKey: "failure")
+        let snapshot: [String: Any] = [
+            "pendingSinceBucketByLane": [:],
+            "records": [legacyRecord],
+            "version": 1,
+        ]
+        try JSONSerialization.data(withJSONObject: snapshot)
+            .write(to: fileURL, options: .atomic)
+
+        let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
+
+        XCTAssertEqual(store.history.count, 1)
+        XCTAssertNil(store.latestRecord?.failure)
+    }
+
+    func testFinalRecordPreservesTypedFailureOnAcceptedCheckpointReplacement() {
+        let fileURL = temporaryFileURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
+        let runID = UUID()
+        XCTAssertTrue(
+            store.recordAccepted(
+                makeRecord(
+                    runID: runID,
+                    runOutcome: .accepted,
+                    remainingPendingLaneCount: 1
+                )
+            )
+        )
+
+        XCTAssertTrue(
+            store.recordFinal(
+                makeRecord(
+                    runID: runID,
+                    runOutcome: .failed,
+                    failure: AutomaticSyncDiagnosticFailure(
+                        stage: .store,
+                        category: .operationFailed
+                    ),
+                    remainingPendingLaneCount: 1
+                )
+            )
+        )
+        XCTAssertEqual(
+            store.latestRecord?.failure,
+            AutomaticSyncDiagnosticFailure(
+                stage: .store,
+                category: .operationFailed
+            )
+        )
     }
 
     func testFinalRecordReplacesOnlyItsDurableAcceptedCheckpoint() {
@@ -317,6 +554,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
         triggerLane: AutomaticSyncDiagnosticLane = .sleep,
         runOutcome: AutomaticSyncDiagnosticRunOutcome = .completed,
         observerCompletionLatencyBucket: AutomaticSyncObserverCompletionLatencyBucket = .fiveToThirtySeconds,
+        failure: AutomaticSyncDiagnosticFailure? = nil,
         remainingPendingLaneCount: Int
     ) -> AutomaticSyncDiagnosticRecord {
         AutomaticSyncDiagnosticRecord(
@@ -331,6 +569,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
             oldestPendingLaneAgeBucket: .oneToSixHours,
             runOutcome: runOutcome,
             observerCompletionLatencyBucket: observerCompletionLatencyBucket,
+            failure: failure,
             remainingPendingLaneCount: remainingPendingLaneCount
         )
     }
