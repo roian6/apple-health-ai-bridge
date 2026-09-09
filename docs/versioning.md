@@ -7,7 +7,7 @@ Apple Health AI Bridge contains independently released components. Always includ
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
 | Receiver/CLI | `1.1.1` | Release tag `receiver-v1.1.1` |
-| iOS Companion | `1.1.1` | Source candidate build `41` |
+| iOS Companion | `1.1.1` | Source candidate build `42` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 The authoritative machine-readable copy is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
@@ -33,13 +33,13 @@ Release notes use the same tag in their filename and install examples.
 The user-visible app version is Xcode `MARKETING_VERSION`. App Store Connect and TestFlight additionally require a monotonically increasing `CURRENT_PROJECT_VERSION` build number. Display both when identifying an installed build:
 
 ```text
-iOS Companion 1.1.1 (build 41)
+iOS Companion 1.1.1 (build 42)
 ```
 
 An iOS source or distribution checkpoint may use a component-scoped tag such as:
 
 ```text
-ios-v1.1.1-build.41
+ios-v1.1.1-build.42
 ```
 
 An iOS tag does not publish Receiver/CLI artifacts. TestFlight/App Store release gates remain authoritative for distributed app builds.
@@ -68,7 +68,7 @@ Use labels such as:
 
 ```text
 Receiver/CLI 1.1.1
-Compatible iOS Companion 1.1.1 (build 41)
+Compatible iOS Companion 1.1.1 (build 42)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```
 
