@@ -80,19 +80,59 @@ public enum BackgroundSyncWorkLane: Equatable, Sendable {
     }
 }
 
-public struct BackgroundSyncWorkPlan: Equatable, Sendable {
-    public let lane: BackgroundSyncWorkLane?
+public struct BackgroundSyncWorkAttempt: Equatable, Sendable {
+    public let lane: BackgroundSyncWorkLane
     public let coveredObserverTypeCodes: [String]
-    public let nextScheduledLaneID: String?
+    public let nextScheduledLaneID: String
+}
 
-    public init(
-        lane: BackgroundSyncWorkLane?,
-        coveredObserverTypeCodes: [String],
-        nextScheduledLaneID: String?
-    ) {
-        self.lane = lane
-        self.coveredObserverTypeCodes = coveredObserverTypeCodes
-        self.nextScheduledLaneID = nextScheduledLaneID
+public struct BackgroundSyncWorkPlan: Equatable, Sendable {
+    public static let maximumLaneAttempts = 4
+    public let attempts: [BackgroundSyncWorkAttempt]
+    public var lane: BackgroundSyncWorkLane? { attempts.first?.lane }
+}
+
+@MainActor
+public enum BackgroundSyncWorkExecutor {
+    public static func recordQueuedCoreLaneProgress(
+        lane: BackgroundSyncWorkLane,
+        querySucceeded: Bool,
+        laneSucceeded: Bool,
+        enqueueFailed: Bool,
+        pendingBefore: Int?,
+        pendingAfter: Int?,
+        validate: () throws -> Void,
+        persist: (BackgroundSyncWorkLane) throws -> Void
+    ) throws {
+        // Scheduling progress is not delivery completion: keep the FIFO head and
+        // observer generations intact. No suspension may separate the fence/write.
+        try Task.checkCancellation()
+        guard HealthBridgeBackgroundSync.coreWorkLanes.contains(lane),
+              querySucceeded, laneSucceeded, !enqueueFailed,
+              pendingBefore == 0, let pendingAfter, pendingAfter > 0 else { return }
+        try validate()
+        try persist(lane)
+    }
+
+    // The caller holds the cursor-bearing transfer gate for this entire execution.
+    // Planning is immutable: arrivals during a lane await belong to a later run.
+    public static func execute(
+        plan: BackgroundSyncWorkPlan,
+        prepare: (BackgroundSyncWorkAttempt) throws -> Void,
+        runLane: (BackgroundSyncWorkLane) async throws -> Bool,
+        didComplete: (BackgroundSyncWorkAttempt) async throws -> Void
+    ) async throws -> [BackgroundSyncWorkAttempt] {
+        var completed: [BackgroundSyncWorkAttempt] = []
+        for attempt in plan.attempts {
+            try Task.checkCancellation()
+            try prepare(attempt)
+            try Task.checkCancellation()
+            guard try await runLane(attempt.lane) else { return completed }
+            try Task.checkCancellation()
+            try await didComplete(attempt)
+            completed.append(attempt)
+        }
+        return completed
     }
 }
 
@@ -128,6 +168,9 @@ public enum HealthBridgeBackgroundSync {
         HealthBridgeAppIdentity.appRefreshIdentifier
     }
     public static let defaultMinimumInterval: TimeInterval = 15 * 60
+    public static let coreWorkLanes: [BackgroundSyncWorkLane] = [
+        .sleep, .dailyActivity, .steps, .workouts,
+    ]
     public static let defaultRunDebounceInterval: TimeInterval = 10 * 60
     public static let defaultObservedHealthTypes: [HealthBridgeHealthType] = [.steps, .workouts, .sleepAnalysis]
     public static let dailyActivityTypeCodes = [
@@ -187,117 +230,76 @@ public enum HealthBridgeBackgroundSync {
         reason: AutomaticSyncReason,
         availableQuantityTypeCodes: [String],
         pendingObserverTypeCodes: [String],
-        continuationLaneID: String?
+        continuationLaneID: String?,
+        coreLaneLastSuccess: [String: Date] = [:],
+        now: Date = Date()
     ) -> BackgroundSyncWorkPlan {
-        let availableQuantityTypeCodeSet = Set(
-            GenericQuantityCoveragePolicy.canonicalSupportedTypeCodes(
-                availableQuantityTypeCodes
+        let available = Set(GenericQuantityCoveragePolicy.canonicalSupportedTypeCodes(
+            availableQuantityTypeCodes
+        ))
+        let scheduled = scheduledWorkLanes(availableQuantityTypeCodes: Array(available))
+        let dirty = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+            for: pendingObserverTypeCodes + reason.observerTypeCodes
+        )
+        func coveredCodes(_ lane: BackgroundSyncWorkLane) -> [String] {
+            dirty.filter { workLane(for: $0, availableQuantityTypeCodeSet: available) == lane }
+        }
+        func progressDate(_ lane: BackgroundSyncWorkLane) -> Date {
+            guard let date = coreLaneLastSuccess[lane.id], date <= now else { return .distantPast }
+            return date
+        }
+        // A queued lane ends the opportunity. Oldest progress must lead even
+        // when every core is overdue again by the next system-granted wake.
+        let overdue = coreWorkLanes.filter { lane in
+            now.timeIntervalSince(progressDate(lane)) >= defaultMinimumInterval
+        }.sorted { progressDate($0) < progressDate($1) }
+        var selected: [BackgroundSyncWorkLane] = []
+        func append(_ lane: BackgroundSyncWorkLane) {
+            guard selected.count < BackgroundSyncWorkPlan.maximumLaneAttempts,
+                  !selected.contains(lane) else { return }
+            selected.append(lane)
+        }
+        let trigger: BackgroundSyncWorkLane?
+        if case .observer(let typeCode) = reason {
+            trigger = workLane(
+                for: GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode),
+                availableQuantityTypeCodeSet: available
             )
-        )
-        let scheduledLanes = scheduledWorkLanes(
-            availableQuantityTypeCodes: Array(availableQuantityTypeCodeSet)
-        )
-        let normalizedPendingTypeCodes = GenericQuantityCoveragePolicy
-            .canonicalTypeCodes(for: pendingObserverTypeCodes)
-
+        } else {
+            trigger = nil
+        }
+        // Core affinity may break an oldest-progress tie, never jump older work.
+        if let trigger, overdue.contains(trigger), let oldest = overdue.first,
+           progressDate(trigger) == progressDate(oldest) {
+            append(trigger)
+        }
+        overdue.forEach(append)
+        if let trigger { append(trigger) }
+        coreWorkLanes.filter { !coveredCodes($0).isEmpty }.forEach(append)
+        let start = continuationLaneID.flatMap { id in scheduled.firstIndex { $0.id == id } } ?? 0
+        let circular = scheduled.indices.map { scheduled[(start + $0) % scheduled.count] }
+        circular.filter { !coveredCodes($0).isEmpty }.forEach(append)
         switch reason {
-        case .observer:
-            let triggerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
-                for: reason.observerTypeCodes
-            )
-            let selectedLane = scheduledLanes.first { candidate in
-                triggerTypeCodes.contains { typeCode in
-                    workLane(
-                        for: typeCode,
-                        availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
-                    ) == candidate
-                }
-            }
-            let coveredTypeCodes = triggerTypeCodes.filter { typeCode in
-                guard let mappedLane = workLane(
-                    for: typeCode,
-                    availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
-                ) else {
-                    return false
-                }
-                return mappedLane == selectedLane
-            }
-            return BackgroundSyncWorkPlan(
-                lane: selectedLane,
-                coveredObserverTypeCodes: coveredTypeCodes,
-                nextScheduledLaneID: nil
-            )
-        case .observerBatch:
-            let triggerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
-                for: reason.observerTypeCodes
-            )
-            let dirtyTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
-                for: triggerTypeCodes + normalizedPendingTypeCodes
-            )
-            return circularDirtyWorkPlan(
-                scheduledLanes: scheduledLanes,
-                dirtyTypeCodes: dirtyTypeCodes,
-                availableQuantityTypeCodeSet: availableQuantityTypeCodeSet,
-                continuationLaneID: continuationLaneID
-            ) ?? BackgroundSyncWorkPlan(
-                lane: nil,
-                coveredObserverTypeCodes: [],
-                nextScheduledLaneID: nil
-            )
         case .scheduledRefresh, .launchCatchUp:
-            let continuationIndex = continuationLaneID.flatMap { laneID in
-                scheduledLanes.firstIndex { $0.id == laneID }
-            } ?? scheduledLanes.startIndex
-            let continuationLane = scheduledLanes[continuationIndex]
-            if let dirtyPlan = circularDirtyWorkPlan(
-                scheduledLanes: scheduledLanes,
-                dirtyTypeCodes: normalizedPendingTypeCodes,
-                availableQuantityTypeCodeSet: availableQuantityTypeCodeSet,
-                continuationLaneID: continuationLaneID
-            ) {
-                return dirtyPlan
-            }
-            let nextIndex = scheduledLanes.index(after: continuationIndex)
-            let nextLane = nextIndex == scheduledLanes.endIndex
-                ? scheduledLanes[scheduledLanes.startIndex]
-                : scheduledLanes[nextIndex]
-            return BackgroundSyncWorkPlan(
-                lane: continuationLane,
-                coveredObserverTypeCodes: [],
-                nextScheduledLaneID: nextLane.id
-            )
+            circular.forEach(append)
+        case .observer, .observerBatch:
+            break
         }
-    }
-
-    private static func circularDirtyWorkPlan(
-        scheduledLanes: [BackgroundSyncWorkLane],
-        dirtyTypeCodes: [String],
-        availableQuantityTypeCodeSet: Set<String>,
-        continuationLaneID: String?
-    ) -> BackgroundSyncWorkPlan? {
-        let continuationIndex = continuationLaneID.flatMap { laneID in
-            scheduledLanes.firstIndex { $0.id == laneID }
-        } ?? scheduledLanes.startIndex
-
-        for offset in scheduledLanes.indices {
-            let candidateIndex = (continuationIndex + offset) % scheduledLanes.count
-            let candidateLane = scheduledLanes[candidateIndex]
-            let coveredTypeCodes = dirtyTypeCodes.filter { typeCode in
-                workLane(
-                    for: typeCode,
-                    availableQuantityTypeCodeSet: availableQuantityTypeCodeSet
-                ) == candidateLane
+        return BackgroundSyncWorkPlan(attempts: selected.enumerated().map { index, lane in
+            let successor: BackgroundSyncWorkLane
+            if index + 1 < selected.count {
+                successor = selected[index + 1]
+            } else {
+                // Every selected lane came from the fixed schedule.
+                let scheduledIndex = scheduled.firstIndex(of: lane)!
+                successor = scheduled[(scheduledIndex + 1) % scheduled.count]
             }
-            guard !coveredTypeCodes.isEmpty else { continue }
-
-            let successorIndex = (candidateIndex + 1) % scheduledLanes.count
-            return BackgroundSyncWorkPlan(
-                lane: candidateLane,
-                coveredObserverTypeCodes: coveredTypeCodes,
-                nextScheduledLaneID: scheduledLanes[successorIndex].id
+            return BackgroundSyncWorkAttempt(
+                lane: lane,
+                coveredObserverTypeCodes: coveredCodes(lane),
+                nextScheduledLaneID: successor.id
             )
-        }
-        return nil
+        })
     }
 
     public static var observedHealthTypes: [HealthBridgeHealthType] {
@@ -374,12 +376,7 @@ public enum HealthBridgeBackgroundSync {
     private static func scheduledWorkLanes(
         availableQuantityTypeCodes: [String]
     ) -> [BackgroundSyncWorkLane] {
-        [
-            .steps,
-            .dailyActivity,
-            .workouts,
-            .sleep,
-        ] + availableQuantityTypeCodes.sorted().map {
+        coreWorkLanes + availableQuantityTypeCodes.sorted().map {
             .quantity(typeCode: $0)
         }
     }
@@ -453,6 +450,54 @@ public enum BackgroundSyncRunCompletion: Equatable, Sendable {
     case interrupted
 }
 
+public enum BackgroundSyncDurablePendingState: Equatable, Sendable {
+    case available(typeCodes: [String])
+    case unavailable
+}
+
+public struct BackgroundSyncFailureRecoveryPlan: Equatable, Sendable {
+    public let pendingTypeCodes: [String]
+    public let durableStateAvailable: Bool
+    public let shouldScheduleRetry: Bool
+}
+
+public enum BackgroundSyncFailureRecoveryPolicy {
+    public static func plan(
+        admittedPendingTypeCodes: [String],
+        gatePendingTypeCodes: [String],
+        durablePendingState: BackgroundSyncDurablePendingState,
+        retryRequested: Bool,
+        automaticSyncReady: Bool,
+        backgroundSyncEnabled: Bool,
+        payloadAdmissionOpen: Bool
+    ) -> BackgroundSyncFailureRecoveryPlan {
+        let durableTypeCodes: [String]
+        let durableStateAvailable: Bool
+        switch durablePendingState {
+        case .available(let typeCodes):
+            durableTypeCodes = typeCodes
+            durableStateAvailable = true
+        case .unavailable:
+            durableTypeCodes = []
+            durableStateAvailable = false
+        }
+        let pendingTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+            for: admittedPendingTypeCodes
+                + gatePendingTypeCodes
+                + durableTypeCodes
+        )
+        return BackgroundSyncFailureRecoveryPlan(
+            pendingTypeCodes: pendingTypeCodes,
+            durableStateAvailable: durableStateAvailable,
+            shouldScheduleRetry: retryRequested
+                && automaticSyncReady
+                && backgroundSyncEnabled
+                && payloadAdmissionOpen
+                && !pendingTypeCodes.isEmpty
+        )
+    }
+}
+
 public actor BackgroundSyncRunGate {
     private let minimumSpacing: TimeInterval
     private var isRunning = false
@@ -522,6 +567,13 @@ public actor BackgroundSyncRunGate {
         )
         activeObserverTypeCodes.removeAll()
         return pendingObserverTypeCodes.sorted()
+    }
+
+    public func completeActiveObserverTypeCodes(_ typeCodes: [String]) {
+        // Do not subtract from pending: it includes callbacks received during an await.
+        activeObserverTypeCodes.subtract(
+            GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
+        )
     }
 
     public func pendingObserverTypeCodesSnapshot() -> [String] {
@@ -978,6 +1030,7 @@ public final class BackgroundSyncSettingsStore {
             "healthBridge.backgroundSync.pendingObserverTypeCodeGenerations"
         static let nextScheduledWorkLaneID =
             "healthBridge.backgroundSync.nextScheduledWorkLaneID"
+        static let coreLaneLastSuccess = "healthBridge.backgroundSync.coreLaneLastSuccess"
         static let mailboxAckScanCheckpoint =
             "healthBridge.backgroundSync.mailboxAckScanCheckpoint"
         static let mailboxAckScanCheckpointGeneration =
@@ -1019,6 +1072,27 @@ public final class BackgroundSyncSettingsStore {
         self.dateFormatter = ISO8601DateFormatter()
         self.dateFormatter.formatOptions = [.withInternetDateTime]
         self.dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+    }
+
+    public var coreLaneLastSuccess: [String: Date] {
+        let persisted = userDefaults.dictionary(forKey: Key.coreLaneLastSuccess) ?? [:]
+        var result: [String: Date] = [:]
+        for lane in HealthBridgeBackgroundSync.coreWorkLanes {
+            if let date = persisted[lane.id] as? Date { result[lane.id] = date }
+        }
+        return result
+    }
+
+    // Local scheduling freshness only, including complete durable queueing.
+    // Delivery/release evidence and cursor/observer completion remain separate.
+    public func recordCoreLaneSuccess(_ lane: BackgroundSyncWorkLane, at date: Date) throws {
+        guard HealthBridgeBackgroundSync.coreWorkLanes.contains(lane) else { return }
+        var successes = coreLaneLastSuccess
+        successes[lane.id] = date
+        userDefaults.set(successes, forKey: Key.coreLaneLastSuccess)
+        guard userDefaults.synchronize() else {
+            throw BackgroundSyncSettingsStoreError.persistenceFailed
+        }
     }
 
     public var isEnabled: Bool {
@@ -1165,6 +1239,7 @@ public final class BackgroundSyncSettingsStore {
     }
 
     public func resetScheduledWorkContinuation() throws {
+        userDefaults.removeObject(forKey: Key.coreLaneLastSuccess)
         try persistNextScheduledWorkLaneID(nil)
     }
 

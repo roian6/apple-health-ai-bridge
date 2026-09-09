@@ -58,9 +58,7 @@ def test_background_refresh_revalidates_automatic_sync_after_transfer_handoff() 
     end = text.index("private func stopBackgroundRunIfUnavailable(", start)
     admitted_body = text[start:end]
 
-    eligibility_check = admitted_body.index(
-        "await stopBackgroundRunIfUnavailable(startedAt: startedAt)"
-    )
+    eligibility_check = admitted_body.index("await stopBackgroundRunIfUnavailable(")
     first_health_read = admitted_body.index("await self.syncRecentStepCounts(")
     assert eligibility_check < first_health_read
 

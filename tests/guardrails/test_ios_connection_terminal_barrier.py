@@ -650,9 +650,12 @@ def test_automatic_sync_backpressure_and_disable_ordering() -> None:
     finish_end = source.index(
         "private func deferAutomaticSyncForPendingOutboxIfNeeded(", finish_start
     )
+    finish = source[finish_start:finish_end]
+    assert "finalization.takeAdmission()" in finish
+    assert "await backgroundRunGate.finishRun(" in finish
+    assert "retainAdmission ? .interrupted : .succeeded" in finish
     assert (
-        "await backgroundRunGate.finishRun(.interrupted)"
-        in source[finish_start:finish_end]
+        "settingsStore.receiverSettingsGenerationToken == expectedGeneration" in finish
     )
     defer_start = finish_end
     defer_end = source.index("private struct BackgroundCoreLaneResult", defer_start)

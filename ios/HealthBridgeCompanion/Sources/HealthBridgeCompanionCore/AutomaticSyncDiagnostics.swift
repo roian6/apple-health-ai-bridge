@@ -62,6 +62,7 @@ public enum AutomaticSyncDiagnosticWakeSource: String, Codable, Equatable, Senda
 }
 
 public enum AutomaticSyncDiagnosticTriggerReason: String, Codable, Equatable, Sendable {
+    case observerError = "observer_error"
     case observer
     case observerBatch = "observer_batch"
     case scheduledRefresh = "scheduled_refresh"
@@ -84,6 +85,75 @@ public enum AutomaticSyncDiagnosticRunOutcome: String, Codable, Equatable, Senda
     case interrupted
     case failed
     case completed
+}
+
+public enum AutomaticSyncDiagnosticFailureStage: String, Codable, Equatable, Sendable {
+    case read
+    case store
+    case encoding
+    case transport
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let rawValue = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: rawValue) ?? .unknown
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+public enum AutomaticSyncDiagnosticFailureCategory: String, Codable, Equatable, Sendable {
+    case operationFailed = "operation_failed"
+    case cancellation
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let rawValue = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: rawValue) ?? .unknown
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+public struct AutomaticSyncDiagnosticFailure: Codable, Equatable, Sendable {
+    public let stage: AutomaticSyncDiagnosticFailureStage
+    public let category: AutomaticSyncDiagnosticFailureCategory
+
+    public init(
+        stage: AutomaticSyncDiagnosticFailureStage,
+        category: AutomaticSyncDiagnosticFailureCategory
+    ) {
+        self.stage = stage
+        self.category = category
+    }
+
+    public static let unknown = AutomaticSyncDiagnosticFailure(
+        stage: .unknown,
+        category: .unknown
+    )
+
+    public static func classified(
+        stage: AutomaticSyncDiagnosticFailureStage,
+        isCancellation: Bool
+    ) -> Self {
+        if isCancellation {
+            return AutomaticSyncDiagnosticFailure(
+                stage: stage,
+                category: .cancellation
+            )
+        }
+        guard stage != .unknown else { return .unknown }
+        return AutomaticSyncDiagnosticFailure(
+            stage: stage,
+            category: .operationFailed
+        )
+    }
 }
 
 public enum AutomaticSyncPendingAgeBucket: String, Codable, Equatable, Sendable {
@@ -132,6 +202,7 @@ public struct AutomaticSyncPendingSnapshot: Equatable, Sendable {
     public let pendingLaneCount: Int
     public let oldestPendingLane: AutomaticSyncDiagnosticLane?
     public let oldestPendingLaneAgeBucket: AutomaticSyncPendingAgeBucket
+    public var recovery: BackgroundObserverPendingDiagnostic? = nil
 
     static let empty = AutomaticSyncPendingSnapshot(
         pendingLaneCount: 0,
@@ -141,23 +212,38 @@ public struct AutomaticSyncPendingSnapshot: Equatable, Sendable {
 }
 
 @MainActor
+public enum AutomaticSyncObserverEventAdmission {
+    case continueProcessing
+    case complete(AutomaticSyncDiagnosticDraft?)
+}
+
+@MainActor
 enum AutomaticSyncObserverEventLifecycle {
     static func process(
         startedAt: Date,
         now: () -> Date = Date.init,
+        admissionHandler: () async -> AutomaticSyncObserverEventAdmission,
         eventHandler: () async -> AutomaticSyncDiagnosticDraft?,
         acknowledge: () -> Void,
         persistDiagnostic: (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void
     ) async {
-        let diagnostic = await eventHandler()
+        let admission = await admissionHandler()
         let completionLatency = now().timeIntervalSince(startedAt)
         acknowledge()
+        let diagnostic: AutomaticSyncDiagnosticDraft?
+        switch admission {
+        case .continueProcessing:
+            diagnostic = await eventHandler()
+        case .complete(let admittedDiagnostic):
+            diagnostic = admittedDiagnostic
+        }
         guard let diagnostic else { return }
         persistDiagnostic(diagnostic, completionLatency)
     }
 }
 
 public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
+    public var causalChain: AutomaticSyncCausalChain?
     public let runID: UUID
     public let wakeSource: AutomaticSyncDiagnosticWakeSource
     public let triggerReason: AutomaticSyncDiagnosticTriggerReason
@@ -169,6 +255,7 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
     public let oldestPendingLaneAgeBucket: AutomaticSyncPendingAgeBucket
     public let runOutcome: AutomaticSyncDiagnosticRunOutcome
     public let observerCompletionLatencyBucket: AutomaticSyncObserverCompletionLatencyBucket
+    public let failure: AutomaticSyncDiagnosticFailure?
     public let remainingPendingLaneCount: Int
 
     public init(
@@ -183,8 +270,11 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
         oldestPendingLaneAgeBucket: AutomaticSyncPendingAgeBucket,
         runOutcome: AutomaticSyncDiagnosticRunOutcome,
         observerCompletionLatencyBucket: AutomaticSyncObserverCompletionLatencyBucket,
-        remainingPendingLaneCount: Int
+        failure: AutomaticSyncDiagnosticFailure? = nil,
+        remainingPendingLaneCount: Int,
+        causalChain: AutomaticSyncCausalChain? = nil
     ) {
+        self.causalChain = causalChain
         self.runID = runID
         self.wakeSource = wakeSource
         self.triggerReason = triggerReason
@@ -196,6 +286,7 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
         self.oldestPendingLaneAgeBucket = oldestPendingLaneAgeBucket
         self.runOutcome = runOutcome
         self.observerCompletionLatencyBucket = observerCompletionLatencyBucket
+        self.failure = failure
         self.remainingPendingLaneCount = remainingPendingLaneCount
     }
 
@@ -208,11 +299,26 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
                 : "observed pending \(oldestPendingLaneAgeBucket.rawValue)"
             return "\($0.displayName) (\(observedAge))"
         } ?? "none"
+        let failureSummary = failure.map {
+            "; failure=\($0.stage.rawValue)/\($0.category.rawValue)"
+        } ?? ""
         return "trigger=\(trigger); admission=\(admissionResult.rawValue); "
             + "selected=\(selectedLane.displayName); pending=\(pendingLaneCount); "
             + "oldest=\(oldest); outcome=\(runOutcome.rawValue); "
             + "remaining=\(remainingPendingLaneCount); observer completion="
             + observerCompletionLatencyBucket.rawValue
+            + failureSummary
+            + (causalChain.map { chain in
+                "; chain=v\(chain.version)" + (chain.truncated ? "/truncated" : "")
+                    + (chain.observerFailureRetention.map { "; observer_retention=\($0.rawValue)" } ?? "")
+                    + (chain.initialRecoveryPending.map { "; recovery_initial=\($0.durableState.rawValue)/\($0.lanes.count)" } ?? "")
+                    + (chain.remainingRecoveryPending.map { "; recovery_remaining=\($0.durableState.rawValue)/\($0.lanes.count)" } ?? "")
+                    + "; lanes=" + chain.lanes.map { lane in
+                        "\(lane.lane.rawValue):\(lane.attempted ? "attempted" : "selected")"
+                            + "/\(lane.query.rawValue)/\(lane.newestSampleAge.rawValue)"
+                            + "/\(lane.outbox.rawValue)/\(lane.delivery.rawValue)"
+                    }.joined(separator: " -> ")
+            } ?? "")
     }
 
     func replacingRunOutcome(
@@ -230,7 +336,9 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
             oldestPendingLaneAgeBucket: oldestPendingLaneAgeBucket,
             runOutcome: outcome,
             observerCompletionLatencyBucket: observerCompletionLatencyBucket,
-            remainingPendingLaneCount: remainingPendingLaneCount
+            failure: failure,
+            remainingPendingLaneCount: remainingPendingLaneCount,
+            causalChain: causalChain
         )
     }
 
@@ -249,7 +357,9 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
             oldestPendingLaneAgeBucket: oldestPendingLaneAgeBucket,
             runOutcome: runOutcome,
             observerCompletionLatencyBucket: bucket,
-            remainingPendingLaneCount: remainingPendingLaneCount
+            failure: failure,
+            remainingPendingLaneCount: remainingPendingLaneCount,
+            causalChain: causalChain
         )
     }
 }

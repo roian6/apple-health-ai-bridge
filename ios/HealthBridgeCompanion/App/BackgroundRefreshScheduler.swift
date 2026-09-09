@@ -3,6 +3,17 @@ import Foundation
 
 @MainActor
 enum BackgroundRefreshScheduler {
+    private static let requests = BackgroundRefreshRequestCoalescer()
+
+    static func noteRequestConsumed() {
+        requests.requestWasConsumed()
+    }
+
+    static func cancelPendingRefresh() {
+        requests.invalidate()
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: HealthBridgeBackgroundSync.appRefreshIdentifier)
+    }
+
     static func scheduleNextRefreshIfNeeded(
         viewModel: HealthBridgeCompanionViewModel,
         now: Date = Date()
@@ -27,8 +38,10 @@ enum BackgroundRefreshScheduler {
         let request = BGAppRefreshTaskRequest(identifier: HealthBridgeBackgroundSync.appRefreshIdentifier)
         request.earliestBeginDate = earliestBeginDate
         do {
-            try BGTaskScheduler.shared.submit(request)
-            viewModel.noteBackgroundRefreshScheduled(earliestBeginDate: earliestBeginDate)
+            try requests.submitIfNeeded(generation: viewModel.backgroundRefreshConnectionGeneration) {
+                try BGTaskScheduler.shared.submit(request)
+                viewModel.noteBackgroundRefreshScheduled(earliestBeginDate: earliestBeginDate)
+            }
         } catch {
             viewModel.noteBackgroundRefreshScheduleFailed(error)
         }
