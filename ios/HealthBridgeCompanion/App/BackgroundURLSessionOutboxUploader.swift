@@ -105,7 +105,8 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
               pendingLegacyCancellationFinalizationTaskIDs.isEmpty,
               eventFinalizationCoordinator.pendingIDsSnapshot().isEmpty,
               legacyEventFinalizationCoordinator.pendingIDsSnapshot().isEmpty,
-              await currentLegacyTaskIDs().isEmpty else {
+              let legacyTaskIDs = await currentLegacyTaskIDs(),
+              legacyTaskIDs.isEmpty else {
             return 0
         }
         guard cancellationFlight == nil,
@@ -197,10 +198,15 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             )
         }
         pendingCancellationFinalizationTaskIDs.formUnion(ownedTaskIDs)
-        let sessionTasks = await tasks(
+        guard let sessionTasks = await tasks(
             in: session,
             coordinator: eventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         let enumeratedTaskIDs = Set(sessionTasks.map(\.taskIdentifier))
         pendingCancellationFinalizationTaskIDs.formUnion(enumeratedTaskIDs)
         pendingCancellationFinalizationTaskIDs.formUnion(
@@ -210,12 +216,22 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             for: pendingCancellationFinalizationTaskIDs
         )
         sessionTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
 
-        let reconciledTasks = await tasks(
+        guard let reconciledTasks = await tasks(
             in: session,
             coordinator: eventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         let reconciledTaskIDs = Set(reconciledTasks.map(\.taskIdentifier))
         pendingCancellationFinalizationTaskIDs.formUnion(reconciledTaskIDs)
         pendingCancellationFinalizationTaskIDs.formUnion(
@@ -225,7 +241,12 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             for: pendingCancellationFinalizationTaskIDs
         )
         reconciledTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
 
         let taskIDsRequiringFinalization = pendingCancellationFinalizationTaskIDs
         let barrierFinalized: Bool
@@ -242,13 +263,29 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             timeout: Self.cancellationCompletionTimeout
         )
         let preFinalState = eventFinalizationCoordinator.stateSnapshot()
-        await drainSessionDelegateQueue()
-        let finalTasks = await tasks(
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
+        guard let finalTasks = await tasks(
             in: session,
             coordinator: eventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         finalTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs
+                    .union(finalTasks.map(\.taskIdentifier)).count,
+                fullyFinalized: false
+            )
+        }
         let finalTaskIDs = Set(finalTasks.map(\.taskIdentifier))
         let finalState = eventFinalizationCoordinator.stateSnapshot()
         let finalPendingIDs = finalState.pendingIDs
@@ -256,12 +293,23 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             .union(pendingCancellationFinalizationTaskIDs)
         await cancellationBarrier.retainCompletions(for: finalPendingIDs)
 
-        let postRetentionTasks = await tasks(
+        guard let postRetentionTasks = await tasks(
             in: session,
             coordinator: eventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         postRetentionTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingCancellationFinalizationTaskIDs
+                    .union(postRetentionTasks.map(\.taskIdentifier)).count,
+                fullyFinalized: false
+            )
+        }
         let postRetentionTaskIDs = Set(postRetentionTasks.map(\.taskIdentifier))
         let postRetentionState = eventFinalizationCoordinator.stateSnapshot()
         let finalOwnedTaskIDs = currentOwnedTaskIDs()
@@ -329,10 +377,15 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     private func performInheritedLegacyUploadCancellation() async
         -> BackgroundUploadCancellationResult
     {
-        let inheritedTasks = await tasks(
+        guard let inheritedTasks = await tasks(
             in: legacyCancellationSession,
             coordinator: legacyEventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         let enumeratedTaskIDs = Set(inheritedTasks.map(\.taskIdentifier))
         pendingLegacyCancellationFinalizationTaskIDs.formUnion(enumeratedTaskIDs)
         pendingLegacyCancellationFinalizationTaskIDs.formUnion(
@@ -342,12 +395,22 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             for: pendingLegacyCancellationFinalizationTaskIDs
         )
         inheritedTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
 
-        let reconciledTasks = await tasks(
+        guard let reconciledTasks = await tasks(
             in: legacyCancellationSession,
             coordinator: legacyEventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         let reconciledTaskIDs = Set(reconciledTasks.map(\.taskIdentifier))
         pendingLegacyCancellationFinalizationTaskIDs.formUnion(reconciledTaskIDs)
         pendingLegacyCancellationFinalizationTaskIDs.formUnion(
@@ -357,7 +420,12 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             for: pendingLegacyCancellationFinalizationTaskIDs
         )
         reconciledTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
 
         let taskIDsRequiringFinalization = pendingLegacyCancellationFinalizationTaskIDs
         let barrierFinalized: Bool
@@ -374,13 +442,29 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             timeout: Self.cancellationCompletionTimeout
         )
         let preFinalState = legacyEventFinalizationCoordinator.stateSnapshot()
-        await drainSessionDelegateQueue()
-        let finalTasks = await tasks(
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
+        guard let finalTasks = await tasks(
             in: legacyCancellationSession,
             coordinator: legacyEventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         finalTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs
+                    .union(finalTasks.map(\.taskIdentifier)).count,
+                fullyFinalized: false
+            )
+        }
         let finalTaskIDs = Set(finalTasks.map(\.taskIdentifier))
         let finalState = legacyEventFinalizationCoordinator.stateSnapshot()
         let finalPendingIDs = finalState.pendingIDs
@@ -388,12 +472,23 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             .union(pendingLegacyCancellationFinalizationTaskIDs)
         await legacyCancellationBarrier.retainCompletions(for: finalPendingIDs)
 
-        let postRetentionTasks = await tasks(
+        guard let postRetentionTasks = await tasks(
             in: legacyCancellationSession,
             coordinator: legacyEventFinalizationCoordinator
-        )
+        ) else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs.count,
+                fullyFinalized: false
+            )
+        }
         postRetentionTasks.forEach { $0.cancel() }
-        await drainSessionDelegateQueue()
+        guard await drainSessionDelegateQueue() else {
+            return BackgroundUploadCancellationResult(
+                cancelledCount: pendingLegacyCancellationFinalizationTaskIDs
+                    .union(postRetentionTasks.map(\.taskIdentifier)).count,
+                fullyFinalized: false
+            )
+        }
         let postRetentionTaskIDs = Set(postRetentionTasks.map(\.taskIdentifier))
         let postRetentionState = legacyEventFinalizationCoordinator.stateSnapshot()
         let settledPendingIDs = postRetentionState.pendingIDs
@@ -453,32 +548,35 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     }
 
     private func currentScheduledItemIDs() async -> Set<String>? {
-        await withCheckedContinuation { continuation in
-            session.getAllTasks { tasks in
-                tasks.forEach { task in
-                    self.eventFinalizationCoordinator.begin(task.taskIdentifier)
-                }
-                let parsedItemIDs = tasks.compactMap { task in
-                    BackgroundOutboxTaskDescriptor.itemID(fromTaskDescription: task.taskDescription)
-                }
-                guard parsedItemIDs.count == tasks.count else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                continuation.resume(returning: Set(parsedItemIDs))
-            }
+        let latch = BoundedAsyncValueLatch<[URLSessionTask]>()
+        session.getAllTasks { tasks in
+            latch.resolve(tasks)
         }
+        guard let tasks = await latch.wait(timeout: Self.cancellationCompletionTimeout) else {
+            return nil
+        }
+        tasks.forEach { task in
+            eventFinalizationCoordinator.begin(task.taskIdentifier)
+        }
+        let parsedItemIDs = tasks.compactMap { task in
+            BackgroundOutboxTaskDescriptor.itemID(fromTaskDescription: task.taskDescription)
+        }
+        guard parsedItemIDs.count == tasks.count else { return nil }
+        return Set(parsedItemIDs)
     }
 
-    private func currentLegacyTaskIDs() async -> Set<Int> {
-        await withCheckedContinuation { continuation in
-            legacyCancellationSession.getAllTasks { tasks in
-                tasks.forEach { task in
-                    self.legacyEventFinalizationCoordinator.begin(task.taskIdentifier)
-                }
-                continuation.resume(returning: Set(tasks.map(\.taskIdentifier)))
-            }
+    private func currentLegacyTaskIDs() async -> Set<Int>? {
+        let latch = BoundedAsyncValueLatch<[URLSessionTask]>()
+        legacyCancellationSession.getAllTasks { tasks in
+            latch.resolve(tasks)
         }
+        guard let tasks = await latch.wait(timeout: Self.cancellationCompletionTimeout) else {
+            return nil
+        }
+        tasks.forEach { task in
+            legacyEventFinalizationCoordinator.begin(task.taskIdentifier)
+        }
+        return Set(tasks.map(\.taskIdentifier))
     }
 
     @MainActor
@@ -492,7 +590,9 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             guard let currentItemIDs = await currentScheduledItemIDs() else {
                 return true
             }
-            let legacyTaskIDs = await currentLegacyTaskIDs()
+            guard let legacyTaskIDs = await currentLegacyTaskIDs() else {
+                return true
+            }
             let currentStateAfter = eventFinalizationCoordinator.stateSnapshot()
             let legacyStateAfter = legacyEventFinalizationCoordinator.stateSnapshot()
             if !pendingCancellationFinalizationTaskIDs.isEmpty
@@ -515,15 +615,18 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     private func tasks(
         in session: URLSession,
         coordinator: BackgroundEventFinalizationCoordinator<Int>
-    ) async -> [URLSessionTask] {
-        await withCheckedContinuation { continuation in
-            session.getAllTasks { tasks in
-                tasks.forEach { task in
-                    coordinator.begin(task.taskIdentifier)
-                }
-                continuation.resume(returning: tasks)
-            }
+    ) async -> [URLSessionTask]? {
+        let latch = BoundedAsyncValueLatch<[URLSessionTask]>()
+        session.getAllTasks { tasks in
+            latch.resolve(tasks)
         }
+        guard let tasks = await latch.wait(timeout: Self.cancellationCompletionTimeout) else {
+            return nil
+        }
+        tasks.forEach { task in
+            coordinator.begin(task.taskIdentifier)
+        }
+        return tasks
     }
 
     private func waitForEventFinalizationIdle(
@@ -540,12 +643,12 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         return true
     }
 
-    private func drainSessionDelegateQueue() async {
-        await withCheckedContinuation { continuation in
-            sessionDelegateQueue.addOperation {
-                continuation.resume()
-            }
+    private func drainSessionDelegateQueue() async -> Bool {
+        let latch = BoundedAsyncValueLatch<Void>()
+        sessionDelegateQueue.addOperation {
+            latch.resolve(())
         }
+        return await latch.wait(timeout: Self.cancellationCompletionTimeout) != nil
     }
 
     private func rememberOutboxDirectory(_ directory: URL) {
