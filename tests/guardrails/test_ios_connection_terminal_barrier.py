@@ -806,7 +806,11 @@ def test_terminal_request_prevents_post_opt_out_enqueue() -> None:
 def test_background_upload_cancellation_is_bounded() -> None:
     uploader = BACKGROUND_UPLOADER.read_text()
     assert "static let cancellationCompletionTimeout: TimeInterval" in uploader
-    assert uploader.count("timeout: Self.cancellationCompletionTimeout") == 4
+    assert uploader.count("timeout: Self.cancellationCompletionTimeout") == 8
+    assert uploader.count("let latch = BoundedAsyncValueLatch<[URLSessionTask]>()") == 3
+    assert uploader.count("let latch = BoundedAsyncValueLatch<Void>()") == 1
+    assert "guard let currentItemIDs = await currentScheduledItemIDs() else" in uploader
+    assert "guard let legacyTaskIDs = await currentLegacyTaskIDs() else" in uploader
     assert "func hasPendingUploadTasks() async -> Bool" in uploader
 
     source = VIEW_MODEL.read_text()
