@@ -129,7 +129,6 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         recoveryReadbackHandler: @escaping @MainActor (BackgroundDeliveryRecoveryReadback) -> Void = { _ in },
         isCurrent: @escaping @MainActor () -> Bool,
         observerAdmissionHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncObserverEventAdmission,
-        observerAcknowledgementHandler: @escaping @MainActor (_ typeCode: String) -> Bool = { _ in true },
         observerCompletionHandler: @escaping @MainActor (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void = { _, _ in },
         eventHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncDiagnosticDraft?
     ) {
@@ -183,9 +182,6 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                                 self.recoveryReadbackHandler(self.recovery.readback)
                                 return diagnostic
                             },
-                            acknowledgementIsDurable: {
-                                observerAcknowledgementHandler(healthType.typeCode)
-                            },
                             acknowledge: completion.call,
                             persistDiagnostic: observerCompletionHandler
                         )
@@ -206,9 +202,6 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                         },
                         eventHandler: {
                             await eventHandler(healthType.typeCode, runID)
-                        },
-                        acknowledgementIsDurable: {
-                            observerAcknowledgementHandler(healthType.typeCode)
                         },
                         acknowledge: completion.call,
                         persistDiagnostic: observerCompletionHandler

@@ -33,13 +33,13 @@ Release notes use the same tag in their filename and install examples.
 The user-visible app version is Xcode `MARKETING_VERSION`. App Store Connect and TestFlight additionally require a monotonically increasing `CURRENT_PROJECT_VERSION` build number. Display both when identifying an installed build:
 
 ```text
-iOS Companion 1.1.1 (build 44)
+iOS Companion 1.1.1 (build 45)
 ```
 
 An iOS source or distribution checkpoint may use a component-scoped tag such as:
 
 ```text
-ios-v1.1.1-build.44
+ios-v1.1.1-build.45
 ```
 
 An iOS tag does not publish Receiver/CLI artifacts. TestFlight/App Store release gates remain authoritative for distributed app builds.
@@ -68,7 +68,7 @@ Use labels such as:
 
 ```text
 Receiver/CLI 1.1.1
-Compatible iOS Companion 1.1.1 (build 44)
+Compatible iOS Companion 1.1.1 (build 45)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```
 

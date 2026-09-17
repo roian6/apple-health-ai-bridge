@@ -208,7 +208,6 @@ enum AutomaticSyncObserverEventLifecycle {
         now: () -> Date = Date.init,
         admissionHandler: () async -> AutomaticSyncObserverEventAdmission,
         eventHandler: () async -> AutomaticSyncDiagnosticDraft?,
-        acknowledgementIsDurable: () -> Bool = { true },
         acknowledge: () -> Void,
         persistDiagnostic: (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void
     ) async {
@@ -217,11 +216,9 @@ enum AutomaticSyncObserverEventLifecycle {
         let completionLatency: TimeInterval
         switch admission {
         case .continueProcessing:
-            diagnostic = await eventHandler()
             completionLatency = now().timeIntervalSince(startedAt)
-            if acknowledgementIsDurable() {
-                acknowledge()
-            }
+            acknowledge()
+            diagnostic = await eventHandler()
         case .complete(let admittedDiagnostic):
             diagnostic = admittedDiagnostic
             completionLatency = now().timeIntervalSince(startedAt)

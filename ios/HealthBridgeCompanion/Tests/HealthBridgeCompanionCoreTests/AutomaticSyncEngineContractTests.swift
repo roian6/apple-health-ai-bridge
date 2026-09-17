@@ -118,7 +118,8 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
         )
     }
 
-    func testConcurrentTriggersUseDurableStateAndCoalesceOneLaterPass() async throws {
+    @MainActor
+    func testDurableObserverAdmissionAcknowledgesOverlappingCoalescedRunBeforeAcquisition() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }
         try fixture.store.markPendingObserverTypeCodes(["heart_rate"])
@@ -138,10 +139,38 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
         )
         let firstRun = Task { try await engine.requestRun() }
         _ = await entered.wait(timeout: 1)
-        try fixture.store.markPendingObserverTypeCodes(["weight"])
 
-        try await engine.requestRun()
-        try await engine.requestRun()
+        var events: [String] = []
+        await AutomaticSyncObserverEventLifecycle.process(
+            startedAt: Date(timeIntervalSince1970: 1_788_000_000),
+            admissionHandler: {
+                do {
+                    try fixture.store.markPendingObserverTypeCodes(["weight"])
+                    events.append("admission")
+                    return .continueProcessing
+                } catch {
+                    XCTFail("Durable observer admission failed: \(error)")
+                    return .deferAcknowledgement(nil)
+                }
+            },
+            eventHandler: {
+                events.append("acquisition")
+                do {
+                    try await engine.requestRun()
+                } catch {
+                    XCTFail("Overlapping automatic run failed: \(error)")
+                }
+                return nil
+            },
+            acknowledge: { events.append("acknowledge") },
+            persistDiagnostic: { _, _ in events.append("persist") }
+        )
+
+        XCTAssertEqual(
+            events,
+            ["admission", "acknowledge", "acquisition"],
+            "A durably admitted callback must be acknowledged before its coalesced acquisition returns."
+        )
         release.resolve(())
         try await firstRun.value
         let processed = await observed.values

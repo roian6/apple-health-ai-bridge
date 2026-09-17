@@ -3,7 +3,7 @@ import XCTest
 
 final class AutomaticSyncDiagnosticsTests: XCTestCase {
     @MainActor
-    func testObserverAcknowledgesAfterContinuationBeforeDiagnosticPersistence() async {
+    func testObserverAcknowledgesBeforeContinuationAndDiagnosticPersistence() async {
         let fileURL = temporaryFileURL()
         defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
         let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
@@ -48,13 +48,13 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
         }
 
         while resumeContinuation == nil { await Task.yield() }
-        XCTAssertEqual(events, ["admission", "continuation started"])
+        XCTAssertEqual(events, ["admission", "acknowledge", "continuation started"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
         resumeContinuation?.resume()
         await processing.value
 
         XCTAssertEqual(events, [
-            "admission", "continuation started", "continuation finished", "acknowledge", "persist",
+            "admission", "acknowledge", "continuation started", "continuation finished", "persist",
         ])
         XCTAssertEqual(store.latestRecord?.observerCompletionLatencyBucket, .underOneSecond)
     }
@@ -104,7 +104,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
     }
 
     @MainActor
-    func testObserverContinuationDoesNotAcknowledgeUntilAcquisitionIsDurable() async {
+    func testObserverContinuationAcknowledgesBeforeAcquisition() async {
         let draft = AutomaticSyncDiagnosticDraft(
             reason: .observer(typeCode: HealthBridgeHealthType.steps.typeCode)
         )
@@ -116,12 +116,8 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
                 return .continueProcessing
             },
             eventHandler: {
-                events.append("continuation")
+                events.append("acquisition")
                 return draft
-            },
-            acknowledgementIsDurable: {
-                events.append("durability check")
-                return false
             },
             acknowledge: { events.append("acknowledge") },
             persistDiagnostic: { _, _ in events.append("persist") }
@@ -129,7 +125,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
 
         XCTAssertEqual(
             events,
-            ["admission", "continuation", "durability check", "persist"]
+            ["admission", "acknowledge", "acquisition", "persist"]
         )
     }
 

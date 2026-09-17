@@ -2826,27 +2826,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     return .deferAcknowledgement(diagnostic)
                 }
                 BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
-                guard self.terminalPayloadActionAdmissionIsOpen else {
-                    return .deferAcknowledgement(self.recordUnavailableAutomaticSyncDiagnostic(
-                        reason: .observer(typeCode: typeCode),
-                        runID: diagnosticRunID
-                    ))
-                }
                 return .continueProcessing
-            },
-            observerAcknowledgementHandler: { [weak self] typeCode in
-                guard let self else { return false }
-                do {
-                    let generations = try self.backgroundSyncStore
-                        .loadPendingObserverTypeCodeGenerations()
-                    guard let generation = generations[typeCode] else { return true }
-                    return try self.outbox?.hasPendingGenerationRetirement(
-                        typeCode: typeCode,
-                        generation: generation
-                    ) == true
-                } catch {
-                    return false
-                }
             },
             observerCompletionHandler: { [weak self] completedDraft, latency in
                 self?.persistCompletedObserverAutomaticSyncDiagnostic(
