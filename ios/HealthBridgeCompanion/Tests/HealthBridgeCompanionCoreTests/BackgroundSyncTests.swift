@@ -20,8 +20,10 @@ final class BackgroundSyncTests: XCTestCase {
     func testExecutionModeKeepsAuthorizationForegroundOnlyAndAutomaticFallbackOneDay() {
         XCTAssertTrue(HealthBridgeSyncExecutionMode.foreground.shouldRequestReadAuthorization)
         XCTAssertNil(HealthBridgeSyncExecutionMode.foreground.cursorlessFallbackDays)
+        XCTAssertTrue(HealthBridgeSyncExecutionMode.foreground.shouldAttemptInlineDirectDelivery)
         XCTAssertFalse(HealthBridgeSyncExecutionMode.automatic.shouldRequestReadAuthorization)
         XCTAssertEqual(HealthBridgeSyncExecutionMode.automatic.cursorlessFallbackDays, 1)
+        XCTAssertTrue(HealthBridgeSyncExecutionMode.automatic.shouldAttemptInlineDirectDelivery)
     }
 
     func testBackgroundSyncDefaultsToDisabledAndPersistsEnabledState() throws {
@@ -155,42 +157,17 @@ final class BackgroundSyncTests: XCTestCase {
         XCTAssertEqual(wake.summary, "Background handler entered from healthkit_observer")
     }
 
-    func testForegroundCatchUpRunsWhenAutomaticSyncIsStale() {
-
+    func testForegroundCatchUpRunsOnlyForDurablePendingGenerations() throws {
         let suiteName = "HealthBridgeForegroundCatchUpTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = BackgroundSyncSettingsStore(userDefaults: defaults)
-        let now = Date(timeIntervalSince1970: 1_780_020_000)
 
-        XCTAssertFalse(store.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
-
+        XCTAssertFalse(store.shouldRunForegroundCatchUp())
         store.setEnabled(true)
-        XCTAssertTrue(store.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
-
-        store.recordRun(
-            startedAt: now.addingTimeInterval(-120),
-            finishedAt: now.addingTimeInterval(-60),
-            succeeded: true,
-            summary: "fresh"
-        )
-        XCTAssertFalse(store.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
-
-        store.recordRun(
-            startedAt: now.addingTimeInterval(-120),
-            finishedAt: now.addingTimeInterval(-60),
-            succeeded: false,
-            summary: "recent failure"
-        )
-        XCTAssertTrue(store.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
-
-        store.recordRun(
-            startedAt: now.addingTimeInterval(-1_200),
-            finishedAt: now.addingTimeInterval(-1_000),
-            succeeded: true,
-            summary: "stale"
-        )
-        XCTAssertTrue(store.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
+        XCTAssertFalse(store.shouldRunForegroundCatchUp())
+        try store.markPendingObserverTypeCodes(["heart_rate"])
+        XCTAssertTrue(store.shouldRunForegroundCatchUp())
     }
 
     func testObserverDirtinessPersistsAcrossReloadAndUsesGenerationSafeClear() throws {
@@ -206,12 +183,12 @@ final class BackgroundSyncTests: XCTestCase {
             succeeded: true,
             summary: "fresh"
         )
-        XCTAssertFalse(store.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
+        XCTAssertFalse(store.shouldRunForegroundCatchUp())
 
         try store.markPendingObserverTypeCodes(["body_mass", "active_energy"])
         let reloaded = BackgroundSyncSettingsStore(userDefaults: defaults)
         XCTAssertEqual(reloaded.pendingObserverTypeCodes, ["energy", "weight"])
-        XCTAssertTrue(reloaded.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
+        XCTAssertTrue(reloaded.shouldRunForegroundCatchUp())
 
         let firstGeneration = reloaded.pendingObserverTypeCodeGenerations
         try reloaded.markPendingObserverTypeCodes(["weight"])
@@ -227,7 +204,7 @@ final class BackgroundSyncTests: XCTestCase {
             typeCodes: ["weight"]
         )
         XCTAssertTrue(reloaded.pendingObserverTypeCodes.isEmpty)
-        XCTAssertFalse(reloaded.shouldRunForegroundCatchUp(now: now, minimumInterval: 900))
+        XCTAssertFalse(reloaded.shouldRunForegroundCatchUp())
     }
 
     func testObserverDirtinessFileSurvivesReloadAndClearsGenerationSafely() throws {
@@ -289,10 +266,7 @@ final class BackgroundSyncTests: XCTestCase {
         XCTAssertThrowsError(
             try readFailingSettings.loadPendingObserverTypeCodeGenerations()
         )
-        XCTAssertEqual(
-            Set(readFailingSettings.pendingObserverTypeCodes),
-            Set(HealthBridgeBackgroundSync.supportedAutomaticQuantityTypeCodes)
-        )
+        XCTAssertTrue(readFailingSettings.pendingObserverTypeCodes.isEmpty)
     }
 
     func testPolicyDoesNotScheduleWhenDisabled() {
@@ -345,39 +319,6 @@ final class BackgroundSyncTests: XCTestCase {
             Set(HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes).count,
             HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes.count
         )
-    }
-
-    func testObserverAutomaticQuantityPlanIncludesObservedTypesAndUnobservedTrigger() {
-        let plan = HealthBridgeBackgroundSync.automaticQuantitySyncPlan(
-            availableTypeCodes: ["heart_rate", "oxygen_saturation", "body_mass", "unknown_metric"],
-            observedTypeCodes: ["heart_rate"],
-            reason: .observer(typeCode: "oxygen_saturation")
-        )
-
-        XCTAssertEqual(plan.typeCodes, ["heart_rate", "oxygen_saturation"])
-        XCTAssertEqual(plan.fallbackHistoryDepth, .lastDays(1))
-    }
-
-    func testObserverBatchPlanIncludesEveryCoalescedTrigger() {
-        let plan = HealthBridgeBackgroundSync.automaticQuantitySyncPlan(
-            availableTypeCodes: ["heart_rate", "oxygen_saturation", "body_mass"],
-            observedTypeCodes: ["heart_rate"],
-            reason: .observerBatch(typeCodes: ["body_mass", "oxygen_saturation", "body_mass"])
-        )
-
-        XCTAssertEqual(plan.typeCodes, ["heart_rate", "oxygen_saturation", "weight"])
-        XCTAssertEqual(plan.fallbackHistoryDepth, .lastDays(1))
-    }
-
-    func testScheduledAutomaticQuantityPlanReconcilesEveryAvailableSupportedType() {
-        let plan = HealthBridgeBackgroundSync.automaticQuantitySyncPlan(
-            availableTypeCodes: ["body_mass", "heart_rate", "oxygen_saturation", "unknown_metric"],
-            observedTypeCodes: [],
-            reason: .scheduledRefresh
-        )
-
-        XCTAssertEqual(plan.typeCodes, ["heart_rate", "oxygen_saturation", "weight"])
-        XCTAssertEqual(plan.fallbackHistoryDepth, .lastDays(1))
     }
 
     func testBackgroundDeliveryTracksValidatedForegroundLanesIncludingSleep() {
@@ -478,6 +419,46 @@ final class BackgroundSyncTests: XCTestCase {
     }
 
     func testAutomaticCursorlessSyncDoesNotCommitSharedForegroundProgress() {
+        let automaticFallback = GenericQuantityAnchoredCursorOwnershipPolicy.resolve(
+            typeCode: "heart_rate",
+            executionMode: .automatic,
+            sharedCursorValue: nil,
+            automaticCursorValue: "automatic-anchor"
+        )
+        XCTAssertEqual(
+            automaticFallback.cursorKind,
+            GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "heart_rate")
+        )
+        XCTAssertEqual(automaticFallback.cursorValue, "automatic-anchor")
+        XCTAssertTrue(automaticFallback.isIndependentAutomaticFallback)
+
+        let automaticWithShared = GenericQuantityAnchoredCursorOwnershipPolicy.resolve(
+            typeCode: "heart_rate",
+            executionMode: .automatic,
+            sharedCursorValue: "shared-anchor",
+            automaticCursorValue: "stale-automatic-anchor"
+        )
+        XCTAssertEqual(
+            automaticWithShared.cursorKind,
+            GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "heart_rate")
+        )
+        XCTAssertEqual(automaticWithShared.cursorValue, "shared-anchor")
+        XCTAssertFalse(automaticWithShared.isIndependentAutomaticFallback)
+        XCTAssertNotEqual(automaticFallback.cursorKind, automaticWithShared.cursorKind)
+
+        let foreground = GenericQuantityAnchoredCursorOwnershipPolicy.resolve(
+            typeCode: "heart_rate",
+            executionMode: .foreground,
+            sharedCursorValue: "foreground-anchor",
+            automaticCursorValue: "ignored-automatic-anchor"
+        )
+        XCTAssertEqual(
+            foreground.cursorKind,
+            GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "heart_rate")
+        )
+        XCTAssertEqual(foreground.cursorValue, "foreground-anchor")
+        XCTAssertFalse(foreground.isIndependentAutomaticFallback)
+
         XCTAssertTrue(
             HealthBridgeSyncExecutionMode.foreground.shouldPersistSharedProgress(
                 hadUsableCursor: false
@@ -498,236 +479,6 @@ final class BackgroundSyncTests: XCTestCase {
                 hadUsableCursor: true
             )
         )
-    }
-
-    func testRunGateRejectsConcurrentAndDebouncedBackgroundRuns() async throws {
-        let gate = BackgroundSyncRunGate(minimumSpacing: 10 * 60)
-        let firstStart = Date(timeIntervalSince1970: 1_780_123_200)
-
-        let firstAdmission = await gate.beginRun(now: firstStart)
-        XCTAssertTrue(firstAdmission.shouldRun)
-        XCTAssertEqual(firstAdmission.startedAt, firstStart)
-
-        let concurrentAdmission = await gate.beginRun(now: firstStart.addingTimeInterval(1))
-        XCTAssertFalse(concurrentAdmission.shouldRun)
-        XCTAssertEqual(concurrentAdmission.skipReason, .alreadyRunning)
-
-        await gate.finishRun(.succeeded)
-
-        let debouncedAdmission = await gate.beginRun(now: firstStart.addingTimeInterval(5 * 60))
-        XCTAssertFalse(debouncedAdmission.shouldRun)
-        XCTAssertEqual(debouncedAdmission.skipReason, .debounced)
-
-        let laterAdmission = await gate.beginRun(now: firstStart.addingTimeInterval(11 * 60))
-        XCTAssertTrue(laterAdmission.shouldRun)
-        XCTAssertEqual(laterAdmission.startedAt, firstStart.addingTimeInterval(11 * 60))
-    }
-
-    func testRunGateAllowsOnlyOneAcceptedConcurrentAdmission() async {
-        let gate = BackgroundSyncRunGate(minimumSpacing: 10 * 60)
-        let now = Date(timeIntervalSince1970: 1_780_123_200)
-
-        let admissions = await withTaskGroup(of: BackgroundSyncRunAdmission.self) { group in
-            for _ in 0..<20 {
-                group.addTask {
-                    await gate.beginRun(now: now)
-                }
-            }
-
-            var results: [BackgroundSyncRunAdmission] = []
-            for await result in group {
-                results.append(result)
-            }
-            return results
-        }
-
-        XCTAssertEqual(admissions.filter(\.shouldRun).count, 1)
-        XCTAssertEqual(admissions.filter { $0.skipReason == .alreadyRunning }.count, 19)
-    }
-
-    func testRunGateCoalescesObserverTriggersAndDebouncesFollowUp() async {
-        let gate = BackgroundSyncRunGate(minimumSpacing: 10 * 60)
-        let now = Date(timeIntervalSince1970: 1_780_123_200)
-
-        let first = await gate.beginRun(reason: .observer(typeCode: "heart_rate"), now: now)
-        let second = await gate.beginRun(reason: .observer(typeCode: "weight"), now: now.addingTimeInterval(1))
-        _ = await gate.beginRun(reason: .observer(typeCode: "heart_rate"), now: now.addingTimeInterval(2))
-
-        XCTAssertTrue(first.shouldRun)
-        XCTAssertEqual(second.skipReason, .alreadyRunning)
-        let pending = await gate.finishRun(.succeeded)
-        XCTAssertEqual(pending, ["heart_rate", "weight"])
-
-        let followUp = await gate.beginRun(
-            reason: .observerBatch(typeCodes: pending),
-            now: now.addingTimeInterval(3)
-        )
-        XCTAssertFalse(followUp.shouldRun)
-        XCTAssertEqual(followUp.skipReason, .debounced)
-        let retryTypeCodes = await gate.pendingObserverTypeCodesSnapshot()
-        XCTAssertEqual(retryTypeCodes, ["heart_rate", "weight"])
-        let retry = await gate.beginRun(
-            reason: .observerBatch(typeCodes: retryTypeCodes),
-            now: now.addingTimeInterval(10 * 60 + 1)
-        )
-        XCTAssertTrue(retry.shouldRun)
-        let remaining = await gate.finishRun(.succeeded)
-        XCTAssertEqual(remaining, [])
-    }
-
-    func testAcceptedObserverDirtinessIsRetainedWhenRunDefers() async {
-        let gate = BackgroundSyncRunGate(minimumSpacing: 0)
-        let now = Date(timeIntervalSince1970: 1_780_123_200)
-
-        let admission = await gate.beginRun(
-            reason: .observer(typeCode: "heart_rate"),
-            now: now
-        )
-        XCTAssertTrue(admission.shouldRun)
-        let retained = await gate.finishRun(.interrupted)
-        XCTAssertEqual(retained, ["heart_rate"])
-        let pendingSnapshot = await gate.pendingObserverTypeCodesSnapshot()
-        XCTAssertEqual(pendingSnapshot, ["heart_rate"])
-    }
-
-    func testFailedScheduledRunReconcilesFreshGateWithDurableBacklog() {
-        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
-            admittedPendingTypeCodes: ["sleep_analysis"],
-            gatePendingTypeCodes: [],
-            durablePendingState: .available(typeCodes: ["sleep_analysis"]),
-            retryRequested: true,
-            automaticSyncReady: true,
-            backgroundSyncEnabled: true,
-            payloadAdmissionOpen: true
-        )
-
-        XCTAssertEqual(recovery.pendingTypeCodes, ["sleep_analysis"])
-        XCTAssertTrue(recovery.durableStateAvailable)
-        XCTAssertTrue(recovery.shouldScheduleRetry)
-    }
-
-    func testAdmittedScheduledInjectedLaneFailureRetainsDurableWorkInFreshGate() async throws {
-        let suiteName = "HealthBridgeInjectedFailureTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let store = BackgroundSyncSettingsStore(userDefaults: defaults)
-        let gate = BackgroundSyncRunGate(minimumSpacing: 0)
-        try store.markPendingObserverTypeCodes(["sleep_analysis"])
-        let admittedSnapshot = try store.loadPendingObserverTypeCodeGenerations()
-        let admission = await gate.beginRun(reason: .scheduledRefresh)
-        XCTAssertTrue(admission.shouldRun)
-
-        do {
-            throw SyntheticBackgroundLaneFailure.injected
-        } catch SyntheticBackgroundLaneFailure.injected {
-            let gatePending = await gate.finishRun(.interrupted)
-            let durablePending = try store.loadPendingObserverTypeCodeGenerations()
-            let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
-                admittedPendingTypeCodes: Array(admittedSnapshot.keys),
-                gatePendingTypeCodes: gatePending,
-                durablePendingState: .available(typeCodes: Array(durablePending.keys)),
-                retryRequested: true,
-                automaticSyncReady: true,
-                backgroundSyncEnabled: true,
-                payloadAdmissionOpen: true
-            )
-            await gate.retainObserverTypeCodes(recovery.pendingTypeCodes)
-            let retainedByGate = await gate.pendingObserverTypeCodesSnapshot()
-
-            XCTAssertEqual(recovery.pendingTypeCodes, ["sleep_analysis"])
-            XCTAssertEqual(retainedByGate, ["sleep_analysis"])
-            XCTAssertEqual(durablePending, admittedSnapshot)
-            XCTAssertTrue(recovery.shouldScheduleRetry)
-        }
-    }
-
-    func testFailedLaunchRunKeepsSnapshotWhenDurableReloadIsUnavailable() {
-        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
-            admittedPendingTypeCodes: ["heart_rate"],
-            gatePendingTypeCodes: ["step_count"],
-            durablePendingState: .unavailable,
-            retryRequested: true,
-            automaticSyncReady: true,
-            backgroundSyncEnabled: true,
-            payloadAdmissionOpen: true
-        )
-
-        XCTAssertEqual(recovery.pendingTypeCodes, ["heart_rate", "step_count"])
-        XCTAssertFalse(recovery.durableStateAvailable)
-        XCTAssertTrue(recovery.shouldScheduleRetry)
-    }
-
-    func testFailedRunDistinguishesGenuinelyEmptyDurableState() {
-        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
-            admittedPendingTypeCodes: [],
-            gatePendingTypeCodes: [],
-            durablePendingState: .available(typeCodes: []),
-            retryRequested: true,
-            automaticSyncReady: true,
-            backgroundSyncEnabled: true,
-            payloadAdmissionOpen: true
-        )
-
-        XCTAssertEqual(recovery.pendingTypeCodes, [])
-        XCTAssertTrue(recovery.durableStateAvailable)
-        XCTAssertFalse(recovery.shouldScheduleRetry)
-    }
-
-    func testFailedRunUnionsConcurrentObserverWorkWithoutClearingGenerations() throws {
-        let suiteName = "HealthBridgeFailureRecoveryTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let store = BackgroundSyncSettingsStore(userDefaults: defaults)
-        try store.markPendingObserverTypeCodes(["sleep_analysis"])
-        let admitted = try store.loadPendingObserverTypeCodeGenerations()
-        try store.markPendingObserverTypeCodes(["sleep_analysis", "heart_rate"])
-        let concurrent = try store.loadPendingObserverTypeCodeGenerations()
-
-        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
-            admittedPendingTypeCodes: Array(admitted.keys),
-            gatePendingTypeCodes: ["heart_rate"],
-            durablePendingState: .available(typeCodes: Array(concurrent.keys)),
-            retryRequested: true,
-            automaticSyncReady: true,
-            backgroundSyncEnabled: true,
-            payloadAdmissionOpen: true
-        )
-
-        XCTAssertEqual(recovery.pendingTypeCodes, ["heart_rate", "sleep_analysis"])
-        XCTAssertEqual(
-            try store.loadPendingObserverTypeCodeGenerations(),
-            concurrent,
-            "Failure planning must not clear or overwrite a newer observer generation."
-        )
-        XCTAssertGreaterThan(
-            try XCTUnwrap(concurrent["sleep_analysis"]),
-            try XCTUnwrap(admitted["sleep_analysis"])
-        )
-    }
-
-    func testFailedRunRetryRemainsBoundedByCancellationDisableAndConnectionFence() {
-        func shouldRetry(
-            retryRequested: Bool = true,
-            ready: Bool = true,
-            enabled: Bool = true,
-            admissionOpen: Bool = true
-        ) -> Bool {
-            BackgroundSyncFailureRecoveryPolicy.plan(
-                admittedPendingTypeCodes: ["heart_rate"],
-                gatePendingTypeCodes: [],
-                durablePendingState: .available(typeCodes: ["heart_rate"]),
-                retryRequested: retryRequested,
-                automaticSyncReady: ready,
-                backgroundSyncEnabled: enabled,
-                payloadAdmissionOpen: admissionOpen
-            ).shouldScheduleRetry
-        }
-
-        XCTAssertTrue(shouldRetry())
-        XCTAssertFalse(shouldRetry(retryRequested: false))
-        XCTAssertFalse(shouldRetry(ready: false))
-        XCTAssertFalse(shouldRetry(enabled: false))
-        XCTAssertFalse(shouldRetry(admissionOpen: false))
     }
 
     func testCancellationCertificationFailsClosedForEveryUncertainSignal() {
@@ -756,24 +507,6 @@ final class BackgroundSyncTests: XCTestCase {
         XCTAssertFalse(certify(coordinatorIdle: false))
         XCTAssertFalse(certify(generationStable: false))
         XCTAssertFalse(certify(introducedAfterWait: true))
-    }
-
-    func testAutomaticPayloadGenerationRequiresTrustedEmptyOutbox() {
-        XCTAssertTrue(
-            AutomaticSyncPayloadGenerationPolicy.shouldGenerateNewPayloads(
-                trustedPendingOutboxCount: 0
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.shouldGenerateNewPayloads(
-                trustedPendingOutboxCount: 1
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.shouldGenerateNewPayloads(
-                trustedPendingOutboxCount: nil
-            )
-        )
     }
 
     func testMailboxBackgroundOpportunitySelectsOneBoundedDeliveryPhase() {
@@ -863,34 +596,6 @@ final class BackgroundSyncTests: XCTestCase {
         )
     }
 
-    func testRunGateRetainsObserverDirtinessWhenRunDefersForOutbox() async {
-        let gate = BackgroundSyncRunGate(minimumSpacing: 0)
-        let now = Date(timeIntervalSince1970: 1_780_123_200)
-        _ = await gate.beginRun(reason: .scheduledRefresh, now: now)
-        _ = await gate.beginRun(
-            reason: .observer(typeCode: "heart_rate"),
-            now: now.addingTimeInterval(1)
-        )
-
-        let deferred = await gate.finishRun(.interrupted)
-        XCTAssertEqual(deferred, ["heart_rate"])
-
-        let reconciliation = await gate.beginRun(
-            reason: .scheduledRefresh,
-            now: now.addingTimeInterval(2)
-        )
-        XCTAssertTrue(reconciliation.shouldRun)
-        let retained = await gate.finishRun(.succeeded)
-        XCTAssertEqual(retained, ["heart_rate"])
-        let cleared = await gate.beginRun(
-            reason: .scheduledRefresh,
-            now: now.addingTimeInterval(3)
-        )
-        XCTAssertTrue(cleared.shouldRun)
-        let clearedPending = await gate.finishRun(.succeeded)
-        XCTAssertEqual(clearedPending, [])
-    }
-
     func testDirectTransferRequiresCancellationFinalizationAndNoBackgroundTasks() {
         XCTAssertTrue(
             BackgroundUploadCancellationPolicy.canBeginDirectTransfer(
@@ -908,54 +613,6 @@ final class BackgroundSyncTests: XCTestCase {
             BackgroundUploadCancellationPolicy.canBeginDirectTransfer(
                 cancellationWasFullyFinalized: true,
                 hasPendingUploadTasks: true
-            )
-        )
-    }
-
-    func testPayloadGenerationPolicyStopsAutomaticQuantityLoopAfterDurableQueue() {
-        XCTAssertTrue(
-            AutomaticSyncPayloadGenerationPolicy.shouldStopQuantityLoop(
-                isAutomaticSync: true,
-                hasDurablyQueuedPayload: true
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.shouldStopQuantityLoop(
-                isAutomaticSync: false,
-                hasDurablyQueuedPayload: true
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.shouldStopQuantityLoop(
-                isAutomaticSync: true,
-                hasDurablyQueuedPayload: false
-            )
-        )
-    }
-
-    func testPayloadGenerationPolicyDetectsOnlyTheFirstDurableFIFOHead() {
-        XCTAssertTrue(
-            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
-                pendingBefore: 0,
-                pendingAfter: 1
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
-                pendingBefore: 1,
-                pendingAfter: 1
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
-                pendingBefore: nil,
-                pendingAfter: 1
-            )
-        )
-        XCTAssertFalse(
-            AutomaticSyncPayloadGenerationPolicy.didCreateDurableFIFOHead(
-                pendingBefore: 0,
-                pendingAfter: nil
             )
         )
     }

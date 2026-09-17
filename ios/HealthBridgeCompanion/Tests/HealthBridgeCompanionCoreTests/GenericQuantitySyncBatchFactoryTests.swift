@@ -733,6 +733,9 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
     }
 
     func testAnchoredQuantityFactoryBuildsAnchorOnlyUpload() throws {
+        let cursorKind = GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(
+            for: "heart_rate"
+        )
         let changes = HealthKitAnchoredQuantityChanges(
             typeCode: "heart_rate",
             samples: [],
@@ -743,13 +746,16 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
         )
 
         let batch = try XCTUnwrap(
-            GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(changes: changes).first
+            GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(
+                changes: changes,
+                cursorKind: cursorKind
+            ).first
         )
 
         XCTAssertTrue(batch.samples.isEmpty)
         XCTAssertTrue(batch.deletedRecords.isEmpty)
         XCTAssertEqual(batch.sync.cursors.map(\.cursorKind), [
-            "healthkit_anchored_quantity:heart_rate",
+            cursorKind,
         ])
         XCTAssertTrue(ForegroundSyncUploadPolicy.shouldUpload(batch))
     }
@@ -794,51 +800,47 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
         XCTAssertEqual(plan.predicateStart, try date("2026-06-10T05:45:00Z"))
     }
 
-    func testAnchoredQuantityProgressRequiresSuccessfulReadAndDurableDelivery() {
-        XCTAssertTrue(GenericQuantityAnchoredProgressPolicy.shouldPersistAnchor(
-            readSucceeded: true,
-            delivery: .uploaded
-        ))
-        XCTAssertTrue(GenericQuantityAnchoredProgressPolicy.shouldPersistAnchor(
-            readSucceeded: true,
-            delivery: .durablyQueued
-        ))
-        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldPersistAnchor(
-            readSucceeded: false,
-            delivery: .uploaded
-        ))
-        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldPersistAnchor(
-            readSucceeded: true,
-            delivery: .failed
-        ))
-        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldPersistAnchor(
-            readSucceeded: true,
-            delivery: .nonDurablyQueued
-        ))
-    }
 
     func testAnchoredQuantityProgressRequiresReadableProofBeforeCreatingFirstAnchor() {
         XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: true,
             hadUsableAnchor: false,
+            anchorAdvanced: false,
+            activeSampleCount: 0,
+            deletedSampleCount: 0
+        ))
+        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
+            canPersistSharedProgress: true,
+            hadUsableAnchor: false,
+            anchorAdvanced: true,
             activeSampleCount: 0,
             deletedSampleCount: 0
         ))
         XCTAssertTrue(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: true,
             hadUsableAnchor: false,
+            anchorAdvanced: false,
             activeSampleCount: 1,
             deletedSampleCount: 0
         ))
         XCTAssertTrue(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: true,
             hadUsableAnchor: true,
+            anchorAdvanced: true,
+            activeSampleCount: 0,
+            deletedSampleCount: 0
+        ))
+        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
+            canPersistSharedProgress: true,
+            hadUsableAnchor: true,
+            anchorAdvanced: false,
             activeSampleCount: 0,
             deletedSampleCount: 0
         ))
         XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: false,
             hadUsableAnchor: false,
+            anchorAdvanced: false,
             activeSampleCount: 1,
             deletedSampleCount: 0
         ))

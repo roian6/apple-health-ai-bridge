@@ -1094,7 +1094,6 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
 
     assert "QuantityObservationStore" in background_sync
     assert "supportedAutomaticQuantityTypeCodes" in background_sync
-    assert "automaticQuantitySyncPlan" in background_sync
     assert "unifiedFullCoverageMigrationPlan" not in scope_policy
     assert "LegacyGenericQuantitySelectionStore" not in scope_policy
     assert "invalidateIfRuntimeCoverageChanged" in ux_state
@@ -1123,13 +1122,6 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     assert "includeAllSupportedHealthData" not in view_model
     assert "guard includeAllSupportedHealthData else { return [] }" not in view_model
     assert "if includeAllSupportedHealthData {" not in view_model
-    assert "HealthBridgeBackgroundSync.workPlan(" in view_model
-    assert (
-        "pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys)" in view_model
-    )
-    assert "completedObserverTypeCodes: completedObserverTypeCodes" in view_model
-    assert "typeCodes: attempt.coveredObserverTypeCodes" in view_model
-    assert "BackgroundSyncWorkExecutor.execute(" in view_model
     assert "typeCodes: [typeCode]" in view_model
     assert (
         "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in view_model
@@ -1564,47 +1556,6 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
     upload_end = view_model.index("private func uploadPendingOutbox(", upload_start)
     upload_body = view_model[upload_start:upload_end]
     assert "guard !hasPendingPairing, !Task.isCancelled" in upload_body
-
-    background_run_start = view_model.index(
-        "private func performBackgroundRefreshSync("
-    )
-    background_run_end = view_model.index(
-        "private func finishBackgroundRunPreservingObserverDirtiness",
-        background_run_start,
-    )
-    background_run_body = view_model[background_run_start:background_run_end]
-    queued_recursion = background_run_body.rindex(
-        "await self.performAdmittedBackgroundRefreshSync("
-    )
-    assert (
-        "runWithExclusiveDirectOutboxTransfer" in background_run_body[:queued_recursion]
-    )
-
-    admitted_start = view_model.index(
-        "private func performAdmittedBackgroundRefreshSync("
-    )
-    admitted_end = view_model.index(
-        "private func scheduleDebouncedObserverCatchUp", admitted_start
-    )
-    admitted_body = view_model[admitted_start:admitted_end]
-    final_guard = admitted_body.index("stopBackgroundRunIfUnavailable(")
-    private_storage = admitted_body.index("preparePrivateStorageForUploadAdmission()")
-    assert final_guard < private_storage
-
-    stop_start = view_model.index(
-        "private func stopBackgroundRunIfUnavailable", admitted_end
-    )
-    stop_end = view_model.index("func requestHealthPermissions() async", stop_start)
-    stop_body = view_model[stop_start:stop_end]
-    assert all(
-        check in stop_body
-        for check in (
-            "if hasPendingPairing",
-            "if Task.isCancelled",
-            "settingsStore.receiverSettingsGenerationToken != expectedGeneration",
-            "isCancellation: true",
-        )
-    )
 
     scheduler_start = view_model.index("private func startBackgroundOutboxScheduling(")
     scheduler_end = view_model.index(

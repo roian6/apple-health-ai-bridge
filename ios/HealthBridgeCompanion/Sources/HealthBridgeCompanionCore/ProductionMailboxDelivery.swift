@@ -112,6 +112,7 @@ public final class ProductionMailboxDelivery {
     private let outbox: FileOutbox
     private let cursorStore: any SyncCursorStoring
     private let proofStore: CoreLaneUploadProofStore?
+    private let pendingGenerationStore: BackgroundSyncSettingsStore?
     private let sleepStore: (any SleepSyncManifestStoring)?
     private let keyStore: MailboxKeyStore
 
@@ -120,6 +121,7 @@ public final class ProductionMailboxDelivery {
         outbox: FileOutbox,
         cursorStore: any SyncCursorStoring,
         proofStore: CoreLaneUploadProofStore? = nil,
+        pendingGenerationStore: BackgroundSyncSettingsStore? = nil,
         sleepStore: (any SleepSyncManifestStoring)? = nil,
         keyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
@@ -129,6 +131,7 @@ public final class ProductionMailboxDelivery {
         self.outbox = outbox
         self.cursorStore = cursorStore
         self.proofStore = proofStore
+        self.pendingGenerationStore = pendingGenerationStore
         self.sleepStore = sleepStore
         self.keyStore = keyStore
     }
@@ -646,15 +649,23 @@ public final class ProductionMailboxDelivery {
             : nil
         let finalizer: any OutboxDeliveryCommitFinalizing
         if let sleepStore, let transition, transition.outboxItemID == itemID {
+            let transactionFinalizer = OutboxDeliveryCursorFinalizer(
+                outbox: outbox,
+                cursorStore: cursorStore,
+                proofStore: proofStore,
+                pendingGenerationStore: pendingGenerationStore
+            )
             finalizer = OutboxDeliverySleepFinalizer(
                 store: sleepStore,
-                pendingTransition: transition
+                pendingTransition: transition,
+                transactionFinalizer: transactionFinalizer
             )
         } else {
             finalizer = OutboxDeliveryCursorFinalizer(
                 outbox: outbox,
                 cursorStore: cursorStore,
-                proofStore: proofStore
+                proofStore: proofStore,
+                pendingGenerationStore: pendingGenerationStore
             )
         }
         return OutboxDeliveryCoordinator(

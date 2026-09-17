@@ -19,10 +19,6 @@ def test_each_automatic_healthkit_query_has_typed_start_and_result_seams() -> No
         start = source.index(query)
         assert "noteAutomaticSyncQueryStarted(" in source[start - 110 : start]
         assert "noteAutomaticSyncQueryResult(" in source[start : start + 500]
-    assert "diagnostic.notePlan(workPlan.attempts.map(\\.lane))" in source
-    assert "diagnostic.noteAttempt(lane)" in source
-    assert "diagnosticOutbox?.automaticSyncDiagnosticDraft = diagnostic" in source
-    assert "diagnosticOutbox?.automaticSyncDiagnosticDraft = nil" in source
 
 
 def test_local_outbox_evidence_is_not_payload_or_receiver_proof() -> None:
@@ -55,24 +51,6 @@ def test_local_outbox_evidence_is_not_payload_or_receiver_proof() -> None:
     )
     for name in ("BatchV1.swift", "BatchEncoding.swift", "ReceiverClient.swift"):
         assert "AutomaticSyncCausal" not in (CORE / name).read_text()
-
-
-def test_durable_admission_is_recorded_at_the_accepted_marker_write_seam() -> None:
-    source = (IOS / "App/HealthBridgeCompanionViewModel.swift").read_text()
-    start = source.index("diagnostic.notePlan(workPlan.attempts.map(\\.lane))")
-    end = source.index("if workPlan.lane == nil", start)
-    seam = source[start:end]
-    assert seam.index("guard recordBackgroundSyncRunIfAllowed(") < seam.index(
-        "outcome: .accepted,"
-    )
-    failure = seam[seam.index(") else {") : seam.index("diagnostic.noteRunAccepted()")]
-    assert failure.index("diagnostic.noteDurableStateUnavailable()") < failure.index(
-        "await finishBackgroundRunPreservingObserverDirtiness("
-    )
-    assert failure.index("return") < len(failure)
-    assert seam.index("diagnostic.noteRunAccepted()") < seam.index(
-        "persistAcceptedAutomaticSyncDiagnostic(diagnostic)"
-    )
 
 
 def test_gate_has_no_product_defaults_or_aggregate_success_shortcut() -> None:

@@ -193,6 +193,12 @@ final class StepCountSyncBatchFactoryTests: XCTestCase {
         XCTAssertFalse(HealthKitAnchoredCursorPolicy.hasUsableCursorValue(""))
         XCTAssertFalse(HealthKitAnchoredCursorPolicy.hasUsableCursorValue("  \n\t"))
         XCTAssertTrue(HealthKitAnchoredCursorPolicy.hasUsableCursorValue("opaque-anchor-v1"))
+        XCTAssertFalse(HealthKitAnchoredCursorPolicy.hasAdvanced(
+            from: "opaque-anchor-v1", to: "opaque-anchor-v1"
+        ))
+        XCTAssertTrue(HealthKitAnchoredCursorPolicy.hasAdvanced(
+            from: "opaque-anchor-v1", to: "opaque-anchor-v2"
+        ))
     }
 
     func testAnchoredStepPolicyUsesBoundedBootstrapUntilAnchorExists() throws {

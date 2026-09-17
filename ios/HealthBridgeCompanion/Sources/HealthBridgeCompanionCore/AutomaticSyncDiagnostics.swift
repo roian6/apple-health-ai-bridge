@@ -25,23 +25,6 @@ public enum AutomaticSyncDiagnosticLane: String, Codable, Equatable, Hashable, S
         }
     }
 
-    init(workLane: BackgroundSyncWorkLane?) {
-        switch workLane {
-        case .steps:
-            self = .steps
-        case .dailyActivity:
-            self = .dailyActivity
-        case .workouts:
-            self = .workouts
-        case .sleep:
-            self = .sleep
-        case .quantity:
-            self = .quantity
-        case nil:
-            self = .noWork
-        }
-    }
-
     var displayName: String {
         switch self {
         case .dailyActivity:
@@ -215,6 +198,7 @@ public struct AutomaticSyncPendingSnapshot: Equatable, Sendable {
 public enum AutomaticSyncObserverEventAdmission {
     case continueProcessing
     case complete(AutomaticSyncDiagnosticDraft?)
+    case deferAcknowledgement(AutomaticSyncDiagnosticDraft?)
 }
 
 @MainActor
@@ -228,14 +212,20 @@ enum AutomaticSyncObserverEventLifecycle {
         persistDiagnostic: (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void
     ) async {
         let admission = await admissionHandler()
-        let completionLatency = now().timeIntervalSince(startedAt)
-        acknowledge()
         let diagnostic: AutomaticSyncDiagnosticDraft?
+        let completionLatency: TimeInterval
         switch admission {
         case .continueProcessing:
+            completionLatency = now().timeIntervalSince(startedAt)
+            acknowledge()
             diagnostic = await eventHandler()
         case .complete(let admittedDiagnostic):
             diagnostic = admittedDiagnostic
+            completionLatency = now().timeIntervalSince(startedAt)
+            acknowledge()
+        case .deferAcknowledgement(let admittedDiagnostic):
+            diagnostic = admittedDiagnostic
+            completionLatency = now().timeIntervalSince(startedAt)
         }
         guard let diagnostic else { return }
         persistDiagnostic(diagnostic, completionLatency)

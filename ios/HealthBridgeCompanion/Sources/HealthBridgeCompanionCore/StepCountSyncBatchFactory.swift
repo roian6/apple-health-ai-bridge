@@ -81,6 +81,10 @@ public enum HealthKitAnchoredCursorPolicy {
         guard let cursorValue else { return false }
         return !cursorValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+
+    public static func hasAdvanced(from previousValue: String?, to currentValue: String) -> Bool {
+        previousValue != currentValue
+    }
 }
 
 public enum AnchoredStepSyncPolicy {

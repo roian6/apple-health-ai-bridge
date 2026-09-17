@@ -95,6 +95,9 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     ) async throws -> Int {
         rememberOutboxDirectory(outbox.directoryURL)
         await recoverPersistedTaskCompletions()
+        _ = try directCursorFinalizer(outbox: outbox).finalizeDirectAcknowledgments(
+            receiverBindingID: receiverBindingID
+        )
         guard let taskOwnershipStore,
               (try? taskOwnershipStore.records().isEmpty) == true else {
             return 0
@@ -163,6 +166,48 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             DeliveryTransportInput(item: pendingItems[0])
         )
         return result == .published ? 1 : 0
+    }
+
+    private func directCursorFinalizer(
+        outbox: FileOutbox
+    ) throws -> OutboxDeliveryCursorFinalizer {
+        let cursorStore = try FileSyncCursorStore(
+            fileURL: outbox.directoryURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("sync-cursors.json")
+        )
+        return OutboxDeliveryCursorFinalizer(
+            outbox: outbox,
+            cursorStore: cursorStore,
+            proofStore: CoreLaneUploadProofStore(),
+            pendingGenerationStore: BackgroundSyncSettingsStore()
+        )
+    }
+
+    @MainActor
+    private func scheduleNextDirectUploadIfPossible() async {
+        guard let outboxDirectory = currentOutboxDirectory() else { return }
+        let settingsStore = ReceiverSettingsStore()
+        let receiverURLString = settingsStore.receiverURLString
+        guard settingsStore.activeTransport == .directHTTP,
+              let receiverURL = URL(string: receiverURLString),
+              let receiverBindingID = settingsStore.receiverBindingID else {
+            return
+        }
+        do {
+            let bearerToken = try settingsStore.loadBearerToken()
+            guard !bearerToken.isEmpty else { return }
+            let outbox = try FileOutbox(directory: outboxDirectory)
+            _ = try await schedulePendingUploads(
+                outbox: outbox,
+                receiverURL: receiverURL,
+                bearerToken: bearerToken,
+                receiverGeneration: settingsStore.receiverSettingsGenerationToken,
+                receiverBindingID: receiverBindingID
+            )
+        } catch {
+            // The durable FIFO head remains available to the next admitted trigger.
+        }
     }
 
     @MainActor
@@ -692,7 +737,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                 receiverGeneration: record.receiverGeneration,
                 receiverBindingID: record.receiverBindingID
             )
-            guard finishCompletedUpload(
+            guard let finalizationOutcome = finishCompletedUpload(
                 descriptor: descriptor,
                 completion: completion
             ) else {
@@ -704,9 +749,12 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             } catch {
                 continue
             }
-            Self.dispatchCompletionHandler(
-                eventFinalizationCoordinator.complete(record.taskID)
-            )
+            let accepted = finalizationOutcome == .retired
+            let systemCompletionHandler = eventFinalizationCoordinator.complete(record.taskID)
+            if accepted {
+                await scheduleNextDirectUploadIfPossible()
+            }
+            Self.dispatchCompletionHandler(systemCompletionHandler)
         }
     }
 
@@ -823,11 +871,11 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let durablyReconciled = self.finishCompletedUpload(
+            let finalizationOutcome = self.finishCompletedUpload(
                 descriptor: descriptor,
                 completion: completion
             )
-            guard durablyReconciled, completionMetadataPersisted else { return }
+            guard let finalizationOutcome, completionMetadataPersisted else { return }
             await completionBarrier.complete(taskID)
             var ownershipFinalized = ownershipRecord == nil
             if ownershipRecord != nil,
@@ -840,7 +888,12 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                 }
             }
             guard ownershipFinalized else { return }
-            Self.dispatchCompletionHandler(finalizationCoordinator.complete(taskID))
+            let accepted = finalizationOutcome == .retired
+            let systemCompletionHandler = finalizationCoordinator.complete(taskID)
+            if accepted {
+                await self.scheduleNextDirectUploadIfPossible()
+            }
+            Self.dispatchCompletionHandler(systemCompletionHandler)
         }
     }
 
@@ -848,9 +901,9 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     private func finishCompletedUpload(
         descriptor: DirectUploadCompletionDescriptor,
         completion: BackgroundUploadTaskCompletion
-    ) -> Bool {
+    ) -> DirectUploadFinalizationOutcome? {
         guard let outboxDirectory = currentOutboxDirectory() else {
-            return false
+            return nil
         }
         do {
             let outbox = try FileOutbox(directory: outboxDirectory)
@@ -875,10 +928,11 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     )
                 },
                 retire: { itemID, receiverBindingID in
-                    if let item = try outbox.pendingItem(id: itemID),
-                       item.receiverIdentity == receiverBindingID {
-                        try outbox.markUploaded(item)
-                    }
+                    _ = try self.directCursorFinalizer(outbox: outbox)
+                        .recordDirectReceiverAcceptance(
+                            itemID: itemID,
+                            receiverBindingID: receiverBindingID
+                        )
                     // A replayed successful callback may follow durable payload retirement.
                     outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)
                 }
@@ -886,10 +940,10 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             if outcome == .retained {
                 outbox.noteDiagnosticDelivery(itemID: descriptor.itemID, outcome: .failed)
             }
-            return true
+            return outcome
         } catch {
             // Keep ownership durable until a later launch can replay reconciliation.
-            return false
+            return nil
         }
     }
 
@@ -925,7 +979,34 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     }
 }
 
+@MainActor
 final class HealthBridgeBackgroundURLSessionAppDelegate: NSObject, UIApplicationDelegate {
+    let applicationRuntime: HealthBridgeCompanionApplicationRuntime
+
+    override convenience init() {
+        self.init(applicationRuntime: .shared)
+    }
+
+    init(applicationRuntime: HealthBridgeCompanionApplicationRuntime) {
+        self.applicationRuntime = applicationRuntime
+        super.init()
+    }
+
+    @discardableResult
+    func bootstrapForBackgroundLaunch() -> Task<Void, Never> {
+        Task { @MainActor in
+            await applicationRuntime.bootstrap()
+        }
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        bootstrapForBackgroundLaunch()
+        return true
+    }
+
     func application(
         _ application: UIApplication,
         handleEventsForBackgroundURLSession identifier: String,

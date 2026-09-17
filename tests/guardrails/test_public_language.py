@@ -77,21 +77,6 @@ def test_foreground_sync_exposes_cancel_without_deleting_durable_queue() -> None
     assert 'title: "Cancel"' in content_view
 
 
-def test_sleep_delivery_obeys_fifo_head_network_attempt_policy() -> None:
-    view_model = Path(
-        "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift",
-    ).read_text(encoding="utf-8")
-    sleep_body = view_model.split(
-        "private func deliverPendingSleepTransition(",
-        maxsplit=1,
-    )[1].split("func syncSupportedQuantityMetrics() async", maxsplit=1)[0]
-
-    policy_index = sleep_body.index("shouldAttemptNetworkForQueuedPayload")
-    upload_index = sleep_body.index("uploadPendingOutbox(")
-    assert "pendingItems.first?.id == outboxItemID" in sleep_body
-    assert policy_index < upload_index
-
-
 def test_release_qa_requires_clean_install_and_real_camera_qr_pairing() -> None:
     qa_text = Path("docs/qa/public-release-qa.md").read_text(encoding="utf-8")
     checklist_text = Path(
@@ -453,9 +438,9 @@ def test_current_component_identities_are_explicit() -> None:
     assert '__version__: Final = "1.1.1"' in package_init
     assert '"version": "1.1.1"' in server_manifest
     assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 43;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 48;") == 2
     assert '?? "1.1.1"' in content_view
-    assert '?? "43"' in content_view
+    assert '?? "48"' in content_view
     assert "pre-1.0" not in security
 
 

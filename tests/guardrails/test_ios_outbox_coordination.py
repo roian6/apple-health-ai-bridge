@@ -7,6 +7,9 @@ UPLOADER = Path(
 BACKGROUND_UPLOAD = Path(
     "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/BackgroundOutboxUpload.swift"
 )
+FILE_OUTBOX = Path(
+    "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/FileOutbox.swift"
+)
 
 
 def test_direct_sync_takes_exclusive_outbox_handoff_before_uploading() -> None:
@@ -35,43 +38,6 @@ def test_connection_test_revalidates_receiver_after_exclusive_handoff() -> None:
     readiness = body.index("guard canSendConnectionTest, !Task.isCancelled")
     upload = body.index("await uploadPayloadsWithOutbox(")
     assert readiness < upload
-
-
-def test_background_refresh_coalesces_observer_admission_before_transfer_handoff() -> (
-    None
-):
-    text = VIEW_MODEL.read_text()
-    start = text.index("private func performBackgroundRefreshSync(")
-    end = text.index("private func performAdmittedBackgroundRefreshSync(", start)
-    admission_body = text[start:end]
-
-    admission = admission_body.index("await backgroundRunGate.beginRun(reason: reason")
-    transfer_handoff = admission_body.index(
-        "await runWithExclusiveDirectOutboxTransfer"
-    )
-    assert admission < transfer_handoff
-
-
-def test_background_refresh_revalidates_automatic_sync_after_transfer_handoff() -> None:
-    text = VIEW_MODEL.read_text()
-    start = text.index("private func performAdmittedBackgroundRefreshSync(")
-    end = text.index("private func stopBackgroundRunIfUnavailable(", start)
-    admitted_body = text[start:end]
-
-    eligibility_check = admitted_body.index("await stopBackgroundRunIfUnavailable(")
-    first_health_read = admitted_body.index("await self.syncRecentStepCounts(")
-    assert eligibility_check < first_health_read
-
-    stop_start = end
-    stop_end = text.index("func requestHealthPermissions()", stop_start)
-    stop_body = text[stop_start:stop_end]
-    for required in (
-        "automaticSyncReady",
-        "backgroundSyncEnabled",
-        "canSendConnectionTest",
-        "await finishBackgroundRunPreservingObserverDirtiness(",
-    ):
-        assert required in stop_body
 
 
 def test_background_event_completion_waits_for_persistent_finalization() -> None:
@@ -121,7 +87,6 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
         "DirectUploadFinalizer.finish(",
         "currentReceiverGeneration: settingsStore.receiverSettingsGenerationToken",
         "currentReceiverBindingID: settingsStore.receiverBindingID",
-        "item.receiverIdentity == receiverBindingID",
     ):
         assert fragment in finish
 
@@ -140,6 +105,15 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
     assert finalizer.index(generation_check) < finalizer.index(stale_result)
     assert finalizer.index(binding_check) < finalizer.index(stale_result)
     assert finalizer.index(stale_result) < finalizer.index(retire)
+
+    outbox = FILE_OUTBOX.read_text()
+    accepted_start = outbox.index("public func recordDirectUploadAccepted(")
+    accepted_end = outbox.index(
+        "public func directFinalizationRecordReady(", accepted_start
+    )
+    accepted = outbox[accepted_start:accepted_end]
+    assert "finalizationRecord.cursorCheckpoint?.receiverIdentity" in accepted
+    assert "item.receiverIdentity == receiverIdentity" in accepted
 
 
 def test_background_task_ownership_is_durable_from_resume_through_reconciliation() -> (

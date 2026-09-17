@@ -20,25 +20,76 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     private let outbox: FileOutbox
     private let cursorStore: any SyncCursorStoring
     private let proofStore: CoreLaneUploadProofStore?
+    private let pendingGenerationStore: BackgroundSyncSettingsStore?
 
     public init(
         outbox: FileOutbox,
         cursorStore: any SyncCursorStoring,
-        proofStore: CoreLaneUploadProofStore? = nil
+        proofStore: CoreLaneUploadProofStore? = nil,
+        pendingGenerationStore: BackgroundSyncSettingsStore? = nil
     ) {
         self.outbox = outbox
         self.cursorStore = cursorStore
         self.proofStore = proofStore
+        self.pendingGenerationStore = pendingGenerationStore
     }
 
     public func isFinalized(
         _ context: OutboxDeliveryFinalizationContext
     ) throws -> Bool {
-        try checkpoint(for: context) == nil
+        try finalizationRecord(for: context) == nil
     }
 
     public func finalize(_ context: OutboxDeliveryFinalizationContext) throws {
-        guard let checkpoint = try checkpoint(for: context) else { return }
+        guard let record = try finalizationRecord(for: context) else { return }
+        try finalize(record)
+    }
+
+    @discardableResult
+    public func recordDirectReceiverAcceptance(
+        itemID: String,
+        receiverBindingID: String
+    ) throws -> Bool {
+        guard let record = try outbox.recordDirectUploadAccepted(
+            itemID: itemID,
+            receiverIdentity: receiverBindingID
+        ) else {
+            return false
+        }
+        try finalize(record)
+        return true
+    }
+
+    @discardableResult
+    public func finalizeDirectAcknowledgments(
+        receiverBindingID: String
+    ) throws -> Bool {
+        guard let record = try outbox.directFinalizationRecordReady(
+            receiverIdentity: receiverBindingID
+        ) else {
+            return false
+        }
+        try finalize(record)
+        return true
+    }
+
+    private func finalize(_ record: FileOutboxFinalizationRecord) throws {
+        if let checkpoint = record.cursorCheckpoint {
+            try finalizeCursor(checkpoint)
+        }
+        if !record.pendingGenerationRetirements.isEmpty {
+            guard let pendingGenerationStore else {
+                throw FileOutboxCursorCheckpointError.pendingCommit
+            }
+            try pendingGenerationStore.clearPendingObserverTypeCodes(
+                matching: record.pendingGenerationRetirements,
+                typeCodes: record.pendingGenerationRetirements.keys.sorted()
+            )
+        }
+        try outbox.acknowledgeFinalizationRecord(record)
+    }
+
+    private func finalizeCursor(_ checkpoint: FileOutboxCursorCheckpoint) throws {
         if try cursorStore.cursorValue(
             receiverBindingID: checkpoint.receiverIdentity,
             sourceKey: checkpoint.sourceKey,
@@ -52,13 +103,12 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             )
         }
         finalizeUploadProof(checkpoint)
-        try outbox.acknowledgeCursorCheckpoint(checkpoint)
     }
 
-    private func checkpoint(
+    private func finalizationRecord(
         for context: OutboxDeliveryFinalizationContext
-    ) throws -> FileOutboxCursorCheckpoint? {
-        try outbox.cursorCheckpointReadyForDeliveryFinalization(
+    ) throws -> FileOutboxFinalizationRecord? {
+        try outbox.finalizationRecordReadyForDelivery(
             itemID: context.itemID,
             ownership: context.ownership
         )
@@ -96,43 +146,51 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
 public final class OutboxDeliverySleepFinalizer: OutboxDeliveryCommitFinalizing {
     private let store: any SleepSyncManifestStoring
     private let pendingTransition: SleepSyncPendingTransition
+    private let transactionFinalizer: OutboxDeliveryCursorFinalizer?
 
     public init(
         store: any SleepSyncManifestStoring,
-        pendingTransition: SleepSyncPendingTransition
+        pendingTransition: SleepSyncPendingTransition,
+        transactionFinalizer: OutboxDeliveryCursorFinalizer? = nil
     ) {
         self.store = store
         self.pendingTransition = pendingTransition
+        self.transactionFinalizer = transactionFinalizer
     }
 
     public func isFinalized(
         _ context: OutboxDeliveryFinalizationContext
     ) throws -> Bool {
         try validate(context)
-        guard let current = try store.loadPendingTransition() else {
-            return try store.loadManifest() == pendingTransition.manifest
+        let sleepFinalized: Bool
+        if let current = try store.loadPendingTransition() {
+            guard current == pendingTransition else {
+                throw OutboxDeliveryCoordinatorError.ownershipMismatch
+            }
+            sleepFinalized = false
+        } else {
+            sleepFinalized = try store.loadManifest() == pendingTransition.manifest
         }
-        guard current == pendingTransition else {
-            throw OutboxDeliveryCoordinatorError.ownershipMismatch
-        }
-        return false
+        guard sleepFinalized else { return false }
+        return try transactionFinalizer?.isFinalized(context) ?? true
     }
 
     public func finalize(_ context: OutboxDeliveryFinalizationContext) throws {
         try validate(context)
-        guard let current = try store.loadPendingTransition() else {
+        if let current = try store.loadPendingTransition() {
+            guard current == pendingTransition else {
+                throw OutboxDeliveryCoordinatorError.ownershipMismatch
+            }
+            if try store.loadManifest() != pendingTransition.manifest {
+                try store.saveManifest(pendingTransition.manifest)
+            }
+            try store.clearPendingTransition(id: pendingTransition.id)
+        } else {
             guard try store.loadManifest() == pendingTransition.manifest else {
                 throw OutboxDeliveryCoordinatorError.finalizationIncomplete
             }
-            return
         }
-        guard current == pendingTransition else {
-            throw OutboxDeliveryCoordinatorError.ownershipMismatch
-        }
-        if try store.loadManifest() != pendingTransition.manifest {
-            try store.saveManifest(pendingTransition.manifest)
-        }
-        try store.clearPendingTransition(id: pendingTransition.id)
+        try transactionFinalizer?.finalize(context)
     }
 
     private func validate(_ context: OutboxDeliveryFinalizationContext) throws {

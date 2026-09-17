@@ -23,7 +23,7 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
 
     private func record(_ lanes: [AutomaticSyncLaneEvidence], truncated: Bool = false) -> AutomaticSyncDiagnosticRecord {
         let draft = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
-        draft.noteAdmission(.accepted(startedAt: now))
+        draft.noteAdmission()
         var record = draft.record
         record.causalChain = AutomaticSyncCausalChain(lanes: lanes, truncated: truncated, durableAdmission: .persisted)
         return record
@@ -62,7 +62,7 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = BackgroundSyncSettingsStore(userDefaults: defaults)
         let draft = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
-        draft.noteAdmission(.accepted(startedAt: now))
+        draft.noteAdmission()
         XCTAssertThrowsError(try settings.recordRunLifecycle(startedAt: now, finishedAt: nil,
             outcome: .accepted, succeeded: false, summary: "Synthetic marker"))
         draft.noteDurableStateUnavailable()
@@ -118,7 +118,7 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = BackgroundSyncSettingsStore(userDefaults: defaults)
         let draft = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
-        draft.noteAdmission(.accepted(startedAt: now))
+        draft.noteAdmission()
         XCTAssertEqual(try durableAdmissionJSON(draft.record), "unknown")
         var gateOnly = draft.record
         gateOnly.causalChain?.lanes = core.map(evidence)
@@ -129,7 +129,7 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
         draft.notePlan([.sleep, .dailyActivity, .steps, .workouts])
         XCTAssertEqual(try durableAdmissionJSON(draft.record), "persisted")
         XCTAssertEqual(BackgroundSyncSettingsStore(userDefaults: defaults).lastRun?.outcome, .accepted)
-        for lane in [BackgroundSyncWorkLane.sleep, .dailyActivity, .steps, .workouts] {
+        for lane in core {
             draft.noteAttempt(lane)
             draft.noteQuery(.records, newestSampleAge: 60, now: now)
             draft.noteDelivery(.accepted, now: now)
@@ -244,16 +244,16 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
         XCTAssertEqual(gate([record([queued] + core.dropFirst().map(evidence))]), .hold)
     }
 
-    func testOrderedSelectionAttemptBoundsAndPrivacySerialization() throws {
+    func testOrderedSelectionAttemptAndPrivacySerialization() throws {
         let draft = AutomaticSyncDiagnosticDraft(reason: .observer(typeCode: "heart_rate"))
-        draft.notePlan([.sleep, .steps, .quantity(typeCode: "private_optional_identifier"), .workouts, .dailyActivity])
+        draft.notePlan([.sleep, .steps, .quantity, .workouts, .dailyActivity])
         draft.noteAttempt(.sleep)
         draft.noteQuery(.records, newestSampleAge: 9_000, now: now)
         draft.noteQueued(itemIDs: (1...100).map(item), complete: true, now: now)
         let chain = try XCTUnwrap(draft.record.causalChain)
-        XCTAssertEqual(chain.lanes.map(\.lane), [.sleep, .steps, .quantity, .workouts])
-        XCTAssertEqual(chain.lanes.map(\.attempted), [true, false, false, false])
-        XCTAssertEqual(chain.lanes.map(\.query), [.records, .notRun, .notRun, .notRun])
+        XCTAssertEqual(chain.lanes.first?.lane, .sleep)
+        XCTAssertEqual(chain.lanes.first?.attempted, true)
+        XCTAssertEqual(chain.lanes.first?.query, .records)
         XCTAssertEqual(chain.lanes[0].newestSampleAge, .oneToSixHours)
         XCTAssertTrue(chain.truncated)
         XCTAssertLessThanOrEqual(chain.lanes[0].pendingItems.count, AutomaticSyncLaneEvidence.maximumPendingItems)

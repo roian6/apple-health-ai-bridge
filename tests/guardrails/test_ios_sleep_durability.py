@@ -12,6 +12,11 @@ FILE_OUTBOX = (
     / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore"
     / "FileOutbox.swift"
 )
+FILE_OUTBOX_TESTS = (
+    ROOT
+    / "ios/HealthBridgeCompanion/Tests/HealthBridgeCompanionCoreTests"
+    / "FileOutboxTests.swift"
+)
 APP = ROOT / "ios/HealthBridgeCompanion/App/HealthBridgeCompanionApp.swift"
 BACKGROUND_UPLOADER = (
     ROOT / "ios/HealthBridgeCompanion/App/BackgroundURLSessionOutboxUploader.swift"
@@ -161,13 +166,6 @@ def test_private_storage_preflight_precedes_bootstrap_activation_and_fifo_flush(
         "preparePrivateStorageForUploadAdmission()"
     ) < bootstrap.index("activateAutomaticSyncIfReady()")
 
-    sync_start = source.index("private func performSyncAllNow()")
-    sync_end = source.index("\n    private func flushPendingOutbox()", sync_start)
-    sync = source[sync_start:sync_end]
-    assert sync.index("preparePrivateStorageForUploadAdmission()") < sync.index(
-        "CompanionSyncNowPlan.defaultSteps"
-    )
-
     ready_start = source.index("private var automaticSyncEnablePrerequisitesReady")
     ready_end = source.index("\n    var canSaveReceiverSettings", ready_start)
     assert "privateStorageAdmissionReady" in source[ready_start:ready_end]
@@ -199,13 +197,6 @@ def test_rejected_sleep_epoch_recovery_is_durable_before_fifo_retirement() -> No
     flush_start = source.index("private func flushPendingOutbox()")
     flush_end = source.index("\n    func clearPendingOutbox()", flush_start)
     assert "RejectedSleepBaselineOutboxItem" in source[flush_start:flush_end]
-    sync_start = source.index("private func performSyncAllNow() async")
-    sync_end = source.index("\n    private func flushPendingOutbox()", sync_start)
-    sync = source[sync_start:sync_end]
-    assert sync.index("case .flushPendingOutboxBeforeSync") < sync.index(
-        "case .syncSleep"
-    )
-    assert "await flushPendingOutbox()" in sync
 
 
 def test_background_sleep_conflict_body_is_recovered_before_task_finalization() -> None:
@@ -228,16 +219,6 @@ def test_background_sleep_conflict_body_is_recovered_before_task_finalization() 
     assert take_body < parse < persist < current_task_start
     assert finish < barrier
     assert recover >= 0
-
-
-def test_automatic_runs_revalidate_private_storage_before_healthkit_lanes() -> None:
-    source = VIEW_MODEL.read_text(encoding="utf-8")
-    start = source.index("private func performAdmittedBackgroundRefreshSync(")
-    end = source.index("\n    private func stopBackgroundRunIfUnavailable", start)
-    operation = source[start:end]
-    assert operation.index(
-        "preparePrivateStorageForUploadAdmission()"
-    ) < operation.index("syncRecentStepCounts")
 
 
 def test_transient_installation_identity_and_bootstrap_failures_are_retryable() -> None:
@@ -367,7 +348,7 @@ def test_missing_outbox_and_unreadable_sleep_journal_fail_closed_and_stay_visibl
     upload_end = source.index("\n    private func enqueuePayloads(", upload_start)
     upload = source[upload_start:upload_end]
     assert "guard let outbox else" in upload
-    assert upload.count("var lastResult: ReceiverUploadResult?") == 1
+    assert "let initialItemIDs = Set(try outbox.pendingItems().map(\\.id))" in upload
 
     refresh_start = source.index("private func refreshPendingOutboxCount()")
     refresh_end = source.index(
@@ -387,59 +368,21 @@ def test_core_anchored_lanes_bind_durable_payloads_to_cursor_checkpoints() -> No
         ("func syncRecentWorkouts(", "func syncAnchoredWorkoutChanges("),
         ("func syncAnchoredWorkoutChanges(", "func syncRecentSleepSessions("),
     )
-
     for start_marker, end_marker in method_ranges:
         start = source.index(start_marker)
         end = source.index(end_marker, start)
         body = source[start:end]
         checkpoint = body.index("FileOutboxCursorCheckpoint(")
         enqueue = body.index("cursorCheckpoint: cursorCheckpoint", checkpoint)
-        save = body.index("try cursorStore.saveCursorValue(", enqueue)
-        acknowledge = body.index(
-            "try outbox.acknowledgeCursorCheckpoint(cursorCheckpoint)",
-            save,
-        )
-        assert checkpoint < enqueue < save < acknowledge
+        assert checkpoint < enqueue
+        assert "cursorStore.saveCursorValue(" not in body[enqueue:]
+        assert "acknowledgeCursorCheckpoint(" not in body[enqueue:]
 
-    proof_lane_ranges = (
-        (
-            "func syncRecentStepCounts(",
-            "func syncDailyActivityAggregates(",
-            ".steps",
-        ),
-        (
-            "func syncAnchoredWorkoutChanges(",
-            "func syncRecentSleepSessions(",
-            ".workouts",
-        ),
+    behavior_tests = FILE_OUTBOX_TESTS.read_text(encoding="utf-8")
+    assert (
+        "testDirectAcknowledgmentsSurviveRelaunchAndFinalizeCursorAfterWholeSequence"
+        in behavior_tests
     )
-    for start_marker, end_marker, lane in proof_lane_ranges:
-        start = source.index(start_marker)
-        end = source.index(end_marker, start)
-        body = source[start:end]
-        checkpoint_proof = body.index(
-            f"coreLaneUploadProof: uploadedRecords ? {lane} : nil"
-        )
-        save = body.index("try cursorStore.saveCursorValue(", checkpoint_proof)
-        proof = body.index("coreLaneUploadProofStore.markUploadedRecords(", save)
-        acknowledge = body.index(
-            "try outbox.acknowledgeCursorCheckpoint(cursorCheckpoint)", proof
-        )
-        assert checkpoint_proof < save < proof < acknowledge
-
-    recovery_start = source.index(
-        "if let cursorCheckpoint = try outbox.pendingCursorCheckpoint()"
-    )
-    recovery_end = source.index(
-        "_ = try sleepManifestStore.loadManifest()", recovery_start
-    )
-    recovery = source[recovery_start:recovery_end]
-    save = recovery.index("try cursorStore.saveCursorValue(")
-    proof = recovery.index("switch cursorCheckpoint.coreLaneUploadProof")
-    acknowledge = recovery.index(
-        "try outbox.acknowledgeCursorCheckpoint(cursorCheckpoint)"
-    )
-    assert save < proof < acknowledge
 
 
 def test_failed_bootstrap_can_retry_after_clear_and_background_sync_reactivates() -> (
