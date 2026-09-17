@@ -9,7 +9,7 @@ from typing import cast
 ROOT = Path(__file__).parents[2]
 
 
-def test_ios_1_1_1_build_43_leaves_receiver_1_1_1_unchanged() -> None:
+def test_ios_1_1_1_build_48_leaves_receiver_1_1_1_unchanged() -> None:
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = cast("dict[str, object]", tomllib.load(handle)["project"])
     component_versions = cast(
@@ -37,9 +37,9 @@ def test_ios_1_1_1_build_43_leaves_receiver_1_1_1_unchanged() -> None:
     assert receiver == {"release_tag": "receiver-v1.1.1", "version": "1.1.1"}
     assert component_versions["release_scope"] == "ios"
     assert helper_info["CFBundleShortVersionString"] == "1.1.1"
-    assert ios == {"build": "47", "marketing_version": "1.1.1"}
+    assert ios == {"build": "48", "marketing_version": "1.1.1"}
     assert ios_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert ios_project.count("CURRENT_PROJECT_VERSION = 47;") == 2
+    assert ios_project.count("CURRENT_PROJECT_VERSION = 48;") == 2
 
 
 def test_receiver_1_1_1_release_notes_are_receiver_only_and_helper_bound() -> None:
