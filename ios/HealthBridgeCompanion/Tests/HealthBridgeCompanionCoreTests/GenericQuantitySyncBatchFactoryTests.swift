@@ -805,24 +805,42 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
         XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: true,
             hadUsableAnchor: false,
+            anchorAdvanced: false,
+            activeSampleCount: 0,
+            deletedSampleCount: 0
+        ))
+        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
+            canPersistSharedProgress: true,
+            hadUsableAnchor: false,
+            anchorAdvanced: true,
             activeSampleCount: 0,
             deletedSampleCount: 0
         ))
         XCTAssertTrue(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: true,
             hadUsableAnchor: false,
+            anchorAdvanced: false,
             activeSampleCount: 1,
             deletedSampleCount: 0
         ))
         XCTAssertTrue(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: true,
             hadUsableAnchor: true,
+            anchorAdvanced: true,
+            activeSampleCount: 0,
+            deletedSampleCount: 0
+        ))
+        XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
+            canPersistSharedProgress: true,
+            hadUsableAnchor: true,
+            anchorAdvanced: false,
             activeSampleCount: 0,
             deletedSampleCount: 0
         ))
         XCTAssertFalse(GenericQuantityAnchoredProgressPolicy.shouldIncludeAnchor(
             canPersistSharedProgress: false,
             hadUsableAnchor: false,
+            anchorAdvanced: false,
             activeSampleCount: 1,
             deletedSampleCount: 0
         ))

@@ -119,63 +119,139 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
     }
 
     @MainActor
-    func testDurableObserverAdmissionAcknowledgesOverlappingCoalescedRunBeforeAcquisition() async throws {
+    func testObserverBurstAcknowledgesDurableAdmissionsAndUsesOneBoundedWorkOwner() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }
-        try fixture.store.markPendingObserverTypeCodes(["heart_rate"])
         let observed = TypeCodeRecorder()
         let entered = BoundedAsyncValueLatch<Void>()
         let release = BoundedAsyncValueLatch<Void>()
+        let finished = BoundedAsyncValueLatch<Void>()
+        let waitingTriggerStarted = BoundedAsyncValueLatch<Void>()
+        let typeCodes = Array(
+            HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes.prefix(14)
+        )
+        let blockedTypeCode = try XCTUnwrap(typeCodes.first)
+        XCTAssertEqual(Set(typeCodes).count, 14)
+        var activeOwners = 0
+        var maximumActiveOwners = 0
+        var opportunityCount = 0
+        var opportunityDeliveryPhaseCount = 0
+        var opportunityFinalStatusCount = 0
+        var opportunityReasons: [AutomaticSyncReason] = []
+        var opportunityRunIDs: [UUID] = []
+        var opportunityBootstrapFlags: [Bool] = []
+        let firstObserverRunID = UUID()
+        let scheduledRunID = UUID()
         let engine = AutomaticSyncEngine(
             pendingStore: fixture.store,
             processType: { typeCode, _ in
                 await observed.append(typeCode)
-                if typeCode == "heart_rate" {
+                if typeCode == blockedTypeCode {
                     entered.resolve(())
                     _ = await release.wait(timeout: 1)
                 }
                 return .noPayload
+            },
+            performOpportunity: { opportunity, processPendingTypes in
+                activeOwners += 1
+                maximumActiveOwners = max(maximumActiveOwners, activeOwners)
+                opportunityCount += 1
+                opportunityReasons.append(opportunity.reason)
+                opportunityRunIDs.append(opportunity.diagnosticRunID)
+                opportunityBootstrapFlags.append(opportunity.bootstrapBeforeRun)
+                defer {
+                    opportunityFinalStatusCount += 1
+                    activeOwners -= 1
+                    if opportunityFinalStatusCount == 2 {
+                        finished.resolve(())
+                    }
+                }
+                _ = try await processPendingTypes()
+                opportunityDeliveryPhaseCount += 1
             }
         )
-        let firstRun = Task { try await engine.requestRun() }
-        _ = await entered.wait(timeout: 1)
-
-        var events: [String] = []
-        await AutomaticSyncObserverEventLifecycle.process(
-            startedAt: Date(timeIntervalSince1970: 1_788_000_000),
-            admissionHandler: {
-                do {
-                    try fixture.store.markPendingObserverTypeCodes(["weight"])
-                    events.append("admission")
-                    return .continueProcessing
-                } catch {
-                    XCTFail("Durable observer admission failed: \(error)")
-                    return .deferAcknowledgement(nil)
+        let callbackCount = typeCodes.count
+        var durableAdmissions = Array(repeating: false, count: callbackCount)
+        var acknowledgements = Array(repeating: 0, count: callbackCount)
+        let admit: @MainActor (Int, String) async -> Void = { index, typeCode in
+            await AutomaticSyncObserverEventLifecycle.process(
+                startedAt: Date(timeIntervalSince1970: 1_788_000_000),
+                admissionHandler: {
+                    do {
+                        try fixture.store.markPendingObserverTypeCodes([typeCode])
+                        durableAdmissions[index] = true
+                        return .continueProcessing
+                    } catch {
+                        XCTFail("Durable observer admission failed: \(error)")
+                        return .deferAcknowledgement(nil)
+                    }
+                },
+                eventHandler: {
+                    engine.requestRunWithoutWaiting(
+                        reason: .observer(typeCode: typeCode),
+                        diagnosticRunID: index == 0 ? firstObserverRunID : UUID()
+                    )
+                    return nil
+                },
+                acknowledge: {
+                    XCTAssertTrue(durableAdmissions[index])
+                    acknowledgements[index] += 1
+                },
+                persistDiagnostic: { _, _ in
+                    XCTFail("Observer callbacks must not own diagnostic finalization.")
                 }
-            },
-            eventHandler: {
-                events.append("acquisition")
-                do {
-                    try await engine.requestRun()
-                } catch {
-                    XCTFail("Overlapping automatic run failed: \(error)")
-                }
-                return nil
-            },
-            acknowledge: { events.append("acknowledge") },
-            persistDiagnostic: { _, _ in events.append("persist") }
-        )
+            )
+        }
 
-        XCTAssertEqual(
-            events,
-            ["admission", "acknowledge", "acquisition"],
-            "A durably admitted callback must be acknowledged before its coalesced acquisition returns."
-        )
+        await admit(0, blockedTypeCode)
+        guard await entered.wait(timeout: 1) != nil else {
+            release.resolve(())
+            XCTFail("The first automatic opportunity did not start.")
+            return
+        }
+        for index in 1..<callbackCount {
+            await admit(index, typeCodes[index])
+        }
+        let waitingTrigger = Task { @MainActor in
+            waitingTriggerStarted.resolve(())
+            try? await engine.requestRun(
+                reason: .scheduledRefresh,
+                diagnosticRunID: scheduledRunID,
+                bootstrapBeforeRun: true
+            )
+        }
+        guard await waitingTriggerStarted.wait(timeout: 1) != nil else {
+            release.resolve(())
+            XCTFail("The scheduled trigger did not join the active opportunity.")
+            return
+        }
+        await Task.yield()
+        waitingTrigger.cancel()
+
+        XCTAssertEqual(acknowledgements, Array(repeating: 1, count: callbackCount))
         release.resolve(())
-        try await firstRun.value
+        guard await finished.wait(timeout: 1) != nil else {
+            XCTFail("The bounded automatic opportunities did not finish.")
+            return
+        }
+        await waitingTrigger.value
         let processed = await observed.values
 
-        XCTAssertEqual(processed, ["heart_rate", "weight"])
+        XCTAssertEqual(processed, typeCodes)
+        XCTAssertEqual(maximumActiveOwners, 1)
+        XCTAssertEqual(activeOwners, 0)
+        XCTAssertEqual(opportunityCount, 2)
+        XCTAssertEqual(opportunityDeliveryPhaseCount, 2)
+        XCTAssertEqual(opportunityFinalStatusCount, 2)
+        XCTAssertEqual(
+            opportunityReasons,
+            [
+                .observer(typeCode: blockedTypeCode),
+                .scheduledRefresh,
+            ]
+        )
+        XCTAssertEqual(opportunityRunIDs, [firstObserverRunID, scheduledRunID])
+        XCTAssertEqual(opportunityBootstrapFlags, [false, true])
         XCTAssertTrue(
             try fixture.store.loadPendingObserverTypeCodeGenerations().isEmpty
         )

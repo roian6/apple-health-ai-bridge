@@ -386,14 +386,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var sleepSourceKey: String?
     private lazy var manualSyncRunOwner = ManualSyncRunOwner(viewModel: self)
     private lazy var automaticSyncEngine = AutomaticSyncEngine(
-        pendingStore: backgroundSyncStore
-    ) { @MainActor [weak self] typeCode, pendingGenerations in
-        guard let self else { return .blocked }
-        return await self.processAutomaticSyncType(
-            typeCode,
-            pendingGenerations: pendingGenerations
-        )
-    }
+        pendingStore: backgroundSyncStore,
+        processType: { @MainActor [weak self] typeCode, pendingGenerations in
+            guard let self else { return .blocked }
+            return await self.processAutomaticSyncType(
+                typeCode,
+                pendingGenerations: pendingGenerations
+            )
+        },
+        performOpportunity: { @MainActor [weak self] opportunity, processPendingTypes in
+            guard let self else { return }
+            _ = await self.performAutomaticSyncOpportunity(
+                opportunity: opportunity,
+                processPendingTypes: processPendingTypes
+            )
+        }
+    )
     private var backgroundAutomaticSyncFailure: AutomaticSyncDiagnosticFailure?
     private var backgroundAutomaticSyncQuerySucceeded = false
     private var lastOutboxNotice = ""
@@ -2825,7 +2833,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
                     return .deferAcknowledgement(diagnostic)
                 }
-                BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
                 return .continueProcessing
             },
             observerCompletionHandler: { [weak self] completedDraft, latency in
@@ -2836,20 +2843,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
         ) { [weak self] typeCode, diagnosticRunID in
             guard let self else { return nil }
-            guard self.terminalPayloadActionAdmissionIsOpen else {
-                return self.recordUnavailableAutomaticSyncDiagnostic(
-                    reason: .observer(typeCode: typeCode),
-                    runID: diagnosticRunID
-                )
-            }
-            self.noteBackgroundRefreshHandlerStarted(source: "healthkit_observer")
-            self.backgroundSyncStatus = "Apple Health reported a change; running read-only sync."
-            let diagnostic = await self.runBackgroundRefreshSyncCollectingDiagnostic(
+            self.automaticSyncEngine.requestRunWithoutWaiting(
                 reason: .observer(typeCode: typeCode),
                 diagnosticRunID: diagnosticRunID
             )
-            BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
-            return diagnostic
+            return nil
         }
         recordBackgroundSyncRegistrationIfAllowed(
             at: Date(),
@@ -3317,6 +3315,29 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
+    private func performAutomaticSyncOpportunity(
+        opportunity: AutomaticSyncEngine.Opportunity,
+        processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes
+    ) async -> AutomaticSyncDiagnosticDraft {
+        backgroundSyncStatus = "Processing durable Apple Health changes."
+        if case .observer(let typeCode) = opportunity.reason {
+            let diagnosticRunID = opportunity.diagnosticRunID
+            self.noteBackgroundRefreshHandlerStarted(source: "healthkit_observer")
+            return await ownBackgroundRefreshOpportunity(
+                reason: .observer(typeCode: typeCode),
+                diagnosticRunID: diagnosticRunID,
+                bootstrapBeforeRun: opportunity.bootstrapBeforeRun,
+                processPendingTypes: processPendingTypes
+            )
+        }
+        return await ownBackgroundRefreshOpportunity(
+            reason: opportunity.reason,
+            diagnosticRunID: opportunity.diagnosticRunID,
+            bootstrapBeforeRun: opportunity.bootstrapBeforeRun,
+            processPendingTypes: processPendingTypes
+        )
+    }
+
     func runBackgroundRefreshSync(
         reason: AutomaticSyncReason,
         diagnosticRunID: UUID = UUID()
@@ -3324,7 +3345,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         #if canImport(HealthKit)
         backgroundDeliveryCoordinator?.reconcileRegistrations()
         #endif
-        _ = await runBackgroundRefreshSyncCollectingDiagnostic(
+        await runBackgroundRefreshSyncCollectingDiagnostic(
             reason: reason,
             diagnosticRunID: diagnosticRunID
         )
@@ -3332,20 +3353,39 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     func handleBackgroundRefresh() async {
         BackgroundRefreshScheduler.noteRequestConsumed()
-        _ = await runBackgroundRefreshSyncCollectingDiagnostic(
+        await runBackgroundRefreshSyncCollectingDiagnostic(
             reason: .scheduledRefresh,
             diagnosticRunID: UUID(),
             bootstrapBeforeRun: true
         )
+        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
     }
 
     private func runBackgroundRefreshSyncCollectingDiagnostic(
         reason: AutomaticSyncReason,
         diagnosticRunID: UUID,
         bootstrapBeforeRun: Bool = false
+    ) async {
+        guard terminalPayloadActionAdmissionIsOpen || bootstrapBeforeRun else {
+            recordUnavailableAutomaticSyncDiagnostic(
+                reason: reason,
+                runID: diagnosticRunID
+            )
+            return
+        }
+        try? await automaticSyncEngine.requestRun(
+            reason: reason,
+            diagnosticRunID: diagnosticRunID,
+            bootstrapBeforeRun: bootstrapBeforeRun
+        )
+    }
+
+    private func ownBackgroundRefreshOpportunity(
+        reason: AutomaticSyncReason,
+        diagnosticRunID: UUID,
+        bootstrapBeforeRun: Bool,
+        processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes
     ) async -> AutomaticSyncDiagnosticDraft {
-        // A BG handler always joins its finalizer, even if terminal admission
-        // closed before the tracked child started. Observer rejection stays fast.
         guard terminalPayloadActionAdmissionIsOpen || bootstrapBeforeRun else {
             return recordUnavailableAutomaticSyncDiagnostic(
                 reason: reason,
@@ -3356,6 +3396,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             reason: reason,
             runID: diagnosticRunID
         )
+        diagnostic.noteObserverAcknowledged()
         noteAutomaticSyncPending(
             diagnostic,
             initial: true,
@@ -3369,7 +3410,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 reason: reason,
                 diagnostic: diagnostic,
                 bootstrapBeforeRun: bootstrapBeforeRun,
-                capturedGeneration: expectedGeneration
+                capturedGeneration: expectedGeneration,
+                processPendingTypes: processPendingTypes
             )
         }
         trackedSyncTasks[taskID] = task
@@ -3564,7 +3606,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         reason: AutomaticSyncReason,
         diagnostic: AutomaticSyncDiagnosticDraft,
         bootstrapBeforeRun: Bool = false,
-        capturedGeneration: String? = nil
+        capturedGeneration: String? = nil,
+        processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes
     ) async {
         let finalization = BackgroundRefreshFinalizationOwner()
         let expectedGeneration = capturedGeneration ?? settingsStore.receiverSettingsGenerationToken
@@ -3582,7 +3625,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             await self.performBackgroundRefreshWork(
                 diagnostic: diagnostic,
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                processPendingTypes: processPendingTypes
             )
         } finalize: {
             await self.finalizeBackgroundRefresh(
@@ -3655,7 +3699,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func performBackgroundRefreshWork(
         diagnostic: AutomaticSyncDiagnosticDraft,
-        expectedGeneration: String
+        expectedGeneration: String,
+        processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes
     ) async {
         let startedAt = Date()
         guard !Task.isCancelled,
@@ -3769,7 +3814,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
             try preparePrivateStorageForUploadAdmission()
-            try await automaticSyncEngine.requestRun()
+            _ = try await processPendingTypes()
             if (trustedPendingOutboxCount() ?? 0) > 0 {
                 if settingsStore.activeTransport == .mailbox {
                     _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
@@ -4046,6 +4091,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: executionMode
             )
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            guard !changes.stepSamples.isEmpty
+                || !changes.deletedStepSamples.isEmpty
+                || HealthKitAnchoredCursorPolicy.hasAdvanced(
+                    from: anchorCursorValue,
+                    to: changes.anchorCursorValue
+                ) else {
+                statusIsError = false
+                statusMessage = "HealthKit step anchor is unchanged. Nothing sent."
+                return false
+            }
             let batch = StepCountSyncBatchFactory.makeAnchoredStepBatch(
                 changes: changes,
                 generatedAt: now
@@ -4449,6 +4504,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 newestSampleEnd: changes.workouts.map(\.end).max(),
                 executionMode: executionMode
             )
+            guard !changes.workouts.isEmpty
+                || !changes.deletedWorkouts.isEmpty
+                || HealthKitAnchoredCursorPolicy.hasAdvanced(
+                    from: anchorCursorValue,
+                    to: changes.anchorCursorValue
+                ) else {
+                statusIsError = false
+                statusMessage = "HealthKit workout anchor is unchanged. Nothing sent."
+                return false
+            }
             let batch = WorkoutSyncBatchFactory.makeAnchoredWorkoutBatch(
                 changes: changes,
                 generatedAt: now
@@ -5077,13 +5142,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     ) else {
                         continue
                     }
-                    let hadUsableSelectedCursor = HealthKitAnchoredCursorPolicy.hasUsableCursorValue(
-                        cursorOwnership.cursorValue
-                    )
                     let shouldPersistSharedProgress = mode.executionMode.shouldPersistSharedProgress(
                         hadUsableCursor: HealthKitAnchoredCursorPolicy.hasUsableCursorValue(
                             sharedCursorValue
                         )
+                    )
+                    let hadUsableSelectedCursor = HealthKitAnchoredCursorPolicy.hasUsableCursorValue(
+                        cursorOwnership.cursorValue
                     )
                     let canPersistSelectedProgress = shouldPersistSharedProgress
                         || cursorOwnership.isIndependentAutomaticFallback
@@ -5102,10 +5167,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         executionMode: mode.executionMode
                     )
                     try requireCurrentReceiverSyncProgressScope(progressScope)
+                    let anchorAdvanced = HealthKitAnchoredCursorPolicy.hasAdvanced(
+                        from: cursorOwnership.cursorValue,
+                        to: changes.anchorCursorValue
+                    )
                     let shouldIncludeAnchor = GenericQuantityAnchoredProgressPolicy
                         .shouldIncludeAnchor(
                             canPersistSharedProgress: canPersistSelectedProgress,
                             hadUsableAnchor: hadUsableSelectedCursor,
+                            anchorAdvanced: anchorAdvanced,
                             activeSampleCount: changes.samples.count,
                             deletedSampleCount: changes.deletedSamples.count
                         )

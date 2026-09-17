@@ -120,11 +120,14 @@ public enum GenericQuantityAnchoredProgressPolicy {
     public static func shouldIncludeAnchor(
         canPersistSharedProgress: Bool,
         hadUsableAnchor: Bool,
+        anchorAdvanced: Bool,
         activeSampleCount: Int,
         deletedSampleCount: Int
     ) -> Bool {
         guard canPersistSharedProgress else { return false }
-        return hadUsableAnchor || activeSampleCount > 0 || deletedSampleCount > 0
+        return (hadUsableAnchor && anchorAdvanced)
+            || activeSampleCount > 0
+            || deletedSampleCount > 0
     }
 }
 

@@ -93,39 +93,152 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
 }
 
 public final class AutomaticSyncEngine: @unchecked Sendable {
+    public struct Opportunity: Equatable, Sendable {
+        public let reason: AutomaticSyncReason
+        public let diagnosticRunID: UUID
+        public let bootstrapBeforeRun: Bool
+
+        fileprivate init(
+            reason: AutomaticSyncReason,
+            diagnosticRunID: UUID,
+            bootstrapBeforeRun: Bool
+        ) {
+            self.reason = reason
+            self.diagnosticRunID = diagnosticRunID
+            self.bootstrapBeforeRun = bootstrapBeforeRun
+        }
+
+        fileprivate func coalescing(_ newer: Self) -> Self {
+            let existingTypeCodes = reason.observerTypeCodes
+            let newerTypeCodes = newer.reason.observerTypeCodes
+            let coalescedReason: AutomaticSyncReason
+            let coalescedRunID: UUID
+            if !existingTypeCodes.isEmpty, newerTypeCodes.isEmpty {
+                coalescedReason = newer.reason
+                coalescedRunID = newer.diagnosticRunID
+            } else if existingTypeCodes.isEmpty || newerTypeCodes.isEmpty {
+                coalescedReason = reason
+                coalescedRunID = diagnosticRunID
+            } else {
+                coalescedReason = .observerBatch(
+                    typeCodes: Array(Set(existingTypeCodes + newerTypeCodes)).sorted()
+                )
+                coalescedRunID = diagnosticRunID
+            }
+            return Self(
+                reason: coalescedReason,
+                diagnosticRunID: coalescedRunID,
+                bootstrapBeforeRun: bootstrapBeforeRun || newer.bootstrapBeforeRun
+            )
+        }
+    }
+
     public typealias ProcessType = @MainActor @Sendable (
         _ typeCode: String,
         _ pendingGenerations: [String: Int]
     ) async throws -> AutomaticSyncTypeResult
+    public typealias ProcessPendingTypes = @MainActor @Sendable () async throws -> Bool
+    public typealias PerformOpportunity = @MainActor @Sendable (
+        _ opportunity: Opportunity,
+        _ processPendingTypes: @escaping ProcessPendingTypes
+    ) async throws -> Void
 
     private let pendingStore: BackgroundSyncSettingsStore
     private let processType: ProcessType
-    @MainActor private var isRunning = false
-    @MainActor private var rerunRequested = false
+    private let performOpportunity: PerformOpportunity
+    @MainActor private var activeTask: Task<Result<Void, Error>, Never>?
+    @MainActor private var trailingOpportunity: Opportunity?
 
     public init(
         pendingStore: BackgroundSyncSettingsStore,
-        processType: @escaping ProcessType
+        processType: @escaping ProcessType,
+        performOpportunity: PerformOpportunity? = nil
     ) {
         self.pendingStore = pendingStore
         self.processType = processType
+        self.performOpportunity = performOpportunity ?? { _, processPendingTypes in
+            _ = try await processPendingTypes()
+        }
     }
 
     @MainActor
     public func requestRun() async throws {
-        if isRunning {
-            rerunRequested = true
+        let typeCodes = try pendingStore
+            .loadPendingObserverTypeCodeGenerations().keys.sorted()
+        try await requestRun(reason: .observerBatch(typeCodes: typeCodes))
+    }
+
+    @MainActor
+    public func requestRun(
+        reason: AutomaticSyncReason,
+        diagnosticRunID: UUID = UUID(),
+        bootstrapBeforeRun: Bool = false
+    ) async throws {
+        let request = requestRunTask(for: Opportunity(
+            reason: reason,
+            diagnosticRunID: diagnosticRunID,
+            bootstrapBeforeRun: bootstrapBeforeRun
+        ))
+        guard request.ownsTask else {
+            try await request.task.value.get()
             return
         }
-        isRunning = true
-        defer {
-            isRunning = false
-            rerunRequested = false
+        let result = await withTaskCancellationHandler {
+            await request.task.value
+        } onCancel: {
+            request.task.cancel()
         }
-        repeat {
-            rerunRequested = false
-            guard try await processStableSnapshot() else { return }
-        } while rerunRequested
+        try result.get()
+    }
+
+    @MainActor
+    public func requestRunWithoutWaiting(
+        reason: AutomaticSyncReason,
+        diagnosticRunID: UUID
+    ) {
+        _ = requestRunTask(for: Opportunity(
+            reason: reason,
+            diagnosticRunID: diagnosticRunID,
+            bootstrapBeforeRun: false
+        ))
+    }
+
+    @MainActor
+    private func requestRunTask(
+        for opportunity: Opportunity
+    ) -> (task: Task<Result<Void, Error>, Never>, ownsTask: Bool) {
+        if let activeTask {
+            trailingOpportunity = trailingOpportunity?.coalescing(opportunity) ?? opportunity
+            return (activeTask, false)
+        }
+        trailingOpportunity = nil
+        let task = Task { @MainActor [weak self] () -> Result<Void, Error> in
+            guard let self else { return .success(()) }
+            let result: Result<Void, Error>
+            do {
+                try await self.performSingleOpportunity(opportunity)
+                if !Task.isCancelled, let trailingOpportunity = self.trailingOpportunity {
+                    self.trailingOpportunity = nil
+                    try await self.performSingleOpportunity(trailingOpportunity)
+                }
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            self.activeTask = nil
+            self.trailingOpportunity = nil
+            return result
+        }
+        activeTask = task
+        return (task, true)
+    }
+
+    @MainActor
+    private func performSingleOpportunity(_ opportunity: Opportunity) async throws {
+        try await performOpportunity(opportunity) { [weak self] in
+            guard let self else { return false }
+            return try await self.processStableSnapshot()
+        }
     }
 
     @MainActor

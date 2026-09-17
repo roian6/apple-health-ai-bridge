@@ -228,6 +228,11 @@ public final class AutomaticSyncDiagnosticDraft {
         observerCompletionLatencyBucket = .bucket(for: latency)
     }
 
+    func noteObserverAcknowledged() {
+        guard wakeSource == .healthKitObserver else { return }
+        observerCompletionLatencyBucket = .notApplicable
+    }
+
     var defersPersistenceUntilObserverAcknowledgement: Bool {
         wakeSource == .healthKitObserver && observerCompletionLatencyBucket == .pending
     }
