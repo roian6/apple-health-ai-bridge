@@ -71,9 +71,13 @@ final class FileOutboxTests: XCTestCase {
         XCTAssertEqual(pending.map(\.receiverIdentity), ["receiver-a", "receiver-a"])
     }
 
-    func testCursorCheckpointSurvivesRelaunchAndBlocksUploadUntilAcknowledged() throws {
+    func testDirectAcknowledgmentsSurviveRelaunchAndFinalizeCursorAfterWholeSequence() throws {
         let directory = temporaryOutboxDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        let cursorFile = directory
+            .deletingLastPathComponent()
+            .appendingPathComponent("\(UUID().uuidString)-sync-cursors.json")
+        defer { try? FileManager.default.removeItem(at: cursorFile) }
         let checkpoint = FileOutboxCursorCheckpoint(
             receiverIdentity: "receiver-a",
             sourceKey: "apple_health.phone.installation",
@@ -82,30 +86,156 @@ final class FileOutboxTests: XCTestCase {
             coreLaneUploadProof: .steps
         )
         let initial = try FileOutbox(directory: directory)
-        _ = try initial.enqueueSequence(
+        let items = try initial.enqueueSequence(
             [Data("one".utf8), Data("two".utf8)],
             receiverIdentity: "receiver-a",
             cursorCheckpoint: checkpoint
         )
 
-        let relaunched = try FileOutbox(directory: directory)
-        XCTAssertEqual(try relaunched.pendingCursorCheckpoint(), checkpoint)
+        let cursorStore = try FileSyncCursorStore(fileURL: cursorFile)
+        let firstLaunch = try FileOutbox(directory: directory)
+        let firstFinalizer = OutboxDeliveryCursorFinalizer(
+            outbox: firstLaunch,
+            cursorStore: cursorStore
+        )
+        XCTAssertEqual(
+            try firstLaunch.uploadablePendingItems(for: "receiver-a").map(\.id),
+            items.map(\.id)
+        )
+        XCTAssertFalse(try firstFinalizer.recordDirectReceiverAcceptance(
+            itemID: items[0].id,
+            receiverBindingID: "receiver-a"
+        ))
+        XCTAssertEqual(
+            try FileOutbox(directory: directory)
+                .uploadablePendingItems(for: "receiver-a").map(\.id),
+            [items[1].id]
+        )
+
+        let secondLaunch = try FileOutbox(directory: directory)
+        let secondFinalizer = OutboxDeliveryCursorFinalizer(
+            outbox: secondLaunch,
+            cursorStore: cursorStore
+        )
+        XCTAssertTrue(
+            try secondFinalizer.recordDirectReceiverAcceptance(
+                itemID: items[1].id,
+                receiverBindingID: "receiver-a"
+            )
+        )
+        let readyLaunch = try FileOutbox(directory: directory)
+        XCTAssertTrue(try readyLaunch.pendingItems().isEmpty)
+        XCTAssertFalse(try secondFinalizer.recordDirectReceiverAcceptance(
+            itemID: items[1].id,
+            receiverBindingID: "receiver-a"
+        ))
+        XCTAssertEqual(
+            try cursorStore.cursorValue(
+                receiverBindingID: "receiver-a",
+                sourceKey: checkpoint.sourceKey,
+                cursorKind: checkpoint.cursorKind
+            ),
+            checkpoint.cursorValue
+        )
+        XCTAssertNil(try readyLaunch.pendingCursorCheckpoint())
+        XCTAssertTrue(try FileOutbox(directory: directory).pendingItems().isEmpty)
+    }
+
+    func testLegacySingleTransactionMigratesWithoutDiscardingItsCheckpoint() throws {
+        let directory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let legacyID = "00000000000000000001-legacy"
+        let legacyPayload = Data("legacy-payload".utf8)
+        try legacyPayload.write(
+            to: directory.appendingPathComponent(legacyID).appendingPathExtension("json")
+        )
+        try Data(
+            #"{"entries":[{"id":"00000000000000000001-legacy","receiverIdentity":"receiver-a","sequence":1}],"nextSequence":2,"version":3}"#.utf8
+        ).write(to: directory.appendingPathComponent(".fifo-sequence"))
+        try Data(
+            #"{"cursorCheckpoint":{"cursorKind":"legacy-anchor","cursorValue":"legacy-v1","receiverIdentity":"receiver-a","sourceKey":"synthetic-source"},"entries":[{"id":"00000000000000000001-legacy","receiverIdentity":"receiver-a","sequence":1}],"pendingGenerationRetirements":{"steps":1},"version":1}"#.utf8
+        ).write(to: directory.appendingPathComponent(".enqueue-transaction"))
+
+        let outbox = try FileOutbox(directory: directory)
+        let nextCheckpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: "receiver-a",
+            sourceKey: "synthetic-source",
+            cursorKind: "heart-anchor",
+            cursorValue: "heart-v1"
+        )
+        let nextItem = try XCTUnwrap(outbox.enqueueSequence(
+            [Data("next-payload".utf8)],
+            receiverIdentity: "receiver-a",
+            cursorCheckpoint: nextCheckpoint,
+            pendingGenerationRetirements: ["heart_rate": 1]
+        ).first)
+
+        let journal = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: directory.appendingPathComponent(".enqueue-transaction"))
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(journal["version"] as? Int, 2)
+        XCTAssertEqual((journal["transactions"] as? [[String: Any]])?.count, 2)
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [legacyID, nextItem.id])
+        XCTAssertEqual(try outbox.pendingCursorCheckpoint()?.cursorValue, "legacy-v1")
+    }
+
+    func testDirectAcceptanceCannotRetireMailboxOwnedCheckpointTransaction() throws {
+        let directory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("mailbox-owned".utf8)
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: "receiver-a",
+            sourceKey: "apple_health.phone.installation",
+            cursorKind: "healthkit_anchored_quantity:energy",
+            cursorValue: "anchor-mailbox"
+        )
+        let outbox = try FileOutbox(directory: directory)
+        let item = try XCTUnwrap(outbox.enqueueSequence(
+            [payload],
+            receiverIdentity: "receiver-a",
+            cursorCheckpoint: checkpoint
+        ).first)
+        let payloadSHA256 = SHA256.hash(data: payload)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let binding = try outbox.finalizeMailboxEnvelope(
+            itemID: item.id,
+            envelope: Data("encrypted-envelope".utf8),
+            expectedPayloadSHA256: payloadSHA256
+        )
+        let envelopeURL = directory.appendingPathComponent(binding.envelopeFilename)
+
         XCTAssertThrowsError(
-            try relaunched.uploadablePendingItems(for: "receiver-a")
+            try outbox.uploadablePendingItems(for: "receiver-a")
         ) { error in
             XCTAssertEqual(
-                error as? FileOutboxCursorCheckpointError,
-                .pendingCommit
+                error as? FileOutboxMailboxError,
+                .mailboxArtifactsRequireHold
+            )
+        }
+        XCTAssertThrowsError(
+            try outbox.recordDirectUploadAccepted(
+                itemID: item.id,
+                receiverIdentity: "receiver-a"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? FileOutboxMailboxError,
+                .mailboxArtifactsRequireHold
             )
         }
 
-        try relaunched.acknowledgeCursorCheckpoint(checkpoint)
-
-        XCTAssertNil(try relaunched.pendingCursorCheckpoint())
-        XCTAssertEqual(
-            try relaunched.uploadablePendingItems(for: "receiver-a").count,
-            2
-        )
+        let relaunched = try FileOutbox(directory: directory)
+        XCTAssertEqual(try relaunched.pendingCursorCheckpoint(), checkpoint)
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), payload)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: envelopeURL.path))
+        XCTAssertEqual(try relaunched.mailboxBinding(for: item.id), binding)
     }
 
     func testCursorCheckpointCannotBeAcknowledgedWithoutCommittedPayload() throws {

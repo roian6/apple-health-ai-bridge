@@ -97,30 +97,15 @@ public final class AutomaticSyncDiagnosticDraft {
         }
     }
 
-    public func noteAdmission(_ admission: BackgroundSyncRunAdmission) {
-        if admission.shouldRun {
-            admissionResult = .accepted
-            return
-        }
-        switch admission.skipReason {
-        case .alreadyRunning:
-            admissionResult = .skippedAlreadyRunning
-        case .debounced:
-            admissionResult = .skippedDebounced
-        case nil:
-            admissionResult = .notReached
-        }
-        runOutcome = .skipped
+    public func noteAdmission() {
+        admissionResult = .accepted
     }
 
-    public func noteSelection(_ lane: BackgroundSyncWorkLane?) {
-        selectedLane = AutomaticSyncDiagnosticLane(workLane: lane)
-    }
-
-    public func notePlan(_ lanes: [BackgroundSyncWorkLane]) {
+    public func notePlan(_ lanes: [AutomaticSyncDiagnosticLane]) {
         let previous = causalChain
+        selectedLane = lanes.count == 1 ? lanes[0] : lanes.isEmpty ? .noWork : .mixed
         causalChain = AutomaticSyncCausalChain(lanes: lanes.map {
-            AutomaticSyncLaneEvidence(lane: AutomaticSyncDiagnosticLane(workLane: $0))
+            AutomaticSyncLaneEvidence(lane: $0)
         }, durableAdmission: causalChain.durableAdmission)
         causalChain.observerFailureRetention = previous.observerFailureRetention
         causalChain.initialRecoveryPending = previous.initialRecoveryPending
@@ -128,9 +113,9 @@ public final class AutomaticSyncDiagnosticDraft {
         activeLaneIndex = nil
     }
 
-    public func noteAttempt(_ lane: BackgroundSyncWorkLane) {
+    public func noteAttempt(_ lane: AutomaticSyncDiagnosticLane) {
         activeLaneIndex = causalChain.lanes.firstIndex {
-            !$0.attempted && $0.lane == AutomaticSyncDiagnosticLane(workLane: lane)
+            !$0.attempted && $0.lane == lane
         }
         queryStarted = false
         if let activeLaneIndex { causalChain.lanes[activeLaneIndex].attempted = true }

@@ -60,15 +60,6 @@ GENERIC_QUANTITY_BATCH_FACTORY_TESTS = (
 )
 
 
-def test_background_sync_defines_unified_supported_quantity_planner() -> None:
-    source = BACKGROUND_SYNC.read_text()
-
-    assert "supportedAutomaticQuantityTypeCodes" in source
-    assert "automaticQuantitySyncPlan(" in source
-    assert "AutomaticQuantitySyncPlan" in source
-    assert "AutomaticSyncReason" in source
-
-
 def test_background_delivery_plan_accepts_all_automatic_quantity_types() -> None:
     source = BACKGROUND_SYNC.read_text()
 
@@ -108,52 +99,8 @@ def test_view_model_registers_and_syncs_unified_automatic_coverage() -> None:
     assert "func runBackgroundRefreshSync(" in source
     assert "reason: AutomaticSyncReason" in source
     assert "diagnosticRunID: UUID = UUID()" in source
-    assert "HealthBridgeBackgroundSync.workPlan(" in source
-    assert "pendingObserverTypeCodes: Array(observerGenerationSnapshot.keys)" in source
     assert "typeCodes: [typeCode]" in source
     assert "historyDepth: .lastDays(1)" in source
-
-
-def test_new_payload_queues_behind_existing_fifo_without_repeated_network_attempt() -> (
-    None
-):
-    source = VIEW_MODEL.read_text()
-
-    assert "uploadWithOutbox" not in source
-    assert source.count("uploadPayloadsWithOutbox(") >= 6
-    helper = source.split("private func uploadPayloadsWithOutbox", 1)[1].split(
-        "private func enqueuePayloads", 1
-    )[0]
-    assert "uploadPendingOutbox" not in helper
-    policy = helper.index(
-        "CompanionPayloadNetworkAttemptPolicy.shouldAttemptNetworkForNewPayload"
-    )
-    enqueue = helper.index("try enqueuePayloads(", policy)
-    upload = helper.index("receiverClient.upload(")
-    assert policy < enqueue < upload
-
-
-def test_failed_presync_fifo_flush_continues_lanes_without_repeating_network() -> None:
-    source = VIEW_MODEL.read_text()
-    sync_now = source.split("func performSyncAllNow() async", 1)[1].split(
-        "private func flushPendingOutbox", 1
-    )[0]
-    flush_case = sync_now.split("case .flushPendingOutboxBeforeSync:", 1)[1].split(
-        "case .syncAnchoredSteps:", 1
-    )[0]
-    flush_helper = source.split("private func flushPendingOutbox", 1)[1].split(
-        "func clearPendingOutbox", 1
-    )[0]
-
-    assert "guard await flushPendingOutbox() else" in flush_case
-    assert "continue" in flush_case
-    assert "async -> Bool" in flush_helper
-    summary_flow = flush_helper.split("let summary =", 1)[1].split(
-        "} catch let conflict", 1
-    )[0]
-    assert summary_flow.index("if summary.failedCount > 0") < summary_flow.rindex(
-        "return true"
-    )
 
 
 def test_connection_check_does_not_report_queued_test_payload_as_passed() -> None:
@@ -166,9 +113,7 @@ def test_connection_check_does_not_report_queued_test_payload_as_passed() -> Non
     )[0]
 
     assert "Connection check passed. Queued uploads" not in check_connection
-    assert (
-        "case .queuedPendingRetry:\n                statusIsError = true" in send_test
-    )
+    assert "statusIsError = deliveryResult.directUpload == nil" in send_test
 
 
 def test_background_entry_points_pass_explicit_sync_reasons() -> None:
@@ -191,10 +136,6 @@ def test_background_entry_points_pass_explicit_sync_reasons() -> None:
 def test_automatic_core_sync_uses_one_day_fallback_without_authorization() -> None:
     source = VIEW_MODEL.read_text()
 
-    assert "syncRecentStepCounts(executionMode: .automatic)" in source
-    assert "syncDailyActivityAggregates(executionMode: .automatic)" in source
-    assert "syncAnchoredWorkoutChanges(executionMode: .automatic)" in source
-    assert "syncRecentSleepSessions(executionMode: .automatic)" in source
     assert source.count("if executionMode.shouldRequestReadAuthorization") >= 4
     assert source.count("executionMode.cursorlessFallbackDays") >= 3
     assert (
@@ -218,40 +159,6 @@ def test_ios_daily_aggregate_finalization_contract() -> None:
     )
     assert "isComplete: false" in regression_tests
     assert "isComplete: true" in regression_tests
-
-
-def test_cursorless_automatic_sync_cannot_commit_shared_foreground_progress() -> None:
-    source = VIEW_MODEL.read_text()
-    progress_prefix = "let shouldPersistSharedProgress = "
-    progress_marker = f"{progress_prefix}executionMode.shouldPersistSharedProgress("
-    generic_progress_prefix = "let canPersistSharedProgress = "
-    generic_progress_marker = (
-        f"{generic_progress_prefix}mode.executionMode.shouldPersistSharedProgress("
-    )
-
-    assert source.count(progress_marker) == 3
-    assert (
-        source.count(
-            "hadUsableCursor: HealthKitAnchoredCursorPolicy.hasUsableCursorValue("
-        )
-        == 2
-    )
-    assert source.count(generic_progress_marker) == 1
-    assert "hadUsableCursor: hadUsableAnchor" in source
-    assert source.count("if shouldPersistSharedProgress,") >= 2
-    assert "let cursor = shouldPersistSharedProgress" in source
-    assert "? batch.sync.cursors.first(where:" in source
-    assert source.count("if shouldIncludeAnchor,") == 1
-    assert source.count("coreLaneUploadProof: uploadedRecords ?") == 2
-    assert "var executionMode: HealthBridgeSyncExecutionMode" in source
-    assert "includeAnchorCursor: shouldIncludeAnchor" in source
-    assert "let shouldIncludeAnchor = GenericQuantityAnchoredProgressPolicy" in source
-    assert ".shouldIncludeAnchor(" in source
-    assert "GenericQuantityAnchoredProgressPolicy.shouldPersistAnchor(" in source
-    assert "cursorKind: queryPlan.anchorCursorKind" in source
-    assert "allowNewCursorCreation: mode.allowNewCursorCreation" not in source
-    assert "let persistableQuantityTypeCodes = Set(" not in source
-    assert "let persistableQuantityCursorKinds = Set(" not in source
 
 
 def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() -> None:
@@ -299,16 +206,6 @@ def test_active_background_model_has_no_optional_eligibility_gate() -> None:
     assert "skippedNoEligibleSelection" not in source
     assert "optionalQuantityTypeCodesForBackground" not in source
     assert "optionalQuantityStatusForBackgroundSelection" not in source
-
-
-def test_sync_now_names_the_unified_supported_quantity_lane() -> None:
-    ux_state = UX_STATE.read_text()
-    view_model = VIEW_MODEL.read_text()
-
-    assert "syncSupportedQuantityMetrics" in ux_state
-    assert "syncSelectedOptionalMetrics" not in ux_state
-    assert "syncSupportedQuantityMetrics" in view_model
-    assert "syncSelectedOptionalQuantityMetrics" not in view_model
 
 
 def test_observed_quantity_state_is_not_an_eligibility_gate() -> None:

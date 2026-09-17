@@ -72,7 +72,6 @@ public struct AutomaticSyncLaneEvidence: Codable, Equatable, Sendable {
     }
 }
 
-/// Outcome of the settings-store accepted-marker write, not the in-memory run gate.
 public enum AutomaticSyncDurableAdmission: String, Codable, Sendable {
     case unknown, persisted, failed
 }
@@ -89,8 +88,8 @@ public struct AutomaticSyncCausalChain: Codable, Equatable, Sendable {
     public init(lanes: [AutomaticSyncLaneEvidence], truncated: Bool = false,
                 durableAdmission: AutomaticSyncDurableAdmission = .unknown) {
         self.durableAdmission = durableAdmission
-        self.lanes = Array(lanes.prefix(BackgroundSyncWorkPlan.maximumLaneAttempts))
-        self.truncated = truncated || lanes.count > BackgroundSyncWorkPlan.maximumLaneAttempts
+        self.lanes = lanes
+        self.truncated = truncated
         bound()
     }
 
@@ -132,8 +131,6 @@ public struct AutomaticSyncCausalChain: Codable, Equatable, Sendable {
     }
 
     private mutating func bound() {
-        truncated = truncated || lanes.count > BackgroundSyncWorkPlan.maximumLaneAttempts
-        lanes = Array(lanes.prefix(BackgroundSyncWorkPlan.maximumLaneAttempts))
         for index in lanes.indices {
             if lanes[index].pendingItems.count > AutomaticSyncLaneEvidence.maximumPendingItems {
                 lanes[index].pendingItems = Array(lanes[index].pendingItems.prefix(AutomaticSyncLaneEvidence.maximumPendingItems))
@@ -207,8 +204,7 @@ public enum CoreFreshnessReleasePolicy {
         for record in records {
             guard record.admissionResult == .accepted,
                   let chain = record.causalChain, chain.version == 2, !chain.truncated,
-                  chain.durableAdmission == .persisted,
-                  chain.lanes.count <= BackgroundSyncWorkPlan.maximumLaneAttempts else { continue }
+                  chain.durableAdmission == .persisted else { continue }
             for lane in chain.lanes where requiredLanes.contains(lane.lane) {
                 guard let sourceRequirement = sourceFreshnessRequirements[lane.lane],
                       !lane.truncated, lane.attempted,

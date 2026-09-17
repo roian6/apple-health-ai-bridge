@@ -57,82 +57,103 @@ public enum AutomaticSyncReason: Equatable, Sendable {
     }
 }
 
-public enum BackgroundSyncWorkLane: Equatable, Sendable {
-    case steps
-    case dailyActivity
-    case workouts
-    case sleep
-    case quantity(typeCode: String)
+public struct AutomaticSyncTypeResult: Equatable, Sendable {
+    fileprivate enum Disposition: Equatable, Sendable {
+        case noPayload
+        case retryableReadFailure
+        case payloadEnqueued
+        case blocked
+    }
 
-    public var id: String {
-        switch self {
-        case .steps:
-            return "steps"
-        case .dailyActivity:
-            return "daily_activity"
-        case .workouts:
-            return "workouts"
-        case .sleep:
-            return "sleep"
-        case .quantity(let typeCode):
-            return "quantity:\(typeCode)"
-        }
+    fileprivate let disposition: Disposition
+    fileprivate let coveredGenerations: [String: Int]?
+
+    public static let noPayload = Self(disposition: .noPayload, coveredGenerations: nil)
+    public static let retryableReadFailure = Self(
+        disposition: .retryableReadFailure,
+        coveredGenerations: nil
+    )
+    public static let payloadEnqueued = Self(
+        disposition: .payloadEnqueued,
+        coveredGenerations: nil
+    )
+    public static let blocked = Self(disposition: .blocked, coveredGenerations: nil)
+
+    public static func noPayloadCovering(
+        _ generations: [String: Int]
+    ) -> Self {
+        Self(disposition: .noPayload, coveredGenerations: generations)
+    }
+
+    public static func retryableReadFailureCovering(
+        _ generations: [String: Int]
+    ) -> Self {
+        Self(disposition: .retryableReadFailure, coveredGenerations: generations)
     }
 }
 
-public struct BackgroundSyncWorkAttempt: Equatable, Sendable {
-    public let lane: BackgroundSyncWorkLane
-    public let coveredObserverTypeCodes: [String]
-    public let nextScheduledLaneID: String
-}
+public final class AutomaticSyncEngine: @unchecked Sendable {
+    public typealias ProcessType = @MainActor @Sendable (
+        _ typeCode: String,
+        _ pendingGenerations: [String: Int]
+    ) async throws -> AutomaticSyncTypeResult
 
-public struct BackgroundSyncWorkPlan: Equatable, Sendable {
-    public static let maximumLaneAttempts = 4
-    public let attempts: [BackgroundSyncWorkAttempt]
-    public var lane: BackgroundSyncWorkLane? { attempts.first?.lane }
-}
+    private let pendingStore: BackgroundSyncSettingsStore
+    private let processType: ProcessType
+    @MainActor private var isRunning = false
+    @MainActor private var rerunRequested = false
 
-@MainActor
-public enum BackgroundSyncWorkExecutor {
-    public static func recordQueuedCoreLaneProgress(
-        lane: BackgroundSyncWorkLane,
-        querySucceeded: Bool,
-        laneSucceeded: Bool,
-        enqueueFailed: Bool,
-        pendingBefore: Int?,
-        pendingAfter: Int?,
-        validate: () throws -> Void,
-        persist: (BackgroundSyncWorkLane) throws -> Void
-    ) throws {
-        // Scheduling progress is not delivery completion: keep the FIFO head and
-        // observer generations intact. No suspension may separate the fence/write.
-        try Task.checkCancellation()
-        guard HealthBridgeBackgroundSync.coreWorkLanes.contains(lane),
-              querySucceeded, laneSucceeded, !enqueueFailed,
-              pendingBefore == 0, let pendingAfter, pendingAfter > 0 else { return }
-        try validate()
-        try persist(lane)
+    public init(
+        pendingStore: BackgroundSyncSettingsStore,
+        processType: @escaping ProcessType
+    ) {
+        self.pendingStore = pendingStore
+        self.processType = processType
     }
 
-    // The caller holds the cursor-bearing transfer gate for this entire execution.
-    // Planning is immutable: arrivals during a lane await belong to a later run.
-    public static func execute(
-        plan: BackgroundSyncWorkPlan,
-        prepare: (BackgroundSyncWorkAttempt) throws -> Void,
-        runLane: (BackgroundSyncWorkLane) async throws -> Bool,
-        didComplete: (BackgroundSyncWorkAttempt) async throws -> Void
-    ) async throws -> [BackgroundSyncWorkAttempt] {
-        var completed: [BackgroundSyncWorkAttempt] = []
-        for attempt in plan.attempts {
-            try Task.checkCancellation()
-            try prepare(attempt)
-            try Task.checkCancellation()
-            guard try await runLane(attempt.lane) else { return completed }
-            try Task.checkCancellation()
-            try await didComplete(attempt)
-            completed.append(attempt)
+    @MainActor
+    public func requestRun() async throws {
+        if isRunning {
+            rerunRequested = true
+            return
         }
-        return completed
+        isRunning = true
+        defer {
+            isRunning = false
+            rerunRequested = false
+        }
+        repeat {
+            rerunRequested = false
+            guard try await processStableSnapshot() else { return }
+        } while rerunRequested
+    }
+
+    @MainActor
+    private func processStableSnapshot() async throws -> Bool {
+        let snapshot = try pendingStore.loadPendingObserverTypeCodeGenerations()
+        var handled: Set<String> = []
+        for typeCode in snapshot.keys.sorted() where !handled.contains(typeCode) {
+            try Task.checkCancellation()
+            guard let generation = snapshot[typeCode] else { continue }
+            let result = try await processType(typeCode, snapshot)
+            let coveredGenerations = (result.coveredGenerations ?? [typeCode: generation])
+                .filter { snapshot[$0.key] == $0.value }
+            handled.formUnion(coveredGenerations.keys)
+            switch result.disposition {
+            case .noPayload:
+                try pendingStore.clearPendingObserverTypeCodes(
+                    matching: coveredGenerations,
+                    typeCodes: coveredGenerations.keys.sorted()
+                )
+            case .retryableReadFailure:
+                continue
+            case .payloadEnqueued:
+                continue
+            case .blocked:
+                return false
+            }
+        }
+        return true
     }
 }
 
@@ -148,18 +169,12 @@ public enum HealthBridgeSyncExecutionMode: Equatable, Sendable {
         self == .automatic ? 1 : nil
     }
 
+    public var shouldAttemptInlineDirectDelivery: Bool {
+        true
+    }
+
     public func shouldPersistSharedProgress(hadUsableCursor: Bool) -> Bool {
         self == .foreground || hadUsableCursor
-    }
-}
-
-public struct AutomaticQuantitySyncPlan: Equatable, Sendable {
-    public let typeCodes: [String]
-    public let fallbackHistoryDepth: HealthHistoryDepth
-
-    public init(typeCodes: [String], fallbackHistoryDepth: HealthHistoryDepth) {
-        self.typeCodes = typeCodes
-        self.fallbackHistoryDepth = fallbackHistoryDepth
     }
 }
 
@@ -168,10 +183,6 @@ public enum HealthBridgeBackgroundSync {
         HealthBridgeAppIdentity.appRefreshIdentifier
     }
     public static let defaultMinimumInterval: TimeInterval = 15 * 60
-    public static let coreWorkLanes: [BackgroundSyncWorkLane] = [
-        .sleep, .dailyActivity, .steps, .workouts,
-    ]
-    public static let defaultRunDebounceInterval: TimeInterval = 10 * 60
     public static let defaultObservedHealthTypes: [HealthBridgeHealthType] = [.steps, .workouts, .sleepAnalysis]
     public static let dailyActivityTypeCodes = [
         "basal_energy",
@@ -192,114 +203,6 @@ public enum HealthBridgeBackgroundSync {
             HealthBridgeHealthType.dedicatedSyncTypes.map(\.typeCode)
                 + supportedAutomaticQuantityTypeCodes
         )).sorted()
-    }
-
-    public static func automaticQuantitySyncPlan(
-        availableTypeCodes: [String],
-        observedTypeCodes: [String],
-        reason: AutomaticSyncReason
-    ) -> AutomaticQuantitySyncPlan {
-        let supported = Set(supportedAutomaticQuantityTypeCodes)
-        let available = Set(
-            GenericQuantityCoveragePolicy.canonicalTypeCodes(for: availableTypeCodes)
-                .filter { supported.contains($0) }
-        )
-        let observed = Set(
-            GenericQuantityCoveragePolicy.canonicalTypeCodes(for: observedTypeCodes)
-                .filter { available.contains($0) }
-        )
-
-        let selected: Set<String>
-        switch reason {
-        case .observer, .observerBatch:
-            let trigger = Set(
-                GenericQuantityCoveragePolicy.canonicalTypeCodes(for: reason.observerTypeCodes)
-                    .filter { available.contains($0) }
-            )
-            selected = observed.union(trigger)
-        case .scheduledRefresh, .launchCatchUp:
-            selected = available
-        }
-        return AutomaticQuantitySyncPlan(
-            typeCodes: selected.sorted(),
-            fallbackHistoryDepth: .lastDays(1)
-        )
-    }
-
-    public static func workPlan(
-        reason: AutomaticSyncReason,
-        availableQuantityTypeCodes: [String],
-        pendingObserverTypeCodes: [String],
-        continuationLaneID: String?,
-        coreLaneLastSuccess: [String: Date] = [:],
-        now: Date = Date()
-    ) -> BackgroundSyncWorkPlan {
-        let available = Set(GenericQuantityCoveragePolicy.canonicalSupportedTypeCodes(
-            availableQuantityTypeCodes
-        ))
-        let scheduled = scheduledWorkLanes(availableQuantityTypeCodes: Array(available))
-        let dirty = GenericQuantityCoveragePolicy.canonicalTypeCodes(
-            for: pendingObserverTypeCodes + reason.observerTypeCodes
-        )
-        func coveredCodes(_ lane: BackgroundSyncWorkLane) -> [String] {
-            dirty.filter { workLane(for: $0, availableQuantityTypeCodeSet: available) == lane }
-        }
-        func progressDate(_ lane: BackgroundSyncWorkLane) -> Date {
-            guard let date = coreLaneLastSuccess[lane.id], date <= now else { return .distantPast }
-            return date
-        }
-        // A queued lane ends the opportunity. Oldest progress must lead even
-        // when every core is overdue again by the next system-granted wake.
-        let overdue = coreWorkLanes.filter { lane in
-            now.timeIntervalSince(progressDate(lane)) >= defaultMinimumInterval
-        }.sorted { progressDate($0) < progressDate($1) }
-        var selected: [BackgroundSyncWorkLane] = []
-        func append(_ lane: BackgroundSyncWorkLane) {
-            guard selected.count < BackgroundSyncWorkPlan.maximumLaneAttempts,
-                  !selected.contains(lane) else { return }
-            selected.append(lane)
-        }
-        let trigger: BackgroundSyncWorkLane?
-        if case .observer(let typeCode) = reason {
-            trigger = workLane(
-                for: GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode),
-                availableQuantityTypeCodeSet: available
-            )
-        } else {
-            trigger = nil
-        }
-        // Core affinity may break an oldest-progress tie, never jump older work.
-        if let trigger, overdue.contains(trigger), let oldest = overdue.first,
-           progressDate(trigger) == progressDate(oldest) {
-            append(trigger)
-        }
-        overdue.forEach(append)
-        if let trigger { append(trigger) }
-        coreWorkLanes.filter { !coveredCodes($0).isEmpty }.forEach(append)
-        let start = continuationLaneID.flatMap { id in scheduled.firstIndex { $0.id == id } } ?? 0
-        let circular = scheduled.indices.map { scheduled[(start + $0) % scheduled.count] }
-        circular.filter { !coveredCodes($0).isEmpty }.forEach(append)
-        switch reason {
-        case .scheduledRefresh, .launchCatchUp:
-            circular.forEach(append)
-        case .observer, .observerBatch:
-            break
-        }
-        return BackgroundSyncWorkPlan(attempts: selected.enumerated().map { index, lane in
-            let successor: BackgroundSyncWorkLane
-            if index + 1 < selected.count {
-                successor = selected[index + 1]
-            } else {
-                // Every selected lane came from the fixed schedule.
-                let scheduledIndex = scheduled.firstIndex(of: lane)!
-                successor = scheduled[(scheduledIndex + 1) % scheduled.count]
-            }
-            return BackgroundSyncWorkAttempt(
-                lane: lane,
-                coveredObserverTypeCodes: coveredCodes(lane),
-                nextScheduledLaneID: successor.id
-            )
-        })
     }
 
     public static var observedHealthTypes: [HealthBridgeHealthType] {
@@ -373,36 +276,6 @@ public enum HealthBridgeBackgroundSync {
             .map(HealthKitTypeCatalog.healthType(from:))
     }
 
-    private static func scheduledWorkLanes(
-        availableQuantityTypeCodes: [String]
-    ) -> [BackgroundSyncWorkLane] {
-        coreWorkLanes + availableQuantityTypeCodes.sorted().map {
-            .quantity(typeCode: $0)
-        }
-    }
-
-    private static func workLane(
-        for typeCode: String,
-        availableQuantityTypeCodeSet: Set<String>
-    ) -> BackgroundSyncWorkLane? {
-        switch typeCode {
-        case HealthBridgeHealthType.steps.typeCode:
-            return .steps
-        case HealthBridgeHealthType.workouts.typeCode:
-            return .workouts
-        case HealthBridgeHealthType.sleepAnalysis.typeCode:
-            return .sleep
-        default:
-            if dailyActivityTypeCodes.contains(typeCode) {
-                return .dailyActivity
-            }
-            guard availableQuantityTypeCodeSet.contains(typeCode) else {
-                return nil
-            }
-            return .quantity(typeCode: typeCode)
-        }
-    }
-
     private static func appendUnique(
         _ base: [HealthBridgeHealthType],
         _ additions: [HealthBridgeHealthType]
@@ -414,185 +287,6 @@ public enum HealthBridgeBackgroundSync {
             seen.insert(healthType.typeCode)
         }
         return result
-    }
-}
-
-public enum BackgroundSyncRunSkipReason: Equatable, Sendable {
-    case alreadyRunning
-    case debounced
-
-    public var userDescription: String {
-        switch self {
-        case .alreadyRunning:
-            return "another background refresh is already running"
-        case .debounced:
-            return "a background refresh already ran recently"
-        }
-    }
-}
-
-public struct BackgroundSyncRunAdmission: Equatable, Sendable {
-    public let shouldRun: Bool
-    public let startedAt: Date?
-    public let skipReason: BackgroundSyncRunSkipReason?
-
-    public static func accepted(startedAt: Date) -> BackgroundSyncRunAdmission {
-        BackgroundSyncRunAdmission(shouldRun: true, startedAt: startedAt, skipReason: nil)
-    }
-
-    public static func skipped(_ reason: BackgroundSyncRunSkipReason) -> BackgroundSyncRunAdmission {
-        BackgroundSyncRunAdmission(shouldRun: false, startedAt: nil, skipReason: reason)
-    }
-}
-
-public enum BackgroundSyncRunCompletion: Equatable, Sendable {
-    case succeeded
-    case interrupted
-}
-
-public enum BackgroundSyncDurablePendingState: Equatable, Sendable {
-    case available(typeCodes: [String])
-    case unavailable
-}
-
-public struct BackgroundSyncFailureRecoveryPlan: Equatable, Sendable {
-    public let pendingTypeCodes: [String]
-    public let durableStateAvailable: Bool
-    public let shouldScheduleRetry: Bool
-}
-
-public enum BackgroundSyncFailureRecoveryPolicy {
-    public static func plan(
-        admittedPendingTypeCodes: [String],
-        gatePendingTypeCodes: [String],
-        durablePendingState: BackgroundSyncDurablePendingState,
-        retryRequested: Bool,
-        automaticSyncReady: Bool,
-        backgroundSyncEnabled: Bool,
-        payloadAdmissionOpen: Bool
-    ) -> BackgroundSyncFailureRecoveryPlan {
-        let durableTypeCodes: [String]
-        let durableStateAvailable: Bool
-        switch durablePendingState {
-        case .available(let typeCodes):
-            durableTypeCodes = typeCodes
-            durableStateAvailable = true
-        case .unavailable:
-            durableTypeCodes = []
-            durableStateAvailable = false
-        }
-        let pendingTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
-            for: admittedPendingTypeCodes
-                + gatePendingTypeCodes
-                + durableTypeCodes
-        )
-        return BackgroundSyncFailureRecoveryPlan(
-            pendingTypeCodes: pendingTypeCodes,
-            durableStateAvailable: durableStateAvailable,
-            shouldScheduleRetry: retryRequested
-                && automaticSyncReady
-                && backgroundSyncEnabled
-                && payloadAdmissionOpen
-                && !pendingTypeCodes.isEmpty
-        )
-    }
-}
-
-public actor BackgroundSyncRunGate {
-    private let minimumSpacing: TimeInterval
-    private var isRunning = false
-    private var mostRecentStartedAt: Date?
-    private var pendingObserverTypeCodes: Set<String> = []
-    private var activeObserverTypeCodes: Set<String> = []
-
-    public init(minimumSpacing: TimeInterval = HealthBridgeBackgroundSync.defaultRunDebounceInterval) {
-        self.minimumSpacing = minimumSpacing
-    }
-
-    public func beginRun(now: Date = Date()) -> BackgroundSyncRunAdmission {
-        beginRun(reason: .scheduledRefresh, now: now)
-    }
-
-    public func beginRun(
-        reason: AutomaticSyncReason,
-        now: Date = Date()
-    ) -> BackgroundSyncRunAdmission {
-        let observerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
-            for: reason.observerTypeCodes
-        )
-        if isRunning {
-            pendingObserverTypeCodes.formUnion(observerTypeCodes)
-            return .skipped(.alreadyRunning)
-        }
-
-        if let mostRecentStartedAt,
-           now.timeIntervalSince(mostRecentStartedAt) < minimumSpacing {
-            pendingObserverTypeCodes.formUnion(observerTypeCodes)
-            return .skipped(.debounced)
-        }
-
-        isRunning = true
-        mostRecentStartedAt = now
-        activeObserverTypeCodes = Set(observerTypeCodes)
-        pendingObserverTypeCodes.subtract(observerTypeCodes)
-        return .accepted(startedAt: now)
-    }
-
-    @discardableResult
-    public func finishRun(_ completion: BackgroundSyncRunCompletion) -> [String] {
-        isRunning = false
-        let preservingPendingObserverTypeCodes = completion == .interrupted
-        if preservingPendingObserverTypeCodes {
-            pendingObserverTypeCodes.formUnion(activeObserverTypeCodes)
-        }
-        activeObserverTypeCodes.removeAll()
-        let pending = pendingObserverTypeCodes.sorted()
-        if !preservingPendingObserverTypeCodes {
-            pendingObserverTypeCodes.removeAll()
-        }
-        return pending
-    }
-
-    public func finishBoundedRun(
-        completedObserverTypeCodes: [String]
-    ) -> [String] {
-        isRunning = false
-        let completedTypeCodes = Set(
-            GenericQuantityCoveragePolicy.canonicalTypeCodes(
-                for: completedObserverTypeCodes
-            )
-        )
-        pendingObserverTypeCodes.formUnion(
-            activeObserverTypeCodes.subtracting(completedTypeCodes)
-        )
-        activeObserverTypeCodes.removeAll()
-        return pendingObserverTypeCodes.sorted()
-    }
-
-    public func completeActiveObserverTypeCodes(_ typeCodes: [String]) {
-        // Do not subtract from pending: it includes callbacks received during an await.
-        activeObserverTypeCodes.subtract(
-            GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
-        )
-    }
-
-    public func pendingObserverTypeCodesSnapshot() -> [String] {
-        pendingObserverTypeCodes.sorted()
-    }
-
-    public func hasActiveRun() -> Bool {
-        isRunning
-    }
-
-    public func retainObserverTypeCodes(_ typeCodes: [String]) {
-        pendingObserverTypeCodes.formUnion(
-            GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
-        )
-    }
-
-    public func remainingSpacing(now: Date = Date()) -> TimeInterval {
-        guard let mostRecentStartedAt else { return 0 }
-        return max(0, minimumSpacing - now.timeIntervalSince(mostRecentStartedAt))
     }
 }
 
@@ -620,29 +314,6 @@ public enum BackgroundUploadCancellationCertificationPolicy {
             && finalCoordinatorIsIdle
             && coordinatorGenerationIsStable
             && !introducedTaskAfterWait
-    }
-}
-
-public enum AutomaticSyncPayloadGenerationPolicy {
-    public static func shouldGenerateNewPayloads(
-        trustedPendingOutboxCount: Int?
-    ) -> Bool {
-        trustedPendingOutboxCount == 0
-    }
-
-    public static func shouldStopQuantityLoop(
-        isAutomaticSync: Bool,
-        hasDurablyQueuedPayload: Bool
-    ) -> Bool {
-        isAutomaticSync && hasDurablyQueuedPayload
-    }
-
-    public static func didCreateDurableFIFOHead(
-        pendingBefore: Int?,
-        pendingAfter: Int?
-    ) -> Bool {
-        guard let pendingBefore, let pendingAfter else { return false }
-        return pendingAfter > pendingBefore
     }
 }
 
@@ -1010,7 +681,6 @@ public final class BackgroundSyncSettingsStore {
         static let lastOutcome = "healthBridge.backgroundSync.lastOutcome"
         static let lastSucceeded = "healthBridge.backgroundSync.lastSucceeded"
         static let lastSummary = "healthBridge.backgroundSync.lastSummary"
-        static let lastSelectedLane = "healthBridge.backgroundSync.lastSelectedLane"
         static let lastSkippedStartedAt =
             "healthBridge.backgroundSync.lastSkippedStartedAt"
         static let lastSkippedFinishedAt =
@@ -1028,9 +698,6 @@ public final class BackgroundSyncSettingsStore {
         static let lastWakeSummary = "healthBridge.backgroundWake.lastSummary"
         static let pendingObserverTypeCodeGenerations =
             "healthBridge.backgroundSync.pendingObserverTypeCodeGenerations"
-        static let nextScheduledWorkLaneID =
-            "healthBridge.backgroundSync.nextScheduledWorkLaneID"
-        static let coreLaneLastSuccess = "healthBridge.backgroundSync.coreLaneLastSuccess"
         static let mailboxAckScanCheckpoint =
             "healthBridge.backgroundSync.mailboxAckScanCheckpoint"
         static let mailboxAckScanCheckpointGeneration =
@@ -1074,27 +741,6 @@ public final class BackgroundSyncSettingsStore {
         self.dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
     }
 
-    public var coreLaneLastSuccess: [String: Date] {
-        let persisted = userDefaults.dictionary(forKey: Key.coreLaneLastSuccess) ?? [:]
-        var result: [String: Date] = [:]
-        for lane in HealthBridgeBackgroundSync.coreWorkLanes {
-            if let date = persisted[lane.id] as? Date { result[lane.id] = date }
-        }
-        return result
-    }
-
-    // Local scheduling freshness only, including complete durable queueing.
-    // Delivery/release evidence and cursor/observer completion remain separate.
-    public func recordCoreLaneSuccess(_ lane: BackgroundSyncWorkLane, at date: Date) throws {
-        guard HealthBridgeBackgroundSync.coreWorkLanes.contains(lane) else { return }
-        var successes = coreLaneLastSuccess
-        successes[lane.id] = date
-        userDefaults.set(successes, forKey: Key.coreLaneLastSuccess)
-        guard userDefaults.synchronize() else {
-            throw BackgroundSyncSettingsStoreError.persistenceFailed
-        }
-    }
-
     public var isEnabled: Bool {
         !disableIntentStore.isDisableIntentPending
             && userDefaults.bool(forKey: Key.isEnabled)
@@ -1117,11 +763,6 @@ public final class BackgroundSyncSettingsStore {
             summary: summary,
             outcome: outcome
         )
-    }
-
-    var lastSelectedLane: AutomaticSyncDiagnosticLane? {
-        userDefaults.string(forKey: Key.lastSelectedLane)
-            .flatMap(AutomaticSyncDiagnosticLane.init(rawValue:))
     }
 
     public var lastRegistration: BackgroundDeliveryRegistrationStatus? {
@@ -1211,36 +852,11 @@ public final class BackgroundSyncSettingsStore {
     }
 
     public var pendingObserverTypeCodeGenerations: [String: Int] {
-        (try? loadPendingObserverTypeCodeGenerations())
-            ?? Dictionary(
-                uniqueKeysWithValues: HealthBridgeBackgroundSync
-                    .supportedAutomaticQuantityTypeCodes
-                    .map { ($0, Int.max) }
-            )
+        (try? loadPendingObserverTypeCodeGenerations()) ?? [:]
     }
 
     public var pendingObserverTypeCodes: [String] {
         pendingObserverTypeCodeGenerations.keys.sorted()
-    }
-
-    public var nextScheduledWorkLaneID: String? {
-        userDefaults.string(forKey: Key.nextScheduledWorkLaneID)
-    }
-
-    public func persistNextScheduledWorkLaneID(_ laneID: String?) throws {
-        if let laneID, !laneID.isEmpty {
-            userDefaults.set(laneID, forKey: Key.nextScheduledWorkLaneID)
-        } else {
-            userDefaults.removeObject(forKey: Key.nextScheduledWorkLaneID)
-        }
-        guard userDefaults.synchronize() else {
-            throw BackgroundSyncSettingsStoreError.persistenceFailed
-        }
-    }
-
-    public func resetScheduledWorkContinuation() throws {
-        userDefaults.removeObject(forKey: Key.coreLaneLastSuccess)
-        try persistNextScheduledWorkLaneID(nil)
     }
 
     public func mailboxAckScanCheckpoint(
@@ -1346,24 +962,6 @@ public final class BackgroundSyncSettingsStore {
         succeeded: Bool,
         summary: String
     ) throws {
-        try recordRunLifecycle(
-            startedAt: startedAt,
-            finishedAt: finishedAt,
-            outcome: outcome,
-            succeeded: succeeded,
-            summary: summary,
-            selectedLane: nil
-        )
-    }
-
-    func recordRunLifecycle(
-        startedAt: Date,
-        finishedAt: Date?,
-        outcome: BackgroundSyncRunOutcome,
-        succeeded: Bool,
-        summary: String,
-        selectedLane: AutomaticSyncDiagnosticLane?
-    ) throws {
         if outcome == .skipped {
             let finishedAt = finishedAt ?? startedAt
             userDefaults.set(
@@ -1395,11 +993,6 @@ public final class BackgroundSyncSettingsStore {
             forKey: Key.lastSucceeded
         )
         userDefaults.set(summary, forKey: Key.lastSummary)
-        if outcome == .accepted, let selectedLane {
-            userDefaults.set(selectedLane.rawValue, forKey: Key.lastSelectedLane)
-        } else {
-            userDefaults.removeObject(forKey: Key.lastSelectedLane)
-        }
         guard userDefaults.synchronize() else {
             throw BackgroundSyncSettingsStoreError.persistenceFailed
         }
@@ -1433,24 +1026,8 @@ public final class BackgroundSyncSettingsStore {
         userDefaults.set(summary, forKey: Key.lastWakeSummary)
     }
 
-    public func shouldRunForegroundCatchUp(
-        now: Date = Date(),
-        minimumInterval: TimeInterval = HealthBridgeBackgroundSync.defaultMinimumInterval
-    ) -> Bool {
-        guard isEnabled else { return false }
-        if !pendingObserverTypeCodeGenerations.isEmpty {
-            return true
-        }
-        if userDefaults.object(forKey: Key.lastSucceeded) != nil,
-           !userDefaults.bool(forKey: Key.lastSucceeded) {
-            return true
-        }
-        guard let lastFinishedAt = userDefaults.string(forKey: Key.lastFinishedAt),
-              let finishedAt = dateFormatter.date(from: lastFinishedAt)
-        else {
-            return true
-        }
-        return now.timeIntervalSince(finishedAt) >= minimumInterval
+    public func shouldRunForegroundCatchUp() -> Bool {
+        return isEnabled && !pendingObserverTypeCodeGenerations.isEmpty
     }
 }
 

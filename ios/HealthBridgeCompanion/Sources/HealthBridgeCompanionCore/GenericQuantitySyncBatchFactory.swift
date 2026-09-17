@@ -116,13 +116,6 @@ public struct GenericQuantityAnchoredQueryPlan: Equatable, Sendable {
     }
 }
 
-public enum GenericQuantityAnchoredDeliveryDisposition: Equatable, Sendable {
-    case uploaded
-    case durablyQueued
-    case failed
-    case nonDurablyQueued
-}
-
 public enum GenericQuantityAnchoredProgressPolicy {
     public static func shouldIncludeAnchor(
         canPersistSharedProgress: Bool,
@@ -133,18 +126,30 @@ public enum GenericQuantityAnchoredProgressPolicy {
         guard canPersistSharedProgress else { return false }
         return hadUsableAnchor || activeSampleCount > 0 || deletedSampleCount > 0
     }
+}
 
-    public static func shouldPersistAnchor(
-        readSucceeded: Bool,
-        delivery: GenericQuantityAnchoredDeliveryDisposition
-    ) -> Bool {
-        guard readSucceeded else { return false }
-        switch delivery {
-        case .uploaded, .durablyQueued:
-            return true
-        case .failed, .nonDurablyQueued:
-            return false
-        }
+public struct GenericQuantityAnchoredCursorOwnership: Equatable, Sendable {
+    public let cursorKind: String
+    public let cursorValue: String?
+    public let isIndependentAutomaticFallback: Bool
+}
+
+public enum GenericQuantityAnchoredCursorOwnershipPolicy {
+    public static func resolve(
+        typeCode: String,
+        executionMode: HealthBridgeSyncExecutionMode,
+        sharedCursorValue: String?,
+        automaticCursorValue: String?
+    ) -> GenericQuantityAnchoredCursorOwnership {
+        let useAutomaticFallback = executionMode == .automatic
+            && !HealthKitAnchoredCursorPolicy.hasUsableCursorValue(sharedCursorValue)
+        return GenericQuantityAnchoredCursorOwnership(
+            cursorKind: useAutomaticFallback
+                ? GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: typeCode)
+                : GenericQuantitySyncBatchFactory.anchoredCursorKind(for: typeCode),
+            cursorValue: useAutomaticFallback ? automaticCursorValue : sharedCursorValue,
+            isIndependentAutomaticFallback: useAutomaticFallback
+        )
     }
 }
 
@@ -465,6 +470,7 @@ public enum GenericQuantityForegroundSyncPolicy {
 public enum GenericQuantitySyncBatchFactory {
     public static let foregroundCursorPrefix = "foreground_quantity_sync"
     public static let anchoredCursorPrefix = "healthkit_anchored_quantity"
+    public static let automaticAnchoredCursorPrefix = "automatic_healthkit_anchored_quantity"
     public static let defaultMaxSamplesPerBatch = 500
 
     public static func anchoredCursorKind(for typeCode: String) -> String {
@@ -472,11 +478,17 @@ public enum GenericQuantitySyncBatchFactory {
         return "\(anchoredCursorPrefix):\(canonicalTypeCode)"
     }
 
+    public static func automaticAnchoredCursorKind(for typeCode: String) -> String {
+        let canonicalTypeCode = GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode)
+        return "\(automaticAnchoredCursorPrefix):\(canonicalTypeCode)"
+    }
+
     public static func makeAnchoredQuantityBatches(
         changes: HealthKitAnchoredQuantityChanges,
         generatedAt: Date = Date(),
         maxSamplesPerBatch: Int = defaultMaxSamplesPerBatch,
-        includeAnchorCursor: Bool = true
+        includeAnchorCursor: Bool = true,
+        cursorKind: String? = nil
     ) -> [HealthBridgeBatchV1] {
         let source = HealthBridgeAppleHealthSource.phone
         guard let entry = quantityEntries(for: [changes.typeCode]).first else { return [] }
@@ -542,7 +554,7 @@ public enum GenericQuantitySyncBatchFactory {
                 [
                     HealthBridgeSyncCursor(
                         sourceKey: source.sourceKey,
-                        cursorKind: anchoredCursorKind(for: entry.typeCode),
+                        cursorKind: cursorKind ?? anchoredCursorKind(for: entry.typeCode),
                         cursorValue: changes.anchorCursorValue
                     ),
                 ]

@@ -527,58 +527,6 @@ public enum CompanionStatusLaneBuilder {
     }
 }
 
-public enum CompanionSyncNowStep: Equatable, Sendable {
-    case checkReceiverReachability
-    case flushPendingOutboxBeforeSync
-    case syncAnchoredSteps
-    case syncDailyActivityAggregates
-    case syncAnchoredWorkouts
-    case syncSleep
-    case syncSupportedQuantityMetrics
-}
-
-public enum CompanionSyncNowPlan {
-    public static let defaultSteps: [CompanionSyncNowStep] = [
-        .checkReceiverReachability,
-        .flushPendingOutboxBeforeSync,
-        .syncAnchoredSteps,
-        .syncDailyActivityAggregates,
-        .syncAnchoredWorkouts,
-        .syncSleep,
-        .syncSupportedQuantityMetrics,
-    ]
-}
-
-public enum CompanionPayloadNetworkAttemptPolicy {
-    public static func shouldAttemptNetworkForNewPayload(
-        hasPendingOutbox: Bool,
-        usesMailboxTransport: Bool
-    ) -> Bool {
-        !usesMailboxTransport && !hasPendingOutbox
-    }
-
-    public static func shouldAttemptNetworkForQueuedPayload(
-        isFIFOHead: Bool
-    ) -> Bool {
-        isFIFOHead
-    }
-}
-
-public enum CompanionCursorCheckpointFinalizationPolicy {
-    public static func shouldFinalizeLocally(
-        deliveryWasQueued: Bool,
-        usesMailboxTransport: Bool
-    ) -> Bool {
-        !deliveryWasQueued || !usesMailboxTransport
-    }
-
-    public static func shouldContinueSyncAfterQueuedPayload(
-        usesMailboxTransport: Bool
-    ) -> Bool {
-        !usesMailboxTransport
-    }
-}
-
 public final class CompanionHealthPermissionRequestStore {
     private enum Key {
         static let completedRuntimeTypeCodes =

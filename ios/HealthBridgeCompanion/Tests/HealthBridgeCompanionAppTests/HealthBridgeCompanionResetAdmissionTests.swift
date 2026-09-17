@@ -6,6 +6,67 @@ import XCTest
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testApplicationRuntimeCoalescesBackgroundAndVisibleBootstrapOnOneViewModel() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ApplicationRuntimeTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "ApplicationRuntimeTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        let entered = expectation(description: "application-owned bootstrap entered")
+        let recorder = BootstrapInvocationRecorder()
+        let blocker = BlockingBootstrapCleanup(
+            onStart: {
+                recorder.recordInvocation()
+                entered.fulfill()
+            },
+            onCancel: {}
+        )
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settingsStore,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: try FileOutbox(directory: root.appendingPathComponent("outbox")),
+            cancelInheritedLegacyUploads: { await blocker.wait() }
+        )
+        let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+        let delegate = HealthBridgeBackgroundURLSessionAppDelegate(
+            applicationRuntime: runtime
+        )
+
+        let backgroundLaunch = delegate.bootstrapForBackgroundLaunch()
+        let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(entry, .completed)
+        guard entry == .completed else {
+            backgroundLaunch.cancel()
+            return
+        }
+        let visibleLaunch = Task { @MainActor in
+            await runtime.bootstrap()
+        }
+        await Task.yield()
+        blocker.release()
+        await backgroundLaunch.value
+        await visibleLaunch.value
+
+        XCTAssertTrue(runtime.viewModel === viewModel)
+        XCTAssertTrue(delegate.applicationRuntime === runtime)
+        XCTAssertEqual(recorder.invocationCount, 1)
+    }
+
     func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
         let manager = FileManager.default
         let applicationSupport = try XCTUnwrap(
@@ -55,7 +116,6 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try cursors.saveCursorValue("synthetic-progress", receiverBindingID: binding, sourceKey: "steps", cursorKind: "anchor")
         let background = BackgroundSyncSettingsStore(userDefaults: defaults)
         try background.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
-        try background.persistNextScheduledWorkLaneID("daily_activity")
         let generations = try background.loadPendingObserverTypeCodeGenerations()
         let diagnostics = AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json"))
         let viewModel = try makeViewModel(
@@ -94,7 +154,6 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try before.map { try Data(contentsOf: $0.fileURL) }, payloads)
         XCTAssertEqual(try cursors.cursorValue(receiverBindingID: binding, sourceKey: "steps", cursorKind: "anchor"), "synthetic-progress")
         XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), generations)
-        XCTAssertEqual(background.nextScheduledWorkLaneID, "daily_activity")
         XCTAssertNil(background.lastTaskSchedule, "Disabled automatic sync must not submit a request")
     }
 
@@ -856,6 +915,23 @@ private struct ResetObservation {
 }
 
 private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var invocationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func recordInvocation() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+}
+
+private final class BootstrapInvocationRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
 

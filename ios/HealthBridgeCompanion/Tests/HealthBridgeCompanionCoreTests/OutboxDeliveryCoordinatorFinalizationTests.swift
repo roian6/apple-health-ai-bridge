@@ -3,6 +3,120 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 extension OutboxDeliveryCoordinatorTests {
+    func testMailboxFinalizationCannotAdvanceLaterTransactionBeforeFIFOHead() throws {
+        let harness = try OutboxDeliveryHarness()
+        _ = try advanceToProviderObserved(
+            harness,
+            sealer: CountingMailboxEnvelopeSealer(harness.fixture),
+            finalizer: CountingOutboxDeliveryFinalizer()
+        )
+        let event = try harness.publishCommittedAck()
+        let receipt = try XCTUnwrap(OutboxDeliveryCommittedReceiptV1(event: event))
+        let outbox = try FileOutbox(
+            directory: harness.fixture.root.appendingPathComponent("ordered-cursor-outbox")
+        )
+        let firstCheckpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: harness.ownership.receiverBindingID,
+            sourceKey: "synthetic-source",
+            cursorKind: "first-anchor",
+            cursorValue: "first-v1"
+        )
+        let secondCheckpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: harness.ownership.receiverBindingID,
+            sourceKey: "synthetic-source",
+            cursorKind: "second-anchor",
+            cursorValue: "second-v1"
+        )
+        let firstItem = try XCTUnwrap(outbox.enqueueSequence(
+            [harness.fixture.payload],
+            receiverIdentity: harness.ownership.receiverBindingID,
+            cursorCheckpoint: firstCheckpoint
+        ).first)
+        let secondItem = try XCTUnwrap(outbox.enqueueSequence(
+            [harness.fixture.payload],
+            receiverIdentity: harness.ownership.receiverBindingID,
+            cursorCheckpoint: secondCheckpoint
+        ).first)
+        for item in [firstItem, secondItem] {
+            _ = try outbox.finalizeMailboxEnvelope(
+                itemID: item.id,
+                envelope: Data("synthetic-finalized-envelope-\(item.id)".utf8),
+                expectedPayloadSHA256: mailboxSHA256(harness.fixture.payload)
+            )
+            let encrypted = try XCTUnwrap(outbox.deliveryState(for: item.id))
+            _ = try outbox.compareAndSetDeliveryState(
+                itemID: item.id,
+                expected: encrypted,
+                updated: encrypted.assigning(harness.ownership)
+            )
+        }
+        let secondOwned = try XCTUnwrap(outbox.deliveryState(for: secondItem.id))
+        _ = try outbox.compareAndSetDeliveryState(
+            itemID: secondItem.id,
+            expected: secondOwned,
+            updated: .committed(
+                phase: .ackVerified,
+                ownership: harness.ownership,
+                receipt: receipt
+            )
+        )
+        let cursorStore = CountingSyncCursorStore()
+        let finalizer = OutboxDeliveryCursorFinalizer(
+            outbox: outbox,
+            cursorStore: cursorStore
+        )
+        let secondContext = OutboxDeliveryFinalizationContext(
+            itemID: secondItem.id,
+            ownership: harness.ownership
+        )
+
+        XCTAssertThrowsError(try finalizer.finalize(secondContext)) { error in
+            XCTAssertEqual(
+                error as? FileOutboxCursorCheckpointError,
+                .pendingCommit
+            )
+        }
+        XCTAssertNil(try cursorStore.cursorValue(
+            receiverBindingID: harness.ownership.receiverBindingID,
+            sourceKey: "synthetic-source",
+            cursorKind: "second-anchor"
+        ))
+
+        let firstOwned = try XCTUnwrap(outbox.deliveryState(for: firstItem.id))
+        _ = try outbox.compareAndSetDeliveryState(
+            itemID: firstItem.id,
+            expected: firstOwned,
+            updated: .committed(
+                phase: .ackVerified,
+                ownership: harness.ownership,
+                receipt: receipt
+            )
+        )
+        let firstContext = OutboxDeliveryFinalizationContext(
+            itemID: firstItem.id,
+            ownership: harness.ownership
+        )
+        try finalizer.finalize(firstContext)
+        try finalizer.finalize(secondContext)
+
+        XCTAssertEqual(
+            try cursorStore.cursorValue(
+                receiverBindingID: harness.ownership.receiverBindingID,
+                sourceKey: "synthetic-source",
+                cursorKind: "first-anchor"
+            ),
+            "first-v1"
+        )
+        XCTAssertEqual(
+            try cursorStore.cursorValue(
+                receiverBindingID: harness.ownership.receiverBindingID,
+                sourceKey: "synthetic-source",
+                cursorKind: "second-anchor"
+            ),
+            "second-v1"
+        )
+    }
+
     func testCursorAndSleepFinalizationAreExactlyOnce() throws {
         let harness = try OutboxDeliveryHarness()
         let deliveryFinalizer = CountingOutboxDeliveryFinalizer()

@@ -4,7 +4,7 @@
     "version": "1.0.0"
   },
   "ios_companion": {
-    "build": "43",
+    "build": "44",
     "marketing_version": "1.1.1"
   },
   "receiver_cli": {

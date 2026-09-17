@@ -22,8 +22,6 @@ public struct BackgroundRegistrationRetry: Codable, Equatable, Sendable {
 
 public struct BackgroundDeliveryRecoverySnapshot: Codable, Equatable, Sendable {
     public var version = 1
-    public var observerGenerations: [BackgroundRecoveryLane: Int] = [:]
-    public var observerRecoveryOffered = false
     public var registrations: [BackgroundRecoveryLane: BackgroundRegistrationRetry] = [:]
     public init() {}
 }
@@ -48,7 +46,6 @@ public final class FileBackgroundDeliveryRecoveryStore: BackgroundDeliveryRecove
         guard data.count <= 4_096 else { throw BackgroundSyncSettingsStoreError.persistenceFailed }
         let snapshot = try JSONDecoder().decode(BackgroundDeliveryRecoverySnapshot.self, from: data)
         guard snapshot.version == 1,
-              snapshot.observerGenerations.values.allSatisfy({ $0 > 0 }),
               snapshot.registrations.values.allSatisfy({
                   (1...5).contains($0.attemptCount) && $0.nextEligibleAt.timeIntervalSince1970.isFinite
               }) else { throw BackgroundSyncSettingsStoreError.persistenceFailed }
@@ -91,12 +88,6 @@ public final class BackgroundObserverAcknowledgement: @unchecked Sendable {
 
 }
 
-public enum BackgroundObserverFailureResult: Equatable, Sendable {
-    case retained(lane: BackgroundRecoveryLane, localRecoveryEligible: Bool)
-    case durableStateUnavailable(lane: BackgroundRecoveryLane)
-    case ignored
-}
-
 public enum BackgroundRecoveryDurableState: String, Codable, Sendable {
     case available, unavailable
 }
@@ -106,21 +97,6 @@ public enum BackgroundRecoveryDurableState: String, Codable, Sendable {
 public struct BackgroundObserverPendingDiagnostic: Codable, Equatable, Sendable {
     public let lanes: Set<BackgroundRecoveryLane>
     public let durableState: BackgroundRecoveryDurableState
-}
-
-public struct BackgroundObserverFailureHandoff {
-    public let result: BackgroundObserverFailureResult
-    public let diagnostic: AutomaticSyncDiagnosticDraft
-
-    public var localRecoveryEligible: Bool {
-        if case .retained(_, let eligible) = result { return eligible }
-        return false
-    }
-}
-
-public struct BackgroundObserverRecoveryAdmission: Equatable, Sendable {
-    let generation: UInt64?
-    let lanes: [BackgroundRecoveryLane: Int]
 }
 
 public struct BackgroundRegistrationAttempt: Equatable, Sendable {
@@ -152,10 +128,7 @@ public final class BackgroundDeliveryFailureRecovery {
     private var generation: UInt64?
     private var inFlight: [String: BackgroundRegistrationAttempt] = [:]
     private var successfulTypes: Set<String> = []
-    private var completedObserverTypes: Set<String> = []
     private var durableStateUnavailable = false
-    // Diagnostic-only uncertainty, bounded by the five coarse lanes. Never admits work.
-    private var unretainedObserverLanes: Set<BackgroundRecoveryLane> = []
 
     public init(store: any BackgroundDeliveryRecoveryStoring, now: @escaping () -> Date = Date.init) {
         self.store = store
@@ -168,7 +141,6 @@ public final class BackgroundDeliveryFailureRecovery {
         inFlight = [:]
         successfulTypes = []
         failedTypes = []
-        completedObserverTypes = []
         do { snapshot = try store.load(); durableStateUnavailable = false }
         catch { snapshot = nil; durableStateUnavailable = true }
     }
@@ -183,8 +155,8 @@ public final class BackgroundDeliveryFailureRecovery {
         return .init(
             failedRegistrationLanes: BackgroundRecoveryLane.allCases.filter { registrations[$0] != nil },
             exhaustedRegistrationLaneCount: registrations.values.filter { $0.attemptCount >= Self.maximumRegistrationAttempts }.count,
-            pendingObserverLaneCount: max(observerPendingDiagnostic.lanes.count, durableStateUnavailable ? 1 : 0),
-            durableStateUnavailable: observerPendingDiagnostic.durableState == .unavailable
+            pendingObserverLaneCount: 0,
+            durableStateUnavailable: durableStateUnavailable
         )
     }
 
@@ -196,56 +168,10 @@ public final class BackgroundDeliveryFailureRecovery {
         }.values.map(\.nextEligibleAt).min()
     }
 
-    public func processObserverFailure(
-        typeCode: String, generation: UInt64, acknowledge: () -> Void
-    ) -> BackgroundObserverFailureResult {
-        defer { acknowledge() }
-        guard self.generation == generation else { return .ignored }
-        let lane = BackgroundRecoveryLane(typeCode: typeCode)
-        do {
-            var next = try loadedSnapshot()
-            let previous = next.observerGenerations[lane] ?? 0
-            next.observerGenerations[lane] = previous == Int.max ? Int.max : previous + 1
-            let eligible = !next.observerRecoveryOffered
-            next.observerRecoveryOffered = true
-            try persist(next)
-            unretainedObserverLanes.remove(lane)
-            completedObserverTypes = completedObserverTypes.filter { BackgroundRecoveryLane(typeCode: $0) != lane }
-            return .retained(lane: lane, localRecoveryEligible: eligible)
-        } catch {
-            durableStateUnavailable = true
-            unretainedObserverLanes.insert(lane)
-            return .durableStateUnavailable(lane: lane)
-        }
-    }
-
-    /// Retains the coarse failure token before acknowledging HealthKit. The
-    /// draft is the one local opportunity's identity, not another retry record.
-    public func observerFailureHandoff(
-        typeCode: String, generation: UInt64, runID: UUID,
-        completionLatency: TimeInterval, acknowledge: () -> Void
-    ) -> BackgroundObserverFailureHandoff? {
-        let result = processObserverFailure(typeCode: typeCode, generation: generation, acknowledge: acknowledge)
-        let lane: BackgroundRecoveryLane
-        let state: BackgroundRecoveryDurableState
-        switch result {
-        case .ignored: return nil
-        case .retained(let retainedLane, _): lane = retainedLane; state = .available
-        case .durableStateUnavailable(let unavailableLane): lane = unavailableLane; state = .unavailable
-        }
-        let draft = AutomaticSyncDiagnosticDraft(
-            observerFailureLane: lane, runID: runID,
-            completionLatency: completionLatency, durableState: state
-        )
-        if state == .unavailable { draft.noteDurableStateUnavailable() }
-        else { draft.noteCompletion(.deferred) }
-        return .init(result: result, diagnostic: draft)
-    }
-
     public var observerPendingDiagnostic: BackgroundObserverPendingDiagnostic {
         .init(
-            lanes: Set(snapshot?.observerGenerations.keys.map { $0 } ?? []).union(unretainedObserverLanes),
-            durableState: durableStateUnavailable || !unretainedObserverLanes.isEmpty ? .unavailable : .available
+            lanes: [],
+            durableState: durableStateUnavailable ? .unavailable : .available
         )
     }
 
@@ -266,39 +192,6 @@ public final class BackgroundDeliveryFailureRecovery {
             if initial { draft.notePending(pending) }
             else { draft.noteCompletion(draft.record.runOutcome, remainingPendingSnapshot: pending) }
         }
-    }
-
-    public func observerGenerationSnapshot() throws -> BackgroundObserverRecoveryAdmission {
-        .init(generation: generation, lanes: try loadedSnapshot().observerGenerations)
-    }
-
-    // Expansion is runtime-only. Optional type codes never enter the recovery file.
-    public func pendingObserverTypeCodes(availableTypeCodes: [String]) throws -> [String] {
-        let lanes = try loadedSnapshot().observerGenerations
-        return GenericQuantityCoveragePolicy.canonicalTypeCodes(for: availableTypeCodes).filter {
-            lanes[BackgroundRecoveryLane(typeCode: $0)] != nil && !completedObserverTypes.contains($0)
-        }
-    }
-
-    public func completeObserverWork(
-        typeCodes: [String], matching expected: BackgroundObserverRecoveryAdmission, availableTypeCodes: [String]
-    ) throws {
-        guard generation != nil, generation == expected.generation else { return }
-        var next = try loadedSnapshot()
-        var completed = completedObserverTypes
-        for code in typeCodes {
-            let lane = BackgroundRecoveryLane(typeCode: code)
-            guard let expectedGeneration = expected.lanes[lane],
-                  next.observerGenerations[lane] == expectedGeneration else { continue }
-            completed.insert(code)
-            let laneTypes = availableTypeCodes.filter { BackgroundRecoveryLane(typeCode: $0) == lane }
-            if !laneTypes.isEmpty && laneTypes.allSatisfy({ completed.contains($0) }) {
-                next.observerGenerations.removeValue(forKey: lane)
-            }
-        }
-        if next.observerGenerations.isEmpty { next.observerRecoveryOffered = false }
-        if next != snapshot { try persist(next) }
-        completedObserverTypes = completed
     }
 
     public func claimRegistrations(typeCodes: [String], generation: UInt64) throws -> [BackgroundRegistrationAttempt] {

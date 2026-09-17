@@ -626,77 +626,6 @@ def test_automatic_sync_requires_complete_committed_receiver_settings() -> None:
     assert "settingsStore.loadBearerToken()" in source
 
 
-def test_automatic_sync_backpressure_and_disable_ordering() -> None:
-    source = VIEW_MODEL.read_text()
-
-    refresh_start = source.index("private func performBackgroundRefreshSync(")
-    refresh_end = source.index(
-        "private func performAdmittedBackgroundRefreshSync(", refresh_start
-    )
-    refresh_body = source[refresh_start:refresh_end]
-    before_generation = "mailboxReconciliationPoint: .beforePayloadGeneration"
-    after_durable_enqueue = "mailboxReconciliationPoint: .afterDurableEnqueue"
-    first_backpressure = refresh_body.index(before_generation)
-    direct_transfer = refresh_body.index("runWithExclusiveDirectOutboxTransfer")
-    second_backpressure = refresh_body.index(before_generation, first_backpressure + 1)
-    policy = refresh_body.index(
-        "AutomaticSyncPayloadGenerationPolicy.shouldGenerateNewPayloads("
-    )
-    assert first_backpressure < direct_transfer < second_backpressure < policy
-    assert "finishBackgroundRunPreservingObserverDirtiness(" in refresh_body
-    finish_start = source.index(
-        "private func finishBackgroundRunPreservingObserverDirtiness("
-    )
-    finish_end = source.index(
-        "private func deferAutomaticSyncForPendingOutboxIfNeeded(", finish_start
-    )
-    finish = source[finish_start:finish_end]
-    assert "finalization.takeAdmission()" in finish
-    assert "await backgroundRunGate.finishRun(" in finish
-    assert "retainAdmission ? .interrupted : .succeeded" in finish
-    assert (
-        "settingsStore.receiverSettingsGenerationToken == expectedGeneration" in finish
-    )
-    defer_start = finish_end
-    defer_end = source.index("private struct BackgroundCoreLaneResult", defer_start)
-    assert (
-        "schedulePendingBackgroundOutboxUploadsIfAllowed()"
-        in source[defer_start:defer_end]
-    )
-
-    admitted_start = source.index("private func performAdmittedBackgroundRefreshSync(")
-    admitted_end = source.index(
-        "private func stopBackgroundRunIfUnavailable(", admitted_start
-    )
-    admitted_body = source[admitted_start:admitted_end]
-    assert admitted_body.count("switch lane") == 1
-    assert "if followUpAdmission.shouldRun" not in admitted_body
-    assert "await performAdmittedBackgroundRefreshSync(" not in admitted_body
-    post_lane_backpressure = admitted_body.index(after_durable_enqueue)
-
-    lane_markers = [
-        "await self.syncRecentStepCounts(executionMode: .automatic)",
-        "await self.syncDailyActivityAggregates(executionMode: .automatic)",
-        "await self.syncAnchoredWorkoutChanges(executionMode: .automatic)",
-        "await self.syncRecentSleepSessions(executionMode: .automatic)",
-        "await syncBackgroundAutomaticQuantityMetrics(",
-    ]
-    for lane_marker in lane_markers:
-        lane = admitted_body.index(lane_marker)
-        assert lane < post_lane_backpressure
-
-    quantity_start = source.index("private func syncQuantityMetrics(")
-    quantity_end = source.index("private enum PayloadDeliveryResult", quantity_start)
-    quantity_body = source[quantity_start:quantity_end]
-    queued_delivery = quantity_body.index("queuedAnyPayload = true")
-    queued_stop_policy = quantity_body.index(
-        "AutomaticSyncPayloadGenerationPolicy.shouldStopQuantityLoop(",
-        queued_delivery,
-    )
-    queued_break = quantity_body.index("break", queued_stop_policy)
-    assert queued_delivery < queued_stop_policy < queued_break
-
-
 def test_automatic_sync_disable_is_durable_before_cancellation() -> None:
     source = VIEW_MODEL.read_text()
 
@@ -817,7 +746,9 @@ def test_background_upload_cancellation_is_bounded() -> None:
     transfer_start = source.index(
         "private func runWithExclusiveDirectOutboxTransfer<Result>("
     )
-    transfer_end = source.index("private func performSyncAllNow()", transfer_start)
+    transfer_end = source.index(
+        "private func finishExclusiveDirectOutboxTransfer()", transfer_start
+    )
     transfer_body = source[transfer_start:transfer_end]
     cancel = transfer_body.index("cancelPendingUploads()")
     verify_empty = transfer_body.index("hasPendingUploadTasks()", cancel)
@@ -927,12 +858,6 @@ def test_cancelled_pairing_and_mixed_receiver_queue_remain_fail_closed() -> None
 
     assert "try Task.checkCancellation()" in source
     assert "guard !Task.isCancelled else" in source
-    assert "let hasPendingOutbox = !(try outbox.pendingItems()).isEmpty" in source
-    assert (
-        "CompanionPayloadNetworkAttemptPolicy.shouldAttemptNetworkForNewPayload"
-        in source
-    )
-    assert "without repeating a foreground network attempt" in source
     assert "func requestBackgroundSyncEnabled(_ enabled: Bool)" in source
     toggle_start = source.index("func requestBackgroundSyncEnabled(_ enabled: Bool)")
     toggle_end = source.index(

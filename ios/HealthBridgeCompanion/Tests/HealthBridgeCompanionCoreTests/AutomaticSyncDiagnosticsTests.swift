@@ -3,7 +3,7 @@ import XCTest
 
 final class AutomaticSyncDiagnosticsTests: XCTestCase {
     @MainActor
-    func testObserverAcknowledgesAfterAdmissionBeforeBlockedContinuation() async {
+    func testObserverAcknowledgesAfterContinuationBeforeDiagnosticPersistence() async {
         let fileURL = temporaryFileURL()
         defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
         let store = AutomaticSyncDiagnosticStore(fileURL: fileURL)
@@ -25,10 +25,11 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
                     return .continueProcessing
                 },
                 eventHandler: {
-                    events.append("continuation")
+                    events.append("continuation started")
                     await withCheckedContinuation { continuation in
                         resumeContinuation = continuation
                     }
+                    events.append("continuation finished")
                     return draft
                 },
                 acknowledge: {
@@ -47,12 +48,14 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
         }
 
         while resumeContinuation == nil { await Task.yield() }
-        XCTAssertEqual(events, ["admission", "acknowledge", "continuation"])
+        XCTAssertEqual(events, ["admission", "continuation started"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
         resumeContinuation?.resume()
         await processing.value
 
-        XCTAssertEqual(events, ["admission", "acknowledge", "continuation", "persist"])
+        XCTAssertEqual(events, [
+            "admission", "continuation started", "continuation finished", "acknowledge", "persist",
+        ])
         XCTAssertEqual(store.latestRecord?.observerCompletionLatencyBucket, .underOneSecond)
     }
 
@@ -76,6 +79,58 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
             persistDiagnostic: { _, _ in events.append("persist") }
         )
         XCTAssertEqual(events, ["admission", "acknowledge", "persist"])
+    }
+
+    @MainActor
+    func testObserverDurableAdmissionFailureDoesNotAcknowledge() async {
+        let draft = AutomaticSyncDiagnosticDraft(
+            reason: .observer(typeCode: HealthBridgeHealthType.sleepAnalysis.typeCode)
+        )
+        var events: [String] = []
+        await AutomaticSyncObserverEventLifecycle.process(
+            startedAt: Date(timeIntervalSince1970: 1_788_000_000),
+            admissionHandler: {
+                events.append("admission")
+                return .deferAcknowledgement(draft)
+            },
+            eventHandler: {
+                events.append("continuation")
+                return nil
+            },
+            acknowledge: { events.append("acknowledge") },
+            persistDiagnostic: { _, _ in events.append("persist") }
+        )
+        XCTAssertEqual(events, ["admission", "persist"])
+    }
+
+    @MainActor
+    func testObserverContinuationDoesNotAcknowledgeUntilAcquisitionIsDurable() async {
+        let draft = AutomaticSyncDiagnosticDraft(
+            reason: .observer(typeCode: HealthBridgeHealthType.steps.typeCode)
+        )
+        var events: [String] = []
+        await AutomaticSyncObserverEventLifecycle.process(
+            startedAt: Date(timeIntervalSince1970: 1_788_000_000),
+            admissionHandler: {
+                events.append("admission")
+                return .continueProcessing
+            },
+            eventHandler: {
+                events.append("continuation")
+                return draft
+            },
+            acknowledgementIsDurable: {
+                events.append("durability check")
+                return false
+            },
+            acknowledge: { events.append("acknowledge") },
+            persistDiagnostic: { _, _ in events.append("persist") }
+        )
+
+        XCTAssertEqual(
+            events,
+            ["admission", "continuation", "durability check", "persist"]
+        )
     }
 
     func testHistoryEvictsOldestRecordsAtBound() {
@@ -148,18 +203,8 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
             pendingTypeCodes: ["sleep_analysis"],
             now: firstSeen
         )
-        let recovery = BackgroundSyncFailureRecoveryPolicy.plan(
-            admittedPendingTypeCodes: ["sleep_analysis"],
-            gatePendingTypeCodes: [],
-            durablePendingState: .unavailable,
-            retryRequested: true,
-            automaticSyncReady: true,
-            backgroundSyncEnabled: true,
-            payloadAdmissionOpen: true
-        )
-
         let remaining = store.pendingSnapshot(
-            pendingTypeCodes: recovery.pendingTypeCodes,
+            pendingTypeCodes: ["sleep_analysis"],
             now: firstSeen.addingTimeInterval(25 * 60 * 60)
         )
 

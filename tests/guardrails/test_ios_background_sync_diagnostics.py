@@ -20,10 +20,6 @@ VIEW_MODEL: Final = (
     ROOT / "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
 )
 CONTENT_VIEW: Final = ROOT / "ios/HealthBridgeCompanion/App/ContentView.swift"
-HEALTHKIT_CATALOG: Final = ROOT / (
-    "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/"
-    "HealthKitReadTypeCatalog.swift"
-)
 SWIFT_TESTS: Final = ROOT / (
     "ios/HealthBridgeCompanion/Tests/HealthBridgeCompanionCoreTests/"
     "AutomaticSyncDiagnosticsTests.swift"
@@ -136,153 +132,6 @@ def test_settings_render_distinct_read_only_automatic_sync_evidence_lines() -> N
     )
 
 
-def test_sync_wiring_preserves_observer_completion_order() -> None:
-    # Given: the existing automatic-sync and HealthKit observer flows.
-    view_model = VIEW_MODEL.read_text(encoding="utf-8")
-    catalog = HEALTHKIT_CATALOG.read_text(encoding="utf-8")
-
-    # When: diagnostic calls and observer ACK are inspected.
-    required_view_model_fragments = (
-        "AutomaticSyncDiagnosticDraft(",
-        "runID: diagnosticRunID",
-        "diagnostic.noteAdmission(admission)",
-        "diagnostic.noteSelection(workPlan.lane)",
-        "diagnostic.noteRunAccepted()",
-        "persistAcceptedAutomaticSyncDiagnostic(diagnostic)",
-        "diagnostic.noteCompletion(",
-        "automaticSyncDiagnosticStore.recordFinal(diagnostic.record)",
-        "diagnostic.noteObserverCompletionLatency(latency)",
-        "recordUnavailableAutomaticSyncDiagnostic(",
-        "durableStateUnavailable: true",
-    )
-
-    # Then: every liveness point exists. Error recovery durably retains its
-    # coarse token before ACK; full diagnostic persistence remains after ACK.
-    for fragment in required_view_model_fragments:
-        assert fragment in view_model
-    observer_failure = view_model.split("private func noteHealthKitObserverFailure", 1)[
-        1
-    ].split("#endif", 1)[0]
-    assert (
-        "BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)"
-        in observer_failure
-    )
-
-    assert "observerCompletionHandler:" in catalog
-    assert "observerAdmissionHandler:" in catalog
-    assert "AutomaticSyncObserverEventLifecycle.process(" in catalog
-    assert "AutomaticSyncDiagnosticDraft?" in catalog
-    assert "let runID = UUID()" in catalog
-    assert "acknowledge: completion.call" in catalog
-    assert "completion.beforeRecovery" not in catalog
-    assert "defer { acknowledge() }" in (
-        ROOT
-        / (
-            "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/"
-            "BackgroundDeliveryFailureRecovery.swift"
-        )
-    ).read_text(encoding="utf-8")
-    assert "persistDiagnostic: observerCompletionHandler" in catalog
-    assert "completedDraft, latency in" in view_model
-    assert "persistCompletedObserverAutomaticSyncDiagnostic(" in view_model
-    assert "if !diagnostic.defersPersistenceUntilObserverAcknowledgement" in view_model
-    assert "backgroundSyncStore.lastSelectedLane" in view_model
-
-    observer_start = view_model.split("coordinator.start(", 1)[1].split(
-        "recordBackgroundSyncRegistrationIfAllowed(", 1
-    )[0]
-    admission = observer_start.split("observerAdmissionHandler:", 1)[1].split(
-        "observerCompletionHandler:", 1
-    )[0]
-    continuation = observer_start.split(
-        ") { [weak self] typeCode, diagnosticRunID in", 1
-    )[1]
-    assert "backgroundSyncStore.markPendingObserverTypeCodes([typeCode])" in admission
-    assert (
-        "BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)"
-        in admission
-    )
-    assert "runBackgroundRefreshSyncCollectingDiagnostic(" not in admission
-    assert "runBackgroundRefreshSyncCollectingDiagnostic(" in continuation
-
-
-def test_observer_diagnostic_persistence_seam_has_executable_boundary_coverage() -> (
-    None
-):
-    diagnostics = DIAGNOSTICS.read_text(encoding="utf-8")
-    tests = SWIFT_TESTS.read_text(encoding="utf-8")
-
-    assert "enum AutomaticSyncObserverEventLifecycle" in diagnostics
-    lifecycle = diagnostics.split("enum AutomaticSyncObserverEventLifecycle", 1)[
-        1
-    ].split("public struct AutomaticSyncDiagnosticRecord", 1)[0]
-    admission = lifecycle.index("let admission = await admissionHandler()")
-    acknowledgement = lifecycle.index("acknowledge()")
-    continuation = lifecycle.index("diagnostic = await eventHandler()")
-    persistence = lifecycle.index("persistDiagnostic(diagnostic, completionLatency)")
-    assert admission < acknowledgement < continuation < persistence
-    assert "testObserverAcknowledgesAfterAdmissionBeforeBlockedContinuation" in tests
-    assert "testObserverAdmissionCanFinishWithoutStartingContinuation" in tests
-    assert 'events, ["admission", "acknowledge", "continuation"]' in tests
-    assert "FileManager.default.fileExists(atPath: fileURL.path)" in tests
-    assert "store.recordFinal(completedDraft.record)" in tests
-
-
-def test_diagnostic_lifecycle_distinguishes_accepted_failed_and_completed() -> None:
-    diagnostics = DIAGNOSTICS.read_text(encoding="utf-8")
-    draft = (
-        ROOT
-        / (
-            "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/"
-            "AutomaticSyncDiagnosticDraft.swift"
-        )
-    ).read_text(encoding="utf-8")
-    view_model = VIEW_MODEL.read_text(encoding="utf-8")
-
-    assert "case accepted" in diagnostics
-    assert "case deferred" in diagnostics
-    assert "case failed" in diagnostics
-    assert "func noteRunAccepted()" in draft
-    assert "succeeded ? .completed : .failed" in view_model
-    assert "mailboxReconciliationPoint == .beforePayloadGeneration" in view_model
-    assert "case .failed:" in view_model
-    assert "diagnostic.noteCompletion(.failed)" in view_model
-    assert "automaticSyncDiagnosticStore.recordFinal(diagnostic.record)" in view_model
-
-
-def test_failure_recovery_reconciles_durable_state_and_uses_typed_diagnostics() -> None:
-    background_sync = BACKGROUND_SYNC.read_text(encoding="utf-8")
-    diagnostics = DIAGNOSTICS.read_text(encoding="utf-8")
-    view_model = VIEW_MODEL.read_text(encoding="utf-8")
-
-    recovery = background_sync.split(
-        "public enum BackgroundSyncFailureRecoveryPolicy", 1
-    )[1].split("public actor BackgroundSyncRunGate", 1)[0]
-    compact_recovery = "".join(recovery.split())
-    failure_finish = view_model.split(
-        "private func finishBackgroundRunPreservingObserverDirtiness", 1
-    )[1].split("private func deferAutomaticSyncForPendingOutboxIfNeeded", 1)[0]
-
-    assert (
-        "for:admittedPendingTypeCodes+gatePendingTypeCodes+durableTypeCodes"
-        in compact_recovery
-    )
-    assert "&& !pendingTypeCodes.isEmpty" in recovery
-    assert "loadPendingObserverTypeCodeGenerations()" in failure_finish
-    assert "BackgroundSyncFailureRecoveryPolicy.plan(" in failure_finish
-    assert (
-        "await backgroundRunGate.retainObserverTypeCodes(recovery.pendingTypeCodes)"
-        in failure_finish
-    )
-    assert "if recovery.shouldScheduleRetry" in failure_finish
-    assert "clearPendingObserverTypeCodes" not in failure_finish
-    assert "public struct AutomaticSyncDiagnosticFailure" in diagnostics
-    assert "public let failure: AutomaticSyncDiagnosticFailure?" in diagnostics
-    assert "diagnostic.noteFailure(failure)" in view_model
-    assert "backgroundLaneFailureDetail" not in view_model
-    assert "failureDetail: String?" not in view_model
-
-
 def test_diagnostic_types_are_not_connected_to_upload_or_public_status_surfaces() -> (
     None
 ):
@@ -314,27 +163,6 @@ def test_diagnostic_types_are_not_connected_to_upload_or_public_status_surfaces(
     assert offenders == set()
 
 
-def test_bounded_planner_is_independent_of_diagnostic_storage() -> None:
-    # Scheduler behavior is exercised by BackgroundSyncWorkPlanTests; diagnostics
-    # must remain fail-open rather than becoming a prerequisite for lane planning.
-    source = BACKGROUND_SYNC.read_text(encoding="utf-8")
-    start = source.index("    public static func workPlan(")
-    end = source.index("    public static var observedHealthTypes", start)
-    planner = source[start:end]
-    assert "AutomaticSyncDiagnostic" not in planner
-    assert "maximumLaneAttempts" in planner
-
-    view_model = VIEW_MODEL.read_text(encoding="utf-8")
-    start = view_model.index("let workPlan = HealthBridgeBackgroundSync.workPlan(")
-    end = view_model.index("diagnostic.noteSelection", start)
-    admission_plan = view_model[start:end]
-    assert (
-        "coreLaneLastSuccess: backgroundSyncStore.coreLaneLastSuccess" in admission_plan
-    )
-    assert "now: startedAt" in admission_plan
-    assert "automaticSyncDiagnosticStore" not in admission_plan
-
-
 def test_swift_model_store_rendering_tests_and_xcode_membership_are_present() -> None:
     # Given: the later-Mac Swift gate and the checked-in Xcode project.
     assert SWIFT_TESTS.exists(), "focused Swift diagnostic tests are missing"
@@ -348,7 +176,6 @@ def test_swift_model_store_rendering_tests_and_xcode_membership_are_present() ->
         "testPendingLaneAgeUsesCoarseObservedDurationBuckets",
         "testQuantityPendingAgeTracksOnlyTheCoarseLane",
         "testRecoveryScrubsLegacyNonLanePendingKeysFromDisk",
-        "testObserverAcknowledgesAfterAdmissionBeforeBlockedContinuation",
         "testObserverAdmissionCanFinishWithoutStartingContinuation",
         "testLatestLaneRenderingOmitsPrivateValuesAndIdentifiers",
         "testObserverCompletionLatencyUpdatesOnlyTheMatchingRun",

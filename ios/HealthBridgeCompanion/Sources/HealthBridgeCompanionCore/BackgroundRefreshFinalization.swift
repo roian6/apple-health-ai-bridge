@@ -66,25 +66,9 @@ public final class BoundedAsyncValueLatch<Value: Sendable>: @unchecked Sendable 
 
 @MainActor
 public final class BackgroundRefreshFinalizationOwner {
-    public private(set) var remainingGenerations: [String: Int] = [:]
-    private var admitted = false
     private var finalized = false
 
     public init() {}
-
-    public func admit(_ generations: [String: Int]) {
-        admitted = true
-        remainingGenerations = generations
-    }
-
-    public func complete(_ typeCodes: [String]) {
-        for typeCode in typeCodes { remainingGenerations.removeValue(forKey: typeCode) }
-    }
-
-    public func takeAdmission() -> Bool {
-        defer { admitted = false }
-        return admitted
-    }
 
     public func run(
         work: () async -> Void,

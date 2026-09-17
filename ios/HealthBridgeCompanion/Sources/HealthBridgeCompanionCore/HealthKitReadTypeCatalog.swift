@@ -127,9 +127,9 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         healthTypes: [HealthBridgeHealthType] = HealthBridgeBackgroundSync.observedHealthTypes,
         registrationHandler: @escaping @MainActor (_ typeCode: String, _ succeeded: Bool) -> Void = { _, _ in },
         recoveryReadbackHandler: @escaping @MainActor (BackgroundDeliveryRecoveryReadback) -> Void = { _ in },
-        observerFailureHandler: @escaping @MainActor (BackgroundObserverFailureHandoff) -> Void = { _ in },
         isCurrent: @escaping @MainActor () -> Bool,
         observerAdmissionHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncObserverEventAdmission,
+        observerAcknowledgementHandler: @escaping @MainActor (_ typeCode: String) -> Bool = { _ in true },
         observerCompletionHandler: @escaping @MainActor (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void = { _, _ in },
         eventHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncDiagnosticDraft?
     ) {
@@ -162,18 +162,33 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                             completion.call()
                             return
                         }
-                        guard let handoff = self.recovery.observerFailureHandoff(
-                            typeCode: healthType.typeCode,
-                            generation: expectedCallbackGeneration,
-                            runID: runID,
-                            completionLatency: completionLatency,
-                            acknowledge: completion.call
-                        ) else { return }
-                        handoff.diagnostic.noteObserverCompletionLatency(
-                            Date().timeIntervalSince(observerStartedAt)
+                        await AutomaticSyncObserverEventLifecycle.process(
+                            startedAt: observerStartedAt,
+                            admissionHandler: {
+                                await observerAdmissionHandler(
+                                    healthType.typeCode,
+                                    runID
+                                )
+                            },
+                            eventHandler: {
+                                let diagnostic = AutomaticSyncDiagnosticDraft(
+                                    observerFailureLane: BackgroundRecoveryLane(
+                                        typeCode: healthType.typeCode
+                                    ),
+                                    runID: runID,
+                                    completionLatency: completionLatency,
+                                    durableState: .available
+                                )
+                                diagnostic.noteCompletion(.deferred)
+                                self.recoveryReadbackHandler(self.recovery.readback)
+                                return diagnostic
+                            },
+                            acknowledgementIsDurable: {
+                                observerAcknowledgementHandler(healthType.typeCode)
+                            },
+                            acknowledge: completion.call,
+                            persistDiagnostic: observerCompletionHandler
                         )
-                        observerFailureHandler(handoff)
-                        self.recoveryReadbackHandler(self.recovery.readback)
                     }
                     return
                 }
@@ -191,6 +206,9 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                         },
                         eventHandler: {
                             await eventHandler(healthType.typeCode, runID)
+                        },
+                        acknowledgementIsDurable: {
+                            observerAcknowledgementHandler(healthType.typeCode)
                         },
                         acknowledge: completion.call,
                         persistDiagnostic: observerCompletionHandler

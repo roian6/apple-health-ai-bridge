@@ -3,10 +3,26 @@ import SwiftUI
 import UIKit
 #endif
 
+@MainActor
+final class HealthBridgeCompanionApplicationRuntime {
+    static let shared = HealthBridgeCompanionApplicationRuntime()
+
+    let viewModel: HealthBridgeCompanionViewModel
+
+    init(viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel()) {
+        self.viewModel = viewModel
+    }
+
+    func bootstrap() async {
+        await viewModel.bootstrap()
+    }
+}
+
 @main
+@MainActor
 struct HealthBridgeCompanionApp: App {
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var viewModel = HealthBridgeCompanionViewModel()
+    @StateObject private var viewModel = HealthBridgeCompanionApplicationRuntime.shared.viewModel
     #if os(iOS)
     @UIApplicationDelegateAdaptor(HealthBridgeBackgroundURLSessionAppDelegate.self) private var backgroundURLSessionAppDelegate
     #endif

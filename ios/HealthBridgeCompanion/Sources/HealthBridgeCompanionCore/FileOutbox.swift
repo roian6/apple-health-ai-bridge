@@ -365,6 +365,22 @@ public struct FileOutboxCursorCheckpoint: Codable, Equatable, Sendable {
     }
 }
 
+public struct FileOutboxFinalizationRecord: Equatable, Sendable {
+    public let itemIDs: [String]
+    public let cursorCheckpoint: FileOutboxCursorCheckpoint?
+    public let pendingGenerationRetirements: [String: Int]
+
+    public init(
+        itemIDs: [String] = [],
+        cursorCheckpoint: FileOutboxCursorCheckpoint?,
+        pendingGenerationRetirements: [String: Int]
+    ) {
+        self.itemIDs = itemIDs
+        self.cursorCheckpoint = cursorCheckpoint
+        self.pendingGenerationRetirements = pendingGenerationRetirements
+    }
+}
+
 public enum FileOutboxCursorCheckpointError: Error, Equatable {
     case pendingCommit
     case checkpointMismatch
@@ -501,6 +517,55 @@ public final class FileOutbox {
         let version: Int
         let entries: [SequenceEntry]
         let cursorCheckpoint: FileOutboxCursorCheckpoint?
+        let pendingGenerationRetirements: [String: Int]?
+        let directAcknowledgedItemIDs: [String]?
+
+        init(
+            version: Int,
+            entries: [SequenceEntry],
+            cursorCheckpoint: FileOutboxCursorCheckpoint?,
+            pendingGenerationRetirements: [String: Int]? = nil,
+            directAcknowledgedItemIDs: [String]? = nil
+        ) {
+            self.version = version
+            self.entries = entries
+            self.cursorCheckpoint = cursorCheckpoint
+            self.pendingGenerationRetirements = pendingGenerationRetirements
+            self.directAcknowledgedItemIDs = directAcknowledgedItemIDs
+        }
+
+        var finalizationRecord: FileOutboxFinalizationRecord? {
+            let retirements = pendingGenerationRetirements ?? [:]
+            guard cursorCheckpoint != nil || !retirements.isEmpty else { return nil }
+            return FileOutboxFinalizationRecord(
+                itemIDs: entries.map(\.id),
+                cursorCheckpoint: cursorCheckpoint,
+                pendingGenerationRetirements: retirements
+            )
+        }
+
+        var directAcknowledgedIDs: Set<String> {
+            Set(directAcknowledgedItemIDs ?? [])
+        }
+
+        func recordingDirectAcknowledgment(for itemID: String) -> EnqueueTransaction {
+            var acknowledged = directAcknowledgedIDs
+            acknowledged.insert(itemID)
+            return EnqueueTransaction(
+                version: version,
+                entries: entries,
+                cursorCheckpoint: cursorCheckpoint,
+                pendingGenerationRetirements: pendingGenerationRetirements,
+                directAcknowledgedItemIDs: acknowledged.sorted()
+            )
+        }
+    }
+
+    private struct EnqueueTransactionJournal: Codable, Equatable {
+        static let currentVersion = 2
+
+        let version: Int
+        var transactions: [EnqueueTransaction]
     }
 
     private struct OrphanPayload {
@@ -700,13 +765,15 @@ public final class FileOutbox {
     public func enqueueSequence(
         _ payloads: [Data],
         receiverIdentity: String,
-        cursorCheckpoint: FileOutboxCursorCheckpoint? = nil
+        cursorCheckpoint: FileOutboxCursorCheckpoint? = nil,
+        pendingGenerationRetirements: [String: Int] = [:]
     ) throws -> [FileOutboxItem] {
         guard !payloads.isEmpty else { return [] }
         let prepared = try prepareEnqueueTransaction(
             payloads,
             receiverIdentity: receiverIdentity,
             cursorCheckpoint: cursorCheckpoint,
+            pendingGenerationRetirements: pendingGenerationRetirements,
             stagedPayloadCount: payloads.count
         )
         let items = try commitEnqueueTransaction(
@@ -728,13 +795,15 @@ public final class FileOutbox {
             payloads,
             receiverIdentity: receiverIdentity,
             cursorCheckpoint: nil,
+            pendingGenerationRetirements: [:],
             stagedPayloadCount: stagedPayloadCount
         )
     }
 
     public func enqueueIfAbsent(
         _ payload: Data,
-        receiverIdentity: String
+        receiverIdentity: String,
+        pendingGenerationRetirements: [String: Int] = [:]
     ) throws -> FileOutboxEnqueueResult {
         try requireUploadAdmission()
         for item in try pendingItems() {
@@ -742,6 +811,16 @@ public final class FileOutbox {
             if try Data(contentsOf: item.fileURL) == payload {
                 return FileOutboxEnqueueResult(item: item, wasInserted: false)
             }
+        }
+        if !pendingGenerationRetirements.isEmpty {
+            guard let item = try enqueueSequence(
+                [payload],
+                receiverIdentity: receiverIdentity,
+                pendingGenerationRetirements: pendingGenerationRetirements
+            ).first else {
+                throw SequenceError.invalidManifest
+            }
+            return FileOutboxEnqueueResult(item: item, wasInserted: true)
         }
         return FileOutboxEnqueueResult(
             item: try enqueue(payload, receiverIdentity: receiverIdentity),
@@ -811,17 +890,44 @@ public final class FileOutbox {
 
     public func pendingCursorCheckpoint() throws -> FileOutboxCursorCheckpoint? {
         _ = try reconciledManifest()
-        return try loadEnqueueTransaction()?.cursorCheckpoint
+        return try loadEnqueueTransactions().lazy.compactMap(\.cursorCheckpoint).first
     }
 
-    public func acknowledgeCursorCheckpoint(
-        _ checkpoint: FileOutboxCursorCheckpoint
+    public func hasPendingGenerationRetirements(
+        _ retirements: [String: Int]
+    ) throws -> Bool {
+        guard !retirements.isEmpty else { return false }
+        _ = try reconciledManifest()
+        return try loadEnqueueTransactions().contains {
+            $0.finalizationRecord?.pendingGenerationRetirements == retirements
+        }
+    }
+
+    public func hasPendingGenerationRetirement(
+        typeCode: String,
+        generation: Int
+    ) throws -> Bool {
+        guard !typeCode.isEmpty, generation > 0 else { return false }
+        _ = try reconciledManifest()
+        return try loadEnqueueTransactions().contains {
+            $0.finalizationRecord?.pendingGenerationRetirements[typeCode] == generation
+        }
+    }
+
+    public func acknowledgeFinalizationRecord(
+        _ record: FileOutboxFinalizationRecord
     ) throws {
         try requireUploadAdmission()
-        guard let transaction = try loadEnqueueTransaction(),
-              transaction.cursorCheckpoint == checkpoint else {
+        var transactions = try loadEnqueueTransactions()
+        guard let transactionIndex = transactions.firstIndex(where: {
+            $0.finalizationRecord == record
+        }) else {
             throw FileOutboxCursorCheckpointError.checkpointMismatch
         }
+        guard transactionIndex == 0 else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        let transaction = transactions[transactionIndex]
         guard let manifest = try loadManifest() else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
@@ -829,7 +935,11 @@ public final class FileOutbox {
         let manifestEntries = Dictionary(
             uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
         )
+        let directAcknowledgedIDs = transaction.directAcknowledgedIDs
         guard transaction.entries.allSatisfy({ entry in
+            if directAcknowledgedIDs.contains(entry.id) {
+                return true
+            }
             guard let current = manifestEntries[entry.id],
                   Self.hasSameCollectionIdentity(current, entry),
                   !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
@@ -841,14 +951,90 @@ public final class FileOutbox {
         }) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
-        try removeIfExists(enqueueTransactionURL)
+        transactions.remove(at: transactionIndex)
+        try persistEnqueueTransactions(transactions)
+    }
+
+    public func acknowledgeCursorCheckpoint(
+        _ checkpoint: FileOutboxCursorCheckpoint
+    ) throws {
+        guard let record = try loadEnqueueTransactions().lazy
+            .compactMap(\.finalizationRecord)
+            .first(where: { $0.cursorCheckpoint == checkpoint }) else {
+            throw FileOutboxCursorCheckpointError.checkpointMismatch
+        }
+        try acknowledgeFinalizationRecord(record)
+    }
+
+    @discardableResult
+    public func recordDirectUploadAccepted(
+        itemID: String,
+        receiverIdentity: String
+    ) throws -> FileOutboxFinalizationRecord? {
+        try requireUploadAdmission()
+        guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
+            throw ReceiverOutboxIdentityError.missingReceiverIdentity
+        }
+        var transactions = try loadEnqueueTransactions()
+        if let transactionIndex = transactions.firstIndex(where: {
+            $0.finalizationRecord != nil && $0.entries.contains(where: { $0.id == itemID })
+        }) {
+            let transaction = transactions[transactionIndex]
+            guard let finalizationRecord = transaction.finalizationRecord else {
+                throw FileOutboxCursorCheckpointError.pendingCommit
+            }
+            guard transaction.entries.allSatisfy({
+                $0.receiverIdentity == receiverIdentity
+            }), finalizationRecord.cursorCheckpoint?.receiverIdentity
+                == receiverIdentity || finalizationRecord.cursorCheckpoint == nil else {
+                throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+            }
+            if !transaction.directAcknowledgedIDs.contains(itemID) {
+                try requireDirectRetirementAllowed(itemID: itemID)
+            }
+            let updated = transaction.recordingDirectAcknowledgment(for: itemID)
+            if updated != transaction {
+                transactions[transactionIndex] = updated
+                try persistEnqueueTransactions(transactions)
+            }
+            _ = try reconciledManifest()
+            guard transactionIndex == 0,
+                  updated.directAcknowledgedIDs == Set(updated.entries.map(\.id)) else {
+                return nil
+            }
+            return finalizationRecord
+        }
+        guard let item = try pendingItem(id: itemID) else {
+            // A replayed successful callback may follow durable local retirement.
+            return nil
+        }
+        guard item.receiverIdentity == receiverIdentity else {
+            throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+        }
+        try markUploaded(item)
+        return nil
+    }
+
+    public func directFinalizationRecordReady(
+        receiverIdentity: String
+    ) throws -> FileOutboxFinalizationRecord? {
+        try requireUploadAdmission()
+        _ = try reconciledManifest()
+        guard let transaction = try loadEnqueueTransactions().first,
+              let finalizationRecord = transaction.finalizationRecord,
+              transaction.entries.allSatisfy({
+                  $0.receiverIdentity == receiverIdentity
+              }),
+              finalizationRecord.cursorCheckpoint?.receiverIdentity
+                == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
+              transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)) else {
+            return nil
+        }
+        return finalizationRecord
     }
 
     public func uploadablePendingItems(for receiverIdentity: String) throws -> [FileOutboxItem] {
         try requireUploadAdmission()
-        if try pendingCursorCheckpoint() != nil {
-            throw FileOutboxCursorCheckpointError.pendingCommit
-        }
         guard !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
         }
@@ -860,7 +1046,11 @@ public final class FileOutbox {
         guard oldestReceiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        return items.prefix { $0.receiverIdentity == receiverIdentity }.map { $0 }
+        let uploadable = items.prefix { $0.receiverIdentity == receiverIdentity }.map { $0 }
+        for item in uploadable {
+            try requireDirectRetirementAllowed(itemID: item.id)
+        }
+        return uploadable
     }
 
     public func pendingItem(id: String) throws -> FileOutboxItem? {
@@ -871,18 +1061,22 @@ public final class FileOutbox {
     }
 
     public func markUploaded(_ item: FileOutboxItem) throws {
-        let current = try reconciledManifest().entries.first { $0.id == item.id }
-        let hasMailboxBinding = current?.mailboxBinding != nil
-        let hasDeliveryState = current?.deliveryState != nil
-        let hasEnvelope = try hasEnvelopeArtifact(for: item.id)
-        let hasIntent = try loadMailboxEnvelopeFinalizationIntent()?.itemID == item.id
-        if hasMailboxBinding || hasDeliveryState || hasEnvelope || hasIntent {
-            throw FileOutboxMailboxError.mailboxArtifactsRequireHold
-        }
+        try requireDirectRetirementAllowed(itemID: item.id)
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
         }
         _ = try reconciledManifest()
+    }
+
+    private func requireDirectRetirementAllowed(itemID: String) throws {
+        let current = try reconciledManifest().entries.first { $0.id == itemID }
+        let hasMailboxBinding = current?.mailboxBinding != nil
+        let hasDeliveryState = current?.deliveryState != nil
+        let hasEnvelope = try hasEnvelopeArtifact(for: itemID)
+        let hasIntent = try loadMailboxEnvelopeFinalizationIntent()?.itemID == itemID
+        if hasMailboxBinding || hasDeliveryState || hasEnvelope || hasIntent {
+            throw FileOutboxMailboxError.mailboxArtifactsRequireHold
+        }
     }
 
     public func beginClearIntent() throws {
@@ -1054,13 +1248,26 @@ public final class FileOutbox {
         return updated
     }
 
-    func cursorCheckpointReadyForDeliveryFinalization(
+    func finalizationRecordReadyForDelivery(
         itemID: String,
         ownership: OutboxDeliveryOwnershipV1
-    ) throws -> FileOutboxCursorCheckpoint? {
-        guard let transaction = try loadEnqueueTransaction(),
-              let checkpoint = transaction.cursorCheckpoint,
-              checkpoint.receiverIdentity == ownership.receiverBindingID,
+    ) throws -> FileOutboxFinalizationRecord? {
+        let transactions = try loadEnqueueTransactions()
+        guard let transactionIndex = transactions.firstIndex(where: {
+            $0.entries.contains(where: { $0.id == itemID })
+        }) else {
+            return nil
+        }
+        guard transactionIndex == 0 else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        let transaction = transactions[transactionIndex]
+        guard let finalizationRecord = transaction.finalizationRecord,
+              transaction.entries.allSatisfy({
+                  $0.receiverIdentity == ownership.receiverBindingID
+              }),
+              finalizationRecord.cursorCheckpoint?.receiverIdentity
+                == ownership.receiverBindingID || finalizationRecord.cursorCheckpoint == nil,
               transaction.entries.contains(where: { $0.id == itemID }) else {
             return nil
         }
@@ -1075,7 +1282,7 @@ public final class FileOutbox {
         }) else {
             return nil
         }
-        return checkpoint
+        return finalizationRecord
     }
 
     func finalizeCommittedMailboxDelivery(
@@ -1523,6 +1730,7 @@ public final class FileOutbox {
         _ payloads: [Data],
         receiverIdentity: String,
         cursorCheckpoint: FileOutboxCursorCheckpoint?,
+        pendingGenerationRetirements: [String: Int],
         stagedPayloadCount: Int
     ) throws -> (transaction: EnqueueTransaction, manifest: SequenceManifest) {
         try requireUploadAdmission()
@@ -1530,8 +1738,11 @@ public final class FileOutbox {
             throw SequenceError.invalidManifest
         }
         var manifest = try reconciledManifest()
-        if try loadEnqueueTransaction()?.cursorCheckpoint != nil {
-            throw FileOutboxCursorCheckpointError.pendingCommit
+        var transactions = try loadEnqueueTransactions()
+        guard pendingGenerationRetirements.allSatisfy({
+            !$0.key.isEmpty && $0.value > 0
+        }) else {
+            throw SequenceError.invalidManifest
         }
         var entries: [SequenceEntry] = []
         for _ in payloads {
@@ -1556,9 +1767,14 @@ public final class FileOutbox {
         let transaction = EnqueueTransaction(
             version: EnqueueTransaction.currentVersion,
             entries: entries,
-            cursorCheckpoint: cursorCheckpoint
+            cursorCheckpoint: cursorCheckpoint,
+            pendingGenerationRetirements: pendingGenerationRetirements.isEmpty
+                ? nil
+                : pendingGenerationRetirements,
+            directAcknowledgedItemIDs: nil
         )
-        try persistEnqueueTransaction(transaction)
+        transactions.append(transaction)
+        try persistEnqueueTransactions(transactions)
         for (entry, payload) in zip(entries, payloads).prefix(stagedPayloadCount) {
             let stagedURL = stagedPayloadURL(for: entry.id)
             try payload.write(to: stagedURL, options: [.atomic])
@@ -1580,7 +1796,19 @@ public final class FileOutbox {
         }
         var manifest = initialManifest
         var knownIDs = Set(manifest.entries.map(\.id))
+        let directAcknowledgedIDs = transaction.directAcknowledgedIDs
         for entry in transaction.entries {
+            guard entry.sequence < UInt64.max else {
+                throw SequenceError.exhausted
+            }
+            manifest.nextSequence = max(manifest.nextSequence, entry.sequence + 1)
+            if directAcknowledgedIDs.contains(entry.id) {
+                try removeIfExists(stagedPayloadURL(for: entry.id))
+                try removeIfExists(finalPayloadURL(for: entry.id))
+                manifest.entries.removeAll { $0.id == entry.id }
+                knownIDs.remove(entry.id)
+                continue
+            }
             let stagedURL = stagedPayloadURL(for: entry.id)
             let finalURL = finalPayloadURL(for: entry.id)
             let existing = manifest.entries.first { $0.id == entry.id }
@@ -1608,16 +1836,14 @@ public final class FileOutbox {
             if knownIDs.insert(entry.id).inserted {
                 manifest.entries.append(entry)
             }
-            guard entry.sequence < UInt64.max else {
-                throw SequenceError.exhausted
-            }
-            manifest.nextSequence = max(manifest.nextSequence, entry.sequence + 1)
         }
         try persistManifest(manifest)
-        if transaction.cursorCheckpoint == nil {
-            try removeIfExists(enqueueTransactionURL)
+        if transaction.finalizationRecord == nil {
+            try removeEnqueueTransaction(transaction)
         }
-        return transaction.entries.map { entry in
+        return transaction.entries
+            .filter { !directAcknowledgedIDs.contains($0.id) }
+            .map { entry in
             FileOutboxItem(
                 id: entry.id,
                 fileURL: finalPayloadURL(for: entry.id),
@@ -1628,10 +1854,21 @@ public final class FileOutbox {
         }
     }
 
-    private func persistEnqueueTransaction(_ transaction: EnqueueTransaction) throws {
+    private func persistEnqueueTransactions(
+        _ transactions: [EnqueueTransaction]
+    ) throws {
+        guard !transactions.isEmpty else {
+            try removeIfExists(enqueueTransactionURL)
+            return
+        }
+        try validateEnqueueTransactions(transactions)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(transaction).write(
+        let journal = EnqueueTransactionJournal(
+            version: EnqueueTransactionJournal.currentVersion,
+            transactions: transactions
+        )
+        try encoder.encode(journal).write(
             to: enqueueTransactionURL,
             options: [.atomic]
         )
@@ -1641,57 +1878,106 @@ public final class FileOutbox {
         )
     }
 
-    private func loadEnqueueTransaction() throws -> EnqueueTransaction? {
+    private func loadEnqueueTransactions() throws -> [EnqueueTransaction] {
         guard fileManager.fileExists(atPath: enqueueTransactionURL.path) else {
-            return nil
+            return []
         }
-        let transaction = try JSONDecoder().decode(
-            EnqueueTransaction.self,
-            from: Data(contentsOf: enqueueTransactionURL)
-        )
-        guard transaction.version == EnqueueTransaction.currentVersion,
-              !transaction.entries.isEmpty,
-              Set(transaction.entries.map(\.id)).count == transaction.entries.count,
-              Set(transaction.entries.map(\.sequence)).count == transaction.entries.count else {
-            throw SequenceError.invalidManifest
+        let data = try Data(contentsOf: enqueueTransactionURL)
+        let decoder = JSONDecoder()
+        let transactions: [EnqueueTransaction]
+        if let journal = try? decoder.decode(EnqueueTransactionJournal.self, from: data) {
+            guard journal.version == EnqueueTransactionJournal.currentVersion else {
+                throw SequenceError.invalidManifest
+            }
+            transactions = journal.transactions
+        } else {
+            transactions = [try decoder.decode(EnqueueTransaction.self, from: data)]
         }
-        return transaction
+        try validateEnqueueTransactions(transactions)
+        return transactions
     }
 
-    private func recoverEnqueueTransactionIfNeeded() throws {
-        guard let transaction = try loadEnqueueTransaction() else { return }
-        let loadedManifest = try loadManifest()
-        var manifest = loadedManifest ?? .empty
-        try Self.validate(manifest)
-        let manifestEntries = Dictionary(
-            uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
-        )
-        let allPayloadsAreRecoverable = !clearIntentIsActive
-            && transaction.entries.allSatisfy { entry in
-                fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
-                    || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
-                    || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
-            }
-        if allPayloadsAreRecoverable {
-            _ = try commitEnqueueTransaction(transaction, manifest: manifest)
-            return
+    private func validateEnqueueTransactions(
+        _ transactions: [EnqueueTransaction]
+    ) throws {
+        guard !transactions.isEmpty else {
+            throw SequenceError.invalidManifest
         }
-        if transaction.entries.contains(where: {
-            manifestEntries[$0.id]?.deliveryState?.phase == .committedFinalized
-        }) {
+        var allEntryIDs: Set<String> = []
+        var allSequences: Set<UInt64> = []
+        var previousLastSequence: UInt64?
+        for transaction in transactions {
+            let entryIDs = Set(transaction.entries.map(\.id))
+            let sequences = Set(transaction.entries.map(\.sequence))
+            let acknowledgedIDs = transaction.directAcknowledgedIDs
+            guard transaction.version == EnqueueTransaction.currentVersion,
+                  !transaction.entries.isEmpty,
+                  entryIDs.count == transaction.entries.count,
+                  sequences.count == transaction.entries.count,
+                  acknowledgedIDs.isSubset(of: entryIDs),
+                  transaction.pendingGenerationRetirements?.allSatisfy({
+                      !$0.key.isEmpty && $0.value > 0
+                  }) != false,
+                  acknowledgedIDs.isEmpty || transaction.finalizationRecord != nil,
+                  allEntryIDs.isDisjoint(with: entryIDs),
+                  allSequences.isDisjoint(with: sequences),
+                  transaction.entries.map(\.sequence) == transaction.entries.map(\.sequence).sorted(),
+                  previousLastSequence.map({ $0 < transaction.entries[0].sequence }) != false else {
+                throw SequenceError.invalidManifest
+            }
+            allEntryIDs.formUnion(entryIDs)
+            allSequences.formUnion(sequences)
+            previousLastSequence = transaction.entries.last?.sequence
+        }
+    }
+
+    private func removeEnqueueTransaction(_ transaction: EnqueueTransaction) throws {
+        var transactions = try loadEnqueueTransactions()
+        guard let index = transactions.firstIndex(of: transaction) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
+        transactions.remove(at: index)
+        try persistEnqueueTransactions(transactions)
+    }
 
-        let transactionIDs = Set(transaction.entries.map(\.id))
-        for entry in transaction.entries {
-            try removeIfExists(stagedPayloadURL(for: entry.id))
-            try removeIfExists(finalPayloadURL(for: entry.id))
+    private func recoverEnqueueTransactionsIfNeeded() throws {
+        let transactions = try loadEnqueueTransactions()
+        for transaction in transactions {
+            let loadedManifest = try loadManifest()
+            var manifest = loadedManifest ?? .empty
+            try Self.validate(manifest)
+            let manifestEntries = Dictionary(
+                uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
+            )
+            let allPayloadsAreRecoverable = !clearIntentIsActive
+                && transaction.entries.allSatisfy { entry in
+                    transaction.directAcknowledgedIDs.contains(entry.id)
+                        || fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
+                        || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
+                }
+            if allPayloadsAreRecoverable {
+                _ = try commitEnqueueTransaction(transaction, manifest: manifest)
+                continue
+            }
+            if !transaction.directAcknowledgedIDs.isEmpty
+                || transaction.entries.contains(where: {
+                manifestEntries[$0.id]?.deliveryState?.phase == .committedFinalized
+            }) {
+                throw FileOutboxCursorCheckpointError.pendingCommit
+            }
+
+            let transactionIDs = Set(transaction.entries.map(\.id))
+            for entry in transaction.entries {
+                try removeIfExists(stagedPayloadURL(for: entry.id))
+                try removeIfExists(finalPayloadURL(for: entry.id))
+            }
+            manifest.entries.removeAll { transactionIDs.contains($0.id) }
+            if manifest != loadedManifest {
+                try persistManifest(manifest)
+            }
+            try removeEnqueueTransaction(transaction)
         }
-        manifest.entries.removeAll { transactionIDs.contains($0.id) }
-        if manifest != loadedManifest {
-            try persistManifest(manifest)
-        }
-        try removeIfExists(enqueueTransactionURL)
     }
 
     private func removeIfExists(_ fileURL: URL) throws {
@@ -1700,7 +1986,7 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
-        try recoverEnqueueTransactionIfNeeded()
+        try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
         var manifest = loadedManifest ?? .empty
         try Self.validate(manifest)
