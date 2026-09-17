@@ -3,6 +3,7 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class AutomaticSyncEngineContractTests: XCTestCase {
+    @MainActor
     func testRunUsesDeterministicSnapshotContinuesReadFailureAndPayload() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }
@@ -288,6 +289,7 @@ private actor TypeCodeRecorder {
     }
 }
 
+@MainActor
 private final class PendingGenerationFixture {
     let store: BackgroundSyncSettingsStore
     private let root: URL
