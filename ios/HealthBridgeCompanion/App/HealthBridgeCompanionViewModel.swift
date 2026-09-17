@@ -400,6 +400,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 opportunity: opportunity,
                 processPendingTypes: processPendingTypes
             )
+        },
+        startOwner: { cancelOwner in
+            #if os(iOS)
+            let identifier = UIApplication.shared.beginBackgroundTask(
+                withName: "HealthBridge automatic sync",
+                expirationHandler: cancelOwner
+            )
+            return {
+                guard identifier != .invalid else { return }
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+            #else
+            return {}
+            #endif
         }
     )
     private var backgroundAutomaticSyncFailure: AutomaticSyncDiagnosticFailure?

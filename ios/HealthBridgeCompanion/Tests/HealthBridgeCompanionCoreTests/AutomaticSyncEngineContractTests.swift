@@ -134,6 +134,10 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
         XCTAssertEqual(Set(typeCodes).count, 14)
         var activeOwners = 0
         var maximumActiveOwners = 0
+        var activeOwnerLeases = 0
+        var maximumActiveOwnerLeases = 0
+        var ownerLeaseStartCount = 0
+        var ownerLeaseFinishCount = 0
         var opportunityCount = 0
         var opportunityDeliveryPhaseCount = 0
         var opportunityFinalStatusCount = 0
@@ -168,6 +172,18 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
                 }
                 _ = try await processPendingTypes()
                 opportunityDeliveryPhaseCount += 1
+            },
+            startOwner: { _ in
+                ownerLeaseStartCount += 1
+                activeOwnerLeases += 1
+                maximumActiveOwnerLeases = max(
+                    maximumActiveOwnerLeases,
+                    activeOwnerLeases
+                )
+                return {
+                    ownerLeaseFinishCount += 1
+                    activeOwnerLeases -= 1
+                }
             }
         )
         let callbackCount = typeCodes.count
@@ -240,6 +256,10 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
         XCTAssertEqual(processed, typeCodes)
         XCTAssertEqual(maximumActiveOwners, 1)
         XCTAssertEqual(activeOwners, 0)
+        XCTAssertEqual(ownerLeaseStartCount, 1)
+        XCTAssertEqual(ownerLeaseFinishCount, 1)
+        XCTAssertEqual(maximumActiveOwnerLeases, 1)
+        XCTAssertEqual(activeOwnerLeases, 0)
         XCTAssertEqual(opportunityCount, 2)
         XCTAssertEqual(opportunityDeliveryPhaseCount, 2)
         XCTAssertEqual(opportunityFinalStatusCount, 2)

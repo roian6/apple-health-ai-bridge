@@ -180,6 +180,7 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                                 )
                                 diagnostic.noteCompletion(.deferred)
                                 self.recoveryReadbackHandler(self.recovery.readback)
+                                _ = await eventHandler(healthType.typeCode, runID)
                                 return diagnostic
                             },
                             acknowledge: completion.call,

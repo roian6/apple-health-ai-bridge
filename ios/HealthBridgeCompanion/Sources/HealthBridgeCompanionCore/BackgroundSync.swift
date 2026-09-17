@@ -93,6 +93,12 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
 }
 
 public final class AutomaticSyncEngine: @unchecked Sendable {
+    public typealias CancelOwner = @Sendable () -> Void
+    public typealias FinishOwner = @MainActor @Sendable () -> Void
+    public typealias StartOwner = @MainActor @Sendable (
+        _ cancelOwner: @escaping CancelOwner
+    ) -> FinishOwner
+
     public struct Opportunity: Equatable, Sendable {
         public let reason: AutomaticSyncReason
         public let diagnosticRunID: UUID
@@ -146,19 +152,37 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
     private let pendingStore: BackgroundSyncSettingsStore
     private let processType: ProcessType
     private let performOpportunity: PerformOpportunity
+    private let startOwner: StartOwner
     @MainActor private var activeTask: Task<Result<Void, Error>, Never>?
     @MainActor private var trailingOpportunity: Opportunity?
+
+    @MainActor
+    private final class OwnerCompletion {
+        private var finishOwner: FinishOwner?
+
+        func install(_ finishOwner: @escaping FinishOwner) {
+            self.finishOwner = finishOwner
+        }
+
+        func finish() {
+            let finishOwner = finishOwner
+            self.finishOwner = nil
+            finishOwner?()
+        }
+    }
 
     public init(
         pendingStore: BackgroundSyncSettingsStore,
         processType: @escaping ProcessType,
-        performOpportunity: PerformOpportunity? = nil
+        performOpportunity: PerformOpportunity? = nil,
+        startOwner: StartOwner? = nil
     ) {
         self.pendingStore = pendingStore
         self.processType = processType
         self.performOpportunity = performOpportunity ?? { _, processPendingTypes in
             _ = try await processPendingTypes()
         }
+        self.startOwner = startOwner ?? { _ in {} }
     }
 
     @MainActor
@@ -212,7 +236,9 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             return (activeTask, false)
         }
         trailingOpportunity = nil
+        let ownerCompletion = OwnerCompletion()
         let task = Task { @MainActor [weak self] () -> Result<Void, Error> in
+            defer { ownerCompletion.finish() }
             guard let self else { return .success(()) }
             let result: Result<Void, Error>
             do {
@@ -230,6 +256,9 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             return result
         }
         activeTask = task
+        ownerCompletion.install(startOwner {
+            task.cancel()
+        })
         return (task, true)
     }
 
