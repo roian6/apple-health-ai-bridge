@@ -319,7 +319,7 @@ struct ContentView: View {
         } label: {
             CardRow(
                 title: "Settings",
-                subtitle: viewModel.pendingOutboxCount > 0 || viewModel.statusIsError ? "Connection and sync status" : "Connection and app details",
+                subtitle: "Connection, sync status, and app details",
                 systemImage: "gearshape.fill",
                 tint: .orange
             )
