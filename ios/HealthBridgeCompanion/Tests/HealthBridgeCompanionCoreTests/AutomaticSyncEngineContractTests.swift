@@ -200,7 +200,7 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
                         return .continueProcessing
                     } catch {
                         XCTFail("Durable observer admission failed: \(error)")
-                        return .deferAcknowledgement(nil)
+                        return .complete(nil)
                     }
                 },
                 eventHandler: {

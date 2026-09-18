@@ -82,7 +82,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
     }
 
     @MainActor
-    func testObserverDurableAdmissionFailureDoesNotAcknowledge() async {
+    func testObserverDurableAdmissionFailureAcknowledgesWithoutStartingContinuation() async {
         let draft = AutomaticSyncDiagnosticDraft(
             reason: .observer(typeCode: HealthBridgeHealthType.sleepAnalysis.typeCode)
         )
@@ -91,7 +91,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
             startedAt: Date(timeIntervalSince1970: 1_788_000_000),
             admissionHandler: {
                 events.append("admission")
-                return .deferAcknowledgement(draft)
+                return .complete(draft)
             },
             eventHandler: {
                 events.append("continuation")
@@ -100,7 +100,7 @@ final class AutomaticSyncDiagnosticsTests: XCTestCase {
             acknowledge: { events.append("acknowledge") },
             persistDiagnostic: { _, _ in events.append("persist") }
         )
-        XCTAssertEqual(events, ["admission", "persist"])
+        XCTAssertEqual(events, ["admission", "acknowledge", "persist"])
     }
 
     @MainActor

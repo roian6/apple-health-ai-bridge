@@ -2859,7 +2859,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     && self.settingsStore.receiverSettingsGenerationToken == expectedConnectionGeneration
             },
             observerAdmissionHandler: { [weak self] typeCode, diagnosticRunID in
-                guard let self else { return .deferAcknowledgement(nil) }
+                guard let self else { return .complete(nil) }
                 do {
                     try self.backgroundSyncStore.markPendingObserverTypeCodes([typeCode])
                 } catch {
@@ -2873,7 +2873,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         durableStateUnavailable: true
                     )
                     BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: self)
-                    return .deferAcknowledgement(diagnostic)
+                    return .complete(diagnostic)
                 }
                 return .continueProcessing
             },
