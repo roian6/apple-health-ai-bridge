@@ -304,6 +304,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var isRequestingHealthPermissions = false
     @Published var isCheckingConnection = false
     @Published var isSyncing = false
+    @Published private(set) var automaticSyncOwnerIsActive = false
     @Published var healthHistoryDepth: HealthHistoryDepth
     @Published var historicalBackfillState: HealthHistoricalBackfillState
     @Published private(set) var activityLogMessages: [String]
@@ -401,18 +402,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 processPendingTypes: processPendingTypes
             )
         },
-        startOwner: { cancelOwner in
+        startOwner: { [weak self] cancelOwner in
+            self?.automaticSyncOwnerIsActive = true
             #if os(iOS)
             let identifier = UIApplication.shared.beginBackgroundTask(
                 withName: "HealthBridge automatic sync",
                 expirationHandler: cancelOwner
             )
-            return {
+            return { [weak self] in
+                self?.automaticSyncOwnerIsActive = false
                 guard identifier != .invalid else { return }
                 UIApplication.shared.endBackgroundTask(identifier)
             }
             #else
-            return {}
+            return { [weak self] in
+                self?.automaticSyncOwnerIsActive = false
+            }
             #endif
         }
     )
@@ -741,7 +746,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             receiverURLString: receiverSettingsSaved ? receiverURLString : "",
             hasBearerToken: receiverSettingsSaved,
             healthPermissionsRequested: healthPermissionsRequested,
-            isSyncing: isSyncing,
+            isSyncing: syncPresentationIsActive,
             statusIsError: statusIsError,
             pendingOutboxCount: pendingOutboxCount
         )
@@ -749,6 +754,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     var setupState: CompanionSetupState {
         CompanionSetupState.evaluate(setupSnapshot)
+    }
+
+    var syncPresentationIsActive: Bool {
+        isSyncing || automaticSyncOwnerIsActive
     }
 
     var setupStateDetail: String {

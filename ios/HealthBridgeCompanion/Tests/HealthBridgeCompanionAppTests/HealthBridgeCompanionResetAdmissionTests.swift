@@ -67,6 +67,44 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(recorder.invocationCount, 1)
     }
 
+    func testAutomaticSyncOwnerPublishesOneCoarseSyncingState() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AutomaticSyncOwnerUIStateTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "AutomaticSyncOwnerUIStateTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settingsStore,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        )
+        var observedStates: [Bool] = []
+        let observation = viewModel.$automaticSyncOwnerIsActive.sink {
+            observedStates.append($0)
+        }
+
+        await viewModel.runBackgroundRefreshSync(reason: .launchCatchUp)
+        withExtendedLifetime(observation) {}
+
+        XCTAssertEqual(observedStates, [false, true, false])
+        XCTAssertFalse(viewModel.syncPresentationIsActive)
+    }
+
     func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
         let manager = FileManager.default
         let applicationSupport = try XCTUnwrap(
