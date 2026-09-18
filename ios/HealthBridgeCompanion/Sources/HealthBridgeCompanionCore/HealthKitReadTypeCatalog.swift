@@ -127,6 +127,7 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         healthTypes: [HealthBridgeHealthType] = HealthBridgeBackgroundSync.observedHealthTypes,
         registrationHandler: @escaping @MainActor (_ typeCode: String, _ succeeded: Bool) -> Void = { _, _ in },
         recoveryReadbackHandler: @escaping @MainActor (BackgroundDeliveryRecoveryReadback) -> Void = { _ in },
+        observerEntryHandler: @escaping @Sendable (_ typeCode: String, _ runID: UUID) -> Void = { _, _ in },
         isCurrent: @escaping @MainActor () -> Bool,
         observerAdmissionHandler: @escaping @MainActor (_ typeCode: String, _ runID: UUID) async -> AutomaticSyncObserverEventAdmission,
         observerCompletionHandler: @escaping @MainActor (AutomaticSyncDiagnosticDraft, TimeInterval) -> Void = { _, _ in },
@@ -150,11 +151,12 @@ public final class HealthKitBackgroundDeliveryCoordinator {
             }
             registrationTypes[healthType.typeCode] = sampleType
             let observer = HKObserverQuery(sampleType: sampleType, predicate: nil) { _, completionHandler, error in
+                let runID = UUID()
+                observerEntryHandler(healthType.typeCode, runID)
                 let completion = BackgroundObserverAcknowledgement(completionHandler)
                 let observerStartedAt = Date()
                 guard error == nil else {
                     let completionLatency = Date().timeIntervalSince(observerStartedAt)
-                    let runID = UUID()
                     Task { @MainActor [weak self] in
                         guard let self, self.callbackGeneration == expectedCallbackGeneration,
                               self.isCurrent() else {
@@ -195,7 +197,6 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                         completion.call()
                         return
                     }
-                    let runID = UUID()
                     await AutomaticSyncObserverEventLifecycle.process(
                         startedAt: observerStartedAt,
                         admissionHandler: {

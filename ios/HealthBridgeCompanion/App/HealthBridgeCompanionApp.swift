@@ -8,9 +8,20 @@ final class HealthBridgeCompanionApplicationRuntime {
     static let shared = HealthBridgeCompanionApplicationRuntime()
 
     let viewModel: HealthBridgeCompanionViewModel
+    private let backgroundLaunchPreparation: @MainActor () -> Void
 
-    init(viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel()) {
+    init(
+        viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel(),
+        backgroundLaunchPreparation: (@MainActor () -> Void)? = nil
+    ) {
         self.viewModel = viewModel
+        self.backgroundLaunchPreparation = backgroundLaunchPreparation ?? {
+            viewModel.prepareForBackgroundLaunch()
+        }
+    }
+
+    func prepareForBackgroundLaunch() {
+        backgroundLaunchPreparation()
     }
 
     func bootstrap() async {

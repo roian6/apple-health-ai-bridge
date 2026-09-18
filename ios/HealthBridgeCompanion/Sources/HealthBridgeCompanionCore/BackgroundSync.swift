@@ -816,6 +816,31 @@ private final class UserDefaultsBackgroundObserverDirtinessStore:
 }
 
 public final class BackgroundSyncSettingsStore {
+    private final class WakeEventRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private let userDefaults: UserDefaults
+        private let dateFormatter: ISO8601DateFormatter
+
+        init(userDefaults: UserDefaults) {
+            self.userDefaults = userDefaults
+            self.dateFormatter = ISO8601DateFormatter()
+            self.dateFormatter.formatOptions = [.withInternetDateTime]
+            self.dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        }
+
+        func record(at enteredAt: Date, source: String, summary: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            userDefaults.set(
+                dateFormatter.string(from: enteredAt),
+                forKey: Key.lastWakeEnteredAt
+            )
+            userDefaults.set(source, forKey: Key.lastWakeSource)
+            userDefaults.set(summary, forKey: Key.lastWakeSummary)
+            _ = userDefaults.synchronize()
+        }
+    }
+
     private enum Key {
         static let isEnabled = "healthBridge.backgroundSync.enabled"
         static let lastStartedAt = "healthBridge.backgroundSync.lastStartedAt"
@@ -851,6 +876,7 @@ public final class BackgroundSyncSettingsStore {
     private let observerDirtinessStore: any BackgroundObserverDirtinessStoring
     private let observerDirtinessUsesUserDefaults: Bool
     private let dateFormatter: ISO8601DateFormatter
+    private let wakeEventRecorder: WakeEventRecorder
 
     public convenience init() {
         self.init(
@@ -866,6 +892,7 @@ public final class BackgroundSyncSettingsStore {
         observerDirtinessStore: (any BackgroundObserverDirtinessStoring)? = nil
     ) {
         self.userDefaults = userDefaults
+        self.wakeEventRecorder = WakeEventRecorder(userDefaults: userDefaults)
         self.disableIntentStore = disableIntentStore
             ?? EphemeralBackgroundSyncDisableIntentStore()
         if let observerDirtinessStore {
@@ -1163,9 +1190,18 @@ public final class BackgroundSyncSettingsStore {
     }
 
     public func recordWakeEvent(at enteredAt: Date, source: String, summary: String) {
-        userDefaults.set(dateFormatter.string(from: enteredAt), forKey: Key.lastWakeEnteredAt)
-        userDefaults.set(source, forKey: Key.lastWakeSource)
-        userDefaults.set(summary, forKey: Key.lastWakeSummary)
+        wakeEventRecorder.record(at: enteredAt, source: source, summary: summary)
+    }
+
+    public func healthKitObserverEntryHandler() -> @Sendable (String, UUID) -> Void {
+        let recorder = wakeEventRecorder
+        return { typeCode, runID in
+            recorder.record(
+                at: Date(),
+                source: "healthkit_observer",
+                summary: "HealthKit observer closure entered; type=\(typeCode); run_id=\(runID.uuidString.lowercased())."
+            )
+        }
     }
 
     public func shouldRunForegroundCatchUp() -> Bool {

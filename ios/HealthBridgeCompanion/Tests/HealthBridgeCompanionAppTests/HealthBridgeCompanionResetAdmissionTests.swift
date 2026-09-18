@@ -1,11 +1,75 @@
 import Combine
 import CryptoKit
 import Foundation
+import UIKit
 import XCTest
 @testable import HealthBridgeCompanion
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testDidFinishLaunchingPreparesHealthKitObserversBeforeAsyncBootstrap() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ColdLaunchObserverPreparationTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "ColdLaunchObserverPreparationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        let bootstrapEntered = expectation(description: "async bootstrap entered")
+        let blocker = BlockingBootstrapCleanup(
+            onStart: { bootstrapEntered.fulfill() },
+            onCancel: {}
+        )
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settingsStore,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: try FileOutbox(directory: root.appendingPathComponent("outbox")),
+            cancelInheritedLegacyUploads: { await blocker.wait() }
+        )
+        var observerPreparationCompleted = false
+        let runtime = HealthBridgeCompanionApplicationRuntime(
+            viewModel: viewModel,
+            backgroundLaunchPreparation: {
+                observerPreparationCompleted = true
+            }
+        )
+        let delegate = HealthBridgeBackgroundURLSessionAppDelegate(
+            applicationRuntime: runtime
+        )
+
+        let didFinish = delegate.application(
+            UIApplication.shared,
+            didFinishLaunchingWithOptions: nil
+        )
+
+        XCTAssertTrue(didFinish)
+        XCTAssertTrue(observerPreparationCompleted)
+        let entry = await XCTWaiter.fulfillment(of: [bootstrapEntered], timeout: 2)
+        XCTAssertEqual(entry, .completed)
+        guard entry == .completed else {
+            blocker.release()
+            return
+        }
+        let joinedBootstrap = Task { @MainActor in
+            await runtime.bootstrap()
+        }
+        blocker.release()
+        await joinedBootstrap.value
+    }
+
     func testApplicationRuntimeCoalescesBackgroundAndVisibleBootstrapOnOneViewModel() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ApplicationRuntimeTests", isDirectory: true)

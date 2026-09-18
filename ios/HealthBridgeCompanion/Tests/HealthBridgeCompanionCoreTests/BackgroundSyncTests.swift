@@ -157,6 +157,23 @@ final class BackgroundSyncTests: XCTestCase {
         XCTAssertEqual(wake.summary, "Background handler entered from healthkit_observer")
     }
 
+    func testHealthKitObserverEntryHandlerPersistsCorrelatedRawEntry() throws {
+        let suiteName = "HealthBridgeObserverEntryTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = BackgroundSyncSettingsStore(userDefaults: defaults)
+        let runID = UUID(uuidString: "00112233-4455-6677-8899-AABBCCDDEEFF")!
+
+        store.healthKitObserverEntryHandler()("heart_rate", runID)
+
+        let wake = try XCTUnwrap(store.lastWakeEvent)
+        XCTAssertEqual(wake.source, "healthkit_observer")
+        XCTAssertEqual(
+            wake.summary,
+            "HealthKit observer closure entered; type=heart_rate; run_id=00112233-4455-6677-8899-aabbccddeeff."
+        )
+    }
+
     func testForegroundCatchUpRunsOnlyForDurablePendingGenerations() throws {
         let suiteName = "HealthBridgeForegroundCatchUpTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

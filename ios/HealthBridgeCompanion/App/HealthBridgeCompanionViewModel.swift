@@ -2317,6 +2317,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         runForegroundCatchUpIfNeeded()
     }
 
+    func prepareForBackgroundLaunch() {
+        guard backgroundSyncStore.isEnabled, healthPermissionsRequested else { return }
+        startHealthKitBackgroundDelivery(allowBeforeBootstrap: true)
+    }
+
     func importPairingText() async {
         await runTrackedPairingOperation { [weak self] in
             await self?.performImportPairingText()
@@ -2805,8 +2810,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func startHealthKitBackgroundDeliveryIfNeeded() {
+        startHealthKitBackgroundDelivery(allowBeforeBootstrap: false)
+    }
+
+    private func startHealthKitBackgroundDelivery(allowBeforeBootstrap: Bool) {
         #if canImport(HealthKit)
-        guard automaticSyncReady, backgroundSyncEnabled else { return }
+        let launchPreparationIsAllowed = allowBeforeBootstrap
+            && backgroundSyncStore.isEnabled
+            && healthPermissionsRequested
+        guard launchPreparationIsAllowed || (automaticSyncReady && backgroundSyncEnabled) else {
+            return
+        }
         guard HKHealthStore.isHealthDataAvailable() else {
             backgroundSyncStatus = "Automatic sync is on, but Apple Health data is not available on this device/build."
             return
@@ -2833,9 +2847,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             recoveryReadbackHandler: { [weak self] readback in
                 self?.automaticSyncRecoveryLine = readback.summary
             },
+            observerEntryHandler: backgroundSyncStore.healthKitObserverEntryHandler(),
             isCurrent: { [weak self] in
                 guard let self else { return false }
-                return self.backgroundSyncEnabled && self.automaticSyncReady
+                let lifecycleIsReady = self.automaticSyncReady
+                    || (allowBeforeBootstrap
+                        && self.backgroundSyncStore.isEnabled
+                        && self.healthPermissionsRequested)
+                return self.backgroundSyncEnabled && lifecycleIsReady
                     && self.terminalPayloadActionAdmissionIsOpen
                     && self.settingsStore.receiverSettingsGenerationToken == expectedConnectionGeneration
             },
@@ -3172,6 +3191,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     func noteBackgroundRefreshHandlerStarted(source: String) {
         guard terminalPayloadActionAdmissionIsOpen else { return }
+        if source == "healthkit_observer",
+           let wake = backgroundSyncStore.lastWakeEvent,
+           wake.source == source,
+           wake.summary.hasPrefix("HealthKit observer closure entered;") {
+            return
+        }
         backgroundSyncStore.recordWakeEvent(
             at: Date(),
             source: source,

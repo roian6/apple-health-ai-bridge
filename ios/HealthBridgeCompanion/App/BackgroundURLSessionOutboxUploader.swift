@@ -1003,6 +1003,7 @@ final class HealthBridgeBackgroundURLSessionAppDelegate: NSObject, UIApplication
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        applicationRuntime.prepareForBackgroundLaunch()
         bootstrapForBackgroundLaunch()
         return true
     }
