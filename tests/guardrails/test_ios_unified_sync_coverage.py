@@ -25,6 +25,9 @@ VIEW_MODEL = (
     / "HealthBridgeCompanionViewModel.swift"
 )
 APP = ROOT / "ios" / "HealthBridgeCompanion" / "App" / "HealthBridgeCompanionApp.swift"
+AUTOMATIC_SYNC_RUNTIME = (
+    ROOT / "ios" / "HealthBridgeCompanion" / "App" / "AutomaticSyncRuntime.swift"
+)
 CONTENT_VIEW = ROOT / "ios" / "HealthBridgeCompanion" / "App" / "ContentView.swift"
 UX_STATE = (
     ROOT
@@ -93,12 +96,13 @@ def test_healthkit_observer_restart_does_not_race_disable_against_enable() -> No
 
 def test_view_model_registers_and_syncs_unified_automatic_coverage() -> None:
     source = VIEW_MODEL.read_text()
+    runtime = AUTOMATIC_SYNC_RUNTIME.read_text()
 
     assert "optionalTypeCodes: []" not in source
-    assert "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in source
-    assert "func runBackgroundRefreshSync(" in source
-    assert "reason: AutomaticSyncReason" in source
-    assert "diagnosticRunID: UUID = UUID()" in source
+    assert "automaticQuantityTypeCodes: availableQuantityTypeCodes" in source
+    assert "func runAutomaticSync(" in runtime
+    assert "reason: AutomaticSyncReason" in runtime
+    assert "diagnosticRunID: UUID = UUID()" in runtime
     assert "typeCodes: [typeCode]" in source
     assert "historyDepth: .lastDays(1)" in source
 
@@ -117,18 +121,18 @@ def test_connection_check_does_not_report_queued_test_payload_as_passed() -> Non
 
 
 def test_background_entry_points_pass_explicit_sync_reasons() -> None:
-    view_model = VIEW_MODEL.read_text()
+    runtime = AUTOMATIC_SYNC_RUNTIME.read_text()
     app = APP.read_text()
 
-    observer_entry = view_model.split(
-        'self.noteBackgroundRefreshHandlerStarted(source: "healthkit_observer")', 1
-    )[1].split("BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded", 1)[0]
+    observer_entry = runtime.split("self?.engine.requestRunWithoutWaiting(", 1)[
+        1
+    ].split("return nil", 1)[0]
     assert "reason: .observer(typeCode: typeCode)" in observer_entry
     assert "diagnosticRunID: diagnosticRunID" in observer_entry
-    assert "runBackgroundRefreshSync(reason: .launchCatchUp)" in view_model
-    assert "await viewModel.handleBackgroundRefresh()" in app
-    handler = view_model.split("func handleBackgroundRefresh() async", 1)[1].split(
-        "private func runBackgroundRefreshSyncCollectingDiagnostic", 1
+    assert "engine.requestRun(reason: .launchCatchUp)" in runtime
+    assert "await applicationRuntime.handleBackgroundRefresh()" in app
+    handler = runtime.split("func handleBackgroundRefresh() async", 1)[1].split(
+        "func runAutomaticSync(", 1
     )[0]
     assert "reason: .scheduledRefresh" in handler
 
