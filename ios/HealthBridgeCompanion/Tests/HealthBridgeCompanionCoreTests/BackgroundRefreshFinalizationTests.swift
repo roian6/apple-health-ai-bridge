@@ -34,25 +34,6 @@ final class BackgroundRefreshFinalizationTests: XCTestCase {
         XCTAssertEqual(finalizations, 1)
     }
 
-    func testTerminalStateAndGenerationFenceBackgroundResubmission() {
-        XCTAssertTrue(BackgroundRefreshFinalizationPolicy.shouldScheduleNextRefresh(
-            enabled: true,
-            ready: true,
-            admissionOpen: true,
-            capturedGeneration: "current",
-            currentGeneration: "current"
-        ))
-        for blocked in 0..<4 {
-            XCTAssertFalse(BackgroundRefreshFinalizationPolicy.shouldScheduleNextRefresh(
-                enabled: blocked != 0,
-                ready: blocked != 1,
-                admissionOpen: blocked != 2,
-                capturedGeneration: "current",
-                currentGeneration: blocked == 3 ? "new" : "current"
-            ))
-        }
-    }
-
     func testRequestCoalescingConsumptionGenerationAndSubmissionFailure() throws {
         let requests = BackgroundRefreshRequestCoalescer()
         var submissions = 0

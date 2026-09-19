@@ -44,6 +44,11 @@ public final class AutomaticSyncDiagnosticDraft {
             triggerReason = .launchCatchUp
             triggerLane = nil
             observerCompletionLatencyBucket = .notApplicable
+        case .manualSync:
+            wakeSource = .launchCatchUp
+            triggerReason = .launchCatchUp
+            triggerLane = nil
+            observerCompletionLatencyBucket = .notApplicable
         }
     }
 

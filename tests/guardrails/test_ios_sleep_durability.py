@@ -18,6 +18,13 @@ FILE_OUTBOX_TESTS = (
     / "FileOutboxTests.swift"
 )
 APP = ROOT / "ios/HealthBridgeCompanion/App/HealthBridgeCompanionApp.swift"
+AUTOMATIC_SYNC_RUNTIME = (
+    ROOT / "ios/HealthBridgeCompanion/App/AutomaticSyncRuntime.swift"
+)
+BACKGROUND_SYNC = (
+    ROOT
+    / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/BackgroundSync.swift"
+)
 BACKGROUND_UPLOADER = (
     ROOT / "ios/HealthBridgeCompanion/App/BackgroundURLSessionOutboxUploader.swift"
 )
@@ -79,8 +86,7 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
     )
     expected_generation = operation.index(expected_capture)
     request = operation.index("try FileOutbox.beginTerminalResetRequest(")
-    stop = operation.index("automaticSyncActivated = false")
-    stop_healthkit = operation.index("stopHealthKitBackgroundDelivery()")
+    stop = operation.index("automaticSyncRuntime?.stopAdmission()")
     cancel = operation.index("await self.cancelAndAwaitForegroundPayloadTasks()")
     drain = operation.index("await self.drainTerminalBackgroundPayloadCancellation()")
     exclusive = operation.index("runWithExclusiveDirectOutboxTransfer")
@@ -96,7 +102,6 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
     assert (
         expected_generation
         < stop
-        < stop_healthkit
         < preparation_generation
         < request
         < cancel
@@ -239,7 +244,7 @@ def test_transient_installation_identity_and_bootstrap_failures_are_retryable() 
     ).read_text(encoding="utf-8")
     active_start = app_source.index("if newPhase == .active")
     active_end = app_source.index("} else {", active_start)
-    assert "await viewModel.bootstrap()" in app_source[active_start:active_end]
+    assert "await applicationRuntime.bootstrap()" in app_source[active_start:active_end]
 
 
 def test_nil_item_is_reconciled_by_exact_payload_before_migration() -> None:
@@ -609,11 +614,15 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
 def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     app = APP.read_text(encoding="utf-8")
+    runtime = AUTOMATIC_SYNC_RUNTIME.read_text(encoding="utf-8")
+    background_sync = BACKGROUND_SYNC.read_text(encoding="utf-8")
     bootstrap_start = source.index("func bootstrap() async")
     bootstrap_end = source.index("private func performBootstrap()", bootstrap_start)
     bootstrap = source[bootstrap_start:bootstrap_end]
-    sync_start = source.index("func runBackgroundRefreshSync(")
-    sync_end = source.index("private func performBackgroundRefreshSync", sync_start)
+    sync_start = source.index("private func ownBackgroundRefreshOpportunity(")
+    sync_end = source.index(
+        "private func recordUnavailableAutomaticSyncDiagnostic(", sync_start
+    )
     sync = source[sync_start:sync_end]
 
     assert "withTaskCancellationHandler" in bootstrap
@@ -621,15 +630,31 @@ def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> Non
     assert "bootstrapTask?.cancel()" in bootstrap
     assert "withTaskCancellationHandler" in sync
     assert "task.cancel()" in sync
+    request_start = background_sync.index(
+        "public func requestRun(\n        reason: AutomaticSyncReason"
+    )
+    request_end = background_sync.index(
+        "public func requestRunWithoutWaiting(", request_start
+    )
+    request = background_sync[request_start:request_end]
+    assert "withTaskCancellationHandler" in request
+    assert "request.task.cancel()" in request
+    handler_start = runtime.index("func handleBackgroundRefresh() async")
+    handler_end = runtime.index("func runAutomaticSync(", handler_start)
+    handler = runtime[handler_start:handler_end]
+    assert "engine.requestRun(" in handler
+    assert "bootstrapBeforeRun: true" in handler
+    assert handler.index("engine.requestRun(") < handler.index(
+        "BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded"
+    )
     background_task = app[app.index(".backgroundTask(") :]
     # Executable cancellation-boundary tests cover the shared lifecycle owner.
     # SwiftUI must await that owner rather than returning before its finalizer.
-    assert "await viewModel.handleBackgroundRefresh()" in background_task
+    assert "await applicationRuntime.handleBackgroundRefresh()" in background_task
     assert "guard !Task.isCancelled" not in background_task
     lifecycle = source.split("private func performBackgroundRefreshSync(", 1)[1]
     assert "await finalization.run" in lifecycle
     assert "await self.finalizeBackgroundRefresh(" in lifecycle
-    assert "BackgroundRefreshFinalizationPolicy.shouldScheduleNextRefresh(" in lifecycle
 
 
 def test_healthkit_queries_and_exclusive_gate_are_cancellation_aware() -> None:

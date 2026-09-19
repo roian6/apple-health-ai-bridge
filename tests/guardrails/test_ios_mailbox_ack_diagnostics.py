@@ -2,6 +2,9 @@ from pathlib import Path
 
 VIEW_MODEL = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift")
 APP = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionApp.swift")
+AUTOMATIC_SYNC_RUNTIME = Path(
+    "ios/HealthBridgeCompanion/App/AutomaticSyncRuntime.swift"
+)
 BACKGROUND_SYNC = Path(
     "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/BackgroundSync.swift"
 )
@@ -13,12 +16,11 @@ def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> No
     active_start = app.index("if newPhase == .active")
     foreground = app[active_start : app.index("} else {", active_start)]
 
-    assert startup.index("await viewModel.bootstrap()") < startup.index(
-        "viewModel.runForegroundMailboxReconciliationIfNeeded()"
+    assert startup.index("await applicationRuntime.bootstrap()") < startup.index(
+        "applicationRuntime.runForegroundCatchUpIfNeeded()"
     )
-    assert "viewModel.runForegroundCatchUpIfNeeded()" not in startup
-    assert foreground.index("await viewModel.bootstrap()") < foreground.index(
-        "viewModel.runForegroundCatchUpIfNeeded()"
+    assert foreground.index("await applicationRuntime.bootstrap()") < foreground.index(
+        "applicationRuntime.runForegroundCatchUpIfNeeded()"
     )
     active_guard = "guard !Task.isCancelled, scenePhase == .active else { return }"
     assert all(active_guard in block for block in (startup, foreground))
@@ -26,14 +28,13 @@ def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> No
     mailbox_entry_start = source.index(
         "func runForegroundMailboxReconciliationIfNeeded()"
     )
-    generic_start = source.index("func runForegroundCatchUpIfNeeded()")
+    mailbox_entry_end = source.index("func noteSceneLeftActive()", mailbox_entry_start)
     helper_start = source.index("private func reconcileForegroundMailboxDelivery(")
     helper_end = source.index(
         "private func reconcileMailboxDeliveryIfNeeded(", helper_start
     )
 
-    mailbox_entry = source[mailbox_entry_start:generic_start]
-    generic = source[generic_start:helper_start]
+    mailbox_entry = source[mailbox_entry_start:mailbox_entry_end]
     helper = source[helper_start:helper_end]
 
     assert "!Task.isCancelled" in mailbox_entry
@@ -45,12 +46,18 @@ def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> No
     assert "syncRecentStepCounts" not in mailbox_entry
     assert "requestHealthPermissions" not in mailbox_entry
 
-    mailbox_branch = generic.index("if settingsStore.activeTransport == .mailbox")
-    direct_guard = generic.index("guard\n            !Task.isCancelled")
+    runtime = AUTOMATIC_SYNC_RUNTIME.read_text(encoding="utf-8")
+    generic_start = runtime.index("func runForegroundCatchUpIfNeeded()")
+    generic = runtime[
+        generic_start : runtime.index("func noteSceneLeftActive()", generic_start)
+    ]
+    mailbox_branch = generic.index("if viewModel.usesMailboxTransport")
+    direct_guard = generic.index(
+        "guard viewModel.automaticSyncShouldRunForegroundCatchUp"
+    )
     assert mailbox_branch < direct_guard
-    assert "runForegroundMailboxReconciliationIfNeeded()" in generic
-    assert "runBackgroundRefreshSync(reason: .launchCatchUp)" in generic
-    assert "backgroundSyncEnabled" in generic
+    assert "viewModel.runForegroundMailboxReconciliationIfNeeded()" in generic
+    assert "engine.requestRun(reason: .launchCatchUp)" in generic
 
     bounded_phase = helper.index("reconcileMailboxDeliveryIfNeeded(")
     point = helper.index("at: .beforePayloadGeneration", bounded_phase)
@@ -94,7 +101,7 @@ def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:
     nonactive_scene = app[
         nonactive_start : app.index(".backgroundTask(", nonactive_start)
     ]
-    assert "viewModel.noteSceneLeftActive()" in nonactive_scene
+    assert "applicationRuntime.noteSceneLeftActive()" in nonactive_scene
     assert "if newPhase == .background" in nonactive_scene
 
     source = VIEW_MODEL.read_text(encoding="utf-8")
@@ -102,7 +109,9 @@ def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:
     entry_end = source.index("func noteSceneLeftActive()", entry_start)
     entry = source[entry_start:entry_end]
     reset_start = entry_end
-    reset_end = source.index("func runForegroundCatchUpIfNeeded()", reset_start)
+    reset_end = source.index(
+        "private func reconcileForegroundMailboxDelivery(", reset_start
+    )
     reset = source[reset_start:reset_end]
 
     assert "foregroundMailboxSceneIsActive = true" in entry
@@ -220,7 +229,7 @@ def test_delivery_phase_wrappers_preserve_ack_processing_order() -> None:
 def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     helper_start = source.index("private func reconcileMailboxDeliveryIfNeeded(")
-    helper_end = source.index("func runBackgroundRefreshSync(", helper_start)
+    helper_end = source.index("func performAutomaticSyncOpportunity(", helper_start)
     helper = source[helper_start:helper_end]
 
     assert "publishPendingFIFOHead()" in helper

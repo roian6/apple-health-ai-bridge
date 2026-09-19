@@ -438,9 +438,9 @@ def test_current_component_identities_are_explicit() -> None:
     assert '__version__: Final = "1.1.1"' in package_init
     assert '"version": "1.1.1"' in server_manifest
     assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 48;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 49;") == 2
     assert '?? "1.1.1"' in content_view
-    assert '?? "48"' in content_view
+    assert '?? "49"' in content_view
     assert "pre-1.0" not in security
 
 

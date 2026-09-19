@@ -257,7 +257,7 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "--repo",
         str(ROOT),
         "--tag",
-        "ios-v1.1.1-build.48",
+        "ios-v1.1.1-build.49",
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -267,7 +267,7 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "ios_marketing_version": "1.1.1",
         "project_version": "1.1.1",
         "release_scope": "ios",
-        "tag": "ios-v1.1.1-build.48",
+        "tag": "ios-v1.1.1-build.49",
     }
 
 
@@ -282,7 +282,7 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "schema_id": "health_bridge.batch.v1",
             "version": "1.0.0",
         },
-        "ios_companion": {"build": "48", "marketing_version": "1.1.1"},
+        "ios_companion": {"build": "49", "marketing_version": "1.1.1"},
         "receiver_cli": {"release_tag": "receiver-v1.1.1", "version": "1.1.1"},
         "release_scope": "ios",
         "schema_id": "health_bridge.component_versions.v1",
@@ -346,7 +346,7 @@ def test_release_validate_rejects_noncanonical_or_mismatched_tag(tag: str) -> No
 
     assert completed.returncode == 1
     assert completed.stdout == ""
-    assert "iOS release tag must be ios-v1.1.1-build.48" in completed.stderr
+    assert "iOS release tag must be ios-v1.1.1-build.49" in completed.stderr
 
 
 def test_receiver_and_ios_semver_order_does_not_define_compatibility(
@@ -1031,7 +1031,7 @@ def test_public_docs_name_each_version_surface_and_transition() -> None:
         assert label in readme
         assert label in versioning
     assert "receiver-v1.0.2" in versioning
-    assert "ios-v1.1.1-build.48" in versioning
+    assert "ios-v1.1.1-build.49" in versioning
     assert "Existing `v1.0.0` and `v1.0.1` tags remain immutable" in versioning
     assert (
         "Do not bump an unchanged component merely to make the numbers match"

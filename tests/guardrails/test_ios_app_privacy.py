@@ -888,7 +888,7 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     assert "Queued uploads and sync status" not in content_view
     assert "AppDetailsView" in content_view
     assert "DeveloperDiagnosticsView" not in content_view
-    assert "Connection and app details" in content_view
+    assert "Connection, sync status, and app details" in content_view
     assert 'title: "Settings"' in content_view
     assert "Permissions and app info" not in content_view
     assert "Permissions, troubleshooting, app info" not in content_view
@@ -1123,9 +1123,7 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     assert "guard includeAllSupportedHealthData else { return [] }" not in view_model
     assert "if includeAllSupportedHealthData {" not in view_model
     assert "typeCodes: [typeCode]" in view_model
-    assert (
-        "automaticQuantityTypeCodes: availableAutomaticQuantityTypeCodes" in view_model
-    )
+    assert "automaticQuantityTypeCodes: availableQuantityTypeCodes" in view_model
     assert 'Toggle("Include all supported health data"' not in content_view
     assert "Core access includes Steps, Workouts, and Sleep." not in content_view
     assert (
@@ -1467,15 +1465,18 @@ def test_ios_pairing_bootstrap_precedes_all_automatic_sync_entrypoints() -> None
     view_model = Path(
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
+    automatic_sync_runtime = Path(
+        "ios/HealthBridgeCompanion/App/AutomaticSyncRuntime.swift"
+    ).read_text()
     app = Path(
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionApp.swift"
     ).read_text()
 
     background_task = app.index(".backgroundTask(")
-    assert "await viewModel.handleBackgroundRefresh()" in app[background_task:]
-    handler = view_model.split("func handleBackgroundRefresh() async", 1)[1].split(
-        "private func runBackgroundRefreshSyncCollectingDiagnostic", 1
-    )[0]
+    assert "await applicationRuntime.handleBackgroundRefresh()" in app[background_task:]
+    handler = automatic_sync_runtime.split("func handleBackgroundRefresh() async", 1)[
+        1
+    ].split("func runAutomaticSync(", 1)[0]
     assert "bootstrapBeforeRun: true" in handler
     lifecycle = view_model.split("private func performBackgroundRefreshSync(", 1)[1]
     assert lifecycle.index("await self.bootstrap()") < lifecycle.index(

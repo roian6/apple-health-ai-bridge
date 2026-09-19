@@ -8,13 +8,40 @@ final class HealthBridgeCompanionApplicationRuntime {
     static let shared = HealthBridgeCompanionApplicationRuntime()
 
     let viewModel: HealthBridgeCompanionViewModel
+    let automaticSyncRuntime: AutomaticSyncRuntime
+    private let backgroundLaunchPreparation: @MainActor () -> Void
 
-    init(viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel()) {
+    init(
+        viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel(),
+        backgroundLaunchPreparation: (@MainActor () -> Void)? = nil
+    ) {
         self.viewModel = viewModel
+        let automaticSyncRuntime = AutomaticSyncRuntime(viewModel: viewModel)
+        self.automaticSyncRuntime = automaticSyncRuntime
+        viewModel.installAutomaticSyncRuntime(automaticSyncRuntime)
+        self.backgroundLaunchPreparation = backgroundLaunchPreparation ?? {
+            automaticSyncRuntime.prepareForBackgroundLaunch()
+        }
+    }
+
+    func prepareForBackgroundLaunch() {
+        backgroundLaunchPreparation()
     }
 
     func bootstrap() async {
         await viewModel.bootstrap()
+    }
+
+    func runForegroundCatchUpIfNeeded() {
+        automaticSyncRuntime.runForegroundCatchUpIfNeeded()
+    }
+
+    func noteSceneLeftActive() {
+        automaticSyncRuntime.noteSceneLeftActive()
+    }
+
+    func handleBackgroundRefresh() async {
+        await automaticSyncRuntime.handleBackgroundRefresh()
     }
 }
 
@@ -22,6 +49,7 @@ final class HealthBridgeCompanionApplicationRuntime {
 @MainActor
 struct HealthBridgeCompanionApp: App {
     @Environment(\.scenePhase) private var scenePhase
+    private let applicationRuntime = HealthBridgeCompanionApplicationRuntime.shared
     @StateObject private var viewModel = HealthBridgeCompanionApplicationRuntime.shared.viewModel
     #if os(iOS)
     @UIApplicationDelegateAdaptor(HealthBridgeBackgroundURLSessionAppDelegate.self) private var backgroundURLSessionAppDelegate
@@ -38,28 +66,27 @@ struct HealthBridgeCompanionApp: App {
                     Task { await viewModel.importPairingURL(url) }
                 }
                 .task {
-                    await viewModel.bootstrap()
+                    await applicationRuntime.bootstrap()
                     guard !Task.isCancelled, scenePhase == .active else { return }
-                    viewModel.runForegroundMailboxReconciliationIfNeeded()
+                    applicationRuntime.runForegroundCatchUpIfNeeded()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     if newPhase == .active {
                         Task { @MainActor in
-                            await viewModel.bootstrap()
+                            await applicationRuntime.bootstrap()
                             guard !Task.isCancelled, scenePhase == .active else { return }
-                            viewModel.runForegroundCatchUpIfNeeded()
+                            applicationRuntime.runForegroundCatchUpIfNeeded()
                         }
                     } else {
-                        viewModel.noteSceneLeftActive()
+                        applicationRuntime.noteSceneLeftActive()
                         if newPhase == .background {
                             viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
-                            BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
                         }
                     }
                 }
         }
         .backgroundTask(.appRefresh(HealthBridgeBackgroundSync.appRefreshIdentifier)) {
-            await viewModel.handleBackgroundRefresh()
+            await applicationRuntime.handleBackgroundRefresh()
         }
     }
 }

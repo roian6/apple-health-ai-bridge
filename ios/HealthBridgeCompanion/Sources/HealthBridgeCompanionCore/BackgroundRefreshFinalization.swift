@@ -84,15 +84,6 @@ public final class BackgroundRefreshFinalizationOwner {
     }
 }
 
-public enum BackgroundRefreshFinalizationPolicy {
-    public static func shouldScheduleNextRefresh(
-        enabled: Bool, ready: Bool, admissionOpen: Bool,
-        capturedGeneration: String, currentGeneration: String
-    ) -> Bool {
-        enabled && ready && admissionOpen && capturedGeneration == currentGeneration
-    }
-}
-
 @MainActor
 public final class BackgroundRefreshRequestCoalescer {
     private var submittedGeneration: String?

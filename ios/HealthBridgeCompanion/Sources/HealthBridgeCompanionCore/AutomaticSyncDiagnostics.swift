@@ -198,7 +198,6 @@ public struct AutomaticSyncPendingSnapshot: Equatable, Sendable {
 public enum AutomaticSyncObserverEventAdmission {
     case continueProcessing
     case complete(AutomaticSyncDiagnosticDraft?)
-    case deferAcknowledgement(AutomaticSyncDiagnosticDraft?)
 }
 
 @MainActor
@@ -223,9 +222,6 @@ enum AutomaticSyncObserverEventLifecycle {
             diagnostic = admittedDiagnostic
             completionLatency = now().timeIntervalSince(startedAt)
             acknowledge()
-        case .deferAcknowledgement(let admittedDiagnostic):
-            diagnostic = admittedDiagnostic
-            completionLatency = now().timeIntervalSince(startedAt)
         }
         guard let diagnostic else { return }
         persistDiagnostic(diagnostic, completionLatency)

@@ -254,10 +254,10 @@ struct ContentView: View {
             PrimaryButton(
                 title: "Sync Now",
                 subtitle: syncActionSubtitle,
-                systemImage: viewModel.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.up.arrow.down.circle.fill",
+                systemImage: viewModel.syncPresentationIsActive ? "arrow.triangle.2.circlepath" : "arrow.up.arrow.down.circle.fill",
                 tint: .indigo,
                 isDisabled: !viewModel.canRunPrimaryAction,
-                isLoading: viewModel.isSyncing
+                isLoading: viewModel.syncPresentationIsActive
             ) {
                 Task { await viewModel.performPrimaryAction() }
             }
@@ -319,7 +319,7 @@ struct ContentView: View {
         } label: {
             CardRow(
                 title: "Settings",
-                subtitle: viewModel.pendingOutboxCount > 0 || viewModel.statusIsError ? "Connection and sync status" : "Connection and app details",
+                subtitle: "Connection, sync status, and app details",
                 systemImage: "gearshape.fill",
                 tint: .orange
             )
@@ -346,9 +346,9 @@ struct ContentView: View {
     private var statusTitle: String {
         if viewModel.hasPendingPrivateStorageRecovery { return "Recovery Required" }
         if !viewModel.canSendConnectionTest && viewModel.pendingOutboxCount > 0 { return "Queued Uploads Waiting" }
+        if viewModel.syncPresentationIsActive && viewModel.canSendConnectionTest { return "Syncing" }
         if viewModel.statusIsError { return syncErrorTitle }
         if !viewModel.canSendConnectionTest { return "Not Connected" }
-        if viewModel.isSyncing { return "Syncing" }
         if viewModel.pendingOutboxCount > 0 { return "Waiting to Send" }
         if viewModel.backgroundSyncEnabled { return "Ready to Sync" }
         if viewModel.healthPermissionsRequested { return "Ready to Sync" }
@@ -361,6 +361,9 @@ struct ContentView: View {
         }
         if !viewModel.canSendConnectionTest && viewModel.pendingOutboxCount > 0 {
             return "Queued uploads remain on this iPhone. Reconnect from setup link to retry them."
+        }
+        if viewModel.syncPresentationIsActive && viewModel.canSendConnectionTest {
+            return "Updating allowed Apple Health data."
         }
         if viewModel.statusIsError { return userFacingStatusMessage }
         if !viewModel.canSendConnectionTest { return "Connect this iPhone before syncing." }
@@ -388,17 +391,19 @@ struct ContentView: View {
 
     private var statusColor: Color {
         if !viewModel.canSendConnectionTest && viewModel.pendingOutboxCount > 0 { return .orange }
-        if viewModel.statusIsError || !viewModel.canSendConnectionTest { return .red }
+        if !viewModel.canSendConnectionTest { return .red }
+        if viewModel.syncPresentationIsActive { return .green }
+        if viewModel.statusIsError { return .red }
         if viewModel.pendingOutboxCount > 0 { return .orange }
-        if viewModel.isSyncing || viewModel.backgroundSyncEnabled || viewModel.healthPermissionsRequested { return .green }
+        if viewModel.backgroundSyncEnabled || viewModel.healthPermissionsRequested { return .green }
         return .orange
     }
 
     private var statusSymbol: String {
         if !viewModel.canSendConnectionTest && viewModel.pendingOutboxCount > 0 { return "exclamationmark" }
         if !viewModel.canSendConnectionTest { return "xmark" }
+        if viewModel.syncPresentationIsActive { return "arrow.triangle.2.circlepath" }
         if viewModel.statusIsError || viewModel.pendingOutboxCount > 0 { return "exclamationmark" }
-        if viewModel.isSyncing { return "arrow.triangle.2.circlepath" }
         if viewModel.healthPermissionsRequested || viewModel.backgroundSyncEnabled { return "checkmark" }
         return "heart.text.square"
     }
@@ -791,7 +796,7 @@ private struct AppDetailsView: View {
 
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.1"
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "48"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "49"
         return "\(version) (\(build))"
     }
 }

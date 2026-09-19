@@ -37,9 +37,9 @@ def test_ios_1_1_1_build_48_leaves_receiver_1_1_1_unchanged() -> None:
     assert receiver == {"release_tag": "receiver-v1.1.1", "version": "1.1.1"}
     assert component_versions["release_scope"] == "ios"
     assert helper_info["CFBundleShortVersionString"] == "1.1.1"
-    assert ios == {"build": "48", "marketing_version": "1.1.1"}
+    assert ios == {"build": "49", "marketing_version": "1.1.1"}
     assert ios_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert ios_project.count("CURRENT_PROJECT_VERSION = 48;") == 2
+    assert ios_project.count("CURRENT_PROJECT_VERSION = 49;") == 2
 
 
 def test_receiver_1_1_1_release_notes_are_receiver_only_and_helper_bound() -> None:
