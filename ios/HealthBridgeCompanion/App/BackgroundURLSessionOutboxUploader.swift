@@ -47,6 +47,12 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         task: Task<BackgroundUploadCancellationResult, Never>
     )?
     @MainActor private var pendingLegacyCancellationFinalizationTaskIDs: Set<Int> = []
+    @MainActor private(set) var automaticContinuationAdmissionIsOpen = false
+
+    @MainActor
+    func setAutomaticContinuationAdmissionOpen(_ isOpen: Bool) {
+        automaticContinuationAdmissionIsOpen = isOpen
+    }
 
     private let sessionDelegateQueue: OperationQueue = {
         let queue = OperationQueue()
@@ -186,7 +192,10 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
 
     @MainActor
     private func scheduleNextDirectUploadIfPossible() async {
-        guard let outboxDirectory = currentOutboxDirectory() else { return }
+        guard automaticContinuationAdmissionIsOpen,
+              let outboxDirectory = currentOutboxDirectory() else {
+            return
+        }
         let settingsStore = ReceiverSettingsStore()
         let receiverURLString = settingsStore.receiverURLString
         guard settingsStore.activeTransport == .directHTTP,
@@ -203,7 +212,10 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                 receiverURL: receiverURL,
                 bearerToken: bearerToken,
                 receiverGeneration: settingsStore.receiverSettingsGenerationToken,
-                receiverBindingID: receiverBindingID
+                receiverBindingID: receiverBindingID,
+                isUploadAllowed: { [weak self] in
+                    self?.automaticContinuationAdmissionIsOpen == true
+                }
             )
         } catch {
             // The durable FIFO head remains available to the next admitted trigger.
@@ -992,19 +1004,14 @@ final class HealthBridgeBackgroundURLSessionAppDelegate: NSObject, UIApplication
         super.init()
     }
 
-    @discardableResult
-    func bootstrapForBackgroundLaunch() -> Task<Void, Never> {
-        Task { @MainActor in
-            await applicationRuntime.bootstrap()
-        }
-    }
-
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         applicationRuntime.prepareForBackgroundLaunch()
-        bootstrapForBackgroundLaunch()
+        Task { @MainActor [applicationRuntime = self.applicationRuntime] in
+            await applicationRuntime.bootstrap()
+        }
         return true
     }
 

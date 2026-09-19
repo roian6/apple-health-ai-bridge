@@ -4,6 +4,107 @@ import XCTest
 
 final class AutomaticSyncEngineContractTests: XCTestCase {
     @MainActor
+    func testCancelAndWaitCancelsCurrentOwnerAndDropsTrailingOpportunity() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let ownerStarted = expectation(description: "automatic owner started")
+        let ownerCancelled = expectation(description: "automatic owner cancelled")
+        var reasons: [AutomaticSyncReason] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { _, _ in .noPayload },
+            performOpportunity: { opportunity, _ in
+                reasons.append(opportunity.reason)
+                ownerStarted.fulfill()
+                do {
+                    let neverFinishes = AsyncStream<Void> { _ in }
+                    for await _ in neverFinishes {}
+                    try Task.checkCancellation()
+                } catch {
+                    ownerCancelled.fulfill()
+                    throw error
+                }
+            }
+        )
+        let owner = Task { @MainActor in
+            try? await engine.requestRun(reason: .launchCatchUp)
+        }
+        let started = await XCTWaiter.fulfillment(of: [ownerStarted], timeout: 2)
+        XCTAssertEqual(started, .completed)
+        guard started == .completed else {
+            owner.cancel()
+            return
+        }
+
+        engine.requestRunWithoutWaiting(
+            reason: .observer(typeCode: "heart_rate"),
+            diagnosticRunID: UUID()
+        )
+        await engine.cancelAndWait()
+        await owner.value
+
+        let cancelled = await XCTWaiter.fulfillment(of: [ownerCancelled], timeout: 2)
+        XCTAssertEqual(cancelled, .completed)
+        XCTAssertEqual(reasons, [.launchCatchUp])
+    }
+
+    @MainActor
+    func testCancellingFollowerReturnsWithoutCancellingOwnerOrTrailingOpportunity() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let ownerStarted = expectation(description: "owner started")
+        let followerEntered = expectation(description: "follower entered")
+        let followerCancelled = expectation(description: "follower returned cancellation")
+        var releaseOwner: CheckedContinuation<Void, Never>?
+        var reasons: [AutomaticSyncReason] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { _, _ in .noPayload },
+            performOpportunity: { opportunity, _ in
+                reasons.append(opportunity.reason)
+                guard opportunity.reason == .launchCatchUp else { return }
+                await withCheckedContinuation { continuation in
+                    releaseOwner = continuation
+                    ownerStarted.fulfill()
+                }
+            }
+        )
+        let owner = Task { @MainActor in
+            try? await engine.requestRun(reason: .launchCatchUp)
+        }
+        let started = await XCTWaiter.fulfillment(of: [ownerStarted], timeout: 2)
+        XCTAssertEqual(started, .completed)
+        guard started == .completed else {
+            owner.cancel()
+            return
+        }
+
+        let follower = Task { @MainActor in
+            followerEntered.fulfill()
+            do {
+                try await engine.requestRun(reason: .scheduledRefresh)
+            } catch is CancellationError {
+                followerCancelled.fulfill()
+            } catch {
+                XCTFail("Unexpected follower error: \(error)")
+            }
+        }
+        let entered = await XCTWaiter.fulfillment(of: [followerEntered], timeout: 2)
+        XCTAssertEqual(entered, .completed)
+        await Task.yield()
+        follower.cancel()
+
+        let returned = await XCTWaiter.fulfillment(of: [followerCancelled], timeout: 2)
+        XCTAssertEqual(returned, .completed)
+        XCTAssertEqual(reasons, [.launchCatchUp])
+
+        releaseOwner?.resume()
+        await owner.value
+        await follower.value
+        XCTAssertEqual(reasons, [.launchCatchUp, .scheduledRefresh])
+    }
+
+    @MainActor
     func testRunUsesDeterministicSnapshotContinuesReadFailureAndPayload() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }

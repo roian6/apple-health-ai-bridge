@@ -44,6 +44,7 @@ public enum AutomaticSyncReason: Equatable, Sendable {
     case observerBatch(typeCodes: [String])
     case scheduledRefresh
     case launchCatchUp
+    case manualSync
 
     public var observerTypeCodes: [String] {
         switch self {
@@ -51,7 +52,7 @@ public enum AutomaticSyncReason: Equatable, Sendable {
             return [typeCode]
         case .observerBatch(let typeCodes):
             return typeCodes
-        case .scheduledRefresh, .launchCatchUp:
+        case .scheduledRefresh, .launchCatchUp, .manualSync:
             return []
         }
     }
@@ -171,6 +172,57 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
         }
     }
 
+    private final class FollowerResultWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Result<Void, Error>?, Never>?
+        private var result: Result<Void, Error>?
+        private var isCancelled = false
+
+        func wait() async -> Result<Void, Error>? {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let result {
+                    lock.unlock()
+                    continuation.resume(returning: result)
+                } else if isCancelled {
+                    lock.unlock()
+                    continuation.resume(returning: nil)
+                } else {
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func complete(_ result: Result<Void, Error>) {
+            lock.lock()
+            guard !isCancelled, self.result == nil else {
+                lock.unlock()
+                return
+            }
+            let continuation = continuation
+            self.continuation = nil
+            if continuation == nil {
+                self.result = result
+            }
+            lock.unlock()
+            continuation?.resume(returning: result)
+        }
+
+        func cancel() {
+            lock.lock()
+            guard !isCancelled, result == nil else {
+                lock.unlock()
+                return
+            }
+            isCancelled = true
+            let continuation = continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(returning: nil)
+        }
+    }
+
     public init(
         pendingStore: BackgroundSyncSettingsStore,
         processType: @escaping ProcessType,
@@ -204,7 +256,18 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             bootstrapBeforeRun: bootstrapBeforeRun
         ))
         guard request.ownsTask else {
-            try await request.task.value.get()
+            let waiter = FollowerResultWaiter()
+            Task { @MainActor in
+                waiter.complete(await request.task.value)
+            }
+            let result = await withTaskCancellationHandler {
+                await waiter.wait()
+            } onCancel: {
+                waiter.cancel()
+            }
+            try Task.checkCancellation()
+            guard let result else { throw CancellationError() }
+            try result.get()
             return
         }
         let result = await withTaskCancellationHandler {
@@ -225,6 +288,20 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             diagnosticRunID: diagnosticRunID,
             bootstrapBeforeRun: false
         ))
+    }
+
+    @MainActor
+    public func cancelActiveOwner() {
+        trailingOpportunity = nil
+        activeTask?.cancel()
+    }
+
+    @MainActor
+    public func cancelAndWait() async {
+        trailingOpportunity = nil
+        guard let activeTask else { return }
+        activeTask.cancel()
+        _ = await activeTask.value
     }
 
     @MainActor

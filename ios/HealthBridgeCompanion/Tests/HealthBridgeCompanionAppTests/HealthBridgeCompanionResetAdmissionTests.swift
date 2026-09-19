@@ -46,6 +46,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 observerPreparationCompleted = true
             }
         )
+        XCTAssertTrue(runtime.automaticSyncRuntime.viewModel === viewModel)
         let delegate = HealthBridgeBackgroundURLSessionAppDelegate(
             applicationRuntime: runtime
         )
@@ -111,7 +112,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             applicationRuntime: runtime
         )
 
-        let backgroundLaunch = delegate.bootstrapForBackgroundLaunch()
+        let backgroundLaunch = Task { @MainActor in
+            await runtime.bootstrap()
+        }
         let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 2)
         XCTAssertEqual(entry, .completed)
         guard entry == .completed else {
@@ -162,11 +165,18 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             observedStates.append($0)
         }
 
-        await viewModel.runBackgroundRefreshSync(reason: .launchCatchUp)
+        let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
         withExtendedLifetime(observation) {}
 
         XCTAssertEqual(observedStates, [false, true, false])
         XCTAssertFalse(viewModel.syncPresentationIsActive)
+
+        let uploader = BackgroundURLSessionOutboxUploader.shared
+        uploader.setAutomaticContinuationAdmissionOpen(true)
+        defer { uploader.setAutomaticContinuationAdmissionOpen(false) }
+        runtime.automaticSyncRuntime.stopAdmission()
+        XCTAssertFalse(uploader.automaticContinuationAdmissionIsOpen)
     }
 
     func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
@@ -236,9 +246,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         let entered = expectation(description: "before real background handler")
         let returned = expectation(description: "real handler returned after cancellation finalization")
         var resume: CheckedContinuation<Void, Never>?
+        let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
         let task = Task { @MainActor in
             await withCheckedContinuation { resume = $0; entered.fulfill() }
-            await viewModel.handleBackgroundRefresh()
+            await runtime.handleBackgroundRefresh()
             XCTAssertEqual(background.lastRun?.outcome, .interrupted)
             XCTAssertEqual(diagnostics.latestRecord?.failure?.category, .cancellation)
             returned.fulfill()
