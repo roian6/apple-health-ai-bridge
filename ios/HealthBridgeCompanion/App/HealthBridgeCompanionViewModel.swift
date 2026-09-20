@@ -1683,7 +1683,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               connectionTerminalBarrier.admissionIsOpen else {
             return
         }
-        guard !hasPendingPrivateStorageRecovery, outboxIdentityMigrationReady else { return }
+        let recoverCommittedReceiverRemoval =
+            currentCommittedReceiverRemovalCancellationGeneration() != nil
+        if !recoverCommittedReceiverRemoval {
+            guard !hasPendingPrivateStorageRecovery, outboxIdentityMigrationReady else { return }
+        }
         guard !isPairing else { return }
         guard (try? pairingCoordinator.hasPendingPairing()) != false else { return }
         isPairing = true
@@ -1698,9 +1702,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             if try pairingCoordinator.hasPendingCancellationRecovery() {
                 _ = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                     cancelPairingOperation: false,
-                    advanceGeneration: false
+                    advanceGeneration: false,
+                    recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval
                 ) { expectedGeneration in
-                    try self.pairingCoordinator.finishPendingCancellationIfNeeded(
+                    if recoverCommittedReceiverRemoval {
+                        try self.pairingStateStore.resetPrivatePairingState()
+                        try self.settingsStore.resetInvalidConnectionRecord()
+                        return true
+                    }
+                    return try self.pairingCoordinator.finishPendingCancellationIfNeeded(
                         expectedGeneration: expectedGeneration
                     )
                 }
@@ -1943,6 +1953,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func requireTrustedEmptyOutboxForConnectionTransition(
         outboxIdentityAdmissionWasReady: Bool,
+        expectedGeneration: String? = nil,
+        recoverCommittedReceiverRemoval: Bool = false,
         diagnosePairingCommitBarriers: Bool = false
     ) throws {
         guard let outbox else {
@@ -1959,6 +1971,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 throw ReceiverPairingCommitBarrierError.outboxUnreadable
             }
             throw error
+        }
+        if recoverCommittedReceiverRemoval {
+            guard currentCommittedReceiverRemovalCancellationGeneration()
+                    == expectedGeneration else {
+                throw ReceiverSettingsGenerationError.staleGeneration
+            }
+            guard pendingItemCount == 0, !outbox.destructiveRecoveryIsRequested else {
+                throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
+            }
+            return
         }
         if diagnosePairingCommitBarriers {
             if let failure = ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
@@ -1977,6 +1999,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         ) else {
             throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
         }
+    }
+
+    private func currentCommittedReceiverRemovalCancellationGeneration() -> String? {
+        let currentGeneration = settingsStore.receiverSettingsGenerationToken
+        guard settingsStore.terminalCancellationExpectedGeneration == currentGeneration,
+              (try? settingsStore.loadBearerToken()) == "",
+              settingsStore.receiverURLString
+                != ReceiverSettingsStore.defaultReceiverURLString else {
+            return nil
+        }
+        return currentGeneration
     }
 
     private func refreshHistoricalBackfillPublishedStateIfAllowed() {
@@ -2030,6 +2063,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func performTerminalConnectionTransitionWhileHoldingRequestGate<Result>(
         cancelPairingOperation: Bool,
         advanceGeneration: Bool = true,
+        recoverCommittedReceiverRemoval: Bool = false,
         diagnosePairingCommitBarriers: Bool = false,
         commit: @escaping @MainActor (String) async throws -> Result
     ) async throws -> (
@@ -2082,6 +2116,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             commit: { expectedGeneration in
                 try self.requireTrustedEmptyOutboxForConnectionTransition(
                     outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady,
+                    expectedGeneration: expectedGeneration,
+                    recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval,
                     diagnosePairingCommitBarriers: diagnosePairingCommitBarriers
                 )
                 let result = try await commit(expectedGeneration)
