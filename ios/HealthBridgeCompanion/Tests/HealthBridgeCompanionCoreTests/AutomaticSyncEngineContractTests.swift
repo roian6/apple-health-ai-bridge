@@ -143,6 +143,25 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
     }
 
     @MainActor
+    func testEngineNeverProcessesTypeWithoutDurableGeneration() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                return .noPayload
+            }
+        )
+
+        try await engine.requestRun(reason: .launchCatchUp)
+        let processed = await observed.values
+
+        XCTAssertEqual(processed, [])
+    }
+
+    @MainActor
     func testSecondTriggerDoesNotDuplicateAlreadyStagedGenerations() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }

@@ -2769,13 +2769,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         automaticSyncReady && backgroundSyncEnabled
     }
 
-    var automaticSyncShouldRunForegroundCatchUp: Bool {
-        !Task.isCancelled
+    func automaticSyncShouldRunForegroundCatchUp(
+        opportunityWasConsumed: Bool
+    ) -> Bool {
+        let prerequisitesAreReady = !Task.isCancelled
             && terminalPayloadActionAdmissionIsOpen
             && automaticSyncReady
             && backgroundSyncEnabled
             && canSendConnectionTest
-            && backgroundSyncStore.shouldRunForegroundCatchUp()
+        guard prerequisitesAreReady else { return false }
+        return AutomaticSyncTriggerPolicy.admitsForegroundLaunchReconciliation(
+            prerequisitesAreReady: true,
+            opportunityWasConsumed: opportunityWasConsumed
+        )
     }
 
     func installAutomaticSyncRuntime(_ runtime: AutomaticSyncRuntime) {
@@ -2818,6 +2824,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             && terminalPayloadActionAdmissionIsOpen
             && settingsStore.receiverSettingsGenerationToken
                 == expectedConnectionGeneration
+    }
+
+    func automaticSyncSelectedEligibleTypeCodes() -> [String] {
+        #if canImport(HealthKit)
+        return HealthKitReadTypeCatalog.availableTypeCodes(
+            forTypeCodes: enabledHealthPermissionTypeCodes
+        )
+        #else
+        return []
+        #endif
     }
 
     #if canImport(HealthKit)
@@ -3345,16 +3361,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             runID: diagnosticRunID
         )
         diagnostic.noteObserverAcknowledged()
-        noteAutomaticSyncPending(
-            diagnostic,
-            initial: true,
-            fallbackTypeCodes: reason.observerTypeCodes
-        )
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
         let taskID = UUID()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.performBackgroundRefreshSync(
+                reason: reason,
                 diagnostic: diagnostic,
                 bootstrapBeforeRun: bootstrapBeforeRun,
                 capturedGeneration: expectedGeneration,
@@ -3569,6 +3581,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func performBackgroundRefreshSync(
+        reason: AutomaticSyncReason,
         diagnostic: AutomaticSyncDiagnosticDraft,
         bootstrapBeforeRun: Bool = false,
         capturedGeneration: String? = nil,
@@ -3584,6 +3597,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 self.noteBackgroundRefreshHandlerStarted(source: "bg_app_refresh")
             }
             await self.performBackgroundRefreshWork(
+                reason: reason,
                 diagnostic: diagnostic,
                 expectedGeneration: expectedGeneration,
                 processPendingTypes: processPendingTypes
@@ -3642,6 +3656,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func performBackgroundRefreshWork(
+        reason: AutomaticSyncReason,
         diagnostic: AutomaticSyncDiagnosticDraft,
         expectedGeneration: String,
         processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes
@@ -3650,14 +3665,23 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard !Task.isCancelled,
               settingsStore.receiverSettingsGenerationToken == expectedGeneration else {
             diagnostic.noteFailure(.classified(stage: .unknown, isCancellation: true))
+            noteAutomaticSyncPending(
+                diagnostic, initial: true, fallbackTypeCodes: reason.observerTypeCodes
+            )
             return
         }
         guard terminalPayloadActionAdmissionIsOpen else {
             diagnostic.notePrerequisitesUnavailable()
+            noteAutomaticSyncPending(
+                diagnostic, initial: true, fallbackTypeCodes: reason.observerTypeCodes
+            )
             return
         }
         guard automaticSyncReady else {
             diagnostic.notePrerequisitesUnavailable()
+            noteAutomaticSyncPending(
+                diagnostic, initial: true, fallbackTypeCodes: reason.observerTypeCodes
+            )
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3670,6 +3694,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard backgroundSyncEnabled else {
             diagnostic.notePrerequisitesUnavailable()
+            noteAutomaticSyncPending(
+                diagnostic, initial: true, fallbackTypeCodes: reason.observerTypeCodes
+            )
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3683,6 +3710,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
         guard canSendConnectionTest else {
             diagnostic.notePrerequisitesUnavailable()
+            noteAutomaticSyncPending(
+                diagnostic, initial: true, fallbackTypeCodes: reason.observerTypeCodes
+            )
             recordBackgroundSyncRunIfAllowed(
                 startedAt: startedAt,
                 finishedAt: Date(),
@@ -3696,6 +3726,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
         let observerGenerationSnapshot: [String: Int]
         do {
+            let pendingGenerations = try backgroundSyncStore
+                .loadPendingObserverTypeCodeGenerations()
+            let admittedTypeCodes = AutomaticSyncTriggerPolicy.selectedTypeCodes(
+                for: reason,
+                selectedEligibleTypeCodes: automaticSyncSelectedEligibleTypeCodes(),
+                pendingGenerations: pendingGenerations
+            ).filter { pendingGenerations[$0] == nil }
+            if !admittedTypeCodes.isEmpty {
+                try backgroundSyncStore.markPendingObserverTypeCodes(admittedTypeCodes)
+            }
             observerGenerationSnapshot = try backgroundSyncStore
                 .loadPendingObserverTypeCodeGenerations()
         } catch {

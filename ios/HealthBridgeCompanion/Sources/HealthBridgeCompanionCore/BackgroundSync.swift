@@ -58,6 +58,34 @@ public enum AutomaticSyncReason: Equatable, Sendable {
     }
 }
 
+public enum AutomaticSyncTriggerPolicy {
+    public static func selectedTypeCodes(
+        for reason: AutomaticSyncReason,
+        selectedEligibleTypeCodes: [String],
+        pendingGenerations: [String: Int]
+    ) -> [String] {
+        let pendingTypeCodes = Array(pendingGenerations.keys)
+        switch reason {
+        case .scheduledRefresh, .launchCatchUp:
+            return GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: pendingTypeCodes + selectedEligibleTypeCodes
+            )
+        case .observer, .observerBatch, .manualSync:
+            return GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: pendingTypeCodes
+            )
+        }
+    }
+
+    public static func admitsForegroundLaunchReconciliation(
+        prerequisitesAreReady: Bool,
+        opportunityWasConsumed: Bool
+    ) -> Bool {
+        prerequisitesAreReady
+            && !opportunityWasConsumed
+    }
+}
+
 public struct AutomaticSyncTypeResult: Equatable, Sendable {
     fileprivate enum Disposition: Equatable, Sendable {
         case noPayload
