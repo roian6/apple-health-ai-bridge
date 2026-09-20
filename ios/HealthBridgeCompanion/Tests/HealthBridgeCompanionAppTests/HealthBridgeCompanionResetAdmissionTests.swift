@@ -749,6 +749,105 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try outbox.pendingItems().count, 0)
     }
 
+    func testBootstrapRetiresCancellationAfterReceiverRemovalCommitsBeforeMirrors() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "HealthBridgeResetAdmissionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let receiverTokenStore = MemoryReceiverTokenStore()
+        let preCutoverBackupStore = MemoryReceiverTokenStore()
+        let pendingStore = MemoryReceiverTokenStore()
+        let installationIDStore = MemoryReceiverTokenStore()
+        let cancellationStore = MemoryReceiverTokenStore()
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: receiverTokenStore,
+            preCutoverBackupStore: preCutoverBackupStore,
+            synchronize: { true }
+        )
+        try settingsStore.save(
+            receiverURLString: "https://old.example/v1/batches",
+            bearerToken: "synthetic-device-credential",
+            rotateBindingID: true
+        )
+        let pairingStateStore = ReceiverPairingStateStore(
+            pendingStore: pendingStore,
+            installationIDStore: installationIDStore,
+            cancellationStore: cancellationStore,
+            installationIDGenerator: { "synthetic-installation" },
+            deviceCredentialGenerator: { "synthetic-pairing-credential" }
+        )
+        _ = try pairingStateStore.stage(invitation: syntheticInvitation())
+        let cancellationGeneration = settingsStore.receiverSettingsGenerationToken
+        let coordinator = ReceiverPairingCoordinator(
+            client: ReceiverClient(),
+            stateStore: pairingStateStore,
+            settingsStore: settingsStore
+        )
+        try coordinator.beginPendingCancellation(
+            expectedGeneration: cancellationGeneration
+        )
+
+        try receiverTokenStore.saveToken("")
+
+        let relaunchedSettingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: receiverTokenStore,
+            preCutoverBackupStore: preCutoverBackupStore,
+            synchronize: { true }
+        )
+        let relaunchedPairingStateStore = ReceiverPairingStateStore(
+            pendingStore: pendingStore,
+            installationIDStore: installationIDStore,
+            cancellationStore: cancellationStore,
+            installationIDGenerator: { "synthetic-installation" },
+            deviceCredentialGenerator: { "synthetic-pairing-credential" }
+        )
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        XCTAssertEqual(try outbox.pendingItems().count, 0)
+        XCTAssertEqual(
+            relaunchedSettingsStore.terminalCancellationExpectedGeneration,
+            cancellationGeneration
+        )
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverSettingsGenerationToken,
+            cancellationGeneration
+        )
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverURLString,
+            "https://old.example/v1/batches"
+        )
+        XCTAssertEqual(try relaunchedSettingsStore.loadBearerToken(), "")
+
+        let relaunchedViewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: relaunchedSettingsStore,
+            pairingStateStore: relaunchedPairingStateStore,
+            outbox: outbox
+        )
+        await relaunchedViewModel.bootstrap()
+
+        XCTAssertNil(relaunchedSettingsStore.terminalCancellationExpectedGeneration)
+        XCTAssertNil(try relaunchedPairingStateStore.loadPending())
+        XCTAssertFalse(try relaunchedPairingStateStore.hasPendingCancellation())
+        XCTAssertFalse(relaunchedViewModel.hasPendingPairing)
+        XCTAssertTrue(try relaunchedSettingsStore.receiverSettingsAreCleared())
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverURLString,
+            ReceiverSettingsStore.defaultReceiverURLString
+        )
+    }
+
     func testConfirmedResetRejectsBootstrapReadmissionWhileCancellationIsDraining() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)
