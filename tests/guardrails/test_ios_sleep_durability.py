@@ -601,10 +601,29 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
         "public func beginTerminalCancellationIntent", reset_start
     )
     reset = file_outbox[reset_start:reset_end]
-    assert "if try loadStoredConnectionRecord() != nil" in reset
-    assert "let legacyToken = try tokenStore.loadToken()" in reset
-    assert "explicitLegacyURL == nil" in reset
-    assert "destructiveResetNotRequired" in reset
+    stored_start = reset.index("if let stored = try loadStoredConnectionRecord()")
+    legacy_start = reset.index("} else {", stored_start)
+    legacy_end = reset.index(
+        "} catch ReceiverSettingsRecordError.invalidRecord", legacy_start
+    )
+    stored_record = reset[stored_start:legacy_start]
+    legacy_record = reset[legacy_start:legacy_end]
+    for required_mailbox_exception in (
+        "guard case .v2(let record) = stored",
+        "case .paired(activeTransport: .mailbox) = record.activation",
+        "directHTTPConfiguration(in: record) == nil",
+        "terminalCancellationExpectedGeneration",
+        '== "g\\(record.localScope.generation)"',
+        "throw ReceiverSettingsRecordError.destructiveResetNotRequired",
+        "committedMailboxRemovalGeneration = record.localScope.generation",
+    ):
+        assert required_mailbox_exception in stored_record
+    assert "replacementGeneration = committedMailboxRemovalGeneration" in reset
+    assert "let legacyToken = try tokenStore.loadToken()" in legacy_record
+    assert "explicitLegacyURL == nil" in legacy_record
+    assert (
+        "throw ReceiverSettingsRecordError.destructiveResetNotRequired" in legacy_record
+    )
     assert "catch ReceiverSettingsRecordError.invalidRecord" in reset
     assert "catch KeychainReceiverTokenStoreError.invalidData" in reset
     assert "catch {" not in reset
