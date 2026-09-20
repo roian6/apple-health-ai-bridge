@@ -774,9 +774,11 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             preCutoverBackupStore: preCutoverBackupStore,
             synchronize: { true }
         )
+        let receiverURLString = "https://old.example/v1/batches"
+        let bearerToken = "synthetic-device-credential"
         try settingsStore.save(
-            receiverURLString: "https://old.example/v1/batches",
-            bearerToken: "synthetic-device-credential",
+            receiverURLString: receiverURLString,
+            bearerToken: bearerToken,
             rotateBindingID: true
         )
         let pairingStateStore = ReceiverPairingStateStore(
@@ -820,6 +822,13 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             mailboxIdentity: .available(mailboxIdentity),
             activation: .paired(activeTransport: .mailbox),
             transportConfigurations: [
+                .directHTTP(
+                    activation: .inactive,
+                    configuration: DirectHTTPConnectionConfigurationV1(
+                        receiverURLString: receiverURLString,
+                        bearerToken: bearerToken
+                    )
+                ),
                 .mailbox(
                     activation: .active,
                     configuration: MailboxConnectionConfigurationV1()
@@ -865,16 +874,36 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             try relaunchedSettingsStore.currentConnectionRecordV2(),
             committedPairedMailboxRecord
         )
+        XCTAssertEqual(
+            committedPairedMailboxRecord.transportConfigurations,
+            [
+                .directHTTP(
+                    activation: .inactive,
+                    configuration: DirectHTTPConnectionConfigurationV1(
+                        receiverURLString: receiverURLString,
+                        bearerToken: bearerToken
+                    )
+                ),
+                .mailbox(
+                    activation: .active,
+                    configuration: MailboxConnectionConfigurationV1()
+                ),
+            ]
+        )
         XCTAssertEqual(relaunchedSettingsStore.activeTransport, .mailbox)
         XCTAssertFalse(try relaunchedSettingsStore.receiverSettingsAreCleared())
         XCTAssertEqual(
             relaunchedSettingsStore.receiverURLString,
+            receiverURLString
+        )
+        XCTAssertNotEqual(
+            relaunchedSettingsStore.receiverURLString,
             ReceiverSettingsStore.defaultReceiverURLString
         )
-        XCTAssertEqual(try relaunchedSettingsStore.loadBearerToken(), "")
+        XCTAssertEqual(try relaunchedSettingsStore.loadBearerToken(), bearerToken)
         XCTAssertEqual(
             defaults.string(forKey: "receiverURLString"),
-            "https://old.example/v1/batches"
+            receiverURLString
         )
 
         let relaunchedViewModel = try makeViewModel(
