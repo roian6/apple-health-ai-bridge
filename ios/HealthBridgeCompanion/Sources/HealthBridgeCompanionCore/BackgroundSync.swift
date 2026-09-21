@@ -371,15 +371,28 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
     private func performSingleOpportunity(_ opportunity: Opportunity) async throws {
         try await performOpportunity(opportunity) { [weak self] in
             guard let self else { return false }
-            return try await self.processStableSnapshot()
+            return try await self.processStableSnapshot(reason: opportunity.reason)
         }
     }
 
     @MainActor
-    private func processStableSnapshot() async throws -> Bool {
+    private func processStableSnapshot(reason: AutomaticSyncReason) async throws -> Bool {
         let snapshot = try pendingStore.loadPendingObserverTypeCodeGenerations()
+        let typeCodes: [String]
+        switch reason {
+        case .observer, .observerBatch:
+            typeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                for: reason.observerTypeCodes
+            ).filter { snapshot[$0] != nil }
+        case .scheduledRefresh, .launchCatchUp:
+            typeCodes = pendingStore.automaticSyncTypeCodesInContinuationOrder(
+                snapshot.keys.sorted()
+            )
+        case .manualSync:
+            typeCodes = snapshot.keys.sorted()
+        }
         var handled: Set<String> = []
-        for typeCode in snapshot.keys.sorted() where !handled.contains(typeCode) {
+        for typeCode in typeCodes where !handled.contains(typeCode) {
             try Task.checkCancellation()
             guard let generation = snapshot[typeCode] else { continue }
             let result = try await processType(typeCode, snapshot)
@@ -393,11 +406,17 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
                     typeCodes: coveredGenerations.keys.sorted()
                 )
             case .retryableReadFailure:
-                continue
+                break
             case .payloadEnqueued:
-                continue
+                break
             case .blocked:
                 return false
+            }
+            if reason == .scheduledRefresh || reason == .launchCatchUp {
+                try pendingStore.advanceAutomaticSyncContinuation(
+                    after: typeCode,
+                    in: typeCodes
+                )
             }
         }
         return true
@@ -970,6 +989,8 @@ public final class BackgroundSyncSettingsStore {
         static let lastWakeSummary = "healthBridge.backgroundWake.lastSummary"
         static let pendingObserverTypeCodeGenerations =
             "healthBridge.backgroundSync.pendingObserverTypeCodeGenerations"
+        static let automaticSyncContinuationTypeCode =
+            "healthBridge.backgroundSync.nextScheduledWorkLaneID"
         static let mailboxAckScanCheckpoint =
             "healthBridge.backgroundSync.mailboxAckScanCheckpoint"
         static let mailboxAckScanCheckpointGeneration =
@@ -1181,6 +1202,34 @@ public final class BackgroundSyncSettingsStore {
         try savePendingObserverTypeCodeGenerations(generations)
     }
 
+    func automaticSyncTypeCodesInContinuationOrder(
+        _ typeCodes: [String]
+    ) -> [String] {
+        let ordered = GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
+        guard let continuation = userDefaults.string(
+            forKey: Key.automaticSyncContinuationTypeCode
+        ), let index = ordered.firstIndex(of: continuation) else {
+            return ordered
+        }
+        return Array(ordered[index...] + ordered[..<index])
+    }
+
+    func advanceAutomaticSyncContinuation(
+        after typeCode: String,
+        in typeCodes: [String]
+    ) throws {
+        let ordered = GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
+        guard let index = ordered.firstIndex(of: typeCode), !ordered.isEmpty else { return }
+        let successorIndex = ordered.index(after: index)
+        let successor = successorIndex == ordered.endIndex
+            ? ordered[ordered.startIndex]
+            : ordered[successorIndex]
+        userDefaults.set(successor, forKey: Key.automaticSyncContinuationTypeCode)
+        guard userDefaults.synchronize() else {
+            throw BackgroundSyncSettingsStoreError.persistenceFailed
+        }
+    }
+
     private func savePendingObserverTypeCodeGenerations(
         _ generations: [String: Int]
     ) throws {
@@ -1192,6 +1241,8 @@ public final class BackgroundSyncSettingsStore {
 
     public func resetPendingObserverDirtiness() throws {
         try savePendingObserverTypeCodeGenerations([:])
+        userDefaults.removeObject(forKey: Key.automaticSyncContinuationTypeCode)
+        _ = userDefaults.synchronize()
     }
 
     public func setEnabled(_ enabled: Bool) {

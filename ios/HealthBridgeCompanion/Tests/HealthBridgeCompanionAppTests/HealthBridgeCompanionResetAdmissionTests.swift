@@ -449,6 +449,71 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertNil(background.lastTaskSchedule, "Disabled automatic sync must not submit a request")
     }
 
+    func testBlockedAutomaticOpportunityCannotRecordCompletedSuccess() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BlockedAutomaticOpportunityTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "BlockedAutomaticOpportunityTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        try settings.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-blocked-opportunity-credential",
+            rotateBindingID: true
+        )
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        try background.markPendingObserverTypeCodes(["steps"])
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let diagnostics = AutomaticSyncDiagnosticStore(
+            fileURL: root.appendingPathComponent("diagnostics.json")
+        )
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: try FileOutbox(directory: root.appendingPathComponent("outbox")),
+            automaticSyncDiagnosticStore: diagnostics
+        )
+        await viewModel.bootstrap()
+        let engine = AutomaticSyncEngine(
+            pendingStore: background,
+            processType: { _, _ in .blocked },
+            performOpportunity: { opportunity, processPendingTypes in
+                _ = await viewModel.performAutomaticSyncOpportunity(
+                    opportunity: opportunity,
+                    processPendingTypes: processPendingTypes
+                )
+            }
+        )
+
+        try await engine.requestRun(reason: .observerBatch(typeCodes: ["steps"]))
+
+        let lastRun = try XCTUnwrap(background.lastRun)
+        XCTAssertEqual(lastRun.outcome, .interrupted)
+        XCTAssertFalse(lastRun.succeeded)
+        XCTAssertEqual(diagnostics.latestRecord?.runOutcome, .deferred)
+        XCTAssertGreaterThan(diagnostics.latestRecord?.remainingPendingLaneCount ?? 0, 0)
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), ["steps": 1])
+    }
+
     func testConfirmedResetDuringPairingTerminalRequestWaitsThenDeletes() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)

@@ -18,6 +18,7 @@ public enum AutomaticSyncDeliveryOutcome: String, Codable, CaseIterable, Sendabl
 public struct AutomaticSyncLaneEvidence: Codable, Equatable, Sendable {
     public static let maximumPendingItems = 64
     public let lane: AutomaticSyncDiagnosticLane
+    public let typeCode: String?
     public var attempted = false
     public var query: AutomaticSyncQueryOutcome = .notRun
     public var queryTimeBucket: Int?
@@ -28,7 +29,13 @@ public struct AutomaticSyncLaneEvidence: Codable, Equatable, Sendable {
     public var pendingItems: [UUID] = []
     public var truncated = false
 
-    public init(lane: AutomaticSyncDiagnosticLane) { self.lane = lane }
+    public init(
+        lane: AutomaticSyncDiagnosticLane,
+        typeCode: String? = nil
+    ) {
+        self.lane = lane
+        self.typeCode = typeCode
+    }
 
     public mutating func noteQuery(_ outcome: AutomaticSyncQueryOutcome, newestSampleAge: TimeInterval?, now: Date) {
         query = outcome
@@ -157,6 +164,7 @@ public struct AutomaticSyncCausalChain: Codable, Equatable, Sendable {
         for index in lanes.indices where previous.lanes.indices.contains(index) {
             let old = previous.lanes[index]
             guard lanes[index].lane == old.lane,
+                  lanes[index].typeCode == old.typeCode,
                   lanes[index].queryTimeBucket == old.queryTimeBucket else { continue }
             if old.delivery == .rejected || old.delivery == .retired {
                 lanes[index].outbox = .failed

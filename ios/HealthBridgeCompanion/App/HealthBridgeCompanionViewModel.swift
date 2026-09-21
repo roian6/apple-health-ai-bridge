@@ -458,6 +458,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.quantityObservationStore = quantityObservationStore
         self.coreLaneUploadProofStore = coreLaneUploadProofStore
         self.outbox = outbox
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        outbox?.automaticSyncDiagnosticStore = automaticSyncDiagnosticStore
+        #endif
         self.outboxDirectoryURL = outbox?.directoryURL ?? outboxDirectoryURL
         let resolvedCursorStoreFileURL = cursorStore?.fileURL ?? cursorStoreFileURL
         var resolvedCursorStore = cursorStore
@@ -3542,6 +3545,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return .noPayload
         }
         guard let outbox else { return .blocked }
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        outbox.automaticSyncDiagnosticDraft?.noteAttempt(typeCode: typeCode)
+        #endif
         do {
             if try outbox.hasPendingGenerationRetirements(retirementGenerations) {
                 return .payloadEnqueued
@@ -3590,7 +3596,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         if let failure = backgroundAutomaticSyncFailure {
             if !backgroundAutomaticSyncQuerySucceeded,
                failure.stage == .read,
-               failure.category == .operationFailed {
+               failure.category != .cancellation {
                 statusIsError = false
                 return .retryableReadFailureCovering(retirementGenerations)
             }
@@ -3796,12 +3802,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             pendingTypeCodes: Array(observerGenerationSnapshot.keys),
             now: startedAt
         ))
-        let diagnosticLanes = observerGenerationSnapshot.keys.sorted().map {
-            AutomaticSyncDiagnosticLane(typeCode: $0)
+        diagnostic.notePlan(typeCodes: observerGenerationSnapshot.keys.sorted())
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        outbox?.automaticSyncDiagnosticDraft = diagnostic
+        defer {
+            if outbox?.automaticSyncDiagnosticDraft === diagnostic {
+                outbox?.automaticSyncDiagnosticDraft = nil
+            }
         }
-        diagnostic.notePlan(Array(Set(diagnosticLanes)).sorted {
-            $0.rawValue < $1.rawValue
-        })
+        #endif
         diagnostic.noteAdmission()
         guard recordBackgroundSyncRunIfAllowed(
             startedAt: startedAt,
@@ -3831,10 +3840,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
             }
         }
+        var processedAllPending: Bool?
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
             try preparePrivateStorageForUploadAdmission()
-            _ = try await processPendingTypes()
+            processedAllPending = try await processPendingTypes()
             if (trustedPendingOutboxCount() ?? 0) > 0 {
                 if settingsStore.activeTransport == .mailbox {
                     _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
@@ -3855,26 +3865,35 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let pendingTypeCodes = (try? backgroundSyncStore
             .loadPendingObserverTypeCodeGenerations().keys.sorted()) ?? []
         let failed = statusIsError || diagnostic.record.failure != nil
+        let incomplete = processedAllPending == false
+        let diagnosticOutcome: AutomaticSyncDiagnosticRunOutcome = failed
+            ? .failed
+            : incomplete ? .deferred : .completed
         if diagnostic.defersPersistenceUntilObserverAcknowledgement {
             diagnostic.noteCompletionForDeferredPersistence(
-                failed ? .failed : .completed,
+                diagnosticOutcome,
                 remainingPendingTypeCodes: pendingTypeCodes
             )
         } else {
             diagnostic.noteCompletion(
-                failed ? .failed : .completed,
+                diagnosticOutcome,
                 remainingPendingSnapshot: automaticSyncDiagnosticStore.pendingSnapshot(
                     pendingTypeCodes: pendingTypeCodes
                 )
             )
         }
-        let summary = "Background refresh \(failed ? "finished with errors" : "completed"); pending_outbox=\(pendingOutboxCount)."
+        let summary: String
+        if incomplete {
+            summary = "Background refresh deferred with durable work remaining; pending_outbox=\(pendingOutboxCount)."
+        } else {
+            summary = "Background refresh \(failed ? "finished with errors" : "completed"); pending_outbox=\(pendingOutboxCount)."
+        }
         recordBackgroundSyncRunIfAllowed(
             startedAt: startedAt,
             finishedAt: Date(),
-            succeeded: !failed,
+            succeeded: !failed && !incomplete,
             summary: summary,
-            outcome: .completed
+            outcome: incomplete ? .interrupted : .completed
         )
         backgroundSyncStatus = summary
     }

@@ -143,6 +143,102 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
     }
 
     @MainActor
+    func testObserverOpportunityDoesNotSweepUnrelatedPendingTypes() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        try fixture.store.markPendingObserverTypeCodes(["heart_rate", "steps"])
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                return .noPayload
+            }
+        )
+
+        try await engine.requestRun(reason: .observer(typeCode: "steps"))
+        let processed = await observed.values
+
+        XCTAssertEqual(processed, ["steps"])
+        XCTAssertEqual(
+            try fixture.store.loadPendingObserverTypeCodeGenerations(),
+            ["heart_rate": 1]
+        )
+    }
+
+    @MainActor
+    func testScheduledOpportunitiesResumeAfterCompletedPrefixWhenCancelled() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let selectedTypeCodes = ["energy", "heart_rate", "steps"]
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                if typeCode == "energy" {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+                return .noPayload
+            },
+            performOpportunity: { _, processPendingTypes in
+                let pending = try fixture.store.loadPendingObserverTypeCodeGenerations()
+                try fixture.store.markPendingObserverTypeCodes(
+                    selectedTypeCodes.filter { pending[$0] == nil }
+                )
+                _ = try await processPendingTypes()
+            }
+        )
+
+        for _ in 0..<2 {
+            do {
+                try await engine.requestRun(reason: .scheduledRefresh)
+                XCTFail("The synthetic finite opportunity must cancel after its first energy lane.")
+            } catch is CancellationError {
+                continue
+            }
+        }
+        let processed = await observed.values
+
+        XCTAssertEqual(
+            Array(processed.prefix(3)),
+            ["energy", "heart_rate", "steps"],
+            "A later Steps generation must make progress on the next platform opportunity."
+        )
+    }
+
+    @MainActor
+    func testBlockedResultReturnsIncompleteAndRetainsEveryGeneration() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        try fixture.store.markPendingObserverTypeCodes(["heart_rate", "steps"])
+        let observed = TypeCodeRecorder()
+        var completedAllPending = true
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                return typeCode == "heart_rate" ? .blocked : .noPayload
+            },
+            performOpportunity: { _, processPendingTypes in
+                completedAllPending = try await processPendingTypes()
+            }
+        )
+
+        try await engine.requestRun(reason: .observerBatch(
+            typeCodes: ["heart_rate", "steps"]
+        ))
+        let processed = await observed.values
+
+        XCTAssertFalse(completedAllPending)
+        XCTAssertEqual(processed, ["heart_rate"])
+        XCTAssertEqual(
+            try fixture.store.loadPendingObserverTypeCodeGenerations(),
+            ["heart_rate": 1, "steps": 1]
+        )
+    }
+
+    @MainActor
     func testEngineNeverProcessesTypeWithoutDurableGeneration() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }
