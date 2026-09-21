@@ -418,6 +418,7 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
                     in: typeCodes
                 )
             }
+            try Task.checkCancellation()
         }
         return true
     }
