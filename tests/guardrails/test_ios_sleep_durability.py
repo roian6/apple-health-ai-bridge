@@ -611,7 +611,10 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
     for required_mailbox_exception in (
         "guard case .v2(let record) = stored",
         "case .paired(activeTransport: .mailbox) = record.activation",
-        "directHTTPConfiguration(in: record) == nil",
+        "record.transportConfigurations.contains(where:",
+        "$0.transport == .mailbox && $0.activation == .active",
+        "record.transportConfigurations.allSatisfy(",
+        "$0.transport == .mailbox || $0.activation == .inactive",
         "terminalCancellationExpectedGeneration",
         '== "g\\(record.localScope.generation)"',
         "throw ReceiverSettingsRecordError.destructiveResetNotRequired",
