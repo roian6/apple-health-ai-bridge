@@ -297,11 +297,6 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         )
         await viewModel.bootstrap()
         let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
-        var observedStatusMessages: [String] = []
-        let statusObservation = viewModel.$statusMessage.sink {
-            observedStatusMessages.append($0)
-        }
-        defer { statusObservation.cancel() }
 
         await runtime.automaticSyncRuntime.runAutomaticSync(
             reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
@@ -325,7 +320,18 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertGreaterThan(networkRecorder.invocationCount, 0)
 
         try backgroundSyncStore.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
-        await runtime.automaticSyncRuntime.runAutomaticSync(
+        var processedTypeCodes: [String] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: backgroundSyncStore,
+            processType: { typeCode, pendingGenerations in
+                processedTypeCodes.append(typeCode)
+                return await viewModel.processAutomaticSyncType(
+                    typeCode,
+                    pendingGenerations: pendingGenerations
+                )
+            }
+        )
+        try await engine.requestRun(
             reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
         )
 
@@ -337,12 +343,11 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         )
         XCTAssertNil(try sleepStore.loadPendingTransition())
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(processedTypeCodes, ["sleep_analysis", "steps"])
         XCTAssertTrue(
-            observedStatusMessages.contains {
-                $0.hasPrefix(
-                    "Step sync failed: HealthKit anchor cursor was not valid base64."
-                )
-            },
+            viewModel.statusMessage.hasPrefix(
+                "Step sync failed: HealthKit anchor cursor was not valid base64."
+            ),
             "The later Steps lane must reach its real query path while automatic Sleep finalizes receiver acceptance."
         )
     }
