@@ -3558,24 +3558,25 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         backgroundAutomaticSyncFailure = nil
         backgroundAutomaticSyncQuerySucceeded = false
         let pendingBefore = trustedPendingOutboxCount()
+        let processed: Bool
         switch typeCode {
         case HealthBridgeHealthType.steps.typeCode:
-            _ = await syncRecentStepCounts(
+            processed = await syncRecentStepCounts(
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
             )
         case HealthBridgeHealthType.workouts.typeCode:
-            _ = await syncAnchoredWorkoutChanges(
+            processed = await syncAnchoredWorkoutChanges(
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
             )
         case HealthBridgeHealthType.sleepAnalysis.typeCode:
-            _ = await syncRecentSleepSessions(
+            processed = await syncRecentSleepSessions(
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
             )
         case let code where HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(code):
-            _ = await syncDailyActivityAggregates(
+            processed = await syncDailyActivityAggregates(
                 typeCodes: retirementGenerations.keys.sorted(),
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
@@ -3586,6 +3587,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 historyDepth: .lastDays(1),
                 pendingGenerationRetirements: retirementGenerations
             )
+            processed = false
         }
         if let failure = backgroundAutomaticSyncFailure {
             if !backgroundAutomaticSyncQuerySucceeded,
@@ -3614,7 +3616,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         if pendingAfter > (pendingBefore ?? pendingAfter) {
             return .payloadEnqueued
         }
-        guard backgroundAutomaticSyncQuerySucceeded else { return .blocked }
+        guard backgroundAutomaticSyncQuerySucceeded || processed else { return .blocked }
         return .noPayloadCovering(retirementGenerations)
     }
 
