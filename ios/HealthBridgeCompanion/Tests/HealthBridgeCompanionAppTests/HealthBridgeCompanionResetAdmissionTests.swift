@@ -278,7 +278,15 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 cancellationStore: MemoryReceiverTokenStore(),
                 installationIDGenerator: { installationID }
             ),
-            outbox: outbox
+            outbox: outbox,
+            readAnchoredSleepChanges: { _, _, receivedAt in
+                HealthKitAnchoredSleepChanges(
+                    addedSamples: [],
+                    deletedSamples: [],
+                    anchorCursorValue: "synthetic-bootstrap-sleep-anchor",
+                    receivedAt: receivedAt
+                )
+            }
         )
         await viewModel.bootstrap()
         let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
@@ -290,7 +298,14 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
         XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
         XCTAssertNil(replacementManifest.anchorCursorValue)
-        XCTAssertNil(try sleepStore.loadPendingTransition())
+        let pendingTransition = try XCTUnwrap(sleepStore.loadPendingTransition())
+        XCTAssertEqual(pendingTransition.connectionGeneration, currentGeneration)
+        XCTAssertEqual(
+            pendingTransition.manifest.receiverSettingsGeneration,
+            currentGeneration
+        )
+        let sleepOutboxItemID = try XCTUnwrap(pendingTransition.outboxItemID)
+        XCTAssertNotNil(try outbox.pendingItem(id: sleepOutboxItemID))
         XCTAssertEqual(
             viewModel.statusMessage,
             "Step sync failed: HealthKit anchor cursor was not valid base64.",
@@ -1284,6 +1299,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         outbox: FileOutbox,
         receiverClient: ReceiverClient = ReceiverClient(),
         automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore(),
+        readAnchoredSleepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
         },
@@ -1323,6 +1341,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 service: "synthetic.reset-regression",
                 keychain: MemoryMailboxKeychain()
             ),
+            readAnchoredSleepChanges: readAnchoredSleepChanges,
             cancelInheritedLegacyUploads: cancelInheritedLegacyUploads,
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             terminalRecoveryDrainTimeoutNanoseconds: terminalRecoveryDrainTimeoutNanoseconds

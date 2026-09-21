@@ -378,6 +378,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var sleepManifestStore: SleepSyncManifestStoring?
     private let sleepManifestFileURL: URL?
     private let sleepResetEpochStore: SleepResetEpochStore
+    private let readAnchoredSleepChanges: (@MainActor (
+        String?, Date?, Date
+    ) async throws -> HealthKitAnchoredSleepChanges)?
     private let cancelInheritedLegacyUploads: @MainActor () async -> BackgroundUploadCancellationResult
     private let terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)?
     private let terminalRecoveryDrainTimeoutNanoseconds: UInt64
@@ -414,6 +417,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         mailboxKeyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
         ),
+        readAnchoredSleepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             await BackgroundURLSessionOutboxUploader.shared.cancelInheritedLegacyUploads()
         },
@@ -477,6 +483,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.sleepManifestStore = sleepManifestStore
         self.sleepManifestFileURL = sleepManifestFileURL
         self.sleepResetEpochStore = sleepResetEpochStore
+        self.readAnchoredSleepChanges = readAnchoredSleepChanges
         self.cancelInheritedLegacyUploads = cancelInheritedLegacyUploads
         self.terminalBackgroundPayloadDrain = terminalBackgroundPayloadDrain
         self.terminalRecoveryDrainTimeoutNanoseconds = terminalRecoveryDrainTimeoutNanoseconds
@@ -4747,11 +4754,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             failureStage = .read
             noteAutomaticSyncQueryStarted(executionMode: executionMode)
-            let changes = try await HealthKitSleepReader().readAnchoredSleepChanges(
-                anchorCursorValue: manifestPlan.anchorCursorValue,
-                historyStartDate: manifestPlan.historyStartDate,
-                receivedAt: now
-            )
+            let changes: HealthKitAnchoredSleepChanges
+            if let readAnchoredSleepChanges {
+                changes = try await readAnchoredSleepChanges(
+                    manifestPlan.anchorCursorValue,
+                    manifestPlan.historyStartDate,
+                    now
+                )
+            } else {
+                changes = try await HealthKitSleepReader().readAnchoredSleepChanges(
+                    anchorCursorValue: manifestPlan.anchorCursorValue,
+                    historyStartDate: manifestPlan.historyStartDate,
+                    receivedAt: now
+                )
+            }
             noteAutomaticSyncQueryResult(
                 hasRecords: !changes.addedSamples.isEmpty || !changes.deletedSamples.isEmpty,
                 newestSampleEnd: changes.addedSamples.map(\.end).max(),
