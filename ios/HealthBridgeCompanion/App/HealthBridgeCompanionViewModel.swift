@@ -4681,6 +4681,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         if executionMode != .automatic {
                             return delivered
                         }
+                        failureStage = .store
                         if try sleepManifestStore.loadPendingTransition() != nil {
                             return delivered
                         }
