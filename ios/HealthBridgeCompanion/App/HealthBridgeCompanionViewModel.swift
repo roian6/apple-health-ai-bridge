@@ -2003,18 +2003,21 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func currentCommittedReceiverRemovalCancellationGeneration() -> String? {
         let currentGeneration = settingsStore.receiverSettingsGenerationToken
-        guard settingsStore.terminalCancellationExpectedGeneration == currentGeneration,
-              (try? settingsStore.loadBearerToken()) == "" else {
+        guard settingsStore.terminalCancellationExpectedGeneration == currentGeneration else {
             return nil
         }
-        if settingsStore.receiverURLString != ReceiverSettingsStore.defaultReceiverURLString {
+        if (try? settingsStore.loadBearerToken()) == "",
+           settingsStore.receiverURLString != ReceiverSettingsStore.defaultReceiverURLString {
             return currentGeneration
         }
         guard let record = try? settingsStore.currentConnectionRecordV2(),
               case .paired(activeTransport: .mailbox) = record.activation,
-              record.transportConfigurations.count == 1,
-              record.transportConfigurations[0].transport == .mailbox,
-              record.transportConfigurations[0].activation == .active else {
+              record.transportConfigurations.contains(where: {
+                  $0.transport == .mailbox && $0.activation == .active
+              }),
+              record.transportConfigurations.allSatisfy({
+                  $0.transport == .mailbox || $0.activation == .inactive
+              }) else {
             return nil
         }
         return currentGeneration

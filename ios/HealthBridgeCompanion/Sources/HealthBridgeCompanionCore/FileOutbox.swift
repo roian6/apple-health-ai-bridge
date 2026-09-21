@@ -3755,7 +3755,12 @@ public final class ReceiverSettingsStore {
             if let stored = try loadStoredConnectionRecord() {
                 guard case .v2(let record) = stored,
                       case .paired(activeTransport: .mailbox) = record.activation,
-                      directHTTPConfiguration(in: record) == nil,
+                      record.transportConfigurations.contains(where: {
+                          $0.transport == .mailbox && $0.activation == .active
+                      }),
+                      record.transportConfigurations.allSatisfy({
+                          $0.transport == .mailbox || $0.activation == .inactive
+                      }),
                       terminalCancellationExpectedGeneration
                         == "g\(record.localScope.generation)" else {
                     throw ReceiverSettingsRecordError.destructiveResetNotRequired
