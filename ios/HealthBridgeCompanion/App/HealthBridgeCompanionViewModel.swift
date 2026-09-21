@@ -4745,11 +4745,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 historyDepth: currentHistoryDepth,
                 requestedHistoryStartDate: requestedHistoryStartDate
             )
-            guard executionMode == .foreground || manifestPlan.anchorCursorValue != nil else {
-                statusIsError = false
-                statusMessage = "Open the app and run Sync Now once before automatic Sleep sync begins."
-                return false
-            }
             failureStage = .read
             noteAutomaticSyncQueryStarted(executionMode: executionMode)
             let changes = try await HealthKitSleepReader().readAnchoredSleepChanges(
