@@ -3558,25 +3558,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         backgroundAutomaticSyncFailure = nil
         backgroundAutomaticSyncQuerySucceeded = false
         let pendingBefore = trustedPendingOutboxCount()
-        let processed: Bool
         switch typeCode {
         case HealthBridgeHealthType.steps.typeCode:
-            processed = await syncRecentStepCounts(
+            _ = await syncRecentStepCounts(
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
             )
         case HealthBridgeHealthType.workouts.typeCode:
-            processed = await syncAnchoredWorkoutChanges(
+            _ = await syncAnchoredWorkoutChanges(
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
             )
         case HealthBridgeHealthType.sleepAnalysis.typeCode:
-            processed = await syncRecentSleepSessions(
+            _ = await syncRecentSleepSessions(
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
             )
         case let code where HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(code):
-            processed = await syncDailyActivityAggregates(
+            _ = await syncDailyActivityAggregates(
                 typeCodes: retirementGenerations.keys.sorted(),
                 executionMode: .automatic,
                 pendingGenerationRetirements: retirementGenerations
@@ -3587,7 +3586,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 historyDepth: .lastDays(1),
                 pendingGenerationRetirements: retirementGenerations
             )
-            processed = false
         }
         if let failure = backgroundAutomaticSyncFailure {
             if !backgroundAutomaticSyncQuerySucceeded,
@@ -3616,7 +3614,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         if pendingAfter > (pendingBefore ?? pendingAfter) {
             return .payloadEnqueued
         }
-        guard backgroundAutomaticSyncQuerySucceeded || processed else { return .blocked }
+        guard backgroundAutomaticSyncQuerySucceeded else { return .blocked }
         return .noPayloadCovering(retirementGenerations)
     }
 
@@ -4673,25 +4671,31 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         && settingsStore.receiverURLString == url.absoluteString
                     if matchesCurrentConnection {
                         failureStage = .transport
-                        return try await deliverPendingSleepTransition(
+                        let delivered = try await deliverPendingSleepTransition(
                             pendingTransition,
                             store: sleepManifestStore,
                             to: url,
                             executionMode: executionMode,
                             pendingGenerationRetirements: pendingGenerationRetirements
                         )
-                    }
-                    let trackedItemStillExists = try pendingTransition.outboxItemID.map { itemID in
-                        try outbox.pendingItem(id: itemID) != nil
-                    } ?? false
-                    if trackedItemStillExists {
+                        if executionMode != .automatic
+                            || (try sleepManifestStore.loadPendingTransition()) != nil
+                        {
+                            return delivered
+                        }
+                    } else {
+                        let trackedItemStillExists = try pendingTransition.outboxItemID.map { itemID in
+                            try outbox.pendingItem(id: itemID) != nil
+                        } ?? false
+                        if trackedItemStillExists {
+                            refreshPendingOutboxCount()
+                            statusIsError = true
+                            statusMessage = "A pending Sleep upload belongs to an earlier connection. It is quarantined and must be deleted before Sleep sync can continue."
+                            return false
+                        }
+                        try sleepManifestStore.resetSynchronizationState()
                         refreshPendingOutboxCount()
-                        statusIsError = true
-                        statusMessage = "A pending Sleep upload belongs to an earlier connection. It is quarantined and must be deleted before Sleep sync can continue."
-                        return false
                     }
-                    try sleepManifestStore.resetSynchronizationState()
-                    refreshPendingOutboxCount()
                 }
             }
             statusIsError = false
@@ -4950,7 +4954,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         statusMessage = hasRecordChanges
             ? "Synced the durable authoritative sleep transition. Pending outbox: \(pendingOutboxCount)."
             : "Recorded the durable sleep anchor transition. Pending outbox: \(pendingOutboxCount)."
-        return executionMode == .automatic || uploadedRecords
+        return uploadedRecords
     }
 
     func syncSupportedQuantityMetrics() async {
