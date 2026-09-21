@@ -266,7 +266,7 @@ public enum StepCountSyncBatchFactory {
             endTime: HealthBridgeUTCFormatter.string(from: windowEnd)
         )
         let validStepSamples = stepSamples
-            .filter { $0.count > 0 && $0.start < $0.end }
+            .filter { $0.count > 0 && $0.start <= $0.end }
         let sampleRecords = validStepSamples
             .sorted { lhs, rhs in
                 if lhs.start == rhs.start {
