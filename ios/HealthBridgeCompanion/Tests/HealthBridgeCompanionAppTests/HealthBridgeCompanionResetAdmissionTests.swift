@@ -341,8 +341,14 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             committedManifest.anchorCursorValue,
             "synthetic-bootstrap-sleep-anchor"
         )
-        XCTAssertNil(try sleepStore.loadPendingTransition())
-        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let currentTransition = try XCTUnwrap(sleepStore.loadPendingTransition())
+        XCTAssertEqual(currentTransition.connectionGeneration, currentGeneration)
+        XCTAssertEqual(
+            currentTransition.manifest.receiverSettingsGeneration,
+            currentGeneration
+        )
+        let currentOutboxItemID = try XCTUnwrap(currentTransition.outboxItemID)
+        XCTAssertNotNil(try outbox.pendingItem(id: currentOutboxItemID))
         XCTAssertEqual(processedTypeCodes, ["sleep_analysis", "steps"])
         XCTAssertTrue(
             viewModel.statusMessage.hasPrefix(
