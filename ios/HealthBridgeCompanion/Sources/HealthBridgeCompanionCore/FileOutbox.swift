@@ -3749,24 +3749,45 @@ public final class ReceiverSettingsStore {
         try clearReceiverSettings()
     }
 
+    public func committedReceiverRemovalCancellationGeneration() throws -> UInt64? {
+        guard let cancellationGeneration = terminalCancellationExpectedGeneration else {
+            return nil
+        }
+        if let stored = try loadStoredConnectionRecord() {
+            guard case .v2(let record) = stored,
+                  case .paired(activeTransport: .mailbox) = record.activation,
+                  record.transportConfigurations.contains(where: {
+                      $0.transport == .mailbox && $0.activation == .active
+                  }),
+                  record.transportConfigurations.allSatisfy({
+                      $0.transport == .mailbox || $0.activation == .inactive
+                  }),
+                  cancellationGeneration == "g\(record.localScope.generation)" else {
+                return nil
+            }
+            return record.localScope.generation
+        }
+
+        let legacyToken = try tokenStore.loadToken()
+        guard legacyToken.isEmpty,
+              let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey),
+              explicitLegacyURL != Self.defaultReceiverURLString else {
+            return nil
+        }
+        let generation = UInt64(
+            max(0, userDefaults.integer(forKey: receiverSettingsGenerationKey))
+        )
+        return cancellationGeneration == "g\(generation)" ? generation : nil
+    }
+
     public func resetInvalidConnectionRecord() throws {
         var committedMailboxRemovalGeneration: UInt64?
         do {
-            if let stored = try loadStoredConnectionRecord() {
-                guard case .v2(let record) = stored,
-                      case .paired(activeTransport: .mailbox) = record.activation,
-                      record.transportConfigurations.contains(where: {
-                          $0.transport == .mailbox && $0.activation == .active
-                      }),
-                      record.transportConfigurations.allSatisfy({
-                          $0.transport == .mailbox || $0.activation == .inactive
-                      }),
-                      terminalCancellationExpectedGeneration
-                        == "g\(record.localScope.generation)" else {
+            committedMailboxRemovalGeneration = try committedReceiverRemovalCancellationGeneration()
+            if committedMailboxRemovalGeneration == nil {
+                if try loadStoredConnectionRecord() != nil {
                     throw ReceiverSettingsRecordError.destructiveResetNotRequired
                 }
-                committedMailboxRemovalGeneration = record.localScope.generation
-            } else {
                 let legacyToken = try tokenStore.loadToken()
                 let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
                 if legacyToken.isEmpty, explicitLegacyURL == nil {

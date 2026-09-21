@@ -1683,8 +1683,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               connectionTerminalBarrier.admissionIsOpen else {
             return
         }
-        let recoverCommittedReceiverRemoval =
-            currentCommittedReceiverRemovalCancellationGeneration() != nil
+        let recoverCommittedReceiverRemoval: Bool
+        do {
+            recoverCommittedReceiverRemoval =
+                try settingsStore.committedReceiverRemovalCancellationGeneration() != nil
+        } catch {
+            return
+        }
         if !recoverCommittedReceiverRemoval {
             guard !hasPendingPrivateStorageRecovery, outboxIdentityMigrationReady else { return }
         }
@@ -1973,8 +1978,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             throw error
         }
         if recoverCommittedReceiverRemoval {
-            guard currentCommittedReceiverRemovalCancellationGeneration()
-                    == expectedGeneration else {
+            guard let committedGeneration = try settingsStore
+                    .committedReceiverRemovalCancellationGeneration(),
+                  "g\(committedGeneration)" == expectedGeneration else {
                 throw ReceiverSettingsGenerationError.staleGeneration
             }
             guard pendingItemCount == 0, !outbox.destructiveRecoveryIsRequested else {
@@ -1999,28 +2005,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         ) else {
             throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
         }
-    }
-
-    private func currentCommittedReceiverRemovalCancellationGeneration() -> String? {
-        let currentGeneration = settingsStore.receiverSettingsGenerationToken
-        guard settingsStore.terminalCancellationExpectedGeneration == currentGeneration else {
-            return nil
-        }
-        if (try? settingsStore.loadBearerToken()) == "",
-           settingsStore.receiverURLString != ReceiverSettingsStore.defaultReceiverURLString {
-            return currentGeneration
-        }
-        guard let record = try? settingsStore.currentConnectionRecordV2(),
-              case .paired(activeTransport: .mailbox) = record.activation,
-              record.transportConfigurations.contains(where: {
-                  $0.transport == .mailbox && $0.activation == .active
-              }),
-              record.transportConfigurations.allSatisfy({
-                  $0.transport == .mailbox || $0.activation == .inactive
-              }) else {
-            return nil
-        }
-        return currentGeneration
     }
 
     private func refreshHistoricalBackfillPublishedStateIfAllowed() {

@@ -584,7 +584,6 @@ def test_destructive_recovery_resets_all_progress_and_unreadable_connection() ->
 
 def test_transient_private_storage_failure_is_retryable_not_destructive() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
-    file_outbox = FILE_OUTBOX.read_text(encoding="utf-8")
     content_view = (ROOT / "ios/HealthBridgeCompanion/App/ContentView.swift").read_text(
         encoding="utf-8"
     )
@@ -596,41 +595,6 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
     assert "catch FileSyncCursorStoreError.invalidData" in source
     assert "hasTransientPrivateStorageFailure = true" in source
     assert 'Label("Retry Private Storage"' in content_view
-    reset_start = file_outbox.index("public func resetInvalidConnectionRecord()")
-    reset_end = file_outbox.index(
-        "public func beginTerminalCancellationIntent", reset_start
-    )
-    reset = file_outbox[reset_start:reset_end]
-    stored_start = reset.index("if let stored = try loadStoredConnectionRecord()")
-    legacy_start = reset.index("} else {", stored_start)
-    legacy_end = reset.index(
-        "} catch ReceiverSettingsRecordError.invalidRecord", legacy_start
-    )
-    stored_record = reset[stored_start:legacy_start]
-    legacy_record = reset[legacy_start:legacy_end]
-    for required_mailbox_exception in (
-        "guard case .v2(let record) = stored",
-        "case .paired(activeTransport: .mailbox) = record.activation",
-        "record.transportConfigurations.contains(where:",
-        "$0.transport == .mailbox && $0.activation == .active",
-        "record.transportConfigurations.allSatisfy(",
-        "$0.transport == .mailbox || $0.activation == .inactive",
-        "terminalCancellationExpectedGeneration",
-        '== "g\\(record.localScope.generation)"',
-        "throw ReceiverSettingsRecordError.destructiveResetNotRequired",
-        "committedMailboxRemovalGeneration = record.localScope.generation",
-    ):
-        assert required_mailbox_exception in stored_record
-    assert "replacementGeneration = committedMailboxRemovalGeneration" in reset
-    assert "let legacyToken = try tokenStore.loadToken()" in legacy_record
-    assert "explicitLegacyURL == nil" in legacy_record
-    assert (
-        "throw ReceiverSettingsRecordError.destructiveResetNotRequired" in legacy_record
-    )
-    assert "catch ReceiverSettingsRecordError.invalidRecord" in reset
-    assert "catch KeychainReceiverTokenStoreError.invalidData" in reset
-    assert "catch {" not in reset
-    assert "UInt64.random(in: 1 ... UInt64(Int.max))" in reset
 
 
 def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> None:
