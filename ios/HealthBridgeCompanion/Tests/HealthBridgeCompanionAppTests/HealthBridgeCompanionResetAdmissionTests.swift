@@ -267,6 +267,11 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             lane: .steps,
             receiverBindingID: receiverBindingID
         )
+        let networkRecorder = PayloadFenceNetworkRecorder()
+        PayloadFenceURLProtocol.networkRecorder = networkRecorder
+        defer { PayloadFenceURLProtocol.networkRecorder = nil }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [PayloadFenceURLProtocol.self]
 
         let viewModel = try makeViewModel(
             root: root,
@@ -279,6 +284,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 installationIDGenerator: { installationID }
             ),
             outbox: outbox,
+            receiverClient: ReceiverClient(
+                session: URLSession(configuration: sessionConfiguration)
+            ),
             readAnchoredSleepChanges: { _, _, receivedAt in
                 HealthKitAnchoredSleepChanges(
                     addedSamples: [],
@@ -297,15 +305,13 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
 
         let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
         XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
-        XCTAssertNil(replacementManifest.anchorCursorValue)
-        let pendingTransition = try XCTUnwrap(sleepStore.loadPendingTransition())
-        XCTAssertEqual(pendingTransition.connectionGeneration, currentGeneration)
         XCTAssertEqual(
-            pendingTransition.manifest.receiverSettingsGeneration,
-            currentGeneration
+            replacementManifest.anchorCursorValue,
+            "synthetic-bootstrap-sleep-anchor"
         )
-        let sleepOutboxItemID = try XCTUnwrap(pendingTransition.outboxItemID)
-        XCTAssertNotNil(try outbox.pendingItem(id: sleepOutboxItemID))
+        XCTAssertNil(try sleepStore.loadPendingTransition())
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertGreaterThan(networkRecorder.invocationCount, 0)
         XCTAssertEqual(
             viewModel.statusMessage,
             "Step sync failed: HealthKit anchor cursor was not valid base64.",
