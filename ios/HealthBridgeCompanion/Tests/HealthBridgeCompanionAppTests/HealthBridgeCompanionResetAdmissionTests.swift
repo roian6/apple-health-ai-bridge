@@ -267,9 +267,6 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             lane: .steps,
             receiverBindingID: receiverBindingID
         )
-        let diagnosticStore = AutomaticSyncDiagnosticStore(
-            fileURL: root.appendingPathComponent("diagnostics.json")
-        )
 
         let viewModel = try makeViewModel(
             root: root,
@@ -281,22 +278,22 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 cancellationStore: MemoryReceiverTokenStore(),
                 installationIDGenerator: { installationID }
             ),
-            outbox: outbox,
-            automaticSyncDiagnosticStore: diagnosticStore
+            outbox: outbox
         )
         await viewModel.bootstrap()
         let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
 
-        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        await runtime.automaticSyncRuntime.runAutomaticSync(
+            reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
+        )
 
         let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
         XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
         XCTAssertNil(replacementManifest.anchorCursorValue)
         XCTAssertNil(try sleepStore.loadPendingTransition())
-        XCTAssertTrue(
-            diagnosticStore.latestRecord?.causalChain?.lanes.contains {
-                $0.lane == .steps && $0.attempted
-            } == true,
+        XCTAssertEqual(
+            viewModel.statusMessage,
+            "Step sync failed: HealthKit anchor cursor was not valid base64.",
             "The later Steps lane must reach its real query path after stale Sleep recovery."
         )
     }
