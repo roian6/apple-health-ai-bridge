@@ -81,13 +81,17 @@ def _connect_database_under_lifecycle(
     with database_access_lock(db_path, exclusive=False, create=True):
         protected_identity = _protect_database_files(db_path)
         try:
-            with sqlite3.connect(db_path) as connection:
-                opened_identity = _protect_database_files(db_path)
-                if opened_identity != protected_identity:
-                    message = f"database path changed before SQLite open: {db_path}"
-                    raise OSError(message)
-                _ = connection.execute("pragma foreign_keys = on")
-                yield connection
+            connection = sqlite3.connect(db_path)
+            try:
+                with connection:
+                    opened_identity = _protect_database_files(db_path)
+                    if opened_identity != protected_identity:
+                        message = f"database path changed before SQLite open: {db_path}"
+                        raise OSError(message)
+                    _ = connection.execute("pragma foreign_keys = on")
+                    yield connection
+            finally:
+                connection.close()
         finally:
             _ = _protect_database_files(db_path)
 
@@ -115,10 +119,14 @@ def connect_readonly_database(
         require_quiescent_database(db_path)
         resolved = db_path.resolve(strict=True)
         uri = f"{resolved.as_uri()}?mode=ro&immutable=1"
-        with sqlite3.connect(uri, uri=True) as connection:
-            _ = connection.execute("pragma query_only = on")
-            _ = connection.execute("pragma foreign_keys = on")
-            yield connection
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            with connection:
+                _ = connection.execute("pragma query_only = on")
+                _ = connection.execute("pragma foreign_keys = on")
+                yield connection
+        finally:
+            connection.close()
 
 
 def initialize_database(db_path: Path) -> None:
