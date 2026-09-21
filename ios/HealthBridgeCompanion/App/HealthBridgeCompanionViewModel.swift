@@ -4678,9 +4678,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             executionMode: executionMode,
                             pendingGenerationRetirements: pendingGenerationRetirements
                         )
-                        if executionMode != .automatic
-                            || (try sleepManifestStore.loadPendingTransition()) != nil
-                        {
+                        if executionMode != .automatic {
+                            return delivered
+                        }
+                        if try sleepManifestStore.loadPendingTransition() != nil {
                             return delivered
                         }
                     } else {
