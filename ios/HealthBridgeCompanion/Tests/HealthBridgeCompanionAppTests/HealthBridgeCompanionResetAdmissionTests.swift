@@ -305,9 +305,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
 
         let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
         XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
-        XCTAssertEqual(
+        XCTAssertNil(
             replacementManifest.anchorCursorValue,
-            "synthetic-bootstrap-sleep-anchor"
+            "An empty initial Sleep read must not advance the durable anchor."
         )
         XCTAssertNil(try sleepStore.loadPendingTransition())
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
