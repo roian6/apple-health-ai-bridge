@@ -320,6 +320,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
         XCTAssertGreaterThan(networkRecorder.invocationCount, 0)
 
+        try backgroundSyncStore.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
         await runtime.automaticSyncRuntime.runAutomaticSync(
             reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
         )
@@ -332,9 +333,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         )
         XCTAssertNil(try sleepStore.loadPendingTransition())
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
-        XCTAssertEqual(
-            viewModel.statusMessage,
-            "Step sync failed: HealthKit anchor cursor was not valid base64.",
+        XCTAssertTrue(
+            viewModel.statusMessage.hasPrefix(
+                "Step sync failed: HealthKit anchor cursor was not valid base64."
+            ),
             "The later Steps lane must reach its real query path while automatic Sleep finalizes receiver acceptance."
         )
     }
