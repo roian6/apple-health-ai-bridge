@@ -179,6 +179,123 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertFalse(uploader.automaticContinuationAdmissionIsOpen)
     }
 
+    func testStaleSleepRecoveryDoesNotBlockLaterStepsQuery() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AutomaticSleepBootstrapFIFOTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "AutomaticSleepBootstrapFIFOTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        try settingsStore.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-sleep-fifo-credential",
+            rotateBindingID: true
+        )
+        let receiverBindingID = try XCTUnwrap(settingsStore.receiverBindingID)
+        let currentGeneration = settingsStore.receiverSettingsGenerationToken
+        let staleGeneration = "g0"
+        XCTAssertNotEqual(currentGeneration, staleGeneration)
+
+        let backgroundSyncStore = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try backgroundSyncStore.setEnabledDurably(true)
+        try backgroundSyncStore.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
+        XCTAssertEqual(backgroundSyncStore.pendingObserverTypeCodes, ["sleep_analysis", "steps"])
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+
+        let installationID = "synthetic-sleep-fifo-installation"
+        let sleepSourceKey = "apple_health.phone.\(installationID)"
+        let sleepStore = try FileSleepSyncManifestStore(
+            fileURL: root.appendingPathComponent("sleep.json")
+        )
+        let staleReservation = SleepSyncBatchFactory.makeManifestReservation(
+            receiverSettingsGeneration: staleGeneration,
+            historyDepth: .allAvailable,
+            historyStartDate: nil,
+            sourceKey: sleepSourceKey,
+            baselineResetEpoch: 1,
+            identityNamespace: try XCTUnwrap(
+                UUID(uuidString: "00000000-0000-0000-0000-000000000001")
+            )
+        )
+        let staleTransition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: staleReservation,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [],
+                deletedSamples: [],
+                anchorCursorValue: "synthetic-stale-sleep-anchor",
+                receivedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            ),
+            receiverSettingsGeneration: staleGeneration,
+            historyDepth: .allAvailable,
+            historyStartDate: nil,
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try sleepStore.saveManifest(staleTransition.manifest)
+        try sleepStore.savePendingTransition(SleepSyncPendingTransition(
+            payload: try HealthBridgeBatchEncoder().encode(staleTransition.batch),
+            manifest: staleTransition.manifest,
+            receiverBindingID: receiverBindingID,
+            connectionGeneration: staleGeneration,
+            outboxItemID: "missing-synthetic-sleep-payload.json"
+        ))
+
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let cursorStore = try FileSyncCursorStore(
+            fileURL: root.appendingPathComponent("cursors.json")
+        )
+        try cursorStore.saveCursorValue(
+            "synthetic-malformed-steps-anchor",
+            receiverBindingID: receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+        )
+        CoreLaneUploadProofStore(userDefaults: defaults).markUploadedRecords(
+            lane: .steps,
+            receiverBindingID: receiverBindingID
+        )
+
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settingsStore,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { installationID }
+            ),
+            outbox: outbox
+        )
+        await viewModel.bootstrap()
+        let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+
+        let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
+        XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
+        XCTAssertNil(replacementManifest.anchorCursorValue)
+        XCTAssertNil(try sleepStore.loadPendingTransition())
+        XCTAssertEqual(
+            viewModel.statusMessage,
+            "Step sync failed: HealthKit anchor cursor was not valid base64.",
+            "The later Steps lane must reach its real query path after stale Sleep recovery."
+        )
+    }
+
     func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
         let manager = FileManager.default
         let applicationSupport = try XCTUnwrap(
