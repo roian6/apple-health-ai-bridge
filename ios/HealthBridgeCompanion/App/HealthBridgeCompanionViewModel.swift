@@ -4898,15 +4898,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard let outboxItemID = trackedTransition.outboxItemID else {
                 throw CocoaError(.fileWriteUnknown)
             }
+            let pendingItems = try outbox.pendingItems()
+            var itemRemains = pendingItems.contains { $0.id == outboxItemID }
             if executionMode == .automatic,
-               settingsStore.activeTransport == .directHTTP {
+               settingsStore.activeTransport == .directHTTP,
+               itemRemains {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
                 statusIsError = false
                 statusMessage = "Sleep transition is durably journaled and queued for background delivery. Pending outbox: \(pendingOutboxCount)."
                 return false
             }
-            let pendingItems = try outbox.pendingItems()
-            var itemRemains = pendingItems.contains { $0.id == outboxItemID }
             var summary: FileOutboxFlushSummary?
             let isFIFOHead = pendingItems.first?.id == outboxItemID
             if itemRemains, !isFIFOHead {
@@ -4947,7 +4948,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         statusMessage = hasRecordChanges
             ? "Synced the durable authoritative sleep transition. Pending outbox: \(pendingOutboxCount)."
             : "Recorded the durable sleep anchor transition. Pending outbox: \(pendingOutboxCount)."
-        return uploadedRecords
+        return executionMode == .automatic || uploadedRecords
     }
 
     func syncSupportedQuantityMetrics() async {
