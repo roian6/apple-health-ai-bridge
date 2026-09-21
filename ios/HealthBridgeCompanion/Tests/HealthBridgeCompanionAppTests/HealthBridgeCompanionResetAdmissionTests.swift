@@ -272,10 +272,6 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         defer { PayloadFenceURLProtocol.networkRecorder = nil }
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.protocolClasses = [PayloadFenceURLProtocol.self]
-        let diagnosticStore = AutomaticSyncDiagnosticStore(
-            fileURL: root.appendingPathComponent("automatic-sync-diagnostics.json")
-        )
-
         let viewModel = try makeViewModel(
             root: root,
             defaults: defaults,
@@ -290,7 +286,6 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             receiverClient: ReceiverClient(
                 session: URLSession(configuration: sessionConfiguration)
             ),
-            automaticSyncDiagnosticStore: diagnosticStore,
             readAnchoredSleepChanges: { _, _, receivedAt in
                 HealthKitAnchoredSleepChanges(
                     addedSamples: [],
@@ -302,6 +297,11 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         )
         await viewModel.bootstrap()
         let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+        var observedStatusMessages: [String] = []
+        let statusObservation = viewModel.$statusMessage.sink {
+            observedStatusMessages.append($0)
+        }
+        defer { statusObservation.cancel() }
 
         await runtime.automaticSyncRuntime.runAutomaticSync(
             reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
@@ -337,16 +337,14 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         )
         XCTAssertNil(try sleepStore.loadPendingTransition())
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
-        let stepsLane = try XCTUnwrap(
-            diagnosticStore.latestRecord?.causalChain?.lanes.first {
-                $0.lane == .steps
-            }
-        )
         XCTAssertTrue(
-            stepsLane.attempted,
+            observedStatusMessages.contains {
+                $0.hasPrefix(
+                    "Step sync failed: HealthKit anchor cursor was not valid base64."
+                )
+            },
             "The later Steps lane must reach its real query path while automatic Sleep finalizes receiver acceptance."
         )
-        XCTAssertEqual(stepsLane.query, .failed)
     }
 
     func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
