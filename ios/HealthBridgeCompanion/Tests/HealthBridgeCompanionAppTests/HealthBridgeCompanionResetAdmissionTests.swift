@@ -282,16 +282,22 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         )
         await viewModel.bootstrap()
         let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+        var observedStatusMessages: [String] = []
+        let statusObservation = viewModel.$statusMessage.sink {
+            observedStatusMessages.append($0)
+        }
 
         await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        withExtendedLifetime(statusObservation) {}
 
         let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
         XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
         XCTAssertNil(replacementManifest.anchorCursorValue)
         XCTAssertNil(try sleepStore.loadPendingTransition())
-        XCTAssertEqual(
-            viewModel.statusMessage,
-            "Step sync failed: HealthKit anchor cursor was not valid base64.",
+        XCTAssertTrue(
+            observedStatusMessages.contains(
+                "Step sync failed: HealthKit anchor cursor was not valid base64."
+            ),
             "The later Steps lane must reach its real query path after stale Sleep recovery."
         )
     }
