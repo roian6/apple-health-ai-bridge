@@ -116,13 +116,17 @@ def _receiver_token_is_active(config: QAReceiverConfig, token: str) -> bool:
     uri = f"{config.database_path.as_uri()}?mode=ro"
     select = "select token_hash from receiver_tokens where token_prefix = ?"
     predicate = "and revoked_at is null"
-    with sqlite3.connect(uri, uri=True) as connection:
-        rows = TOKEN_HASH_ROWS.validate_python(
-            connection.execute(
-                f"{select} {predicate}",
-                (token[:TOKEN_PREFIX_LENGTH],),
-            ).fetchall()
-        )
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        with connection:
+            rows = TOKEN_HASH_ROWS.validate_python(
+                connection.execute(
+                    f"{select} {predicate}",
+                    (token[:TOKEN_PREFIX_LENGTH],),
+                ).fetchall()
+            )
+    finally:
+        connection.close()
     candidate = hash_receiver_token(token)
     return any(hmac.compare_digest(row[0], candidate) for row in rows)
 
