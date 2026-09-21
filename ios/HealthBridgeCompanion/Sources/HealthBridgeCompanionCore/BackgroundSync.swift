@@ -348,7 +348,7 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             let result: Result<Void, Error>
             do {
                 try await self.performSingleOpportunity(opportunity)
-                if !Task.isCancelled, let trailingOpportunity = self.trailingOpportunity {
+                while !Task.isCancelled, let trailingOpportunity = self.trailingOpportunity {
                     self.trailingOpportunity = nil
                     try await self.performSingleOpportunity(trailingOpportunity)
                 }

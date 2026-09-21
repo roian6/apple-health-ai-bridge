@@ -3532,6 +3532,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               backgroundSyncEnabled else {
             return .blocked
         }
+        guard let generation = pendingGenerations[typeCode] else {
+            return .noPayload
+        }
+        let exactGeneration = [typeCode: generation]
         let retirementGenerations: [String: Int]
         if typeCode != HealthBridgeHealthType.steps.typeCode,
            HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode) {
@@ -3539,17 +3543,23 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains($0.key)
                     && $0.key != HealthBridgeHealthType.steps.typeCode
             }
-        } else if let generation = pendingGenerations[typeCode] {
-            retirementGenerations = [typeCode: generation]
         } else {
-            return .noPayload
+            retirementGenerations = exactGeneration
         }
         guard let outbox else { return .blocked }
         #if !HEALTH_BRIDGE_MAILBOX_QA
         outbox.automaticSyncDiagnosticDraft?.noteAttempt(typeCode: typeCode)
         #endif
+        let isRuntimeEligible = automaticSyncSelectedEligibleTypeCodes().contains(typeCode)
         do {
             if try outbox.hasPendingGenerationRetirements(retirementGenerations) {
+                return .payloadEnqueued
+            }
+            if !isRuntimeEligible,
+               try outbox.hasPendingGenerationRetirement(
+                   typeCode: typeCode,
+                   generation: generation
+               ) {
                 return .payloadEnqueued
             }
         } catch {
@@ -3559,6 +3569,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: .automatic
             )
             return .blocked
+        }
+        guard isRuntimeEligible else {
+            return .noPayloadCovering(exactGeneration)
         }
         statusIsError = false
         backgroundAutomaticSyncFailure = nil

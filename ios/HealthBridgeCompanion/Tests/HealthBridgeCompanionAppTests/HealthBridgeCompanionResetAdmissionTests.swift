@@ -514,6 +514,91 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), ["steps": 1])
     }
 
+    func testRuntimeIneligibleGenerationRetiresWithoutBlockingLaterEligibleWork() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RuntimeIneligibleAutomaticTypeTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "RuntimeIneligibleAutomaticTypeTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        try settings.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-ineligible-type-credential",
+            rotateBindingID: true
+        )
+        let unavailableTypeCode = "aaa_runtime_unavailable_quantity"
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        try background.markPendingObserverTypeCodes([unavailableTypeCode, "steps"])
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: outbox
+        )
+        await viewModel.bootstrap()
+        XCTAssertFalse(
+            viewModel.automaticSyncSelectedEligibleTypeCodes().contains(unavailableTypeCode)
+        )
+        var processedTypeCodes: [String] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: background,
+            processType: { typeCode, pendingGenerations in
+                processedTypeCodes.append(typeCode)
+                guard typeCode == unavailableTypeCode else { return .noPayload }
+                return await viewModel.processAutomaticSyncType(
+                    typeCode,
+                    pendingGenerations: pendingGenerations
+                )
+            }
+        )
+
+        try await engine.requestRun(reason: .scheduledRefresh)
+
+        XCTAssertEqual(processedTypeCodes, [unavailableTypeCode, "steps"])
+        XCTAssertTrue(try background.loadPendingObserverTypeCodeGenerations().isEmpty)
+
+        try background.markPendingObserverTypeCodes([unavailableTypeCode])
+        let retainedGenerations = try background.loadPendingObserverTypeCodeGenerations()
+        var outboxRetirements = retainedGenerations
+        outboxRetirements["synthetic_group_peer"] = 1
+        _ = try outbox.enqueueSequence(
+            [Data("synthetic-ineligible-retirement".utf8)],
+            receiverIdentity: try XCTUnwrap(settings.receiverBindingID),
+            pendingGenerationRetirements: outboxRetirements
+        )
+
+        let protectedResult = await viewModel.processAutomaticSyncType(
+            unavailableTypeCode,
+            pendingGenerations: retainedGenerations
+        )
+
+        XCTAssertEqual(protectedResult, .payloadEnqueued)
+        XCTAssertEqual(
+            try background.loadPendingObserverTypeCodeGenerations(),
+            retainedGenerations
+        )
+    }
+
     func testConfirmedResetDuringPairingTerminalRequestWaitsThenDeletes() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)

@@ -105,6 +105,92 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
     }
 
     @MainActor
+    func testThirdOpportunityArrivingDuringTrailingPassRunsUnderSameOwner() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let currentEntered = BoundedAsyncValueLatch<Void>()
+        let releaseCurrent = BoundedAsyncValueLatch<Void>()
+        let trailingEntered = BoundedAsyncValueLatch<Void>()
+        let releaseTrailing = BoundedAsyncValueLatch<Void>()
+        let thirdRan = BoundedAsyncValueLatch<Void>()
+        var reasons: [AutomaticSyncReason] = []
+        var activeOpportunities = 0
+        var maximumActiveOpportunities = 0
+        var ownerLeaseStartCount = 0
+        var ownerLeaseFinishCount = 0
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { _, _ in .noPayload },
+            performOpportunity: { opportunity, _ in
+                activeOpportunities += 1
+                maximumActiveOpportunities = max(
+                    maximumActiveOpportunities,
+                    activeOpportunities
+                )
+                reasons.append(opportunity.reason)
+                defer { activeOpportunities -= 1 }
+                switch reasons.count {
+                case 1:
+                    currentEntered.resolve(())
+                    _ = await releaseCurrent.wait(timeout: 1)
+                case 2:
+                    trailingEntered.resolve(())
+                    _ = await releaseTrailing.wait(timeout: 1)
+                case 3:
+                    thirdRan.resolve(())
+                default:
+                    XCTFail("Each causal opportunity must execute exactly once.")
+                }
+            },
+            startOwner: { _ in
+                ownerLeaseStartCount += 1
+                return { ownerLeaseFinishCount += 1 }
+            }
+        )
+        let owner = Task { @MainActor in
+            try await engine.requestRun(reason: .observer(typeCode: "heart_rate"))
+        }
+        guard await currentEntered.wait(timeout: 1) != nil else {
+            owner.cancel()
+            XCTFail("The current opportunity did not start.")
+            return
+        }
+
+        engine.requestRunWithoutWaiting(
+            reason: .observer(typeCode: "steps"),
+            diagnosticRunID: UUID()
+        )
+        releaseCurrent.resolve(())
+        guard await trailingEntered.wait(timeout: 1) != nil else {
+            owner.cancel()
+            XCTFail("The trailing opportunity did not start.")
+            return
+        }
+
+        engine.requestRunWithoutWaiting(
+            reason: .observer(typeCode: "weight"),
+            diagnosticRunID: UUID()
+        )
+        releaseTrailing.resolve(())
+        let thirdCompleted = await thirdRan.wait(timeout: 1)
+        try await owner.value
+
+        XCTAssertNotNil(thirdCompleted)
+        XCTAssertEqual(
+            reasons,
+            [
+                .observer(typeCode: "heart_rate"),
+                .observer(typeCode: "steps"),
+                .observer(typeCode: "weight"),
+            ]
+        )
+        XCTAssertEqual(maximumActiveOpportunities, 1)
+        XCTAssertEqual(activeOpportunities, 0)
+        XCTAssertEqual(ownerLeaseStartCount, 1)
+        XCTAssertEqual(ownerLeaseFinishCount, 1)
+    }
+
+    @MainActor
     func testRunUsesDeterministicSnapshotContinuesReadFailureAndPayload() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }
