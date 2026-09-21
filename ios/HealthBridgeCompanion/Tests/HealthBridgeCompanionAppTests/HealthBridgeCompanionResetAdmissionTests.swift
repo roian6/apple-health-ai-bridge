@@ -307,15 +307,35 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
         XCTAssertNil(
             replacementManifest.anchorCursorValue,
-            "An empty initial Sleep read must not advance the durable anchor."
+            "An empty initial Sleep read must not advance the durable anchor before acceptance is finalized."
+        )
+        let acknowledgedTransition = try XCTUnwrap(sleepStore.loadPendingTransition())
+        XCTAssertEqual(acknowledgedTransition.connectionGeneration, currentGeneration)
+        XCTAssertEqual(
+            acknowledgedTransition.manifest.anchorCursorValue,
+            "synthetic-bootstrap-sleep-anchor"
+        )
+        let acknowledgedOutboxItemID = try XCTUnwrap(acknowledgedTransition.outboxItemID)
+        XCTAssertNil(try outbox.pendingItem(id: acknowledgedOutboxItemID))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertGreaterThan(networkRecorder.invocationCount, 0)
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(
+            reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
+        )
+
+        let committedManifest = try XCTUnwrap(sleepStore.loadManifest())
+        XCTAssertEqual(committedManifest.receiverSettingsGeneration, currentGeneration)
+        XCTAssertEqual(
+            committedManifest.anchorCursorValue,
+            "synthetic-bootstrap-sleep-anchor"
         )
         XCTAssertNil(try sleepStore.loadPendingTransition())
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
-        XCTAssertGreaterThan(networkRecorder.invocationCount, 0)
         XCTAssertEqual(
             viewModel.statusMessage,
             "Step sync failed: HealthKit anchor cursor was not valid base64.",
-            "The later Steps lane must reach its real query path after stale Sleep recovery."
+            "The later Steps lane must reach its real query path while automatic Sleep finalizes receiver acceptance."
         )
     }
 
