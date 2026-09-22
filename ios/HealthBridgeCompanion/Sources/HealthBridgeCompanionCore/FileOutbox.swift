@@ -3749,19 +3749,54 @@ public final class ReceiverSettingsStore {
         try clearReceiverSettings()
     }
 
+    public func committedReceiverRemovalCancellationGeneration() throws -> UInt64? {
+        guard let cancellationGeneration = terminalCancellationExpectedGeneration else {
+            return nil
+        }
+        if let stored = try loadStoredConnectionRecord() {
+            guard case .v2(let record) = stored,
+                  case .paired(activeTransport: .mailbox) = record.activation,
+                  record.transportConfigurations.contains(where: {
+                      $0.transport == .mailbox && $0.activation == .active
+                  }),
+                  record.transportConfigurations.allSatisfy({
+                      $0.transport == .mailbox || $0.activation == .inactive
+                  }),
+                  cancellationGeneration == "g\(record.localScope.generation)" else {
+                return nil
+            }
+            return record.localScope.generation
+        }
+
+        let legacyToken = try tokenStore.loadToken()
+        guard legacyToken.isEmpty,
+              let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey),
+              explicitLegacyURL != Self.defaultReceiverURLString else {
+            return nil
+        }
+        let generation = UInt64(
+            max(0, userDefaults.integer(forKey: receiverSettingsGenerationKey))
+        )
+        return cancellationGeneration == "g\(generation)" ? generation : nil
+    }
+
     public func resetInvalidConnectionRecord() throws {
+        var committedMailboxRemovalGeneration: UInt64?
         do {
-            if try loadStoredConnectionRecord() != nil {
-                throw ReceiverSettingsRecordError.destructiveResetNotRequired
+            committedMailboxRemovalGeneration = try committedReceiverRemovalCancellationGeneration()
+            if committedMailboxRemovalGeneration == nil {
+                if try loadStoredConnectionRecord() != nil {
+                    throw ReceiverSettingsRecordError.destructiveResetNotRequired
+                }
+                let legacyToken = try tokenStore.loadToken()
+                let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
+                if legacyToken.isEmpty, explicitLegacyURL == nil {
+                    throw ReceiverSettingsRecordError.destructiveResetNotRequired
+                }
+                // Any legacy tuple is unverifiable because older app versions wrote
+                // URL and token separately. It is safe to reset only after the caller
+                // has put the app into explicit private-state recovery.
             }
-            let legacyToken = try tokenStore.loadToken()
-            let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
-            if legacyToken.isEmpty, explicitLegacyURL == nil {
-                throw ReceiverSettingsRecordError.destructiveResetNotRequired
-            }
-            // Any legacy tuple is unverifiable because older app versions wrote
-            // URL and token separately. It is safe to reset only after the caller
-            // has put the app into explicit private-state recovery.
         } catch ReceiverSettingsRecordError.invalidRecord {
             // A malformed prefixed atomic record is also confirmed invalid.
         } catch KeychainReceiverTokenStoreError.invalidData {
@@ -3769,9 +3804,15 @@ public final class ReceiverSettingsStore {
             // overwritten by the explicit recovery action.
         }
         let mirroredGeneration = UInt64(max(0, userDefaults.integer(forKey: receiverSettingsGenerationKey)))
-        var replacementGeneration = UInt64.random(in: 1 ... UInt64(Int.max))
-        while replacementGeneration == mirroredGeneration {
-            replacementGeneration = UInt64.random(in: 1 ... UInt64(Int.max))
+        let replacementGeneration: UInt64
+        if let committedMailboxRemovalGeneration {
+            replacementGeneration = committedMailboxRemovalGeneration
+        } else {
+            var randomGeneration = UInt64.random(in: 1 ... UInt64(Int.max))
+            while randomGeneration == mirroredGeneration {
+                randomGeneration = UInt64.random(in: 1 ... UInt64(Int.max))
+            }
+            replacementGeneration = randomGeneration
         }
         let record = ReceiverConnectionRecordV2(
             localScope: ReceiverLocalConnectionScopeV1(

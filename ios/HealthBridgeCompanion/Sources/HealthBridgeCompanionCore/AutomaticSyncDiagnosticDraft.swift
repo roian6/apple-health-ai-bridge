@@ -8,6 +8,7 @@ public final class AutomaticSyncDiagnosticDraft {
     private let wakeSource: AutomaticSyncDiagnosticWakeSource
     private let triggerReason: AutomaticSyncDiagnosticTriggerReason
     private let triggerLane: AutomaticSyncDiagnosticLane?
+    private let triggerTypeCodes: [String]
     private var admissionResult: AutomaticSyncDiagnosticAdmissionResult = .notReached
     private var selectedLane: AutomaticSyncDiagnosticLane = .noWork
     private var pendingSnapshot: AutomaticSyncPendingSnapshot = .empty
@@ -28,26 +29,31 @@ public final class AutomaticSyncDiagnosticDraft {
             wakeSource = .healthKitObserver
             triggerReason = .observer
             triggerLane = AutomaticSyncDiagnosticLane(typeCode: typeCode)
+            triggerTypeCodes = [GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode)]
             observerCompletionLatencyBucket = .pending
         case .observerBatch(let typeCodes):
             wakeSource = .observerRetry
             triggerReason = .observerBatch
             triggerLane = Self.triggerLane(for: typeCodes)
+            triggerTypeCodes = GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
             observerCompletionLatencyBucket = .notApplicable
         case .scheduledRefresh:
             wakeSource = .backgroundAppRefresh
             triggerReason = .scheduledRefresh
             triggerLane = nil
+            triggerTypeCodes = []
             observerCompletionLatencyBucket = .notApplicable
         case .launchCatchUp:
             wakeSource = .launchCatchUp
             triggerReason = .launchCatchUp
             triggerLane = nil
+            triggerTypeCodes = []
             observerCompletionLatencyBucket = .notApplicable
         case .manualSync:
             wakeSource = .launchCatchUp
             triggerReason = .launchCatchUp
             triggerLane = nil
+            triggerTypeCodes = []
             observerCompletionLatencyBucket = .notApplicable
         }
     }
@@ -60,6 +66,7 @@ public final class AutomaticSyncDiagnosticDraft {
         wakeSource = .healthKitObserver
         triggerReason = .observerError
         triggerLane = AutomaticSyncDiagnosticLane(rawValue: observerFailureLane.rawValue)
+        triggerTypeCodes = []
         observerCompletionLatencyBucket = .bucket(for: completionLatency)
         causalChain.observerFailureRetention = durableState
     }
@@ -107,11 +114,36 @@ public final class AutomaticSyncDiagnosticDraft {
     }
 
     public func notePlan(_ lanes: [AutomaticSyncDiagnosticLane]) {
+        let evidence = lanes.map { lane in
+            AutomaticSyncLaneEvidence(
+                lane: lane,
+                typeCode: triggerTypeCodes.count == 1
+                    && AutomaticSyncDiagnosticLane(typeCode: triggerTypeCodes[0]) == lane
+                    ? triggerTypeCodes[0]
+                    : nil
+            )
+        }
+        notePlan(evidence)
+    }
+
+    public func notePlan(typeCodes: [String]) {
+        let canonical = GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
+        notePlan(canonical.map {
+            AutomaticSyncLaneEvidence(
+                lane: AutomaticSyncDiagnosticLane(typeCode: $0),
+                typeCode: $0
+            )
+        })
+    }
+
+    private func notePlan(_ evidence: [AutomaticSyncLaneEvidence]) {
         let previous = causalChain
+        let lanes = evidence.map(\.lane)
         selectedLane = lanes.count == 1 ? lanes[0] : lanes.isEmpty ? .noWork : .mixed
-        causalChain = AutomaticSyncCausalChain(lanes: lanes.map {
-            AutomaticSyncLaneEvidence(lane: $0)
-        }, durableAdmission: causalChain.durableAdmission)
+        causalChain = AutomaticSyncCausalChain(
+            lanes: evidence,
+            durableAdmission: causalChain.durableAdmission
+        )
         causalChain.observerFailureRetention = previous.observerFailureRetention
         causalChain.initialRecoveryPending = previous.initialRecoveryPending
         causalChain.remainingRecoveryPending = previous.remainingRecoveryPending
@@ -121,6 +153,19 @@ public final class AutomaticSyncDiagnosticDraft {
     public func noteAttempt(_ lane: AutomaticSyncDiagnosticLane) {
         activeLaneIndex = causalChain.lanes.firstIndex {
             !$0.attempted && $0.lane == lane
+        }
+        queryStarted = false
+        if let activeLaneIndex { causalChain.lanes[activeLaneIndex].attempted = true }
+    }
+
+    public func noteAttempt(typeCode: String) {
+        let canonical = GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode)
+        activeLaneIndex = causalChain.lanes.firstIndex {
+            !$0.attempted && $0.typeCode == canonical
+        }
+        if activeLaneIndex == nil {
+            noteAttempt(AutomaticSyncDiagnosticLane(typeCode: canonical))
+            return
         }
         queryStarted = false
         if let activeLaneIndex { causalChain.lanes[activeLaneIndex].attempted = true }

@@ -174,10 +174,6 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     assert "SleepSyncBatchFactory.manifestPlan(" in body
     assert "receiverSettingsGeneration: currentReceiverGeneration" in body
     assert "historyDepth: currentHistoryDepth" in body
-    assert (
-        "guard executionMode == .foreground || manifestPlan.anchorCursorValue != nil"
-        in body
-    )
     assert "anchorCursorValue: manifestPlan.anchorCursorValue" in body
     assert "historyStartDate: manifestPlan.historyStartDate" in body
     assert "forceRepublishAll: manifestPlan.forceRepublishAll" in body

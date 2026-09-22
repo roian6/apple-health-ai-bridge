@@ -105,6 +105,92 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
     }
 
     @MainActor
+    func testThirdOpportunityArrivingDuringTrailingPassRunsUnderSameOwner() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let currentEntered = BoundedAsyncValueLatch<Void>()
+        let releaseCurrent = BoundedAsyncValueLatch<Void>()
+        let trailingEntered = BoundedAsyncValueLatch<Void>()
+        let releaseTrailing = BoundedAsyncValueLatch<Void>()
+        let thirdRan = BoundedAsyncValueLatch<Void>()
+        var reasons: [AutomaticSyncReason] = []
+        var activeOpportunities = 0
+        var maximumActiveOpportunities = 0
+        var ownerLeaseStartCount = 0
+        var ownerLeaseFinishCount = 0
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { _, _ in .noPayload },
+            performOpportunity: { opportunity, _ in
+                activeOpportunities += 1
+                maximumActiveOpportunities = max(
+                    maximumActiveOpportunities,
+                    activeOpportunities
+                )
+                reasons.append(opportunity.reason)
+                defer { activeOpportunities -= 1 }
+                switch reasons.count {
+                case 1:
+                    currentEntered.resolve(())
+                    _ = await releaseCurrent.wait(timeout: 1)
+                case 2:
+                    trailingEntered.resolve(())
+                    _ = await releaseTrailing.wait(timeout: 1)
+                case 3:
+                    thirdRan.resolve(())
+                default:
+                    XCTFail("Each causal opportunity must execute exactly once.")
+                }
+            },
+            startOwner: { _ in
+                ownerLeaseStartCount += 1
+                return { ownerLeaseFinishCount += 1 }
+            }
+        )
+        let owner = Task { @MainActor in
+            try await engine.requestRun(reason: .observer(typeCode: "heart_rate"))
+        }
+        guard await currentEntered.wait(timeout: 1) != nil else {
+            owner.cancel()
+            XCTFail("The current opportunity did not start.")
+            return
+        }
+
+        engine.requestRunWithoutWaiting(
+            reason: .observer(typeCode: "steps"),
+            diagnosticRunID: UUID()
+        )
+        releaseCurrent.resolve(())
+        guard await trailingEntered.wait(timeout: 1) != nil else {
+            owner.cancel()
+            XCTFail("The trailing opportunity did not start.")
+            return
+        }
+
+        engine.requestRunWithoutWaiting(
+            reason: .observer(typeCode: "weight"),
+            diagnosticRunID: UUID()
+        )
+        releaseTrailing.resolve(())
+        let thirdCompleted = await thirdRan.wait(timeout: 1)
+        try await owner.value
+
+        XCTAssertNotNil(thirdCompleted)
+        XCTAssertEqual(
+            reasons,
+            [
+                .observer(typeCode: "heart_rate"),
+                .observer(typeCode: "steps"),
+                .observer(typeCode: "weight"),
+            ]
+        )
+        XCTAssertEqual(maximumActiveOpportunities, 1)
+        XCTAssertEqual(activeOpportunities, 0)
+        XCTAssertEqual(ownerLeaseStartCount, 1)
+        XCTAssertEqual(ownerLeaseFinishCount, 1)
+    }
+
+    @MainActor
     func testRunUsesDeterministicSnapshotContinuesReadFailureAndPayload() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }
@@ -140,6 +226,121 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
             try fixture.store.loadPendingObserverTypeCodeGenerations(),
             ["energy": 1, "sleep_analysis": 1]
         )
+    }
+
+    @MainActor
+    func testObserverOpportunityDoesNotSweepUnrelatedPendingTypes() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        try fixture.store.markPendingObserverTypeCodes(["heart_rate", "steps"])
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                return .noPayload
+            }
+        )
+
+        try await engine.requestRun(reason: .observer(typeCode: "steps"))
+        let processed = await observed.values
+
+        XCTAssertEqual(processed, ["steps"])
+        XCTAssertEqual(
+            try fixture.store.loadPendingObserverTypeCodeGenerations(),
+            ["heart_rate": 1]
+        )
+    }
+
+    @MainActor
+    func testScheduledOpportunitiesResumeAfterCompletedPrefixWhenCancelled() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let selectedTypeCodes = ["energy", "heart_rate", "steps"]
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                if typeCode == "energy" {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+                return .noPayload
+            },
+            performOpportunity: { _, processPendingTypes in
+                let pending = try fixture.store.loadPendingObserverTypeCodeGenerations()
+                try fixture.store.markPendingObserverTypeCodes(
+                    selectedTypeCodes.filter { pending[$0] == nil }
+                )
+                _ = try await processPendingTypes()
+            }
+        )
+
+        for _ in 0..<2 {
+            do {
+                try await engine.requestRun(reason: .scheduledRefresh)
+                XCTFail("The synthetic finite opportunity must cancel after its first energy lane.")
+            } catch is CancellationError {
+                continue
+            }
+        }
+        let processed = await observed.values
+
+        XCTAssertEqual(
+            Array(processed.prefix(3)),
+            ["energy", "heart_rate", "steps"],
+            "A later Steps generation must make progress on the next platform opportunity."
+        )
+    }
+
+    @MainActor
+    func testBlockedResultReturnsIncompleteAndRetainsEveryGeneration() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        try fixture.store.markPendingObserverTypeCodes(["heart_rate", "steps"])
+        let observed = TypeCodeRecorder()
+        var completedAllPending = true
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                return typeCode == "heart_rate" ? .blocked : .noPayload
+            },
+            performOpportunity: { _, processPendingTypes in
+                completedAllPending = try await processPendingTypes()
+            }
+        )
+
+        try await engine.requestRun(reason: .observerBatch(
+            typeCodes: ["heart_rate", "steps"]
+        ))
+        let processed = await observed.values
+
+        XCTAssertFalse(completedAllPending)
+        XCTAssertEqual(processed, ["heart_rate"])
+        XCTAssertEqual(
+            try fixture.store.loadPendingObserverTypeCodeGenerations(),
+            ["heart_rate": 1, "steps": 1]
+        )
+    }
+
+    @MainActor
+    func testEngineNeverProcessesTypeWithoutDurableGeneration() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                return .noPayload
+            }
+        )
+
+        try await engine.requestRun(reason: .launchCatchUp)
+        let processed = await observed.values
+
+        XCTAssertEqual(processed, [])
     }
 
     @MainActor

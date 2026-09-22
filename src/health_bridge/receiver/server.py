@@ -51,7 +51,6 @@ from health_bridge.receiver.tokens import (
 )
 from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import (
-    database_access_lock,
     database_lifecycle_lock,
     initialize_database,
 )
@@ -548,7 +547,6 @@ def serve_receiver(  # noqa: PLR0913 - transport dependencies are explicit.
     )
     with (
         database_lifecycle_lock(db_path, exclusive=False, create=False),
-        database_access_lock(db_path, exclusive=False, create=False),
         (
             ReceiverHTTPServer(
                 host=host,

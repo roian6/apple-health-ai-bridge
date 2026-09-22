@@ -104,14 +104,17 @@ final class AutomaticSyncRuntime {
     }
 
     func runForegroundCatchUpIfNeeded() {
-        guard !foregroundOpportunityConsumed else { return }
+        let opportunityWasConsumed = foregroundOpportunityConsumed
+        guard !opportunityWasConsumed else { return }
         foregroundOpportunityConsumed = true
         reconcileRegistrations()
         if viewModel.usesMailboxTransport {
             viewModel.runForegroundMailboxReconciliationIfNeeded()
             return
         }
-        guard viewModel.automaticSyncShouldRunForegroundCatchUp,
+        guard viewModel.automaticSyncShouldRunForegroundCatchUp(
+            opportunityWasConsumed: opportunityWasConsumed
+        ),
               foregroundCatchUpTask == nil else {
             return
         }

@@ -259,7 +259,11 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
         XCTAssertLessThanOrEqual(chain.lanes[0].pendingItems.count, AutomaticSyncLaneEvidence.maximumPendingItems)
         let data = try JSONEncoder().encode(draft.record)
         let json = String(decoding: data, as: UTF8.self)
-        for forbidden in ["heart_rate", "private_optional_identifier", "payload", "anchor", "cursor", "sourceKey", "deviceID", "receiverIdentity", "http", "SHA", "1800000100"] {
+        XCTAssertTrue(
+            json.contains("heart_rate"),
+            "Private diagnostics must identify the exact selected HealthKit type without values."
+        )
+        for forbidden in ["private_optional_identifier", "payload", "anchor", "cursor", "sourceKey", "deviceID", "receiverIdentity", "http", "SHA", "1800000100"] {
             XCTAssertFalse(json.contains(forbidden), forbidden)
         }
         XCTAssertLessThan(data.count, 8_192)

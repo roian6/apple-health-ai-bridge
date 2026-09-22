@@ -179,6 +179,185 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertFalse(uploader.automaticContinuationAdmissionIsOpen)
     }
 
+    func testStaleSleepRecoveryDoesNotBlockLaterStepsQuery() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AutomaticSleepBootstrapFIFOTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "AutomaticSleepBootstrapFIFOTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        try settingsStore.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-sleep-fifo-credential",
+            rotateBindingID: true
+        )
+        let receiverBindingID = try XCTUnwrap(settingsStore.receiverBindingID)
+        let currentGeneration = settingsStore.receiverSettingsGenerationToken
+        let staleGeneration = "g0"
+        XCTAssertNotEqual(currentGeneration, staleGeneration)
+
+        let backgroundSyncStore = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try backgroundSyncStore.setEnabledDurably(true)
+        try backgroundSyncStore.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
+        XCTAssertEqual(backgroundSyncStore.pendingObserverTypeCodes, ["sleep_analysis", "steps"])
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+
+        let installationID = "synthetic-sleep-fifo-installation"
+        let sleepSourceKey = "apple_health.phone.\(installationID)"
+        let sleepStore = try FileSleepSyncManifestStore(
+            fileURL: root.appendingPathComponent("sleep.json")
+        )
+        let staleReservation = SleepSyncBatchFactory.makeManifestReservation(
+            receiverSettingsGeneration: staleGeneration,
+            historyDepth: .allAvailable,
+            historyStartDate: nil,
+            sourceKey: sleepSourceKey,
+            baselineResetEpoch: 1,
+            identityNamespace: try XCTUnwrap(
+                UUID(uuidString: "00000000-0000-0000-0000-000000000001")
+            )
+        )
+        let staleTransition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: staleReservation,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [],
+                deletedSamples: [],
+                anchorCursorValue: "synthetic-stale-sleep-anchor",
+                receivedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            ),
+            receiverSettingsGeneration: staleGeneration,
+            historyDepth: .allAvailable,
+            historyStartDate: nil,
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try sleepStore.saveManifest(staleTransition.manifest)
+        try sleepStore.savePendingTransition(SleepSyncPendingTransition(
+            payload: try HealthBridgeBatchEncoder().encode(staleTransition.batch),
+            manifest: staleTransition.manifest,
+            receiverBindingID: receiverBindingID,
+            connectionGeneration: staleGeneration,
+            outboxItemID: "missing-synthetic-sleep-payload.json"
+        ))
+
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let cursorStore = try FileSyncCursorStore(
+            fileURL: root.appendingPathComponent("cursors.json")
+        )
+        try cursorStore.saveCursorValue(
+            "synthetic-malformed-steps-anchor",
+            receiverBindingID: receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+        )
+        CoreLaneUploadProofStore(userDefaults: defaults).markUploadedRecords(
+            lane: .steps,
+            receiverBindingID: receiverBindingID
+        )
+        let networkRecorder = PayloadFenceNetworkRecorder()
+        PayloadFenceURLProtocol.networkRecorder = networkRecorder
+        defer { PayloadFenceURLProtocol.networkRecorder = nil }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [PayloadFenceURLProtocol.self]
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settingsStore,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { installationID }
+            ),
+            outbox: outbox,
+            receiverClient: ReceiverClient(
+                session: URLSession(configuration: sessionConfiguration)
+            ),
+            readAnchoredSleepChanges: { _, _, receivedAt in
+                HealthKitAnchoredSleepChanges(
+                    addedSamples: [],
+                    deletedSamples: [],
+                    anchorCursorValue: "synthetic-bootstrap-sleep-anchor",
+                    receivedAt: receivedAt
+                )
+            }
+        )
+        await viewModel.bootstrap()
+        let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(
+            reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
+        )
+
+        let replacementManifest = try XCTUnwrap(sleepStore.loadManifest())
+        XCTAssertEqual(replacementManifest.receiverSettingsGeneration, currentGeneration)
+        XCTAssertNil(
+            replacementManifest.anchorCursorValue,
+            "An empty initial Sleep read must not advance the durable anchor before acceptance is finalized."
+        )
+        let acknowledgedTransition = try XCTUnwrap(sleepStore.loadPendingTransition())
+        XCTAssertEqual(acknowledgedTransition.connectionGeneration, currentGeneration)
+        XCTAssertEqual(
+            acknowledgedTransition.manifest.anchorCursorValue,
+            "synthetic-bootstrap-sleep-anchor"
+        )
+        let acknowledgedOutboxItemID = try XCTUnwrap(acknowledgedTransition.outboxItemID)
+        XCTAssertNil(try outbox.pendingItem(id: acknowledgedOutboxItemID))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertGreaterThan(networkRecorder.invocationCount, 0)
+
+        try backgroundSyncStore.markPendingObserverTypeCodes(["sleep_analysis", "steps"])
+        var processedTypeCodes: [String] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: backgroundSyncStore,
+            processType: { typeCode, pendingGenerations in
+                processedTypeCodes.append(typeCode)
+                return await viewModel.processAutomaticSyncType(
+                    typeCode,
+                    pendingGenerations: pendingGenerations
+                )
+            }
+        )
+        try await engine.requestRun(
+            reason: .observerBatch(typeCodes: ["sleep_analysis", "steps"])
+        )
+
+        let committedManifest = try XCTUnwrap(sleepStore.loadManifest())
+        XCTAssertEqual(committedManifest.receiverSettingsGeneration, currentGeneration)
+        XCTAssertEqual(
+            committedManifest.anchorCursorValue,
+            "synthetic-bootstrap-sleep-anchor"
+        )
+        let currentTransition = try XCTUnwrap(sleepStore.loadPendingTransition())
+        XCTAssertEqual(currentTransition.connectionGeneration, currentGeneration)
+        XCTAssertEqual(
+            currentTransition.manifest.receiverSettingsGeneration,
+            currentGeneration
+        )
+        let currentOutboxItemID = try XCTUnwrap(currentTransition.outboxItemID)
+        XCTAssertNotNil(try outbox.pendingItem(id: currentOutboxItemID))
+        XCTAssertEqual(processedTypeCodes, ["sleep_analysis", "steps"])
+        XCTAssertTrue(
+            viewModel.statusMessage.hasPrefix(
+                "Step sync failed: HealthKit anchor cursor was not valid base64."
+            ),
+            "The later Steps lane must reach its real query path while automatic Sleep finalizes receiver acceptance."
+        )
+    }
+
     func testAutomaticSyncDiagnosticStorePersistsCancellationInIOSContainers() throws {
         let manager = FileManager.default
         let applicationSupport = try XCTUnwrap(
@@ -268,6 +447,156 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try cursors.cursorValue(receiverBindingID: binding, sourceKey: "steps", cursorKind: "anchor"), "synthetic-progress")
         XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), generations)
         XCTAssertNil(background.lastTaskSchedule, "Disabled automatic sync must not submit a request")
+    }
+
+    func testBlockedAutomaticOpportunityCannotRecordCompletedSuccess() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BlockedAutomaticOpportunityTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "BlockedAutomaticOpportunityTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        try settings.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-blocked-opportunity-credential",
+            rotateBindingID: true
+        )
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        try background.markPendingObserverTypeCodes(["steps"])
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let diagnostics = AutomaticSyncDiagnosticStore(
+            fileURL: root.appendingPathComponent("diagnostics.json")
+        )
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: try FileOutbox(directory: root.appendingPathComponent("outbox")),
+            automaticSyncDiagnosticStore: diagnostics
+        )
+        await viewModel.bootstrap()
+        let engine = AutomaticSyncEngine(
+            pendingStore: background,
+            processType: { _, _ in .blocked },
+            performOpportunity: { opportunity, processPendingTypes in
+                _ = await viewModel.performAutomaticSyncOpportunity(
+                    opportunity: opportunity,
+                    processPendingTypes: processPendingTypes
+                )
+            }
+        )
+
+        try await engine.requestRun(reason: .observerBatch(typeCodes: ["steps"]))
+
+        let lastRun = try XCTUnwrap(background.lastRun)
+        XCTAssertEqual(lastRun.outcome, .interrupted)
+        XCTAssertFalse(lastRun.succeeded)
+        XCTAssertEqual(diagnostics.latestRecord?.runOutcome, .deferred)
+        XCTAssertGreaterThan(diagnostics.latestRecord?.remainingPendingLaneCount ?? 0, 0)
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), ["steps": 1])
+    }
+
+    func testRuntimeIneligibleGenerationRetiresWithoutBlockingLaterEligibleWork() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RuntimeIneligibleAutomaticTypeTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "RuntimeIneligibleAutomaticTypeTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(),
+            synchronize: { true }
+        )
+        try settings.save(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-ineligible-type-credential",
+            rotateBindingID: true
+        )
+        let unavailableTypeCode = "aaa_runtime_unavailable_quantity"
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        try background.markPendingObserverTypeCodes([unavailableTypeCode, "steps"])
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        let viewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(),
+                installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore()
+            ),
+            outbox: outbox
+        )
+        await viewModel.bootstrap()
+        XCTAssertFalse(
+            viewModel.automaticSyncSelectedEligibleTypeCodes().contains(unavailableTypeCode)
+        )
+        var processedTypeCodes: [String] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: background,
+            processType: { typeCode, pendingGenerations in
+                processedTypeCodes.append(typeCode)
+                guard typeCode == unavailableTypeCode else { return .noPayload }
+                return await viewModel.processAutomaticSyncType(
+                    typeCode,
+                    pendingGenerations: pendingGenerations
+                )
+            }
+        )
+
+        try await engine.requestRun(reason: .scheduledRefresh)
+
+        XCTAssertEqual(processedTypeCodes, [unavailableTypeCode, "steps"])
+        XCTAssertTrue(try background.loadPendingObserverTypeCodeGenerations().isEmpty)
+
+        try background.markPendingObserverTypeCodes([unavailableTypeCode])
+        let retainedGenerations = try background.loadPendingObserverTypeCodeGenerations()
+        var outboxRetirements = retainedGenerations
+        outboxRetirements["synthetic_group_peer"] = 1
+        _ = try outbox.enqueueSequence(
+            [Data("synthetic-ineligible-retirement".utf8)],
+            receiverIdentity: try XCTUnwrap(settings.receiverBindingID),
+            pendingGenerationRetirements: outboxRetirements
+        )
+
+        let protectedResult = await viewModel.processAutomaticSyncType(
+            unavailableTypeCode,
+            pendingGenerations: retainedGenerations
+        )
+
+        XCTAssertEqual(protectedResult, .payloadEnqueued)
+        XCTAssertEqual(
+            try background.loadPendingObserverTypeCodeGenerations(),
+            retainedGenerations
+        )
     }
 
     func testConfirmedResetDuringPairingTerminalRequestWaitsThenDeletes() async throws {
@@ -749,6 +1078,195 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try outbox.pendingItems().count, 0)
     }
 
+    func testBootstrapRetiresCancellationAfterReceiverRemovalCommitsBeforeMirrors() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "HealthBridgeResetAdmissionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let receiverTokenStore = MemoryReceiverTokenStore()
+        let preCutoverBackupStore = MemoryReceiverTokenStore()
+        let pendingStore = MemoryReceiverTokenStore()
+        let installationIDStore = MemoryReceiverTokenStore()
+        let cancellationStore = MemoryReceiverTokenStore()
+        let settingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: receiverTokenStore,
+            preCutoverBackupStore: preCutoverBackupStore,
+            synchronize: { true }
+        )
+        let receiverURLString = "https://old.example/v1/batches"
+        let bearerToken = "synthetic-device-credential"
+        try settingsStore.save(
+            receiverURLString: receiverURLString,
+            bearerToken: bearerToken,
+            rotateBindingID: true
+        )
+        let pairingStateStore = ReceiverPairingStateStore(
+            pendingStore: pendingStore,
+            installationIDStore: installationIDStore,
+            cancellationStore: cancellationStore,
+            installationIDGenerator: { "synthetic-installation" },
+            deviceCredentialGenerator: { "synthetic-pairing-credential" }
+        )
+        _ = try pairingStateStore.stage(invitation: syntheticInvitation())
+        let cancellationGeneration = settingsStore.receiverSettingsGenerationToken
+        let coordinator = ReceiverPairingCoordinator(
+            client: ReceiverClient(),
+            stateStore: pairingStateStore,
+            settingsStore: settingsStore
+        )
+        try coordinator.beginPendingCancellation(
+            expectedGeneration: cancellationGeneration
+        )
+
+        let mailboxIdentity = MailboxConnectionIdentityV1(
+            receiverID: String(repeating: "1", count: 32),
+            deviceID: String(repeating: "2", count: 32),
+            devicePrincipal: "installation:" + String(repeating: "3", count: 64),
+            deviceSigningKeyID: String(repeating: "4", count: 32),
+            deviceAgreementKeyID: String(repeating: "5", count: 32),
+            receiverSigningKeyID: "6c9a98e60055e4d14e5d591d6b7c1104",
+            receiverAgreementKeyID: "cf09eac7ec4fb8e8acc48b7cc1ee77e5",
+            receiverSigningPublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            receiverAgreementPublicKey: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+            opaqueBinding: "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+            connectionGeneration: 1
+        )
+        let committedPairedMailboxRecord = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: try XCTUnwrap(
+                    settingsStore.currentConnectionRecordV2()
+                ).localScope.generation,
+                bindingID: mailboxIdentity.opaqueBinding
+            ),
+            mailboxIdentity: .available(mailboxIdentity),
+            activation: .paired(activeTransport: .mailbox),
+            transportConfigurations: [
+                .directHTTP(
+                    activation: .inactive,
+                    configuration: DirectHTTPConnectionConfigurationV1(
+                        receiverURLString: receiverURLString,
+                        bearerToken: bearerToken
+                    )
+                ),
+                .mailbox(
+                    activation: .active,
+                    configuration: MailboxConnectionConfigurationV1()
+                ),
+            ]
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let encodedRecord = try encoder.encode(committedPairedMailboxRecord)
+        try receiverTokenStore.saveToken(
+            "health-bridge-connection-v2:" + encodedRecord.base64EncodedString()
+        )
+
+        let relaunchedSettingsStore = ReceiverSettingsStore(
+            userDefaults: defaults,
+            tokenStore: receiverTokenStore,
+            preCutoverBackupStore: preCutoverBackupStore,
+            synchronize: { true }
+        )
+        let relaunchedPairingStateStore = ReceiverPairingStateStore(
+            pendingStore: pendingStore,
+            installationIDStore: installationIDStore,
+            cancellationStore: cancellationStore,
+            installationIDGenerator: { "synthetic-installation" },
+            deviceCredentialGenerator: { "synthetic-pairing-credential" }
+        )
+        let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        XCTAssertEqual(try outbox.pendingItems().count, 0)
+        XCTAssertEqual(
+            relaunchedSettingsStore.terminalCancellationExpectedGeneration,
+            cancellationGeneration
+        )
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverSettingsGenerationToken,
+            cancellationGeneration
+        )
+        XCTAssertEqual(
+            try relaunchedPairingStateStore.pendingCancellationExpectedGeneration(),
+            cancellationGeneration
+        )
+        XCTAssertNotNil(try relaunchedPairingStateStore.loadPending())
+        XCTAssertEqual(
+            try relaunchedSettingsStore.currentConnectionRecordV2(),
+            committedPairedMailboxRecord
+        )
+        XCTAssertEqual(
+            committedPairedMailboxRecord.transportConfigurations,
+            [
+                .directHTTP(
+                    activation: .inactive,
+                    configuration: DirectHTTPConnectionConfigurationV1(
+                        receiverURLString: receiverURLString,
+                        bearerToken: bearerToken
+                    )
+                ),
+                .mailbox(
+                    activation: .active,
+                    configuration: MailboxConnectionConfigurationV1()
+                ),
+            ]
+        )
+        XCTAssertEqual(relaunchedSettingsStore.activeTransport, .mailbox)
+        XCTAssertFalse(try relaunchedSettingsStore.receiverSettingsAreCleared())
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverURLString,
+            receiverURLString
+        )
+        XCTAssertNotEqual(
+            relaunchedSettingsStore.receiverURLString,
+            ReceiverSettingsStore.defaultReceiverURLString
+        )
+        XCTAssertEqual(try relaunchedSettingsStore.loadBearerToken(), bearerToken)
+        XCTAssertEqual(
+            defaults.string(forKey: "receiverURLString"),
+            receiverURLString
+        )
+
+        let relaunchedViewModel = try makeViewModel(
+            root: root,
+            defaults: defaults,
+            settingsStore: relaunchedSettingsStore,
+            pairingStateStore: relaunchedPairingStateStore,
+            outbox: outbox
+        )
+        await relaunchedViewModel.bootstrap()
+
+        XCTAssertNil(relaunchedSettingsStore.terminalCancellationExpectedGeneration)
+        XCTAssertNil(try relaunchedPairingStateStore.loadPending())
+        XCTAssertFalse(try relaunchedPairingStateStore.hasPendingCancellation())
+        XCTAssertFalse(relaunchedViewModel.hasPendingPairing)
+        XCTAssertNotEqual(
+            try relaunchedSettingsStore.currentConnectionRecordV2(),
+            committedPairedMailboxRecord
+        )
+        XCTAssertNil(relaunchedSettingsStore.activeTransport)
+        XCTAssertTrue(try relaunchedSettingsStore.receiverSettingsAreCleared())
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverSettingsGenerationToken,
+            cancellationGeneration
+        )
+        XCTAssertEqual(
+            relaunchedSettingsStore.receiverURLString,
+            ReceiverSettingsStore.defaultReceiverURLString
+        )
+        XCTAssertEqual(try relaunchedSettingsStore.loadBearerToken(), "")
+        XCTAssertNil(defaults.string(forKey: "receiverURLString"))
+        XCTAssertEqual(try outbox.pendingItems().count, 0)
+    }
+
     func testConfirmedResetRejectsBootstrapReadmissionWhileCancellationIsDraining() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("HealthBridgeResetAdmissionTests", isDirectory: true)
@@ -976,6 +1494,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         outbox: FileOutbox,
         receiverClient: ReceiverClient = ReceiverClient(),
         automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore(),
+        readAnchoredSleepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
         },
@@ -1015,6 +1536,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 service: "synthetic.reset-regression",
                 keychain: MemoryMailboxKeychain()
             ),
+            readAnchoredSleepChanges: readAnchoredSleepChanges,
             cancelInheritedLegacyUploads: cancelInheritedLegacyUploads,
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             terminalRecoveryDrainTimeoutNanoseconds: terminalRecoveryDrainTimeoutNanoseconds

@@ -300,7 +300,9 @@ public struct AutomaticSyncDiagnosticRecord: Codable, Equatable, Sendable {
                     + (chain.initialRecoveryPending.map { "; recovery_initial=\($0.durableState.rawValue)/\($0.lanes.count)" } ?? "")
                     + (chain.remainingRecoveryPending.map { "; recovery_remaining=\($0.durableState.rawValue)/\($0.lanes.count)" } ?? "")
                     + "; lanes=" + chain.lanes.map { lane in
-                        "\(lane.lane.rawValue):\(lane.attempted ? "attempted" : "selected")"
+                        "\(lane.lane.rawValue)"
+                            + (lane.typeCode.map { "[\($0)]" } ?? "")
+                            + ":\(lane.attempted ? "attempted" : "selected")"
                             + "/\(lane.query.rawValue)/\(lane.newestSampleAge.rawValue)"
                             + "/\(lane.outbox.rawValue)/\(lane.delivery.rawValue)"
                     }.joined(separator: " -> ")

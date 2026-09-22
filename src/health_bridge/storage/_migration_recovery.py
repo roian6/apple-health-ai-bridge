@@ -50,8 +50,12 @@ def prepare_delivery_receipt_recovery(
     stage_path = Path(stage_name)
     try:
         atomic_copy_private(backup_path, stage_path)
-        with sqlite3.connect(stage_path) as staged_connection:
-            stage_migration(staged_connection)
+        staged_connection = sqlite3.connect(stage_path)
+        try:
+            with staged_connection:
+                stage_migration(staged_connection)
+        finally:
+            staged_connection.close()
         write_hash_pair(
             recovery_path,
             file_sha256(backup_path),

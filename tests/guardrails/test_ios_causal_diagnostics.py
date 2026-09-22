@@ -13,12 +13,12 @@ def test_each_automatic_healthkit_query_has_typed_start_and_result_seams() -> No
         "let changes = try await HealthKitStepCountReader",
         "let aggregates = try await HealthKitGenericQuantityReader",
         "let changes = try await HealthKitWorkoutReader",
-        "let changes = try await HealthKitSleepReader",
+        "let changes: HealthKitAnchoredSleepChanges",
         "let changes = try await reader.readAnchoredQuantityChanges",
     ):
         start = source.index(query)
-        assert "noteAutomaticSyncQueryStarted(" in source[start - 110 : start]
-        assert "noteAutomaticSyncQueryResult(" in source[start : start + 500]
+        assert "noteAutomaticSyncQueryStarted(" in source[start - 180 : start]
+        assert "noteAutomaticSyncQueryResult(" in source[start : start + 900]
 
 
 def test_local_outbox_evidence_is_not_payload_or_receiver_proof() -> None:
