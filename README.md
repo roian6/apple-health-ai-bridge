@@ -33,8 +33,6 @@ You need:
 
 Download [Health Bridge for AI from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) on your iPhone. TestFlight remains available for beta builds and prerelease testing through the [official install page](https://healthbridge.chanhyo.dev/install/).
 
-Three guided onboarding spots are open for Apple Health users who want help connecting the complete path. [Request a guided setup](https://healthbridge.chanhyo.dev/install/#guided-setup) if you have an iPhone, a Mac or Linux receiver computer, and an MCP-compatible AI client. Your health values remain private.
-
 ### 2. Prepare the receiver route
 
 The project does not give you a receiver URL. The URL is the private address by which the iPhone reaches your receiver computer, and it must exist before core setup can create pairing material.
