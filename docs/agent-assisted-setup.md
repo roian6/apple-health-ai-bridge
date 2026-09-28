@@ -124,6 +124,6 @@ Agents can reduce setup burden, but they cannot fully remove Apple platform and 
 
 ## Product implication
 
-Near-term accessibility should focus on TestFlight plus clear agent-assisted setup docs. A desktop/tray receiver app should be reconsidered after TestFlight feedback shows repeated receiver/MCP setup failures that local agents cannot solve.
+Near-term accessibility should focus on the App Store plus clear agent-assisted setup docs. A desktop/tray receiver app should be reconsidered when repeated setup feedback shows receiver/MCP friction that local agents cannot solve.
 
 Hosted relay, manual export import, and Shortcuts fallback remain outside near-term scope unless the project explicitly changes direction.
