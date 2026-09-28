@@ -32,13 +32,13 @@ A new reader should be able to answer these from `README.md`, `docs/architecture
 - What data path does it use?
 - Is HealthKit access read-only?
 - What can be tested without an iPhone?
-- What requires iPhone, Mac/Xcode, and private pairing material?
+- What requires an iPhone, a receiver computer, and private pairing material, and what additionally requires Mac/Xcode for a self-build?
 - Which pairing method is the default user path, which methods are fallbacks, and which method is maintainer-only?
 - What receiver URL shapes fail for physical iPhones?
 - What is not supported yet?
 - What must never be pasted into public issues, PRs, docs, or chat?
 
-The answer should not claim full Apple Health export, HealthKit write support, hosted cloud processing, App Store availability, medical use, or guaranteed background freshness.
+The answer should not claim full Apple Health export, HealthKit write support, hosted cloud processing, medical use, or guaranteed background freshness.
 
 ## Real-device smoke checklist
 
