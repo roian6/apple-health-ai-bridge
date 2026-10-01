@@ -1,6 +1,6 @@
 # Apple Health AI Bridge Roadmap
 
-The current public release set is Receiver/CLI `1.1.1`, iOS Companion `1.1.1 (50)` on the App Store and TestFlight, and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
+The current public release set is Receiver/CLI `1.1.2`, iOS Companion `1.1.1 (50)` on the App Store and TestFlight, and the unchanged Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
 
 ## Current state
 

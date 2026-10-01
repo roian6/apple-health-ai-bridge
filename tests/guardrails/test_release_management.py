@@ -1083,7 +1083,7 @@ def test_public_install_commands_are_pinned_to_current_receiver_release() -> Non
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
     for content, name, expected_tag in (
-        (readme, "README.md", "receiver-v1.1.1"),
+        (readme, "README.md", "receiver-v1.1.2"),
         (setup, "docs/setup.md", "receiver-v1.1.2"),
     ):
         pins = re.findall(
