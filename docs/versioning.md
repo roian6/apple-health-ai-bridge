@@ -7,10 +7,11 @@ Apple Health AI Bridge contains independently released components. Always includ
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
 | Receiver/CLI | `1.1.1` | Release tag `receiver-v1.1.1` |
+| Receiver/CLI source candidate | `1.1.2` | Unpublished; planned tag `receiver-v1.1.2` |
 | iOS Companion | `1.1.1` | Source candidate build `50` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-The authoritative machine-readable copy is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
+The authoritative machine-readable source-candidate mapping is [`component-versions.json`](../component-versions.json). Receiver/CLI `1.1.2` is not yet downloadable; primary installation commands remain pinned to published `receiver-v1.1.1` until the new immutable release is verified. The index declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
 
 ## Version surfaces
 

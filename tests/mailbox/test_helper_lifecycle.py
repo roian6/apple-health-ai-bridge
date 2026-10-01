@@ -65,7 +65,8 @@ def allow_synthetic_distribution_policy(
 
 BUNDLE_ID = "com.example.HealthBridgeMailboxAckPublisher"
 CONTAINER_ID = "iCloud.com.example.HealthBridgeMailboxAckPublisher"
-TAG = "receiver-v1.1.1"
+VERSION = "1.1.2"
+TAG = f"receiver-v{VERSION}"
 TAG_OBJECT = "1" * 40
 COMMIT = "2" * 40
 TREE = "3" * 40
@@ -95,7 +96,7 @@ def _write_archive(
             "CFBundleExecutable": HELPER_EXECUTABLE_NAME,
             "CFBundleIdentifier": BUNDLE_ID,
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "1.1.1",
+            "CFBundleShortVersionString": VERSION,
             "CFBundleVersion": "1",
             "HealthBridgeExpectedBundleIdentifier": BUNDLE_ID,
             "HealthBridgeICloudContainerIdentifier": CONTAINER_ID,
@@ -126,7 +127,7 @@ def _write_archive(
 
 
 def _write_manifest(path: Path, archive: Path, **updates: object) -> None:
-    payload = manifest_payload(archive, schema_version=2)
+    payload = manifest_payload(archive, schema_version=2, version=VERSION)
     payload.update(updates)
     _ = path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -135,8 +136,8 @@ def _write_manifest(path: Path, archive: Path, **updates: object) -> None:
 
 
 def _release(tmp_path: Path) -> tuple[Path, Path]:
-    archive = tmp_path / "HealthBridgeMailboxAckPublisher-1.1.1.zip"
-    manifest = tmp_path / "HealthBridgeMailboxAckPublisher-1.1.1.manifest.json"
+    archive = tmp_path / f"HealthBridgeMailboxAckPublisher-{VERSION}.zip"
+    manifest = tmp_path / f"HealthBridgeMailboxAckPublisher-{VERSION}.manifest.json"
     _write_archive(archive)
     _write_manifest(manifest, archive)
     return archive, manifest
@@ -299,7 +300,7 @@ def _verifier(calls: list[Path]) -> PlatformVerifier:
         icloud_container_identifier: str,
     ) -> None:
         assert bundle_identifier == BUNDLE_ID
-        assert bundle_version == "1.1.1"
+        assert bundle_version == VERSION
         assert bundle_build == "1"
         assert icloud_container_identifier == CONTAINER_ID
         assert app.name == HELPER_APP_NAME

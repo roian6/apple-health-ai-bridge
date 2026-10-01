@@ -149,10 +149,11 @@ The repository contains independently released components. Always include the co
 | Surface | Current version | Identifier |
 | --- | --- | --- |
 | Receiver/CLI | `1.1.1` | signed tag `receiver-v1.1.1` |
+| Receiver/CLI source candidate | `1.1.2` | Unpublished; planned tag `receiver-v1.1.2` |
 | iOS Companion | `1.1.1` | App Store build `50` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
+These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical source-candidate mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md). Installation commands remain pinned to the published `receiver-v1.1.1` until `receiver-v1.1.2` is published and verified.
 
 User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with the signed mailbox helper and its public manifest, SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, helper source tree, Git tree, and Batch Protocol together. Existing `v1.0.0`, `v1.0.1`, and `receiver-v1.1.0` releases remain immutable; current and future receiver releases use component-scoped tags such as `receiver-v1.1.1`.
 

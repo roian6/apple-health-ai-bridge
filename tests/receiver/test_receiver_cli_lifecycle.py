@@ -132,3 +132,28 @@ def test_shipped_cli_accepts_authenticated_post_while_lifetime_lock_is_held(
     assert unauthorized == (401, b'{"error":"unauthorized"}')
     assert authenticated is not None, "authenticated POST timed out under CLI lock"
     assert authenticated.status == 202
+
+
+def test_native_status_and_mcp_read_while_receiver_remains_alive(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "live-reads.sqlite"
+    port = _available_port()
+    executable = str(Path(sys.executable).with_name("health-bridge"))
+
+    with _running_receiver_cli(db_path, port):
+        results = [
+            subprocess.run(
+                [executable, *args, "--db", str(db_path)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=15,
+            )
+            for args in (("status", "--json"), ("mcp", "smoke"))
+        ]
+        assert _health_status(port) == 200
+        assert [result.returncode for result in results] == [0, 0], [
+            result.stderr for result in results
+        ]
+        assert all(result.stdout.strip() for result in results)

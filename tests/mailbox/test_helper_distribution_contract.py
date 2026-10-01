@@ -97,7 +97,9 @@ def _write_archive(path: Path) -> None:
             archive.writestr(member, content)
 
 
-def manifest_payload(archive: Path, *, schema_version: int) -> dict[str, object]:
+def manifest_payload(
+    archive: Path, *, schema_version: int, version: str = VERSION
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_id": (
             "health_bridge.mailbox_ack_helper.release.v2"
@@ -115,11 +117,11 @@ def manifest_payload(archive: Path, *, schema_version: int) -> dict[str, object]
             "build": "1",
             "identifier": BUNDLE_ID,
             "icloud_container_identifier": CONTAINER_ID,
-            "version": VERSION,
+            "version": version,
         },
         "release": {
             "commit": "2" * 40,
-            "tag": TAG,
+            "tag": f"receiver-v{version}",
             "tag_object": "1" * 40,
             "tree": "3" * 40,
         },
