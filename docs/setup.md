@@ -2,6 +2,8 @@
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, and leave Automatic Sync enabled.
 
+Run the installation and setup commands in this guide only after the immutable `receiver-v1.1.2` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older mailbox helper.
+
 ## Before you start
 
 You need:
@@ -132,10 +134,10 @@ After setup, use the printed receiver command with the same bind and port. Keep 
 
 ## Install and run core setup
 
-Install the current signed receiver release:
+After the publication check above, install Receiver/CLI `1.1.2`:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.1"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.2"
 ```
 
 After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.
@@ -223,6 +225,8 @@ Pair only after the receiver and phone route are ready:
 The app asks for all runtime-supported read types in one authorization flow. Apple’s sheet lets you allow or deny individual types.
 
 ## Verify the first sync
+
+Receiver/CLI `1.1.2` supports native CLI and MCP reads while the receiver keeps running. In another terminal, use the same database path for `health-bridge status` and `health-bridge mcp smoke`. No iOS update is required for this receiver fix.
 
 ```bash
 health-bridge status \

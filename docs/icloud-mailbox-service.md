@@ -24,13 +24,16 @@ that developer-no-access boundary remains true.
 
 ## Install and verify the signed helper
 
-Use the Receiver/CLI `1.1.1` GitHub Release assets. Download these files with a
+Download assets and run the commands below only after the immutable `receiver-v1.1.2` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.2`.
+
+Use the Receiver/CLI `1.1.2` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.1-py3-none-any.whl`;
-- `HealthBridgeMailboxAckPublisher-1.1.1.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.1.manifest.json`;
+- `apple_health_ai_bridge-1.1.2-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.1.2.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.1.2.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.2.manifest.json`;
 - `release-metadata.json`;
 - `SHA256SUMS`.
 
@@ -40,14 +43,14 @@ explicitly install it:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-uv tool install ./apple_health_ai_bridge-1.1.1-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.1.2-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.1.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.1.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.2.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.2.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.1.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.1.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.2.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.2.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```

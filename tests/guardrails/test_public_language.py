@@ -434,9 +434,9 @@ def test_current_component_identities_are_explicit() -> None:
     server_manifest = Path("server.json").read_text()
     security = Path("SECURITY.md").read_text()
 
-    assert 'version = "1.1.1"' in pyproject
-    assert '__version__: Final = "1.1.1"' in package_init
-    assert '"version": "1.1.1"' in server_manifest
+    assert 'version = "1.1.2"' in pyproject
+    assert '__version__: Final = "1.1.2"' in package_init
+    assert '"version": "1.1.2"' in server_manifest
     assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
     assert xcode_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
     assert '?? "1.1.1"' in content_view

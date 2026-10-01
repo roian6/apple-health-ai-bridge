@@ -1,7 +1,9 @@
+import plistlib
 import shutil
 from pathlib import Path
 
 import pytest
+from pydantic import TypeAdapter
 
 from tests.guardrails.release_version_fixtures import (
     ReleaseTree,
@@ -29,5 +31,10 @@ def receiver_release_repo(tmp_path: Path) -> Path:
     )
     helper = ROOT / "macos/HealthBridgeMailboxAckPublisher"
     _ = shutil.copytree(helper, repo / helper.relative_to(ROOT), dirs_exist_ok=True)
+    helper_info = repo / helper.relative_to(ROOT) / "Info.plist"
+    with helper_info.open("rb") as handle:
+        info = TypeAdapter(dict[str, str | bool]).validate_python(plistlib.load(handle))
+    info["CFBundleShortVersionString"] = "1.1.1"
+    _ = helper_info.write_bytes(plistlib.dumps(info))
     _ = commit_release_tree(repo, "synthetic receiver release")
     return repo
