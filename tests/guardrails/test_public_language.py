@@ -171,9 +171,7 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
         "https://healthbridge.chanhyo.dev/support",
     ):
         assert url in readme
-    assert (
-        "Apple Health AI Bridge is the open-source project behind Health Bridge for AI."
-    ) in readme
+    assert "<h1>Apple Health AI Bridge</h1>" in readme
     assert "not affiliated with, endorsed by, or sponsored by Apple Inc." in readme
     assert (
         "https://github.com/roian6/apple-health-ai-bridge/security/advisories/new"
@@ -192,23 +190,45 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     assert "healthbridge.chanhyo.dev/privacy" in security
 
 
-def test_product_and_project_names_have_an_explicit_relationship() -> None:
+def test_brand_reference_preserves_project_naming_history() -> None:
     relationship = (
         "Apple Health AI Bridge is the open-source project behind Health Bridge for AI."
     )
     for path in (
-        Path("README.md"),
         Path("docs/brand.md"),
         Path("assets/brand/README.md"),
     ):
         assert relationship in path.read_text(encoding="utf-8"), path
 
 
+def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "<h1>Apple Health AI Bridge</h1>" in readme
+    assert "Health Bridge for AI" not in readme
+    assert "open-source project behind" not in readme
+    assert "https://github.com/roian6/apple-health-ai-bridge.git@" in readme
+
+
+def test_readme_does_not_repeat_its_opening_as_a_prompt_list() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    introduction = readme.split("---", maxsplit=1)[1].split(
+        "## Set up the bridge",
+        maxsplit=1,
+    )[0]
+
+    assert "Try asking:" not in introduction
+    assert "Example prompts:" not in readme
+    assert not any(line.startswith("- ") for line in introduction.splitlines())
+
+
 def test_readme_keeps_continuous_value_with_ios_timing_boundary() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
 
-    assert "continuously available to your own AI agent" in readme
+    introduction = readme.split("## Set up the bridge", maxsplit=1)[0]
+    assert "Automatic sync" in introduction
+    assert "without exporting another file" in introduction
     assert (
         "iOS controls background scheduling, so delivery timing is best-effort "
         "rather than real-time or guaranteed at a specific moment."
@@ -260,7 +280,7 @@ def test_readme_makes_app_store_primary_without_exposing_maintainer_operations()
     assert app_store_url in primary_navigation
     assert "Install the iPhone beta" not in primary_navigation
     assert "official TestFlight install page" not in readme
-    assert "Download [Health Bridge for AI from the App Store]" in readme
+    assert "Download [the iPhone app from the App Store]" in readme
     assert "TestFlight remains available for beta builds" in readme
     assert "docs/maintainers/" not in readme
     assert "App Review" not in docs_section

@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="assets/brand/health-bridge-lockup.png" alt="Health Bridge for AI" width="520">
-  <p><strong>Your Apple Health data, continuously available to your own AI agent.</strong></p>
+  <img src="assets/brand/health-bridge-mark-512.png" alt="" width="80">
+  <h1>Apple Health AI Bridge</h1>
   <p>
     <a href="https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806">Download on the App Store</a> ·
     <a href="docs/setup.md">Set up your bridge</a> ·
@@ -11,13 +11,9 @@
 
 ---
 
-Apple Health AI Bridge is the open-source project behind Health Bridge for AI.
+Apple Health AI Bridge connects your Apple Health history to the AI you already use. Ask how your sleep has changed over the past month or compare this week's workouts with last week's. Automatic sync brings in new records, so you can keep asking without exporting another file each time.
 
-The project gives you a direct, self-hosted path from Apple Health to the AI tools you choose—without routing it through a hosted intermediary. The iPhone companion continuously sends the HealthKit data you permit to a receiver you control, where read-only CLI and MCP interfaces make it available to compatible agents.
-
-Your health data stays under your control: the receiver and database run on your infrastructure, AI access is read-only, and no hosted relay or third-party model is required.
-
-Automatic background sync is designed for continuous use. iOS controls background scheduling, so delivery timing is best-effort rather than real-time or guaranteed at a specific moment.
+The iPhone app syncs the records you allow to a macOS or Linux computer you control. From there, a read-only MCP server gives your chosen AI access to your history.
 
 ## Set up the bridge
 
@@ -29,9 +25,11 @@ You need:
 - an MCP client on the receiver machine, or a terminal for direct CLI access;
 - [`uv`](https://docs.astral.sh/uv/) for the receiver package.
 
+Enable Automatic Sync once you have paired the app. iOS controls background scheduling, so delivery timing is best-effort rather than real-time or guaranteed at a specific moment.
+
 ### 1. Install the iPhone app
 
-Download [Health Bridge for AI from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) on your iPhone. TestFlight remains available for beta builds and prerelease testing through the [official install page](https://healthbridge.chanhyo.dev/install/).
+Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) on your iPhone. TestFlight remains available for beta builds and prerelease testing through the [official install page](https://healthbridge.chanhyo.dev/install/).
 
 ### 2. Prepare the receiver route
 
@@ -66,7 +64,7 @@ health-bridge setup \
   --receiver-port 8765
 ```
 
-`health-bridge setup` creates the private SQLite database and single-use pairing page, prepares the receiver command, emits a canonical same-host stdio MCP descriptor, verifies the local Health Bridge MCP process, and detects client adapters without modifying them.
+`health-bridge setup` creates the private SQLite database and single-use pairing page, prepares the receiver command, emits a canonical same-host stdio MCP descriptor, verifies the local MCP server, and detects client adapters without modifying them.
 
 A successful local MCP check does not prove receiver readiness or phone reachability. Put the printed receiver command under the host's approved service manager, start it, require `{"status":"ok"}` from the printed local `/health` URL, and then require the same response from the exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C uses HTTP only on the same trusted LAN.
 
@@ -86,12 +84,6 @@ The Beta applies application-layer encryption and signatures before an envelope 
 4. Tap **Allow Health Access** and review Apple’s native authorization sheet.
 5. Enable **Automatic Sync**.
 6. Wait for the first successful receiver upload, then ask your agent about your data.
-
-Example prompts:
-
-- “Show yesterday’s workouts and wake-date sleep.”
-- “Which Apple Health metrics have synced recently?”
-- “Summarize my last seven days of activity and mark any source or sync gaps.”
 
 ## What is supported
 

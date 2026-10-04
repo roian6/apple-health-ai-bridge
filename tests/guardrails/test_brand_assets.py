@@ -109,9 +109,11 @@ def test_brand_generator_is_self_contained_for_canonical_outputs() -> None:
     assert "health-bridge-social-card.html" in generator
 
 
-def test_readme_uses_canonical_lockup_and_brand_guide() -> None:
+def test_readme_uses_text_free_mark_and_project_heading() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
-    assert '<img src="assets/brand/health-bridge-lockup.png"' in readme
+    assert '<img src="assets/brand/health-bridge-mark-512.png"' in readme
+    assert "health-bridge-lockup.png" not in readme
+    assert "<h1>Apple Health AI Bridge</h1>" in readme
     assert "docs/brand.md" in readme
 
 
