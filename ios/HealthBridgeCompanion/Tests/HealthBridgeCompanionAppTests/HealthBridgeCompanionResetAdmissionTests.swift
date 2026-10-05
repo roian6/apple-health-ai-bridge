@@ -8,6 +8,120 @@ import XCTest
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testAutomaticSyncDefaultEligibleTypesMatchRuntimeCatalog() async throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        let runtime = try await makeStepsFaultRuntime(fixture)
+        XCTAssertEqual(
+            runtime.viewModel.automaticSyncSelectedEligibleTypeCodes(),
+            HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+    }
+
+    func testAutomaticStepsTriggerInputMatrixAcceptsRawAndFreshCompletedDay() async throws {
+        for eligible in [["steps"], ["basal_energy", "steps"]] {
+            let input = eligible.count == 1 ? "steps" : "steps_and_basal_energy"
+            let triggers: [(String, AutomaticSyncReason, AutomaticSyncDiagnosticTriggerReason)] = [
+                ("observer", .observer(typeCode: "steps"), .observer),
+                ("observerBatch", .observerBatch(typeCodes: Array(eligible.reversed()) + eligible), .observerBatch),
+                ("scheduledRefresh", .scheduledRefresh, .scheduledRefresh),
+                ("launchCatchUp", .launchCatchUp, .launchCatchUp),
+            ]
+            for (trigger, reason, diagnosticReason) in triggers {
+                let fixture = try AutomaticStepsFaultFixture()
+                defer { fixture.cleanUp() }
+                let runtime = try await makeStepsFaultRuntime(fixture, eligibleTypeCodes: eligible)
+                XCTAssertEqual(runtime.viewModel.automaticSyncSelectedEligibleTypeCodes(), eligible)
+                let processed = trigger == "observer" ? ["steps"] : eligible
+                for opportunity in 1...2 {
+                    let scenario = "\(trigger)/\(input)/opportunity_\(opportunity)"
+                    fixture.completedStepsValue = opportunity == 1 ? 4_321 : 5_432
+                    fixture.completedBasalEnergyValue = opportunity == 1 ? 345 : 456
+                    if reason == .observer(typeCode: "steps") || diagnosticReason == .observerBatch {
+                        if opportunity == 1 || diagnosticReason == .observerBatch {
+                            _ = try fixture.admit(eligible)
+                        } else {
+                            try BackgroundSyncSettingsStore(
+                                userDefaults: XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
+                            ).markPendingObserverTypeCodes(["steps"])
+                        }
+                    } else {
+                        XCTAssertTrue(try fixture.pending().isEmpty, scenario)
+                    }
+                    let admitted = try fixture.pending()
+                    let acceptedBefore = fixture.recorder.acceptedPayloads.count
+                    let inspectionsBefore = fixture.recorder.responseInspectionCount
+                    let dailyReadsBefore = fixture.dailyRequests.count
+                    fixture.inspectBeforeACK(
+                        eligible: eligible, admitted: admitted,
+                        acceptedBefore: acceptedBefore, opportunity: opportunity
+                    )
+                    let runID = UUID()
+
+                    await runtime.automaticSyncRuntime.runAutomaticSync(reason: reason, diagnosticRunID: runID)
+
+                    let diagnostic = try XCTUnwrap(AutomaticSyncDiagnosticStore(
+                        fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+                    ).latestRecord)
+                    XCTAssertEqual(diagnostic.runID, runID, scenario)
+                    XCTAssertEqual(diagnostic.triggerReason, diagnosticReason, scenario)
+                    XCTAssertEqual(diagnostic.admissionResult, .accepted, scenario)
+                    XCTAssertNil(diagnostic.failure, scenario)
+                    XCTAssertEqual(
+                        Array(fixture.dailyRequests.dropFirst(dailyReadsBefore)).map { $0.joined(separator: ",") }.sorted(),
+                        processed.sorted(), scenario
+                    )
+                    XCTAssertEqual(fixture.rawAnchors, opportunity == 1
+                        ? [fixture.previousAnchor] : [fixture.previousAnchor, fixture.currentAnchor], scenario)
+                    let payloads = Array(fixture.recorder.acceptedPayloads.dropFirst(acceptedBefore))
+                    XCTAssertEqual(payloads.count, processed.count + (opportunity == 1 ? 1 : 0), scenario)
+                    XCTAssertEqual(fixture.recorder.responseInspectionCount - inspectionsBefore, payloads.count, scenario)
+                    XCTAssertEqual(fixture.recorder.payloads, fixture.recorder.acceptedPayloads, scenario)
+                    let batches = try payloads.map { try JSONDecoder().decode(HealthBridgeBatchV1.self, from: $0) }
+                    XCTAssertTrue(batches.allSatisfy { $0.samples.count == 1 }, scenario)
+                    let samples = batches.flatMap(\.samples)
+                    let raw = samples.filter { $0.metadata["sample_kind"] == "raw_quantity" }
+                    let daily = samples.filter { $0.metadata["sample_kind"] == "daily_aggregate" }
+                    XCTAssertEqual(raw.map(\.value), opportunity == 1 ? [17] : [], scenario)
+                    XCTAssertEqual(raw.map(\.typeCode), opportunity == 1 ? ["steps"] : [], scenario)
+                    XCTAssertEqual(daily.map(\.typeCode).sorted(), processed.sorted(), scenario)
+                    XCTAssertEqual(raw.count + daily.count, samples.count, scenario)
+                    let expected = try XCTUnwrap(fixture.completedStepsDay)
+                    for sample in daily {
+                        XCTAssertEqual(sample.value, sample.typeCode == "steps"
+                            ? fixture.completedStepsValue : fixture.completedBasalEnergyValue, scenario)
+                        XCTAssertEqual(sample.unit, sample.typeCode == "steps" ? "count" : "kcal", scenario)
+                        XCTAssertEqual(sample.startTime, HealthBridgeUTCFormatter.string(from: expected.dayStart), scenario)
+                        XCTAssertEqual(sample.endTime, HealthBridgeUTCFormatter.string(from: expected.dayEnd), scenario)
+                        XCTAssertEqual(sample.metadata["aggregation"], "daily_sum", scenario)
+                        XCTAssertEqual(sample.metadata["aggregation_completeness"], "complete", scenario)
+                        XCTAssertEqual(sample.metadata["source_resolution"], "healthkit_statistics_merged_sources", scenario)
+                        XCTAssertEqual(sample.metadata["calendar_day"], expected.calendarDay, scenario)
+                        XCTAssertEqual(sample.metadata["time_zone_identifier"], Calendar.current.timeZone.identifier, scenario)
+                        let day = try XCTUnwrap(expected.calendarDay).replacingOccurrences(of: "-", with: "")
+                        let recordType = sample.typeCode == "steps" ? "steps" : "basal-energy"
+                        XCTAssertEqual(sample.clientRecordID, "hk-daily-activity-\(recordType)-\(day)", scenario)
+                    }
+                    XCTAssertFalse(samples.contains { $0.value == 99 }, "Incomplete today must be excluded: \(scenario)")
+                    let allRaw = try fixture.acceptedSamples(kind: "raw_quantity")
+                    let allDaily = try fixture.acceptedSamples(kind: "daily_aggregate")
+                    XCTAssertEqual(allRaw.count, 1, scenario)
+                    XCTAssertTrue(Set(allRaw.map(\.clientRecordID)).isDisjoint(with: allDaily.map(\.clientRecordID)), scenario)
+                    XCTAssertEqual(allDaily.filter { $0.typeCode == "steps" }.map(\.value),
+                        opportunity == 1 ? [4_321] : [4_321, 5_432], scenario)
+                    XCTAssertEqual(try fixture.stepCursor(), fixture.currentAnchor, scenario)
+                    let remaining = try fixture.pending()
+                    XCTAssertEqual(remaining, trigger == "observer" ? admitted.filter { $0.key == "basal_energy" } : [:], scenario)
+                    XCTAssertEqual(diagnostic.remainingPendingLaneCount, remaining.count, scenario)
+                    XCTAssertTrue(try FileOutbox(directory: fixture.root.appendingPathComponent("outbox")).pendingItems().isEmpty, scenario)
+                    print("ISSUE58_MATRIX \(scenario)")
+                }
+            }
+        }
+    }
+
     func testAutomaticStepsCharacterizationDeliversRawThenUnchangedAnchorSendsNothing() async throws {
         try await exerciseAutomaticStepsUnchangedAnchor(expectMergedDaily: false)
     }
@@ -227,7 +341,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
     }
 
     private func makeStepsFaultRuntime(
-        _ fixture: AutomaticStepsFaultFixture
+        _ fixture: AutomaticStepsFaultFixture,
+        eligibleTypeCodes: [String]? = nil
     ) async throws -> HealthBridgeCompanionApplicationRuntime {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
         let configuration = URLSessionConfiguration.ephemeral
@@ -253,6 +368,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             readAnchoredStepChanges: { anchor, start, receivedAt in
                 try fixture.readRaw(anchor: anchor, start: start, receivedAt: receivedAt)
             },
+            automaticSyncEligibleTypeCodesForTesting: eligibleTypeCodes,
             readDailyActivityAggregates: { types, start, end, calendar in
                 try fixture.readDaily(types: types, start: start, end: end, calendar: calendar)
             },
@@ -1961,6 +2077,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         readAnchoredStepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredStepChanges)? = nil,
+        automaticSyncEligibleTypeCodesForTesting: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
         ) async throws -> [HealthKitDailyActivityAggregate])? = nil,
@@ -2006,6 +2123,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             ),
             readAnchoredSleepChanges: readAnchoredSleepChanges,
             readAnchoredStepChanges: readAnchoredStepChanges,
+            automaticSyncEligibleTypeCodesForTesting: automaticSyncEligibleTypeCodesForTesting,
             readDailyActivityAggregates: readDailyActivityAggregates,
             scheduleDirectBackgroundUploads: scheduleDirectBackgroundUploads,
             cancelInheritedLegacyUploads: cancelInheritedLegacyUploads,
@@ -2033,6 +2151,8 @@ private final class AutomaticStepsFaultFixture {
     var sessions: [URLSession] = []
     var failRawRead = false
     var failStepsDailyRead = false
+    var completedStepsValue: Double = 4_321
+    var completedBasalEnergyValue: Double = 345
     private(set) var declinedBackgroundSchedules = 0
     private(set) var rawAnchors: [String] = []
     private(set) var dailyRequests: [[String]] = []
@@ -2105,6 +2225,42 @@ private final class AutomaticStepsFaultFixture {
         }.filter { $0.metadata["sample_kind"] == kind }
     }
 
+    func inspectBeforeACK(eligible: [String], admitted: [String: Int], acceptedBefore: Int, opportunity: Int) {
+        let root = root
+        let suiteName = suiteName
+        let binding = receiverBindingID
+        let rawCursor = opportunity == 1 ? previousAnchor : currentAnchor
+        let dailyCursor = currentAnchor
+        recorder.setBeforeResponse { payload, acceptedCount in
+            let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: payload)
+            let pending = try BackgroundSyncSettingsStore(
+                userDefaults: XCTUnwrap(UserDefaults(suiteName: suiteName))
+            ).loadPendingObserverTypeCodeGenerations()
+            if acceptedCount == acceptedBefore {
+                XCTAssertEqual(pending.keys.sorted(), eligible.sorted())
+            }
+            let outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+            XCTAssertTrue(try outbox.pendingItems().contains { try Data(contentsOf: $0.fileURL) == payload })
+            for sample in batch.samples {
+                let generation = try XCTUnwrap(pending[sample.typeCode], "Generation must remain pending before ACK.")
+                if let original = admitted[sample.typeCode] { XCTAssertEqual(generation, original) }
+                let isDaily = sample.metadata["sample_kind"] == "daily_aggregate"
+                XCTAssertEqual(try outbox.hasPendingGenerationRetirement(
+                    typeCode: sample.typeCode, generation: generation
+                ), isDaily, "Only daily coverage can carry the retirement marker.")
+                if sample.typeCode == "steps" {
+                    let cursor = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json")).cursorValue(
+                        receiverBindingID: binding,
+                        sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                        cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+                    )
+                    XCTAssertEqual(cursor, isDaily ? dailyCursor : rawCursor,
+                        "Raw cursor advances only after its ACK; daily delivery preserves it.")
+                }
+            }
+        }
+    }
+
     func readRaw(anchor: String?, start: Date?, receivedAt: Date) throws -> HealthKitAnchoredStepChanges {
         let anchor = try XCTUnwrap(anchor)
         rawAnchors.append(anchor)
@@ -2139,7 +2295,7 @@ private final class AutomaticStepsFaultFixture {
         return types.flatMap { type in
             let completed = HealthKitDailyActivityAggregate(
                 typeCode: type, dayStart: yesterday, dayEnd: today,
-                value: type == "steps" ? 4_321 : 345,
+                value: type == "steps" ? completedStepsValue : completedBasalEnergyValue,
                 calendarDay: formatter.string(from: yesterday),
                 timeZoneIdentifier: calendar.timeZone.identifier
             )
@@ -2176,6 +2332,29 @@ private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
     private var recordedPayloads: [Data] = []
     private var successfulPayloads: [Data] = []
     private var failedStepsSampleKinds: Set<String> = []
+    private var beforeResponse: (@Sendable (Data, Int) throws -> Void)?
+    private var inspectionCount = 0
+
+    func setBeforeResponse(_ inspect: @escaping @Sendable (Data, Int) throws -> Void) {
+        lock.lock()
+        beforeResponse = inspect
+        lock.unlock()
+    }
+
+    var responseInspectionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return inspectionCount
+    }
+
+    func inspectBeforeResponse(_ payload: Data) throws {
+        lock.lock()
+        let inspect = beforeResponse
+        let acceptedCount = successfulPayloads.count
+        if inspect != nil { inspectionCount += 1 }
+        lock.unlock()
+        try inspect?(payload, acceptedCount)
+    }
 
     func setFailedStepsSampleKinds(_ kinds: Set<String>) {
         lock.lock()
@@ -2290,6 +2469,15 @@ private final class PayloadFenceURLProtocol: URLProtocol, @unchecked Sendable {
               ) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
+        }
+        if statusCode == 200, let payload {
+            do {
+                try Self.networkRecorder?.inspectBeforeResponse(payload)
+            } catch {
+                XCTFail("Pre-ACK inspection failed.")
+                client?.urlProtocol(self, didFailWithError: error)
+                return
+            }
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let body = statusCode == 200 ? #"{"status":"ok"}"# : #"{"status":"synthetic_failure"}"#

@@ -384,6 +384,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let readAnchoredStepChanges: (@MainActor (
         String?, Date?, Date
     ) async throws -> HealthKitAnchoredStepChanges)?
+    private let automaticSyncEligibleTypeCodesForTesting: [String]?
     private let readDailyActivityAggregates: (@MainActor (
         [String], Date, Date, Calendar
     ) async throws -> [HealthKitDailyActivityAggregate])?
@@ -430,6 +431,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         readAnchoredStepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredStepChanges)? = nil,
+        automaticSyncEligibleTypeCodesForTesting: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
         ) async throws -> [HealthKitDailyActivityAggregate])? = nil,
@@ -502,6 +504,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.sleepResetEpochStore = sleepResetEpochStore
         self.readAnchoredSleepChanges = readAnchoredSleepChanges
         self.readAnchoredStepChanges = readAnchoredStepChanges
+        self.automaticSyncEligibleTypeCodesForTesting = automaticSyncEligibleTypeCodesForTesting
         self.readDailyActivityAggregates = readDailyActivityAggregates
         self.scheduleDirectBackgroundUploads = scheduleDirectBackgroundUploads
         self.cancelInheritedLegacyUploads = cancelInheritedLegacyUploads
@@ -2887,7 +2890,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     func automaticSyncSelectedEligibleTypeCodes() -> [String] {
         #if canImport(HealthKit)
         return HealthKitReadTypeCatalog.availableTypeCodes(
-            forTypeCodes: enabledHealthPermissionTypeCodes
+            forTypeCodes: automaticSyncEligibleTypeCodesForTesting ?? enabledHealthPermissionTypeCodes
         )
         #else
         return []
