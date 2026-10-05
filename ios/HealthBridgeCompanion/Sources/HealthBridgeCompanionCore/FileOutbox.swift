@@ -369,15 +369,24 @@ public struct FileOutboxFinalizationRecord: Equatable, Sendable {
     public let itemIDs: [String]
     public let cursorCheckpoint: FileOutboxCursorCheckpoint?
     public let pendingGenerationRetirements: [String: Int]
+    public let stepsRawAndDailyCoverage: Bool?
+
+    public var eligiblePendingGenerationRetirements: [String: Int] {
+        pendingGenerationRetirements.filter {
+            $0.key != "steps" || stepsRawAndDailyCoverage == true
+        }
+    }
 
     public init(
         itemIDs: [String] = [],
         cursorCheckpoint: FileOutboxCursorCheckpoint?,
-        pendingGenerationRetirements: [String: Int]
+        pendingGenerationRetirements: [String: Int],
+        stepsRawAndDailyCoverage: Bool? = nil
     ) {
         self.itemIDs = itemIDs
         self.cursorCheckpoint = cursorCheckpoint
         self.pendingGenerationRetirements = pendingGenerationRetirements
+        self.stepsRawAndDailyCoverage = stepsRawAndDailyCoverage
     }
 }
 
@@ -518,6 +527,7 @@ public final class FileOutbox {
         let entries: [SequenceEntry]
         let cursorCheckpoint: FileOutboxCursorCheckpoint?
         let pendingGenerationRetirements: [String: Int]?
+        let stepsRawAndDailyCoverage: Bool?
         let directAcknowledgedItemIDs: [String]?
 
         init(
@@ -525,12 +535,14 @@ public final class FileOutbox {
             entries: [SequenceEntry],
             cursorCheckpoint: FileOutboxCursorCheckpoint?,
             pendingGenerationRetirements: [String: Int]? = nil,
+            stepsRawAndDailyCoverage: Bool? = nil,
             directAcknowledgedItemIDs: [String]? = nil
         ) {
             self.version = version
             self.entries = entries
             self.cursorCheckpoint = cursorCheckpoint
             self.pendingGenerationRetirements = pendingGenerationRetirements
+            self.stepsRawAndDailyCoverage = stepsRawAndDailyCoverage
             self.directAcknowledgedItemIDs = directAcknowledgedItemIDs
         }
 
@@ -540,7 +552,8 @@ public final class FileOutbox {
             return FileOutboxFinalizationRecord(
                 itemIDs: entries.map(\.id),
                 cursorCheckpoint: cursorCheckpoint,
-                pendingGenerationRetirements: retirements
+                pendingGenerationRetirements: retirements,
+                stepsRawAndDailyCoverage: stepsRawAndDailyCoverage
             )
         }
 
@@ -556,6 +569,7 @@ public final class FileOutbox {
                 entries: entries,
                 cursorCheckpoint: cursorCheckpoint,
                 pendingGenerationRetirements: pendingGenerationRetirements,
+                stepsRawAndDailyCoverage: stepsRawAndDailyCoverage,
                 directAcknowledgedItemIDs: acknowledged.sorted()
             )
         }
@@ -766,7 +780,8 @@ public final class FileOutbox {
         _ payloads: [Data],
         receiverIdentity: String,
         cursorCheckpoint: FileOutboxCursorCheckpoint? = nil,
-        pendingGenerationRetirements: [String: Int] = [:]
+        pendingGenerationRetirements: [String: Int] = [:],
+        stepsRawAndDailyCoverage: Bool? = nil
     ) throws -> [FileOutboxItem] {
         guard !payloads.isEmpty else { return [] }
         let prepared = try prepareEnqueueTransaction(
@@ -774,6 +789,7 @@ public final class FileOutbox {
             receiverIdentity: receiverIdentity,
             cursorCheckpoint: cursorCheckpoint,
             pendingGenerationRetirements: pendingGenerationRetirements,
+            stepsRawAndDailyCoverage: stepsRawAndDailyCoverage,
             stagedPayloadCount: payloads.count
         )
         let items = try commitEnqueueTransaction(
@@ -899,7 +915,7 @@ public final class FileOutbox {
         guard !retirements.isEmpty else { return false }
         _ = try reconciledManifest()
         return try loadEnqueueTransactions().contains {
-            $0.finalizationRecord?.pendingGenerationRetirements == retirements
+            $0.finalizationRecord?.eligiblePendingGenerationRetirements == retirements
         }
     }
 
@@ -910,7 +926,7 @@ public final class FileOutbox {
         guard !typeCode.isEmpty, generation > 0 else { return false }
         _ = try reconciledManifest()
         return try loadEnqueueTransactions().contains {
-            $0.finalizationRecord?.pendingGenerationRetirements[typeCode] == generation
+            $0.finalizationRecord?.eligiblePendingGenerationRetirements[typeCode] == generation
         }
     }
 
@@ -1731,6 +1747,7 @@ public final class FileOutbox {
         receiverIdentity: String,
         cursorCheckpoint: FileOutboxCursorCheckpoint?,
         pendingGenerationRetirements: [String: Int],
+        stepsRawAndDailyCoverage: Bool? = nil,
         stagedPayloadCount: Int
     ) throws -> (transaction: EnqueueTransaction, manifest: SequenceManifest) {
         try requireUploadAdmission()
@@ -1771,6 +1788,7 @@ public final class FileOutbox {
             pendingGenerationRetirements: pendingGenerationRetirements.isEmpty
                 ? nil
                 : pendingGenerationRetirements,
+            stepsRawAndDailyCoverage: stepsRawAndDailyCoverage,
             directAcknowledgedItemIDs: nil
         )
         transactions.append(transaction)
