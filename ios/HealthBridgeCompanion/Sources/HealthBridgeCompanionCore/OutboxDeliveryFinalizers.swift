@@ -77,13 +77,14 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         if let checkpoint = record.cursorCheckpoint {
             try finalizeCursor(checkpoint)
         }
-        if !record.pendingGenerationRetirements.isEmpty {
+        let retirements = record.eligiblePendingGenerationRetirements
+        if !retirements.isEmpty {
             guard let pendingGenerationStore else {
                 throw FileOutboxCursorCheckpointError.pendingCommit
             }
             try pendingGenerationStore.clearPendingObserverTypeCodes(
-                matching: record.pendingGenerationRetirements,
-                typeCodes: record.pendingGenerationRetirements.keys.sorted()
+                matching: retirements,
+                typeCodes: retirements.keys.sorted()
             )
         }
         try outbox.acknowledgeFinalizationRecord(record)

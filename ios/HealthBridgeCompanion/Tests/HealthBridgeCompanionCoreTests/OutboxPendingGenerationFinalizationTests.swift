@@ -38,7 +38,8 @@ final class OutboxPendingGenerationFinalizationTests: XCTestCase {
             [Data("steps".utf8)],
             receiverIdentity: "receiver-a",
             cursorCheckpoint: stepsCheckpoint,
-            pendingGenerationRetirements: ["steps": try XCTUnwrap(generations["steps"])]
+            pendingGenerationRetirements: ["steps": try XCTUnwrap(generations["steps"])],
+            stepsRawAndDailyCoverage: true
         ).first)
         let heartItem = try XCTUnwrap(outbox.enqueueSequence(
             [Data("heart".utf8)],
@@ -104,6 +105,100 @@ final class OutboxPendingGenerationFinalizationTests: XCTestCase {
         )
         XCTAssertTrue(try pendingStore.loadPendingObserverTypeCodeGenerations().isEmpty)
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
+    }
+
+    func testLegacyCursorlessRawRetainsStepsAndProvenCursorlessDailyRetiresAfterRelaunch() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StepsCoverageTests-\(UUID().uuidString)")
+        let directory = root.appendingPathComponent("outbox")
+        let suiteName = "StepsCoverageTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let pendingStore = BackgroundSyncSettingsStore(
+            userDefaults: defaults,
+            observerDirtinessStore: FileBackgroundObserverDirtinessStore(
+                fileURL: root.appendingPathComponent("pending.json")
+            )
+        )
+        try pendingStore.markPendingObserverTypeCodes(["steps"])
+        let original = try pendingStore.loadPendingObserverTypeCodeGenerations()
+        let start = Date(timeIntervalSince1970: 1_699_920_000)
+        let end = start.addingTimeInterval(86_400)
+        let raw = StepCountSyncBatchFactory.makeAnchoredStepBatch(
+            changes: HealthKitAnchoredStepChanges(
+                stepSamples: [HealthKitStepSampleSummary(
+                    uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000058")),
+                    start: start, end: start.addingTimeInterval(60), count: 17
+                )],
+                deletedStepSamples: [], anchorCursorValue: "synthetic-anchor",
+                windowStart: start, windowEnd: end
+            ),
+            generatedAt: end
+        )
+        let outbox = try FileOutbox(directory: directory)
+        let rawItem = try XCTUnwrap(outbox.enqueueSequence(
+            [try HealthBridgeBatchEncoder().encode(raw)],
+            receiverIdentity: "receiver-a",
+            pendingGenerationRetirements: original
+        ).first)
+        let journal = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(
+            contentsOf: directory.appendingPathComponent(".enqueue-transaction")
+        )) as? [String: Any])
+        XCTAssertEqual(journal["version"] as? Int, 2)
+        let transaction = try XCTUnwrap((journal["transactions"] as? [[String: Any]])?.first)
+        XCTAssertNil(transaction["cursorCheckpoint"])
+        XCTAssertNil(transaction["stepsRawAndDailyCoverage"])
+        XCTAssertEqual(transaction["pendingGenerationRetirements"] as? [String: Int], original)
+        XCTAssertFalse(try outbox.hasPendingGenerationRetirements(original))
+        XCTAssertFalse(try outbox.hasPendingGenerationRetirement(typeCode: "steps", generation: 1))
+
+        let rawRecord = try XCTUnwrap(outbox.recordDirectUploadAccepted(
+            itemID: rawItem.id, receiverIdentity: "receiver-a"
+        ))
+        XCTAssertNil(rawRecord.cursorCheckpoint)
+        XCTAssertEqual(rawRecord.pendingGenerationRetirements, original)
+        XCTAssertTrue(rawRecord.eligiblePendingGenerationRetirements.isEmpty)
+        let relaunched = try FileOutbox(directory: directory)
+        let cursorStore = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
+        let finalizer = OutboxDeliveryCursorFinalizer(
+            outbox: relaunched, cursorStore: cursorStore, pendingGenerationStore: pendingStore
+        )
+        XCTAssertTrue(try finalizer.finalizeDirectAcknowledgments(receiverBindingID: "receiver-a"))
+        XCTAssertEqual(try pendingStore.loadPendingObserverTypeCodeGenerations(), original)
+        XCTAssertTrue(try relaunched.pendingItems().isEmpty)
+        XCTAssertFalse(try finalizer.finalizeDirectAcknowledgments(receiverBindingID: "receiver-a"))
+
+        let daily = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            aggregates: [HealthKitDailyActivityAggregate(
+                typeCode: "steps", dayStart: start, dayEnd: end, value: 4_321
+            )],
+            typeCodes: ["steps"], windowStart: start, windowEnd: end, generatedAt: end
+        ))
+        let dailyItem = try XCTUnwrap(relaunched.enqueueSequence(
+            [try HealthBridgeBatchEncoder().encode(daily)],
+            receiverIdentity: "receiver-a",
+            pendingGenerationRetirements: original,
+            stepsRawAndDailyCoverage: true
+        ).first)
+        XCTAssertTrue(try relaunched.hasPendingGenerationRetirements(original))
+        let dailyRecord = try XCTUnwrap(relaunched.recordDirectUploadAccepted(
+            itemID: dailyItem.id, receiverIdentity: "receiver-a"
+        ))
+        XCTAssertNil(dailyRecord.cursorCheckpoint)
+        XCTAssertEqual(dailyRecord.stepsRawAndDailyCoverage, true)
+        XCTAssertEqual(dailyRecord.eligiblePendingGenerationRetirements, original)
+        XCTAssertEqual(try pendingStore.loadPendingObserverTypeCodeGenerations(), original)
+        let recoveredFinalizer = OutboxDeliveryCursorFinalizer(
+            outbox: try FileOutbox(directory: directory), cursorStore: cursorStore,
+            pendingGenerationStore: pendingStore
+        )
+        XCTAssertTrue(try recoveredFinalizer.finalizeDirectAcknowledgments(receiverBindingID: "receiver-a"))
+        XCTAssertTrue(try pendingStore.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertTrue(try FileOutbox(directory: directory).pendingItems().isEmpty)
+        XCTAssertFalse(try recoveredFinalizer.finalizeDirectAcknowledgments(receiverBindingID: "receiver-a"))
     }
 
     func testRetirementTokensSurviveRelaunchWithoutCursorAndBecomeReadyAfterWholeSequence() throws {

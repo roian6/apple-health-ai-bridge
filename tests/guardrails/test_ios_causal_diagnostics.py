@@ -10,8 +10,8 @@ CORE = IOS / "Sources/HealthBridgeCompanionCore"
 def test_each_automatic_healthkit_query_has_typed_start_and_result_seams() -> None:
     source = (IOS / "App/HealthBridgeCompanionViewModel.swift").read_text()
     for query in (
-        "let changes = try await HealthKitStepCountReader",
-        "let aggregates = try await HealthKitGenericQuantityReader",
+        "let changes: HealthKitAnchoredStepChanges",
+        "let aggregates: [HealthKitDailyActivityAggregate]",
         "let changes = try await HealthKitWorkoutReader",
         "let changes: HealthKitAnchoredSleepChanges",
         "let changes = try await reader.readAnchoredQuantityChanges",
