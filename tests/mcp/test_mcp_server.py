@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from subprocess import run
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -165,6 +166,60 @@ def test_mcp_tool_definitions_expose_only_read_only_tools() -> None:
     assert "sql" not in descriptions
     assert "read-only" in descriptions
     assert "clinical interpretation" in descriptions
+
+
+@pytest.mark.parametrize("request_id", [1, "health-bridge-ping"])
+def test_mcp_ping_returns_empty_result_without_opening_database(
+    tmp_path: Path,
+    request_id: int | str,
+) -> None:
+    db_path = tmp_path / "missing-parent" / "unused.sqlite"
+
+    response = dispatch_request(
+        db_path,
+        {"jsonrpc": "2.0", "id": request_id, "method": "ping"},
+    )
+
+    assert response == {"jsonrpc": "2.0", "id": request_id, "result": {}}
+    assert not db_path.parent.exists()
+
+
+def test_mcp_stdio_answers_ping_before_and_after_initialize(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-parent" / "unused.sqlite"
+    stdin = (
+        '{"jsonrpc":"2.0","id":"before-initialize","method":"ping"}\n'
+        '{"jsonrpc":"2.0","id":1,"method":"initialize",'
+        '"params":{"protocolVersion":"2024-11-05","capabilities":{},'
+        '"clientInfo":{"name":"health-bridge-test","version":"1.0.0"}}}\n'
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+        '{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}\n'
+    )
+
+    result = run(
+        ["uv", "run", "health-bridge", "mcp", "start", "--db", str(db_path)],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    responses = [
+        required_object(cast("JsonValue", json.loads(line)))
+        for line in result.stdout.splitlines()
+    ]
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert len(responses) == 3
+    assert responses[0] == {
+        "jsonrpc": "2.0",
+        "id": "before-initialize",
+        "result": {},
+    }
+    initialized = InitializeResponse.model_validate(responses[1])
+    assert initialized.result.protocol_version == "2024-11-05"
+    assert responses[2] == {"jsonrpc": "2.0", "id": 2, "result": {}}
+    assert not db_path.parent.exists()
 
 
 def test_mcp_dispatch_lists_and_calls_read_only_tool(tmp_path: Path) -> None:

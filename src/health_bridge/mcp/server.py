@@ -154,6 +154,10 @@ def _parse_request(request: JsonMapping) -> JsonRpcRequest:
     )
 
 
+def _ping(_db_path: Path, request: JsonRpcRequest) -> JsonObject:
+    return {"jsonrpc": "2.0", "id": request.request_id, "result": {}}
+
+
 def _initialize(_db_path: Path, request: JsonRpcRequest) -> JsonObject:
     return {
         "jsonrpc": "2.0",
@@ -268,6 +272,7 @@ def _error(request_id: int | str | None, code: int, message: str) -> JsonObject:
 
 
 HANDLERS: Final[dict[str, Handler]] = {
+    "ping": _ping,
     "initialize": _initialize,
     "tools/list": _list_tools,
     "tools/call": _call_tool,
