@@ -118,7 +118,11 @@ jobs:
           uv sync --all-extras --dev --locked
           version="${RELEASE_TAG#receiver-v}"
           release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
+          node_asset=""
+          if [[ -f node-cli/package.json ]]; then
+            node_asset="$(jq -r '.name + "-" + .version + ".tgz,"' node-cli/package.json)"
+          fi
+          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,${node_asset}apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
           test "$(gh api "$release_api" \
             --jq '[.assets[].name] | sort | join(",")')" = "$expected_assets"
           mkdir dist
@@ -279,7 +283,11 @@ jobs:
             --tag "$RELEASE_TAG" | jq -r '.version')"
           release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
           asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
-          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
+          node_asset=""
+          if [[ -f node-cli/package.json ]]; then
+            node_asset="$(jq -r '.name + "-" + .version + ".tgz,"' node-cli/package.json)"
+          fi
+          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,${node_asset}apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
           test "$asset_names" = "$expected_assets"
           mkdir dist
           IFS=',' read -r -a expected_names <<< "$expected_assets"

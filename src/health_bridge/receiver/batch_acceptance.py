@@ -34,6 +34,7 @@ class BatchAcceptanceInput:
 class PreparedBatch:
     exact_bytes: bytes
     batch: HealthBridgeBatchV1
+    receiver_installation_id_hash: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +64,11 @@ class BatchAcceptanceCore:
             bound = bind_batch_to_principal(batch, value.principal)
         except SourcePrincipalMismatchError:
             return BatchPrincipalMismatch()
-        return PreparedBatch(exact_bytes=value.exact_bytes, batch=bound)
+        return PreparedBatch(
+            exact_bytes=value.exact_bytes,
+            batch=bound,
+            receiver_installation_id_hash=value.principal.installation_id_hash,
+        )
 
     @staticmethod
     def commit(
@@ -71,7 +76,12 @@ class BatchAcceptanceCore:
         prepared: PreparedBatch,
         source_name: str,
     ) -> IngestResult:
-        return ingest_batch(db_path, prepared.batch, source_name)
+        return ingest_batch(
+            db_path,
+            prepared.batch,
+            source_name,
+            receiver_installation_id_hash=prepared.receiver_installation_id_hash,
+        )
 
     @staticmethod
     def commit_in_connection(
@@ -79,4 +89,9 @@ class BatchAcceptanceCore:
         prepared: PreparedBatch,
         source_name: str,
     ) -> TransactionalIngestResult:
-        return ingest_batch_in_connection(connection, prepared.batch, source_name)
+        return ingest_batch_in_connection(
+            connection,
+            prepared.batch,
+            source_name,
+            receiver_installation_id_hash=prepared.receiver_installation_id_hash,
+        )

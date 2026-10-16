@@ -97,3 +97,28 @@ def test_exact_fifo_head_ack_path_avoids_directory_enumeration() -> None:
     assert "MailboxAckFileReader.enumerateWindow(" not in exact
     assert "getdirentriesattr(" not in exact
     assert "getattrlistbulk(" not in exact
+
+
+def test_raw_budget_precedes_reads_and_exhaustion_uses_existing_checkpoint() -> None:
+    reader = (CORE / "MailboxAckFileReader.swift").read_text(encoding="utf-8")
+    scanner = (CORE / "MailboxAckScanner.swift").read_text(encoding="utf-8")
+    hydration = (CORE / "MailboxAckHydration.swift").read_text(encoding="utf-8")
+    delivery = (CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    start = reader.index("static func enumerate(")
+    enumeration = reader[start : reader.index("static func read(", start)]
+    budget = enumeration.index("guard inspectedEntryCount < maximumRawEntries")
+    read = enumeration.index("readdir(stream)")
+    count = enumeration.index("inspectedEntryCount += 1")
+    classify = enumeration.index("MailboxLayoutV1.classify(")
+    assert budget < read < count < classify
+    assert "maximumRawEntries: Int = MailboxAckScanner.maximumScanFiles" in enumeration
+    assert "maximumEnumerationEntries = 2 * maximumScanFiles" in scanner
+    for source in [scanner, hydration]:
+        assert "catch let error as MailboxAckEnumerationError" in source
+    assert delivery.count("catch MailboxAckEnumerationError.budgetExhausted") == 2
+    start = delivery.index("private func deliverPendingWindow(")
+    fallback = delivery[start : delivery.index("static func ordered", start)]
+    assert "reconcilePendingFIFOHeadAcknowledgment(" in fallback
+    assert "pendingGenerationStore?.mailboxAckScanCheckpoint(" in fallback
+    assert "pendingGenerationStore?.persistMailboxAckScanCheckpoint(" in fallback
+    assert "acknowledgmentEnumerationIncomplete: true" in fallback

@@ -481,25 +481,9 @@ def test_initialize_database_creates_core_tables_when_database_is_empty(
         ("007_sleep_baseline_namespaces",),
         ("008_delivery_receipts",),
         ("009_pairing_transport",),
+        ("010_receiver_installation",),
+        ("011_mailbox_enrollment",),
     ]
-
-
-def test_initialize_database_is_idempotent_when_called_twice(tmp_path: Path) -> None:
-    # Given
-    db_path = tmp_path / "test.sqlite"
-
-    # When
-    initialize_database(db_path)
-    initialize_database(db_path)
-
-    # Then
-    with sqlite3.connect(db_path) as connection:
-        migration_count = fetch_one_int(
-            connection,
-            "select count(*) from schema_migrations",
-        )
-
-    assert migration_count == 9
 
 
 def _create_legacy_sleep_revision_database(db_path: Path) -> None:
@@ -1105,3 +1089,49 @@ def test_pairing_transport_migration_runs_after_delivery_receipt_migration(
     assert migration_ids.index("008_delivery_receipts") < migration_ids.index(
         "009_pairing_transport"
     )
+
+
+def test_receiver_installation_migration_preserves_legacy_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "legacy.sqlite"
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            database_module,
+            "MIGRATION_IDS",
+            tuple(
+                migration
+                for migration in database_module.MIGRATION_IDS
+                if not migration.startswith("010_")
+            ),
+        )
+        initialize_database(db)
+    with connect_database(db) as connection:
+        _ = connection.execute(
+            """insert into sync_runs (started_at, finished_at, status,
+            fixture_name, sample_count) values (?, ?, ?, ?, ?)""",
+            (
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:01Z",
+                "succeeded",
+                "receiver",
+                7,
+            ),
+        )
+
+    initialize_database(db)
+    initialize_database(db)
+
+    with connect_readonly_database(db) as connection:
+        assert connection.execute(
+            """select fixture_name, sample_count, receiver_installation_id_hash
+            from sync_runs"""
+        ).fetchall() == [("receiver", 7, None)]
+        assert (
+            fetch_one_int(
+                connection,
+                "select count(*) from schema_migrations where migration_id like ?",
+                ("010_%",),
+            )
+            == 1
+        )

@@ -203,7 +203,9 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
         description=(
             "Read-only daily observation summaries for a date range with source "
             "provenance, missing-data caveats, sum-safe sample_totals, and "
-            "type-aware sample_statistics for non-summable metrics; no clinical "
+            "type-aware sample_statistics. Current daily totals exclude stale/unknown "
+            "projections; last_known_daily_activity_totals retain values and "
+            "daily_projection_status explains freshness. No clinical "
             "interpretation."
         ),
         input_schema=DATE_RANGE_INPUT_SCHEMA,

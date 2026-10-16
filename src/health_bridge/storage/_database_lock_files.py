@@ -1,9 +1,10 @@
 import os
 import stat
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from threading import RLock
+from typing import Final, TypeAlias
 
 from health_bridge.private_files import (
     PRIVATE_DIRECTORY_MODE,
@@ -12,6 +13,22 @@ from health_bridge.private_files import (
 )
 
 SQLITE_PRIVATE_SIDECAR_SUFFIXES: Final = ("-journal", "-wal", "-shm")
+
+DatabaseIdentity: TypeAlias = tuple[int, int]
+
+
+@dataclass
+class _DatabaseDescriptors:
+    active: int = 0
+    idle: list[tuple[int, bool, DatabaseIdentity]] = field(default_factory=list)
+
+
+# Closing ANY descriptor for an inode drops this process's POSIX SQLite locks.
+# Reuse database and WAL shared-memory descriptors until all bridge connections
+# to the database have closed. WAL read/write locks live on the shared-memory file.
+_descriptor_lock = RLock()
+_database_descriptors: dict[DatabaseIdentity, _DatabaseDescriptors] = {}
+_leased_descriptors: dict[int, tuple[DatabaseIdentity, bool, DatabaseIdentity]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +102,64 @@ def open_lock_file_fd(lock_path: Path, plan: DatabaseLockPlan) -> int | None:
     return fd
 
 
-def open_database_lock_fd(db_path: Path, *, create: bool) -> int:
+def open_database_lock_fd(
+    db_path: Path,
+    *,
+    create: bool,
+    database_identity: DatabaseIdentity | None = None,
+) -> int:
     if create:
         ensure_private_directory(db_path.parent)
     require_private_parent(db_path.parent)
+    with _descriptor_lock:
+        try:
+            entry = db_path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            entry = None
+        if entry is not None:
+            validate_database_lock_stat(db_path, entry)
+            identity = (entry.st_dev, entry.st_ino)
+            lifetime_identity = database_identity or identity
+            pool = _database_descriptors.get(lifetime_identity)
+            if pool is not None:
+                for index, (fd, writable, file_identity) in enumerate(pool.idle):
+                    if file_identity != identity or (create and not writable):
+                        continue
+                    del pool.idle[index]
+                    pool.active += 1
+                    _leased_descriptors[fd] = (lifetime_identity, writable, identity)
+                    return fd
+        fd = _open_database_fd(db_path, create=create)
+        opened = os.fstat(fd)
+        identity = (opened.st_dev, opened.st_ino)
+        lifetime_identity = database_identity or identity
+        pool = _database_descriptors.setdefault(
+            lifetime_identity, _DatabaseDescriptors()
+        )
+        pool.active += 1
+        _leased_descriptors[fd] = (lifetime_identity, create, identity)
+        try:
+            validate_database_lock_stat(db_path, opened)
+            require_path_identity(db_path, opened)
+        except OSError:
+            close_database_lock_fd(fd)
+            raise
+        return fd
+
+
+def close_database_lock_fd(fd: int) -> None:
+    with _descriptor_lock:
+        lifetime_identity, writable, file_identity = _leased_descriptors.pop(fd)
+        pool = _database_descriptors[lifetime_identity]
+        pool.active -= 1
+        pool.idle.append((fd, writable, file_identity))
+        if pool.active == 0:
+            del _database_descriptors[lifetime_identity]
+            for idle_fd, _, _ in pool.idle:
+                os.close(idle_fd)
+
+
+def _open_database_fd(db_path: Path, *, create: bool) -> int:
     access_mode = os.O_RDWR if create else os.O_RDONLY
     flags = access_mode | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
     if create:
@@ -104,11 +175,6 @@ def open_database_lock_fd(db_path: Path, *, create: bool) -> int:
                 raise
     else:
         fd = os.open(db_path, flags)
-    try:
-        validate_database_lock_stat(db_path, os.fstat(fd))
-    except OSError:
-        os.close(fd)
-        raise
     return fd
 
 
@@ -208,6 +274,35 @@ def require_quiescent_database(db_path: Path) -> None:
         if sidecar.exists() or sidecar.is_symlink():
             message = "read-only database snapshot is not quiescent"
             raise OSError(message)
+
+
+def require_live_readable_database(db_path: Path) -> os.stat_result:
+    """Validate without repairing files or creating missing WAL sidecars.
+
+    SQLite may update an existing WAL shared-memory index during a live read.
+    A WAL database without both sidecars needs a writer to prepare it first.
+    """
+    fd = open_database_lock_fd(db_path, create=False)
+    try:
+        identity = os.fstat(fd)
+        header = os.pread(fd, 20, 0)
+        require_path_identity(db_path, identity)
+    finally:
+        close_database_lock_fd(fd)
+    sidecars: set[str] = set()
+    for suffix in SQLITE_PRIVATE_SIDECAR_SUFFIXES:
+        path = Path(f"{db_path}{suffix}")
+        try:
+            entry = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        validate_lock_stat(path, entry)
+        sidecars.add(suffix)
+    uses_wal = header[18:20] == b"\x02\x02" or bool(sidecars & {"-wal", "-shm"})
+    if uses_wal and not {"-wal", "-shm"}.issubset(sidecars):
+        message = "live read requires existing WAL and shared-memory sidecars"
+        raise OSError(message)
+    return identity
 
 
 def validate_lock_stat(lock_path: Path, lock_stat: os.stat_result) -> None:

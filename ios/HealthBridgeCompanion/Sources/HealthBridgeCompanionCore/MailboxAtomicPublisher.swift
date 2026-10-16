@@ -22,22 +22,105 @@ protocol MailboxEnvelopePublishing {
         finalName: String,
         locator: MailboxResolvedLocatorV1
     ) throws -> URL
+
+    @MainActor
+    func publishAwaitingCompletion(
+        _ envelope: Data,
+        finalName: String,
+        locator: MailboxResolvedLocatorV1
+    ) async throws -> URL
 }
 
-struct MailboxFileProviderPublicationExecutor {
+extension MailboxEnvelopePublishing {
+    @MainActor
+    func publishAwaitingCompletion(
+        _ envelope: Data,
+        finalName: String,
+        locator: MailboxResolvedLocatorV1
+    ) async throws -> URL {
+        try publish(envelope, finalName: finalName, locator: locator)
+    }
+}
+
+enum MailboxPublicationExecutionError: Error {
+    case asynchronousPublicationRequired
+}
+
+struct MailboxFileProviderPublicationExecutor: Sendable {
     private let queue = DispatchQueue(
         label: "com.example.HealthBridgeCompanion.mailbox.file-provider-publication"
     )
 
-    func run<T>(_ operation: () throws -> T) rethrows -> T {
-        try queue.sync(execute: operation)
+    func run<T: Sendable>(_ operation: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: operation()) }
+        }
+    }
+
+    func run<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 }
 
-struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
+struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing, Sendable {
+    func publishPairingRequest(_ bytes: Data, locator: MailboxResolvedLocatorV1) async throws {
+        try await executor.run {
+            try self.publishPairingRequestBlocking(bytes, locator: locator)
+        }
+    }
+
+    private func publishPairingRequestBlocking(_ bytes: Data, locator: MailboxResolvedLocatorV1) throws {
+        guard bytes.count <= 65_536 else { throw MailboxPublicationError.unsafeDestination }
+        try MailboxLocatorV1.revalidatePairing(locator)
+        let finalURL = locator.deviceRoot.appendingPathComponent("request.hbp")
+        if let existing = try existingFinal(at: finalURL, expected: bytes) {
+            guard existing else { throw MailboxPublicationError.conflict }
+            return
+        }
+        #if os(iOS)
+        try publishWithUbiquityManager(bytes, to: finalURL) {
+            try MailboxLocatorV1.revalidatePairing(locator)
+        }
+        #else
+        try bytes.write(to: finalURL, options: [.withoutOverwriting])
+        #endif
+        try MailboxLocatorV1.revalidatePairing(locator)
+    }
+
     private let executor = MailboxFileProviderPublicationExecutor()
 
+    @MainActor
+    func publishAwaitingCompletion(
+        _ envelope: Data,
+        finalName: String,
+        locator: MailboxResolvedLocatorV1
+    ) async throws -> URL {
+        try await executor.run {
+            try self.publishBlocking(envelope, finalName: finalName, locator: locator)
+        }
+    }
+
     func publish(
+        _ envelope: Data,
+        finalName: String,
+        locator: MailboxResolvedLocatorV1
+    ) throws -> URL {
+        #if os(iOS)
+        throw MailboxPublicationExecutionError.asynchronousPublicationRequired
+        #else
+        return try publishBlocking(envelope, finalName: finalName, locator: locator)
+        #endif
+    }
+
+    private func publishBlocking(
         _ envelope: Data,
         finalName: String,
         locator: MailboxResolvedLocatorV1
@@ -59,12 +142,11 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
         }
 
         #if os(iOS)
-        try executor.run {
-            try publishWithUbiquityManager(
-                envelope,
-                to: finalURL,
-                locator: locator
-            )
+        try publishWithUbiquityManager(
+            envelope,
+            to: finalURL
+        ) {
+            try revalidate(locator)
         }
         #else
         let temporaryID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
@@ -117,7 +199,7 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
     private func publishWithUbiquityManager(
         _ envelope: Data,
         to finalURL: URL,
-        locator: MailboxResolvedLocatorV1
+        validate: () throws -> Void
     ) throws {
         let stagingRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-bridge-mailbox-qa", isDirectory: true)
@@ -136,7 +218,7 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
                 ofItemAtPath: sourceURL.path
             )
             try sync(finalURL: sourceURL, lane: stagingRoot)
-            try revalidate(locator)
+            try validate()
             try FileManager.default.setUbiquitous(
                 true,
                 itemAt: sourceURL,

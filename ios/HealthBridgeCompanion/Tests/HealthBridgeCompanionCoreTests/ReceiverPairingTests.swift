@@ -72,6 +72,36 @@ final class ReceiverPairingTests: XCTestCase {
         XCTAssertNil(invitation.mailboxProtocolVersion)
     }
 
+    func testDecodesURLFreeMailboxInvitationFromCustomDeepLink() throws {
+        let json = """
+        {
+          "schema_id": "health_bridge.receiver_pairing_invitation.v2",
+          "schema_version": "2.0.0",
+          "label": "synthetic-iphone",
+          "invitation_secret": "hbi_synthetic_native_mailbox_secret",
+          "expires_at": "2099-01-01T00:20:00Z",
+          "transport": "mailbox",
+          "mailbox_protocol_version": 1,
+          "mailbox_bootstrap": {
+            "version": 1,
+            "invitation_id": "00112233445566778899aabbccddeeff",
+            "receiver_signing_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            "receiver_agreement_public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo"
+          }
+        }
+        """
+        let deepLink = makeDeepLink(for: json)
+
+        let material = try ReceiverPairingMaterial(deepLink: deepLink)
+
+        guard case .invitation(let invitation) = material else {
+            return XCTFail("Expected invitation material")
+        }
+        XCTAssertEqual(invitation.transport, .mailbox)
+        XCTAssertEqual(invitation.mailboxProtocolVersion, 1)
+        XCTAssertEqual(invitation.invitationSecret, "hbi_synthetic_native_mailbox_secret")
+    }
+
     func testExplicitMailboxInvitationRequiresMailboxProtocolV1() throws {
         let invitation = try ReceiverPairingInvitation(
             jsonData: Data(mailboxInvitationJSON.utf8)

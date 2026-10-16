@@ -7,6 +7,51 @@ import UIKit
 #endif
 
 @MainActor
+protocol MailboxChangeObserving: AnyObject {
+    func start(onChange: @escaping @MainActor () -> Void)
+    func stop()
+}
+
+@MainActor
+final class NativeMailboxChangeObserver: NSObject, MailboxChangeObserving {
+    private(set) var query: NSMetadataQuery?
+    private var onChange: (@MainActor () -> Void)?
+
+    func start(onChange: @escaping @MainActor () -> Void) {
+        stop()
+        let query = NSMetadataQuery()
+        query.searchScopes = [NSMetadataQueryUbiquitousDocumentsScope]
+        query.predicate = NSPredicate(
+            format: "%K LIKE %@ OR %K LIKE %@",
+            NSMetadataItemFSNameKey, "*.hba", NSMetadataItemFSNameKey, "*.hbd"
+        )
+        query.operationQueue = .main
+        self.query = query
+        self.onChange = onChange
+        for name in [Notification.Name.NSMetadataQueryDidFinishGathering, .NSMetadataQueryDidUpdate] {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(metadataChanged(_:)), name: name, object: query
+            )
+        }
+        query.start()
+    }
+
+    func stop() {
+        onChange = nil
+        if let query {
+            NotificationCenter.default.removeObserver(self, name: nil, object: query)
+            query.stop()
+        }
+        query = nil
+    }
+
+    @objc private func metadataChanged(_ notification: Notification) {
+        guard let query, notification.object as? NSMetadataQuery === query else { return }
+        onChange?()
+    }
+}
+
+@MainActor
 final class AutomaticSyncRuntime {
     unowned let viewModel: HealthBridgeCompanionViewModel
 
@@ -14,8 +59,12 @@ final class AutomaticSyncRuntime {
     private var hasActivatedReadyWork = false
     private var foregroundOpportunityConsumed = false
     private var foregroundCatchUpTask: Task<Void, Never>?
+    private let mailboxChangeObserver: any MailboxChangeObserving
+    private let backgroundRefreshScheduler: any BackgroundRefreshScheduling
+    private var mailboxObservationID: UUID?
+    private var mailboxObservationGeneration: String?
     #if canImport(HealthKit)
-    private let backgroundDeliveryCoordinator = HealthKitBackgroundDeliveryCoordinator()
+    private let backgroundDeliveryCoordinator: HealthKitBackgroundDeliveryCoordinator
     #endif
 
     private lazy var engine = AutomaticSyncEngine(
@@ -27,8 +76,14 @@ final class AutomaticSyncRuntime {
                 pendingGenerations: pendingGenerations
             )
         },
-        performOpportunity: { @MainActor [weak viewModel] opportunity, processPendingTypes in
+        performOpportunity: { @MainActor [weak self, weak viewModel] opportunity, processPendingTypes in
             guard let viewModel else { return }
+            if let observationID = opportunity.deliveryObservationID {
+                guard let self, self.mailboxObservationID == observationID,
+                      let generation = self.mailboxObservationGeneration else { return }
+                await viewModel.performMailboxDeliveryOpportunity(expectedGeneration: generation)
+                return
+            }
             if opportunity.reason == .manualSync {
                 await viewModel.performManualSyncOpportunity(
                     processPendingTypes: processPendingTypes
@@ -45,8 +100,17 @@ final class AutomaticSyncRuntime {
         }
     )
 
-    init(viewModel: HealthBridgeCompanionViewModel) {
+    init(
+        viewModel: HealthBridgeCompanionViewModel,
+        backgroundDeliveryCoordinator: HealthKitBackgroundDeliveryCoordinator? = nil,
+        mailboxChangeObserver: (any MailboxChangeObserving)? = nil,
+        backgroundRefreshScheduler: (any BackgroundRefreshScheduling)? = nil
+    ) {
         self.viewModel = viewModel
+        self.mailboxChangeObserver = mailboxChangeObserver ?? NativeMailboxChangeObserver()
+        self.backgroundRefreshScheduler = backgroundRefreshScheduler ?? NativeBackgroundRefreshScheduler()
+        self.backgroundDeliveryCoordinator = backgroundDeliveryCoordinator
+            ?? HealthKitBackgroundDeliveryCoordinator()
     }
 
     func prepareForBackgroundLaunch() {
@@ -57,7 +121,7 @@ final class AutomaticSyncRuntime {
         #endif
         isActivated = true
         startObservers(allowBeforeBootstrap: true)
-        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+        backgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
     }
 
     func activateIfReady(scheduleOutbox: Bool = true) {
@@ -66,6 +130,7 @@ final class AutomaticSyncRuntime {
         BackgroundURLSessionOutboxUploader.shared
             .setAutomaticContinuationAdmissionOpen(true)
         #endif
+        startMailboxObservationIfNeeded()
         guard !hasActivatedReadyWork else { return }
         hasActivatedReadyWork = true
         if !isActivated {
@@ -75,11 +140,12 @@ final class AutomaticSyncRuntime {
         if scheduleOutbox {
             viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
         }
-        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+        backgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
         runForegroundCatchUpIfNeeded()
     }
 
     func stopAdmission() {
+        stopMailboxObservation()
         #if os(iOS)
         BackgroundURLSessionOutboxUploader.shared
             .setAutomaticContinuationAdmissionOpen(false)
@@ -90,7 +156,7 @@ final class AutomaticSyncRuntime {
         foregroundCatchUpTask?.cancel()
         foregroundCatchUpTask = nil
         engine.cancelActiveOwner()
-        BackgroundRefreshScheduler.cancelPendingRefresh()
+        backgroundRefreshScheduler.cancelPendingRefresh()
         #if canImport(HealthKit)
         backgroundDeliveryCoordinator.stop(
             healthTypes: HealthBridgeBackgroundSync.allKnownBackgroundDeliveryHealthTypes
@@ -100,7 +166,30 @@ final class AutomaticSyncRuntime {
     }
 
     func cancelAndWait() async {
+        stopMailboxObservation()
         await engine.cancelAndWait()
+    }
+
+    private func stopMailboxObservation() {
+        mailboxObservationID = nil
+        mailboxObservationGeneration = nil
+        mailboxChangeObserver.stop()
+    }
+
+    private func startMailboxObservationIfNeeded() {
+        guard mailboxObservationID == nil, viewModel.usesMailboxTransport else { return }
+        let observationID = UUID()
+        let generation = viewModel.automaticSyncConnectionGeneration
+        mailboxObservationID = observationID
+        mailboxObservationGeneration = generation
+        mailboxChangeObserver.start { [weak self] in
+            guard let self, self.mailboxObservationID == observationID,
+                  self.viewModel.usesMailboxTransport,
+                  self.viewModel.automaticSyncObserverIsCurrent(
+                    expectedConnectionGeneration: generation, allowBeforeBootstrap: false
+                  ) else { return }
+            self.engine.requestDeliveryReconciliation(observationID: observationID)
+        }
     }
 
     func runForegroundCatchUpIfNeeded() {
@@ -108,10 +197,6 @@ final class AutomaticSyncRuntime {
         guard !opportunityWasConsumed else { return }
         foregroundOpportunityConsumed = true
         reconcileRegistrations()
-        if viewModel.usesMailboxTransport {
-            viewModel.runForegroundMailboxReconciliationIfNeeded()
-            return
-        }
         guard viewModel.automaticSyncShouldRunForegroundCatchUp(
             opportunityWasConsumed: opportunityWasConsumed
         ),
@@ -128,17 +213,16 @@ final class AutomaticSyncRuntime {
 
     func noteSceneLeftActive() {
         foregroundOpportunityConsumed = false
-        viewModel.noteSceneLeftActive()
     }
 
     func handleBackgroundRefresh() async {
-        BackgroundRefreshScheduler.noteRequestConsumed()
+        backgroundRefreshScheduler.noteRequestConsumed()
         reconcileRegistrations()
         try? await engine.requestRun(
             reason: .scheduledRefresh,
             bootstrapBeforeRun: true
         )
-        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+        backgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
     }
 
     func runAutomaticSync(

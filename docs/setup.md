@@ -1,158 +1,97 @@
-# Set up Health Bridge for AI
+# Set up Health Bridge
 
-The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, and leave Automatic Sync enabled.
-
-Run the installation and setup commands in this guide only after the immutable `receiver-v1.1.2` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older mailbox helper.
+> **Unreleased onboarding preview.** Until the immutable `receiver-v1.1.3` release and its assets are published and verified, this guide is an unreleased preview; use the [published Receiver/CLI 1.1.2 guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md). Direct/Tailscale retains Companion 1.1.1 compatibility. iCloud-native first pairing requires the updated companion and matching signed helper; those updates are not published yet. The coordinated source candidate pairs Receiver/CLI 1.1.3 with Companion 1.1.2/build 62; neither the candidate app nor its matching signed helper is implied to be available by this guide. Existing installations do not change when you read this guide.
 
 ## Before you start
 
-You need:
+You need an iPhone running iOS 18 or later and a macOS or Linux computer to store the receiver database. Keep that computer awake and reachable while syncing; native Windows is not currently supported. Your AI must be able to run commands on that computer, directly or through an existing approved SSH connection.
 
-- an iPhone running iOS 18 or later;
-- an approved build shown on the [Health Bridge install status page](https://healthbridge.chanhyo.dev/install/), or a self-build;
-- a macOS or Linux computer for the receiver and private database; native Windows is not currently supported;
-- [`uv`](https://docs.astral.sh/uv/);
-- for continuous sync away from home, either an existing Tailscale connection or an agent-assisted private HTTPS ingress; for an explicit local-only evaluation, a same-LAN route with the limitations below;
-- optionally, direct terminal access or a same-host stdio MCP client.
+Health Bridge saves the Apple Health data you choose on this computer. Its background process, called the receiver, accepts data from your iPhone. The recommended connection uses Tailscale, a connection app installed on both devices. Sign in with the same account and keep Tailscale enabled on the iPhone. Setup prepares a private HTTPS connection; it does not log you in or make the computer public. If you already have a prepared HTTPS or same-network connection, choose **More connection options**.
 
-## What the receiver URL means
+On a Mac, you can instead send data through iCloud Drive using the same Apple Account on both devices. Keep the Mac logged in; delivery can be delayed. Guided setup reuses a matching signed helper and finds its iCloud Documents folder. If the helper is missing, setup offers to discover, download and verify the exact signed release. If it is unavailable, choose Tailscale, return to connection choices or pause. Selecting local ZIP/manifest files remains an advanced offline option. **The signed 1.1.3 helper release is not publicly available yet.** An older helper cannot substitute for it. In this candidate, both first pairing and subsequent delivery use iCloud; the iPhone needs no Tailscale or prepared receiver address. Use the updated companion for this path, not the currently published app. See [Mac iCloud details](icloud-mailbox-service.md) for advanced configuration.
 
-The receiver URL is the exact address the iPhone uses to upload to the receiver computer. **The project does not issue this URL**, and a documentation hostname is not a working endpoint. The URL must:
+## 1. Install the receiver and run setup
 
-- for continuous sync, be reachable from the physical iPhone on Wi-Fi and cellular data and use a stable private HTTPS route;
-- for an explicit local-only evaluation, be reachable from the iPhone on that LAN and be understood to stop working when the phone leaves it;
-- end exactly in `/v1/batches`;
-- route the same origin's `/health` and `/v1/pairing/redeem` paths to the receiver;
-- remain available whenever automatic sync should succeed.
+The Python package and optional npm thin launcher use the same receiver and CLI. The launcher requires Node.js 18 or newer with npm/npx and manages its private Python runtime; it does not require the user to install Python separately. There is no published npm/PyPI install target yet for this preview. Use only the exact GitHub assets after the availability condition above is met; unpublished test archives are not replacements for the immutable release.
 
-A local-network-only route stops syncing when the iPhone leaves that network. It remains useful for development and explicit local-only use, but it is not the primary continuous-sync path.
-
-Choose one of the following routes **before** running `health-bridge setup`.
-
-## Route A: Already use Tailscale
-
-This is the shortest supported remote path for someone who already uses Tailscale. It is not a product requirement, and the setup guide does not ask a new user to adopt Tailscale by default.
-
-Prerequisites:
-
-1. Tailscale is already installed and signed in on the receiver computer and iPhone.
-2. Both devices are in the same tailnet.
-3. Tailscale is connected on the iPhone.
-4. The receiver computer can remain awake and connected when automatic sync is expected.
-5. Every Route A deployment has a least-privilege Tailscale [grant](https://tailscale.com/docs/features/access-control/grants) (or an existing ACL policy) restricting TCP `8443` on this receiver to the intended user or device. Do not rely on a default allow-all policy for a health-data receiver. On a personal tailnet, review its member and device list; on a shared tailnet, also verify that a non-granted identity cannot open the route.
-
-On the receiver computer, inspect the current device Serve configuration first:
+After publication and verification, install the receiver:
 
 ```bash
-tailscale version
-tailscale status
-tailscale serve status
+uv tool install --force "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.3"
 ```
 
-If HTTPS port `8443` already has a handler, stop and have the installer preserve the existing service instead of replacing it. Port `8443` is used here to keep Health Bridge separate from a common HTTPS `443` handler.
-
-When port `8443` is available, configure an explicit private HTTPS listener that proxies to the receiver's loopback backend:
+For the optional one-shot Node path, use the exact release archive:
 
 ```bash
-tailscale serve --bg --https=8443 http://127.0.0.1:8765
-tailscale serve status
+npm exec --yes --package="https://github.com/roian6/apple-health-ai-bridge/releases/download/receiver-v1.1.3/apple-health-ai-bridge-0.1.0.tgz" -- health-bridge setup
 ```
 
-The final status must show the HTTPS `8443` handler proxying to `http://127.0.0.1:8765`. Use Serve, not Funnel. Funnel publishes a service to the public internet; this path is intended to stay inside your tailnet. If Tailscale asks an administrator to enable HTTPS or Serve, follow the official Tailscale prompt and then rerun the command.
+The commands below assume the installed `health-bridge` command is on PATH. If you use a one-shot npm runner instead, keep that same approved runner prefix for setup and later queries; do not install a second receiver to obtain a different command.
 
-To remove only this Health Bridge listener later, coordinate so no other administrator changes Serve during rollback. Immediately before removal, run `tailscale serve status` and confirm the HTTPS `8443` handler still points to `http://127.0.0.1:8765`. If it has changed or the result is ambiguous, stop and preserve the newer configuration. If it still matches, use the same listener flag with `off`:
+For the Python installation, run:
 
 ```bash
-tailscale serve --https=8443 off
-tailscale serve status
+health-bridge setup
 ```
 
-The final status must show only that the Health Bridge handler is gone. This rollback targets HTTPS `8443` with `off` and never invokes the whole-configuration `reset` command; do not substitute `reset`.
+On a human stdin/stdout terminal, an existing or explicitly configured connection resumes directly. Fresh setup offers **Tailscale (Recommended)**, **iCloud Mailbox (Mac only, Beta)** on a Mac, **More connection options**, and **Set up later**. Prerequisites appear before selection. More connection options reuses already-prepared HTTPS or a same-network-only LAN route. Use arrows and Enter, or Esc to leave; `NO_COLOR` and dumb terminals use numbered choices. EOF or Ctrl-C pauses safely. If Tailscale is unavailable, you can open its official setup page, prepare it yourself and retry, supply an existing private URL, or leave. Setup does not install or log in to a provider for you.
 
-Build the exact batch URL from the current node's Tailscale DNS name. This route-preparation step only sets the URL; continue with the common setup sequence below:
+Continuing explicitly opts into a supervised per-user receiver and its private route. Setup initializes or reuses the database, installs and starts the owned Linux systemd or Mac LaunchAgent service, checks receiver readiness, prepares an invitation and remembers the database and setup options. It refuses to replace a conflicting service or route. Explicit flags override remembered defaults.
+
+Guided setup opens the **private connection URL** in a local desktop browser when available. A headless terminal provides the URL for a trusted screen or your iPhone. The terminal and page follow the same persisted pairing and receipt state: connection alone and empty diagnostic uploads do not complete setup. Terminal waiting stops after ten minutes; unpaired invitations also stop at their original expiry. An already paired installation can resume local progress after page expiry, and Ctrl-C retains the running receiver. The page updates while visible until completion or original expiry (normally 20 minutes); pairing does not extend it.
+
+`setup --no-input` and `setup --json` never prompt, wait, open a browser or configure an AI client. Combining either with `--configure-client` is rejected before preparation. Captured output contains no invitation URL or QR; run setup in a human terminal for that handoff. Detailed redacted service, route, path and MCP information remains available in `setup --json`.
+
+If setup reports a missing prerequisite or unavailable route, resolve that specific problem before pairing. A successful local health check does not prove that the iPhone can reach the computer. Re-running setup reuses the owned healthy receiver and remembered database; it does not reset data, replace a paired device or change the app's Automatic Sync setting. A still-usable invitation is reused; when a new invitation is needed, use the newly printed connection URL.
+
+## 2. Pair the iPhone and start syncing
+
+Download [Health Bridge for AI from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806), or keep your compatible installed companion. TestFlight remains available for beta builds.
+
+Open the connection page on the computer and scan its QR with iPhone Camera. If the page is already open in iPhone Safari, tap **Open in Health Bridge for AI**. The app also accepts the setup link or server address plus invitation code as fallbacks; see [pairing details](pairing.md).
+
+If you need to install Health Bridge for AI (companion app), return to the connection page afterward and tap **Open in Health Bridge for AI**. After connecting, tap **Allow Health Access**, select the Apple Health read permissions you want to grant, then turn on **Automatic Sync**, which starts OFF. To re-request access, use **Request Health Access Again**. HealthKit stays read-only. **Sync Now** is an optional immediate delivery test.
+
+Re-running receiver setup preserves the app's Automatic Sync setting. iOS decides when background delivery runs, so a sleeping receiver, disconnected private network or unavailable Health data can delay updates. The page confirms stored records, not all types, current observation dates or future background timing.
+
+## 3. Read the stored data with your AI
+
+On the receiver computer, start with:
 
 ```bash
-TAILSCALE_DNS_NAME="$(
-  tailscale status --json |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))'
-)"
-: "${TAILSCALE_DNS_NAME:?Tailscale did not report a DNS name; enable the required tailnet DNS/HTTPS feature and retry}"
-export HEALTH_BRIDGE_RECEIVER_URL="https://${TAILSCALE_DNS_NAME}:8443/v1/batches"
+health-bridge status --json
+health-bridge query synced-metrics
 ```
 
-## Route B: Agent-assisted private HTTPS ingress
+Setup remembers the database; normal queries do not need `--db`. Give your agent the packaged [Health Bridge Skill](../skills/health-bridge/SKILL.md) and command access to the receiver computer, directly or through an existing approved SSH connection. Setup does not grant AI execution access. The agent should check stored metric coverage and observation dates before answering, and distinguish missing data from zero activity. Existing records remain readable even when setup is waiting for a new confirmed health-data upload.
 
-Use this path when the receiver or AI-agent host already has—or can deliberately provision—a stable private HTTPS ingress without requiring Tailscale. The phone-facing side must be HTTPS with a certificate trusted by iOS. Plain HTTP may be used only from the reverse proxy to `127.0.0.1:8765` on the same host.
+Guided setup finishes only after records arrive from the connected iPhone, are saved, and a read-only query returns saved data. Run `health-bridge query synced-metrics` to see the saved kinds of data and their dates. Give your AI command access to this computer and the Health Bridge Skill to ask questions about those records. Setup does not automatically connect an AI app. Optional MCP connection settings are available through `--configure-client` without `--json` or `--no-input`; a failed AI-app connection keeps your saved data and command access intact.
 
-A reverse proxy alone does not create internet reachability. The host still needs an intentional private-network route, secure outbound tunnel, or other reviewed ingress that the iPhone can use away from home. An unguessable hostname is not an access-control boundary.
+For example, ask: “Summarize the sleep records stored for the last seven days and tell me about any gaps.” Use `health-bridge query --help` to choose a query, then its `--help` for date ranges. Queries return structured JSON. MCP is optional for the CLI/Skill path.
 
-Ask the setup agent to follow this provider-neutral ingress checklist:
+## Existing-route options
 
-1. **Discover without changing the host.** Inspect the OS, existing private-network clients, DNS and HTTPS ingress or tunnel services, reverse proxies, firewall, service manager, and whether port `8765` is already in use. Do not install a provider, change DNS, open a firewall port, publish a service, or run `health-bridge setup` during discovery.
-2. **Return a reviewable plan.** Show the proposed topology, provider or account prerequisites, exact DNS/ingress/firewall/service changes, whether the route is private or publicly reachable, rollback steps, and privacy/exposure trade-offs. Wait for explicit approval before applying the plan.
-3. **Keep the receiver private.** Bind Health Bridge to `127.0.0.1:8765`; terminate phone-facing TLS at the approved proxy or tunnel. Do not expose port `8765`, use plain HTTP toward the phone, use a self-signed certificate, treat an unguessable hostname as security, enable Tailscale Funnel, or add a browser-login layer that the iOS app cannot satisfy.
-4. **Proxy only the phone protocol.** On one HTTPS origin, allow `GET /health`, `POST /v1/batches`, and `POST /v1/pairing/redeem`. Preserve the `Authorization` header and request bodies. Permit batches up to `5,000,000` bytes and pairing redemption bodies up to `4,096` bytes. Disable request-body and authorization-header logging. Supervise the receiver process and TLS certificate renewal.
-5. **Stop at a public-only design.** If the only workable route is publicly reachable, do not silently publish it. Explain that it needs a deployment-specific hardening review outside this private-ingress guide.
-6. **Prepare the common handoff.** After the approved route exists, set `HEALTH_BRIDGE_RECEIVER_URL` to the exact origin plus `/v1/batches`. Do not claim phone reachability yet; continue with common setup, receiver start, and physical-iPhone verification below.
+These options preserve deliberate Direct/Tailscale/LAN deployments. Do not replace a working route just to follow the default setup path.
 
-The agent must not create a provider account, activate a paid plan, incur charges, accept provider terms, or start a trial unless each action and its price or future billing effect was shown in the plan and the user gave explicit approval for each. Existing login access or approval of the overall topology is not approval for those account or billing actions.
+### Already use Tailscale
 
-Do not print or paste the private URL, pairing page, QR payload, invitation, receiver credential, or database into public chat, issues, logs, or documentation.
+Without `--receiver-url`, setup finds this computer's Tailscale hostname and prepares a private HTTPS connection using Tailscale Serve. Sign in to Tailscale with the same account on both devices and keep it enabled on the iPhone. Existing unrelated Serve mappings are not overwritten; a conflict is reported instead. Tailscale is optional when another suitable connection already exists.
 
-The agent should finish route preparation with a redacted handoff containing:
+### Agent-assisted private HTTPS ingress
 
-- confirmation that `HEALTH_BRIDGE_RECEIVER_URL` is set locally, without printing its value;
-- the loopback backend and planned supervised service;
-- the exact local and phone-facing health checks to run after receiver start, without private host details;
-- the next common setup command;
-- rollback commands for every network or service change.
-
-After the common verification sequence, the handoff must be updated with whether both health checks passed and the next single physical-iPhone action.
-
-If no suitable private route exists, the agent must stop and present the infrastructure choices rather than inventing an endpoint or silently making the receiver public.
-
-## Route C: Local-network-only fallback
-
-Use this route only for development, evaluation, or a deliberate same-LAN installation. Sync stops whenever the iPhone leaves that LAN. The phone-facing connection is plain HTTP, so health payloads and the device credential are visible to that LAN while in transit. Use only a trusted, isolated network; never forward receiver port `8765` from the router to the public internet.
-
-Set `HEALTH_BRIDGE_LAN_HOST` to the receiver's real, stable LAN hostname or private address. On macOS, a Bonjour hostname can be derived without inventing a sample endpoint:
-
-```bash
-export HEALTH_BRIDGE_LAN_HOST="$(scutil --get LocalHostName).local"
-```
-
-On Linux, have the installer select and verify the actual LAN address that belongs to the receiver's intended interface; do not blindly choose the first address when VPN, container, or multiple network interfaces exist. Numeric LAN IPs are supported, but DHCP may change them, so reserve the address or update and re-pair after a change. Then set the exact URL locally:
-
-```bash
-: "${HEALTH_BRIDGE_LAN_HOST:?Set this to the receiver's verified LAN hostname or private address}"
-export HEALTH_BRIDGE_RECEIVER_URL="http://${HEALTH_BRIDGE_LAN_HOST}:8765/v1/batches"
-```
-
-Continue with the common setup sequence below. Route C must use its explicit `0.0.0.0:8765` bind; Routes A and B keep the loopback default.
-
-After setup, use the printed receiver command with the same bind and port. Keep the iPhone on that LAN, grant the app's iOS Local Network permission, derive the health URL as `${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}/health`, and open that exact URL on the physical iPhone before pairing. The Local Network permission alert may fail to resolve the first attempt if access is denied or the route does not recover in time. If an exit node is active, enable **Allow LAN access** or use Route A or Route B instead.
-
-## Install and run core setup
-
-After the publication check above, install Receiver/CLI `1.1.2`:
-
-```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.2"
-```
-
-After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.
-
-This core setup uses Direct, the default transport. Encrypted iCloud Mailbox is a separate explicit opt-in, Mac-only Beta and is never selected automatically when Direct is unavailable; see the [mailbox service guide](icloud-mailbox-service.md) only if you intentionally choose that transport.
-
-The mailbox guide uses the existing `health-bridge setup --transport icloud-mailbox` command with an explicit mailbox root and iCloud container identifier. It also requires the separately downloaded, verified, signed ACK helper before service installation. Direct setup commands in this guide never require that helper and never fall back to mailbox delivery.
-
-For Route A or Route B, keep the safe loopback bind:
+If you already operate a suitable HTTPS tunnel or reverse proxy, keep the receiver on loopback and pass its real batch URL:
 
 ```bash
 health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
 ```
 
-For Route C, explicitly bind to the LAN interface and matching port:
+`HEALTH_BRIDGE_RECEIVER_URL` must be the actual phone-reachable `/v1/batches` endpoint, not an example hostname. Its origin must also route `/health`, `/setup` and `/v1/pairing/redeem` to the receiver. Explicitly supplying the URL does not ask setup to install or reconfigure a tunnel provider.
+
+If no suitable private route exists, choose one with the user before changing DNS, tunnels, proxies, firewall rules or network exposure. An agent must not create a provider account, activate a paid plan, start a trial, accept provider terms or incur charges without previewing that action and obtaining explicit approval for each account or billing effect. Logging in is not that approval. A public HTTPS endpoint is not automatically private.
+
+### Local-network-only route
+
+This local-network-only route is available when off-network sync is not needed:
 
 ```bash
 health-bridge setup \
@@ -161,136 +100,35 @@ health-bridge setup \
   --receiver-port 8765
 ```
 
-Core setup:
+Use the real LAN `/v1/batches` URL. Numeric LAN IPs are supported, but a DHCP reservation or stable local hostname avoids re-pairing after address changes. On a Mac, `scutil --get LocalHostName` identifies the hostname normally used with `.local`. A bare IP may not trigger Apple's Local Network permission correctly; the Local Network permission alert may fail, so prefer a working hostname when necessary. If Tailscale is using an exit node, **Allow LAN access** may be needed.
 
-- creates owner-only private state and a single-use pairing page;
-- prepares a receiver launch command;
-- creates a client-neutral local stdio MCP access descriptor;
-- runs a same-host Health Bridge MCP self-test;
-- detects known client adapters without modifying them.
+This route deliberately uses HTTP only on the same trusted LAN and stops working when the phone leaves it. Do not expose port 8765 directly to the public internet. Loopback addresses such as `127.0.0.1` point at the iPhone itself when used in phone setup material.
 
-It does **not** configure any AI or MCP client by default. Adding a client creates a new process that can read the private health database, so that action requires an explicit choice.
+## Troubleshooting
 
-For automation or review, append `--json` to the exact Route A/B or Route C setup command above. The result is a secret-redacted onboarding schema.
-
-The JSON contains `access_descriptors`, not a supposedly universal client config. A local descriptor identifies the MCP protocol, stdio transport, executable, arguments, optional working directory, and environment references.
-
-The command creates owner-only files under `~/.local/share/health-bridge/`. The generated pairing HTML is secret because it contains a temporary, single-use invitation that normally expires in about 20 minutes. Do not paste it into chat, commit it, or place it on a web server.
-
-## Start and verify the receiver
-
-Run the `receiver_start_command` printed by setup as a supervised process. For Route A or Route B, keep the loopback bind behind the private HTTPS route. Route C deliberately uses the printed `0.0.0.0:8765` LAN bind and must never be port-forwarded to the public internet.
-
-The current setup command prepares the exact launch command but does not install an operating-system service. The installer must use the host's existing service manager, run as the receiver owner, start at boot, restart on failure, keep health values and credentials out of logs, and provide exact stop/disable/remove rollback commands. Until supervision passes, sync works only while the foreground receiver process remains running.
-
-The printed `receiver_health_url` should return:
-
-```json
-{"status":"ok"}
-```
-
-Verify in this order:
-
-1. Check the printed health URL from the receiver host to prove local readiness.
-2. Derive the phone-facing health URL as `${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}/health`.
-3. Open that exact URL on the physical iPhone. Routes A and B require their private HTTPS connection; Route C requires the same trusted LAN and iOS Local Network permission.
-4. Require `{"status":"ok"}` before opening any pairing page.
-
-The local MCP smoke proves neither receiver readiness nor phone reachability. If the physical-iPhone check fails, keep the pairing page private and fix the selected route, service, and access policy first.
-
-If the original invitation expires during service or route verification, create a fresh same-label invitation only after both health checks pass. This rotates the previous active same-label invitation:
-
-```bash
-health-bridge receiver create-pairing \
-  --db ~/.local/share/health-bridge/health.sqlite \
-  --label iPhone \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --format setup-page \
-  --setup-page ~/.local/share/health-bridge/iphone-setup.html
-```
-
-Open only the newly written private page and securely remove stale copies from every location where they were saved or transferred.
-
-## Pair the iPhone
-
-Pair only after the receiver and phone route are ready:
-
-1. On the receiver computer, open the generated pairing HTML file on a trusted screen. If the receiver is headless, securely copy that one file to a trusted local screen; do not publish it or place it on a web server.
-2. Scan the displayed QR with iPhone Camera and open the setup link. As a fallback, open the securely transferred HTML on the iPhone and tap its pairing button.
-3. Confirm the receiver connection in Health Bridge for AI.
-4. Tap **Allow Health Access**.
-5. Review Apple’s native HealthKit authorization sheet.
-6. Enable **Automatic Sync**.
-
-The app asks for all runtime-supported read types in one authorization flow. Apple’s sheet lets you allow or deny individual types.
-
-## Verify the first sync
-
-Receiver/CLI `1.1.2` supports native CLI and MCP reads while the receiver keeps running. In another terminal, use the same database path for `health-bridge status` and `health-bridge mcp smoke`. No iOS update is required for this receiver fix.
-
-```bash
-health-bridge status \
-  --db ~/.local/share/health-bridge/health.sqlite \
-  --json
-```
-
-Then call `get_bridge_status` or `list_synced_metrics`, or use the direct read-only query CLI. Missing data must be reported as unknown; it may mean no record, denied permission, source gaps, or sync gaps.
-
-## Connect an MCP client intentionally
-
-Configure only a client you intend to grant health-data access. Append `--configure-client hermes` (or another documented client name) to the same Route A/B or Route C setup command used above; Route C must repeat its explicit `--receiver-host` and `--receiver-port` flags.
-
-`--configure-client` is repeatable, but configuring more than one client grants each one access. Non-interactive and `--json` runs still make no client changes unless this option is present.
-
-For another same-host stdio MCP client, render `access_descriptors` into that client's documented configuration schema. Do not copy a root key from an unrelated product.
-
-## Deployment boundaries
-
-- Keep SQLite on the receiver host. Do not share it over a network mount.
-- A same-host stdio MCP descriptor does not create remote MCP access.
-- Container/NAS deployment is not yet first-class; supervision, persistent paths, private HTTPS routing, and pairing handoff remain operator responsibilities.
-- Health Bridge does not silently downgrade HTTPS to HTTP or discover and trust endpoints automatically.
-- A public reverse proxy is not automatically private or hardened merely because it uses TLS.
-- Do not expose port 8765 directly to the public internet.
+- **The connection page is not ready:** check the setup error and the receiver's local health endpoint. Do not pair against an unstarted service or replace another application's occupied port.
+- **The computer works but the iPhone cannot connect:** check the exact phone-facing `/health` URL in iPhone Safari, private-network connectivity and the host's sleep/firewall state. Do not disable certificate checks or iOS transport security.
+- **The page expired or became unavailable:** run the same setup command to check the existing connection. An already paired device stays paired; use the CLI to check its confirmed upload state. If pairing is still pending, use the newly printed private URL. Revoked devices or tokens cannot read progress through the old page.
+- **No data after pairing:** review the app's sync state and Apple Health permissions. Permission denial and unavailable types are intentionally indistinguishable to an app; an empty accepted upload is not proof of stored coverage.
+- **A metric is missing or stale:** query `synced-metrics` and the requested observation period. A supported-type list or recent ingestion timestamp is not evidence of current observations.
+- **Pairing material was exposed:** stop using it; explicitly rotate the invitation or revoke the affected device/token as appropriate. Never publish connection URLs, QR images, invitation codes, credentials, database paths or raw health records in support reports.
 
 ## Remove local bridge data
 
-Stop the receiver first. The command is a dry-run unless `--confirm` is present:
+Removing local bridge data is separate from normal setup and sync. Stop the receiver first, then preview the existing purge command (a dry-run without `--confirm`):
 
 ```bash
 health-bridge receiver purge --db ~/.local/share/health-bridge/health.sqlite
 ```
 
-Review the listed SQLite database and sidecars, then repeat with `--confirm` to remove only that local bridge scope. The command refuses confirmation while the receiver is using the database. This does not delete Apple Health data on the iPhone.
+Review the listed SQLite database and sidecars before adding `--confirm`. The command refuses confirmation while the receiver is using the database. This does not delete Apple Health data on the iPhone. If it reports `recovery-required`, preserve the private quarantine and do not restart the receiver until recovery has been reviewed.
 
-If the command returns `recovery-required`, do not restart the receiver. Review the structured source, quarantine, and truncated path lists; the command preserves the private quarantine rather than reporting a false rollback after an irreversible partial purge.
+The app's **Reset Private Sync State** is also destructive and user-confirmed. It clears receiver-scoped cursors, proofs, journals and queued uploads only after closing admission and draining active work. Disconnect or a new connection never adopts a previous connection's queued data; see [private-state details](pairing.md).
 
-## Troubleshooting
+## Browser and advanced connection choices
 
-### The iPhone cannot reach the receiver
+Use my own secure connection (advanced) requires an already configured secure route from your iPhone to this computer. An ordinary website is not a receiver, and typing a URL creates no route. Choose guided Tailscale if unsure. The route must forward /health, /setup, /v1/pairing/redeem and /v1/batches.
 
-- Test the exact HTTPS `/health` URL from the iPhone, not only from the receiver host.
-- Confirm the receiver process and reverse proxy or tunnel are both running.
-- For Tailscale, confirm both devices are in the same tailnet, the iPhone tunnel is connected, Serve is active, and Funnel is not in use.
-- If Tailscale uses an exit node while you test a LAN fallback, enable **Allow LAN access**.
-- Confirm that host, scheme, and port did not change after invitation creation.
-- Do not work around certificate errors by trusting a self-signed certificate or disabling iOS transport security.
-- Do not publish the pairing page while troubleshooting.
+Setup always prints its private human-copyable URL, even if the browser opens. Use --no-browser or an SSH terminal to keep browser launch disabled. A direct-route URL can be opened on a trusted computer or iPhone with that route. The iCloud loopback setup page is local-only: use the Mac's screen or trusted screen sharing on a headless Mac Mini, then scan its QR. Do not open that loopback URL directly on the iPhone. Keep the setup URL private; JSON and captured machine status withhold it.
 
-### No MCP client was configured
-
-This is the safe default. Use `--configure-client hermes` or `--configure-client openclaw` only after deciding that client should gain access.
-
-### Health types are missing
-
-Open iOS Settings and review Health permissions for Health Bridge. The app requests every implemented type available on the current runtime, but Apple may withhold types that are unavailable, restricted, or denied.
-
-### Pairing material was exposed
-
-Do not use it. Create a fresh setup invitation and revoke the affected paired device or token from the receiver CLI.
-
-## Private-state and connection safety
-
-**Reset Private Sync State** is intentionally destructive and user-confirmed. The app first closes upload admission, stops HealthKit background delivery, cancels active work, and revalidates the connection generation. Only after those barriers does it remove receiver-scoped cursors, proofs, journals, and queued payloads. Launch recovery completes an interrupted clear before automatic sync can resume.
-
-Disconnect and every connection replacement use the same local terminal barrier. Disconnect completes locally only after active pairing, foreground uploads, and restored background tasks have drained and saved settings are cleared. A different connection never adopts an old connection's queued records; mismatched or unknown items remain quarantined until the user explicitly deletes queued uploads.
+A timeout or Ctrl-C keeps the connection and saved data. Check the iPhone's Health access, Automatic Sync and network/iCloud prerequisites, then rerun setup. Completion still requires stored health records and successful readback. [Connect an AI app](connect.md) during successful setup or later with health-bridge connect.

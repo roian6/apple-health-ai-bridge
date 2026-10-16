@@ -491,7 +491,7 @@ def test_mcp_read_only_refuses_wal_without_creating_shm(tmp_path: Path) -> None:
     assert not shm_path.exists()
 
 
-def test_mcp_read_only_refuses_active_writer_snapshot(tmp_path: Path) -> None:
+def test_mcp_read_only_accepts_active_writer_with_reserved_lock(tmp_path: Path) -> None:
     db_path = initialized_fixture_db(tmp_path)
     with connect_database(db_path) as connection:
         _ = connection.execute("begin immediate")
@@ -506,11 +506,8 @@ def test_mcp_read_only_refuses_active_writer_snapshot(tmp_path: Path) -> None:
         )
         connection.rollback()
 
-    assert response == {
-        "jsonrpc": "2.0",
-        "id": 20,
-        "error": {"code": -32000, "message": "Health Bridge database is unavailable."},
-    }
+    assert response["id"] == 20
+    assert "result" in response
 
 
 def test_mcp_rejects_noncanonical_date_forms(tmp_path: Path) -> None:

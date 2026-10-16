@@ -296,6 +296,64 @@ private func publish(requestID: String) throws -> PublishReceipt {
     )
 }
 
+private struct PairingPublishRequest: Codable {
+    let version: Int
+    let requestID: String
+    let invitationID: String
+    let byteCount: Int
+    let sha256: String
+}
+
+private struct PairingPublishReceipt: Encodable {
+    let version: Int
+    let requestID: String
+    let invitationID: String
+    let byteCount: Int
+    let sha256: String
+    let published = true
+    let bootstrapVersion = 1
+}
+
+private func publishPairing(requestID: String) throws {
+    guard isHex(requestID, count: 32) else { throw HelperError.invalidArguments }
+    let manager = FileManager.default
+    let root = try applicationRoot()
+    let request = try JSONDecoder().decode(PairingPublishRequest.self, from: readRegularOwnerOnly(
+        root.appendingPathComponent("requests/\(requestID).json"), maximumBytes: maximumRequestBytes
+    ))
+    guard request.version == 1, request.requestID == requestID,
+          isHex(request.invitationID, count: 32), request.byteCount > 0,
+          request.byteCount <= 65_536, isHex(request.sha256, count: 64),
+          let provider = manager.url(forUbiquityContainerIdentifier: containerIdentifier)
+    else { throw HelperError.invalidRequest }
+    var directory = provider
+    for component in ["Documents", "HealthBridgeMailbox", "v1", "pairing", request.invitationID] {
+        directory.appendPathComponent(component, isDirectory: true)
+        var value = stat()
+        guard lstat(directory.path, &value) == 0, value.st_mode & S_IFMT == S_IFDIR
+        else { throw HelperError.unsafeFile }
+    }
+    let source = root.appendingPathComponent("staging/\(requestID).hbp")
+    let bytes = try readRegularOwnerOnly(source, maximumBytes: 65_536)
+    guard bytes.count == request.byteCount, digestHex(bytes) == request.sha256,
+          !source.path.hasPrefix(provider.path + "/") else { throw HelperError.digestMismatch }
+    let final = directory.appendingPathComponent("completion.hbp")
+    if manager.fileExists(atPath: final.path) {
+        guard try readRegularOwnerOnly(final, maximumBytes: 65_536) == bytes
+        else { throw HelperError.destinationConflict }
+    } else {
+        try manager.setUbiquitous(true, itemAt: source, destinationURL: final)
+    }
+    let values = try final.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemUploadingErrorKey])
+    guard values.isUbiquitousItem == true, values.ubiquitousItemUploadingError == nil,
+          try readRegularOwnerOnly(final, maximumBytes: 65_536) == bytes
+    else { throw HelperError.unsafeFile }
+    try writeOwnerOnly(PairingPublishReceipt(
+        version: 1, requestID: requestID, invitationID: request.invitationID,
+        byteCount: request.byteCount, sha256: request.sha256
+    ), to: receiptURL(root: root, requestID: requestID))
+}
+
 precondition(Bundle.main.bundleIdentifier == expectedBundleIdentifier)
 precondition(
     requiredStringArrayEntitlement(
@@ -314,7 +372,14 @@ precondition(
 
 let arguments = CommandLine.arguments.dropFirst()
 do {
-    if arguments.count == 1, let requestID = arguments.first {
+    if arguments.count == 1, arguments.first == "--native-pairing-v1" {
+        guard FileManager.default.url(forUbiquityContainerIdentifier: containerIdentifier) != nil
+        else { throw HelperError.containerUnavailable }
+        print("native-pairing-v1:available")
+    } else if arguments.count == 1, let argument = arguments.first,
+              argument.hasPrefix("pairing:") {
+        try publishPairing(requestID: String(argument.dropFirst(8)))
+    } else if arguments.count == 1, let requestID = arguments.first {
         let appRoot = try applicationRoot()
         try ensureProtocolDirectories(root: appRoot)
         let receipt = try publish(requestID: String(requestID))

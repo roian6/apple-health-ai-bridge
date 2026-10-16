@@ -229,6 +229,12 @@ def test_cli_status_json_reports_structured_redacted_agent_snapshot(
         check=True,
     )
     issued_token = IssuedTokenOutput.model_validate_json(token_result.stdout)
+    internal_cursor_kinds = (
+        "daily_projection_observation:steps",
+        "daily_projection_raw_interval:00000000-0000-0000-0000-000000000123",
+        "daily_projection_raw_coverage:steps",
+        "daily_projection_unresolved:steps",
+    )
     with sqlite3.connect(db_path) as connection:
         source_row = SOURCE_ID_ROW_ADAPTER.validate_python(
             connection.execute(
@@ -248,6 +254,16 @@ def test_cli_status_json_reports_structured_redacted_agent_snapshot(
                 "2026-06-08T09:30:00Z",
             ),
         )
+        for cursor_kind in internal_cursor_kinds:
+            _ = connection.execute(
+                insert_cursor_sql,
+                (
+                    source_id,
+                    cursor_kind,
+                    "private-projection-progress",
+                    "2026-06-08T09:45:00Z",
+                ),
+            )
 
     # When
     status_result = run(
@@ -272,7 +288,20 @@ def test_cli_status_json_reports_structured_redacted_agent_snapshot(
     assert payload.metrics["weight"].latest_cursor_updated_at == "2026-06-08T09:30:00Z"
     assert payload.metrics["workout"].record_count == 1
     assert payload.metrics["sleep_analysis"].record_count == 1
+    assert not any(
+        cursor.cursor_kind.startswith("daily_projection_")
+        for cursor in payload.sync_cursors
+    )
+    assert "00000000-0000-0000-0000-000000000123" not in output_text
     assert payload.sync_cursors[0].cursor_kind == "anchored_object_query"
+    with sqlite3.connect(db_path) as connection:
+        assert fetch_one_int(
+            connection,
+            """
+            select count(*) from sync_cursors
+            where cursor_kind like 'daily_projection_%'
+            """,
+        ) == len(internal_cursor_kinds)
     assert "secret" not in output_text.lower()
     assert "token_hash" not in output_text
     assert issued_token.token not in output_text

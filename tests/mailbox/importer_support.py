@@ -11,7 +11,6 @@ from health_bridge.cli import app
 from health_bridge.mailbox.filesystem import scan_delivery_lane
 from health_bridge.mailbox.importer import MailboxImportConfig, MailboxImporter
 from health_bridge.mailbox.publication import cleanup_quarantine
-from health_bridge.storage.database import initialize_database
 from health_bridge.storage.sqlite_rows import fetch_one_int
 from tests.contract.delivery_v1_support import BATCH
 from tests.receiver.delivery_acceptance_support import (
@@ -19,6 +18,7 @@ from tests.receiver.delivery_acceptance_support import (
     RequestSpec,
     alternate_batch,
     connection,
+    enroll_connection,
     envelope,
 )
 from tests.receiver.delivery_acceptance_support import (
@@ -97,7 +97,7 @@ def environment(tmp_path: Path) -> ImportEnvironment:
     for lane in (deliveries, acks, quarantine):
         lane.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "health.sqlite"
-    initialize_database(db_path)
+    enroll_connection(db_path, connection())
     return ImportEnvironment(
         db_path=db_path,
         mailbox_path=mailbox,

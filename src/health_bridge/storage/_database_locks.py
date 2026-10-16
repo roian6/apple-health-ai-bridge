@@ -8,6 +8,7 @@ from typing import Final
 import health_bridge.storage._database_lock_files as database_lock_files
 from health_bridge.storage._database_lock_files import (
     DatabaseLockPlan,
+    close_database_lock_fd,
     open_database_lock_fd,
     open_lock_file_fd,
     prepare_darwin_stable_lock,
@@ -48,7 +49,7 @@ def database_access_lock(
     exclusive: bool,
     create: bool,
     nonblocking: bool = False,
-) -> Generator[None, None, None]:
+) -> Generator[os.stat_result, None, None]:
     with _database_file_lock(
         db_path,
         DatabaseLockPlan(
@@ -59,15 +60,18 @@ def database_access_lock(
             lock_database=True,
             optional_lock_file=not create,
         ),
-    ):
-        yield
+    ) as identity:
+        if identity is None:
+            message = "database lock identity is unavailable"
+            raise OSError(message)
+        yield identity
 
 
 @contextmanager
 def _database_file_lock(
     db_path: Path,
     plan: DatabaseLockPlan,
-) -> Generator[None, None, None]:
+) -> Generator[os.stat_result | None, None, None]:
     if os.name != "posix":
         message = "database file locking is unavailable on this platform"
         raise OSError(message)
@@ -97,20 +101,27 @@ def _database_file_lock(
                 ):
                     database_fd = (
                         open_database_lock_fd(db_path, create=plan.create)
-                        if plan.lock_database and sys.platform != "darwin"
+                        if plan.lock_database
                         else None
                     )
                     try:
                         with _held_path_flock(
-                            database_fd,
+                            database_fd if sys.platform != "darwin" else None,
                             db_path,
                             exclusive=plan.exclusive,
                             nonblocking=plan.nonblocking,
                         ):
-                            yield
+                            identity = (
+                                os.fstat(database_fd)
+                                if database_fd is not None
+                                else None
+                            )
+                            if identity is not None:
+                                require_path_identity(db_path, identity)
+                            yield identity
                     finally:
                         if database_fd is not None:
-                            os.close(database_fd)
+                            close_database_lock_fd(database_fd)
             finally:
                 if lock_fd is not None:
                     os.close(lock_fd)

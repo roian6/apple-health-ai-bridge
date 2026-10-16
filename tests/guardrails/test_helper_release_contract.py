@@ -9,6 +9,10 @@ import zipfile
 from pathlib import Path
 from typing import cast
 
+import pytest
+
+from tests.guardrails.conftest import write_node_archive
+
 ROOT = Path(__file__).parents[2]
 RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 TAGGED_WORKFLOW = ROOT / ".github/workflows/release.yml"
@@ -152,6 +156,7 @@ def test_release_metadata_binds_expected_exact_source_helper(
     assert len(source["git_tree"]) == 40
 
 
+@pytest.mark.parametrize("receiver_release_repo", ["v3", "v4"], indirect=True)
 def test_final_checksums_bind_helper_digest_and_exact_asset_set(
     tmp_path: Path,
     receiver_release_repo: Path,
@@ -162,6 +167,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
     sdist = dist / "apple_health_ai_bridge-1.1.1.tar.gz"
     _ = wheel.write_bytes(b"wheel fixture")
     _ = sdist.write_bytes(b"sdist fixture")
+    node_archive = write_node_archive(receiver_release_repo, dist)
     metadata = dist / "release-metadata.json"
     created = _run_release_tool(
         "manifest",
@@ -181,6 +187,46 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
         str(metadata),
     )
     assert created.returncode == 0, created.stderr
+    release_json = tmp_path / "release.json"
+    release_payload = {
+        "tag_name": "receiver-v1.1.1",
+        "name": "receiver-v1.1.1",
+        "draft": True,
+        "prerelease": False,
+        "body": (
+            receiver_release_repo / ".github/release/notes-receiver-v1.1.1.md"
+        ).read_text(),
+        "assets": [
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "state": "uploaded",
+                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+            }
+            for path in dist.iterdir()
+        ],
+    }
+    _ = release_json.write_text(json.dumps(release_payload))
+    release_args = (
+        "--repo",
+        str(receiver_release_repo),
+        "--dist-dir",
+        str(dist),
+        "--tag",
+        "receiver-v1.1.1",
+        "--tag-object",
+        "3" * 40,
+        "--commit",
+        "1" * 40,
+        "--tree",
+        "2" * 40,
+        "--release-json",
+        str(release_json),
+        "--notes-file",
+        str(receiver_release_repo / ".github/release/notes-receiver-v1.1.1.md"),
+    )
+    core = _run_release_tool("verify-core-draft", *release_args)
+    assert core.returncode == 0, core.stderr
     release_metadata = cast("dict[str, object]", json.loads(metadata.read_text()))
     helper_contract = cast(
         "dict[str, object]", release_metadata["macos_mailbox_ack_helper"]
@@ -301,6 +347,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
     ]
     assert names == sorted(
         [
+            *([node_archive.name] if node_archive is not None else []),
             archive.name,
             helper_manifest.name,
             wheel.name,
@@ -308,6 +355,30 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
             metadata.name,
         ]
     )
+    release_payload["assets"] = [
+        {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "state": "uploaded",
+            "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+        }
+        for path in dist.iterdir()
+    ]
+    for command, draft in (
+        ("verify-final-draft", True),
+        ("verify-final-published", False),
+    ):
+        release_payload["draft"] = draft
+        _ = release_json.write_text(json.dumps(release_payload))
+        final = _run_release_tool(
+            command,
+            *release_args,
+            "--helper-sha256",
+            helper_digest,
+            "--helper-manifest-sha256",
+            hashlib.sha256(helper_manifest.read_bytes()).hexdigest(),
+        )
+        assert final.returncode == 0, final.stderr
 
 
 def test_owner_staging_script_is_exact_source_and_public_safe() -> None:
@@ -348,6 +419,9 @@ def test_tagged_release_stages_attested_draft_without_publishing() -> None:
     assert "HealthBridgeMailboxAckPublisher" in workflow
     assert "helper-pending" in workflow
     assert "Existing published release" in workflow
+    assert '"${RUNNER_TEMP}/node-launcher.XXXXXX"' in workflow
+    assert "scripts/build-node-launcher.py" in workflow
+    assert "dist/*.tgz" in workflow
 
 
 def test_manual_continuation_is_bound_and_never_replaces_published_release() -> None:
@@ -377,6 +451,8 @@ def test_manual_continuation_is_bound_and_never_replaces_published_release() -> 
     assert "gh release create" not in workflow
     assert "curl" not in workflow
     assert workflow.count("--clobber") == 0
+    assert workflow.count('node_asset="$(jq -r') == 2
+    assert workflow.count("${node_asset}apple_health_ai_bridge-") == 2
     run_lines: list[str] = []
     in_run_block = False
     for line in workflow.splitlines():

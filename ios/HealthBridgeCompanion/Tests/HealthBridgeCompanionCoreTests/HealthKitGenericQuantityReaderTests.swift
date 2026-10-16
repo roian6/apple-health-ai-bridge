@@ -5,6 +5,25 @@ import XCTest
 import HealthKit
 
 final class HealthKitGenericQuantityReaderTests: XCTestCase {
+    func testDailyActivityValuePreservesExplicitZeroAndPositiveSum() throws {
+        let entry = try catalogEntry("flights_climbed")
+        let unit = try XCTUnwrap(HealthKitQuantitySampleMapper.unit(for: entry))
+        for expected in [0.0, 6.0] {
+            let quantity = HKQuantity(unit: .count(), doubleValue: expected)
+            let value = HealthKitGenericQuantityReader.dailyActivityValue(
+                quantity.doubleValue(for: unit), for: entry
+            )
+            XCTAssertEqual(value, expected)
+        }
+    }
+
+    func testDailyActivityValueRejectsUnknownNegativeAndNonfiniteSum() throws {
+        let entry = try catalogEntry("flights_climbed")
+        for rawValue: Double? in [nil, -1, .nan, .infinity, -.infinity] {
+            XCTAssertNil(HealthKitGenericQuantityReader.dailyActivityValue(rawValue, for: entry))
+        }
+    }
+
     func testMapperConvertsKnownQuantitySamplesToCanonicalUnits() throws {
         let start = try date("2026-06-15T07:00:00Z")
         let end = try date("2026-06-15T07:00:05Z")

@@ -1279,7 +1279,7 @@ def test_receiver_create_pairing_cli_can_write_secret_setup_page(
     assert setup_page_path.exists()
     assert stat.S_IMODE(setup_page_path.stat().st_mode) == 0o600
     assert "<svg" in html
-    assert "Use a code instead" in html
+    assert "To connect with a code" in html
     assert (
         re.search(r"[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}", html)
         is not None

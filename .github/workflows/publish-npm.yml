@@ -1,0 +1,92 @@
+name: Publish exact verified npm release
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Immutable public receiver release database ID
+        required: true
+      source_commit:
+        description: Reviewed full source commit SHA
+        required: true
+      package_sha256:
+        description: Reviewed exact packed npm SHA-256
+        required: true
+      metadata_sha256:
+        description: Reviewed exact release-metadata.json SHA-256
+        required: true
+      dist_tag:
+        description: Operator-approved npm dist-tag (no default publication)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: npm-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'roian6/apple-health-ai-bridge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      PACKAGE_SHA256: ${{ inputs.package_sha256 }}
+      METADATA_SHA256: ${{ inputs.metadata_sha256 }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Verify immutable release and download exact public assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PACKAGE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$METADATA_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$DIST_TAG" =~ ^[a-z][a-z0-9-]*$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          jq -e '.draft == false and .prerelease == false and .immutable == true' "$RUNNER_TEMP/release.json"
+          mkdir "$RUNNER_TEMP/npm-release"
+          jq -r '.assets[] | [.id,.name] | @tsv' "$RUNNER_TEMP/release.json" |
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[0-9]+$ ]]
+            [[ "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$RUNNER_TEMP/npm-release/$asset_name"
+          done
+          cd "$RUNNER_TEMP/npm-release"
+          printf '%s  release-metadata.json\n' "$METADATA_SHA256" | sha256sum --check --strict
+          gh attestation verify release-metadata.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$SOURCE_COMMIT" --deny-self-hosted-runners
+          python "$GITHUB_WORKSPACE/scripts/verify-npm-release.py" "$RUNNER_TEMP/release.json" "$SOURCE_COMMIT" "$PACKAGE_SHA256"
+          sha256sum --check --strict SHA256SUMS
+          for artifact in *.tgz *.whl; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$SOURCE_COMMIT" --deny-self-hosted-runners
+          done
+          for artifact in HealthBridgeMailboxAckPublisher-* SHA256SUMS; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" --deny-self-hosted-runners
+          done
+      - name: Publish exact tarball using protected trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e 'const [a,b]=process.versions.node.split(".").map(Number); if(a<22 || a===22&&b<14) process.exit(1)'
+          npm_version="$(npm --version)"
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); if(a<11 || a===11&&(b<5 || b===5&&c<1)) process.exit(1)' "$npm_version"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          unset NODE_AUTH_TOKEN NPM_TOKEN
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/empty.npmrc"
+          touch "$NPM_CONFIG_USERCONFIG"
+          cd "$RUNNER_TEMP/npm-release"
+          packages=(*.tgz)
+          test "${#packages[@]}" -eq 1
+          printf '%s  %s\n' "$PACKAGE_SHA256" "${packages[0]}" | sha256sum --check --strict
+          npm publish "${packages[0]}" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry https://registry.npmjs.org

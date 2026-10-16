@@ -4,6 +4,87 @@ import XCTest
 
 final class AutomaticSyncEngineContractTests: XCTestCase {
     @MainActor
+    func testDeliveryWakesNeverReplaceObserverOrManualWorkOrClearDirtyGenerations() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        try fixture.store.markPendingObserverTypeCodes(["steps"])
+        var release: CheckedContinuation<Void, Never>?
+        var releaseObserver: CheckedContinuation<Void, Never>?
+        var observed: [AutomaticSyncEngine.Opportunity] = []
+        var ownerStarts = 0
+        var processedTypes: [String] = []
+        let entered = expectation(description: "first owner is blocked")
+        let observerEntered = expectation(description: "observer survives delivery wake coalescing")
+        let finished = expectation(description: "single owner joined")
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { type, _ in
+                processedTypes.append(type)
+                return .noPayload
+            },
+            performOpportunity: { opportunity, process in
+                observed.append(opportunity)
+                if observed.count == 1 {
+                    await withCheckedContinuation { continuation in
+                        release = continuation
+                        entered.fulfill()
+                    }
+                } else {
+                    if observed.count == 2 {
+                        await withCheckedContinuation { continuation in
+                            releaseObserver = continuation
+                            observerEntered.fulfill()
+                        }
+                    }
+                    _ = try await process()
+                }
+            },
+            startOwner: { _ in
+                ownerStarts += 1
+                return { finished.fulfill() }
+            }
+        )
+        engine.requestDeliveryReconciliation(observationID: UUID())
+        let started = await XCTWaiter.fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(started, .completed)
+        for _ in 0 ..< 20 { engine.requestDeliveryReconciliation(observationID: UUID()) }
+        engine.requestRunWithoutWaiting(reason: .observer(typeCode: "steps"), diagnosticRunID: UUID())
+        for _ in 0 ..< 20 { engine.requestDeliveryReconciliation(observationID: UUID()) }
+        release?.resume()
+        let observerStarted = await XCTWaiter.fulfillment(of: [observerEntered], timeout: 2)
+        XCTAssertEqual(observerStarted, .completed)
+        XCTAssertEqual(observed.last?.reason, .observer(typeCode: "steps"))
+        XCTAssertNil(observed.last?.deliveryObservationID)
+        engine.requestRunWithoutWaiting(reason: .manualSync, diagnosticRunID: UUID())
+        engine.requestDeliveryReconciliation(observationID: UUID())
+        XCTAssertEqual(try fixture.store.loadPendingObserverTypeCodeGenerations(), ["steps": 1])
+        releaseObserver?.resume()
+        let completed = await XCTWaiter.fulfillment(of: [finished], timeout: 2)
+        XCTAssertEqual(completed, .completed)
+        XCTAssertEqual(ownerStarts, 1)
+        XCTAssertEqual(observed.count, 3)
+        XCTAssertEqual(observed.last?.reason, .manualSync)
+        XCTAssertNil(observed.last?.deliveryObservationID)
+        XCTAssertEqual(processedTypes, ["steps"])
+
+        try fixture.store.markPendingObserverTypeCodes(["steps"])
+        let deliveryFinished = expectation(description: "delivery cannot process dirty types")
+        let deliveryEngine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { _, _ in
+                XCTFail("Delivery-only must not collect.")
+                return .noPayload
+            },
+            startOwner: { _ in { deliveryFinished.fulfill() } }
+        )
+        let pending = try fixture.store.loadPendingObserverTypeCodeGenerations()
+        deliveryEngine.requestDeliveryReconciliation(observationID: UUID())
+        let deliveryCompleted = await XCTWaiter.fulfillment(of: [deliveryFinished], timeout: 2)
+        XCTAssertEqual(deliveryCompleted, .completed)
+        XCTAssertEqual(try fixture.store.loadPendingObserverTypeCodeGenerations(), pending)
+    }
+
+    @MainActor
     func testCancelAndWaitCancelsCurrentOwnerAndDropsTrailingOpportunity() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }

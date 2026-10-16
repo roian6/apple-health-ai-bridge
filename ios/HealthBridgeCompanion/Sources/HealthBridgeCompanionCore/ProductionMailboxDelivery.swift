@@ -44,6 +44,7 @@ public struct ProductionMailboxDeliverySummary: Equatable, Sendable {
     public let scannedByteCount: Int64
     public let ignoredTemporaryCount: Int
     public let quarantine: MailboxAckQuarantineSummary
+    public let acknowledgmentEnumerationIncomplete: Bool
 
     public var ackDiagnosticLine: String {
         let counts = Dictionary(grouping: quarantine.records, by: { $0 })
@@ -53,7 +54,8 @@ public struct ProductionMailboxDeliverySummary: Equatable, Sendable {
             + "remainingUnavailable=\(hydration.remainingUnavailableCount), "
             + "skippedUnverifiableIdentity=\(hydration.skippedUnverifiableIdentityCount); "
             + "scan finalCount=\(scannedFinalCount), byteCount=\(scannedByteCount), "
-            + "ignoredTemporaryCount=\(ignoredTemporaryCount); "
+            + "ignoredTemporaryCount=\(ignoredTemporaryCount), "
+            + "incompleteEnumeration=\(acknowledgmentEnumerationIncomplete); "
             + "cleanupFailures=\(ackCleanupFailureCount); quarantine "
             + "invalidName=\(counts[.invalidName, default: 0]), "
             + "unsafeEntry=\(counts[.unsafeEntry, default: 0]), "
@@ -114,7 +116,11 @@ public final class ProductionMailboxDelivery {
     private let proofStore: CoreLaneUploadProofStore?
     private let pendingGenerationStore: BackgroundSyncSettingsStore?
     private let sleepStore: (any SleepSyncManifestStoring)?
+    typealias ComponentsFactory = (ReceiverSettingsStore, FileOutbox, MailboxKeyStore) throws -> ProductionMailboxComponents
+    private let componentsFactory: ComponentsFactory
     private let keyStore: MailboxKeyStore
+    private let providerLocation: MailboxProviderLocation?
+    private var acknowledgmentCheckpoint: String?
 
     public init(
         settingsStore: ReceiverSettingsStore,
@@ -125,7 +131,26 @@ public final class ProductionMailboxDelivery {
         sleepStore: (any SleepSyncManifestStoring)? = nil,
         keyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
-        )
+        ),
+        providerLocation: MailboxProviderLocation? = nil
+    ) {
+        self.settingsStore = settingsStore
+        self.componentsFactory = { try ProductionMailboxComponents.make(settingsStore: $0, outbox: $1, keyStore: $2, providerLocation: providerLocation) }
+        self.outbox = outbox
+        self.cursorStore = cursorStore
+        self.proofStore = proofStore
+        self.pendingGenerationStore = pendingGenerationStore
+        self.sleepStore = sleepStore
+        self.keyStore = keyStore
+        self.providerLocation = providerLocation
+    }
+
+    init(
+        settingsStore: ReceiverSettingsStore, outbox: FileOutbox,
+        cursorStore: any SyncCursorStoring, proofStore: CoreLaneUploadProofStore?,
+        pendingGenerationStore: BackgroundSyncSettingsStore?,
+        sleepStore: (any SleepSyncManifestStoring)?, keyStore: MailboxKeyStore,
+        componentsFactory: @escaping ComponentsFactory
     ) {
         self.settingsStore = settingsStore
         self.outbox = outbox
@@ -134,6 +159,8 @@ public final class ProductionMailboxDelivery {
         self.pendingGenerationStore = pendingGenerationStore
         self.sleepStore = sleepStore
         self.keyStore = keyStore
+        self.componentsFactory = componentsFactory
+        self.providerLocation = nil
     }
 
     public func validateAvailability() throws {
@@ -183,7 +210,8 @@ public final class ProductionMailboxDelivery {
             var terminalCount = 0
             for _ in 0 ..< 4 {
                 try Task.checkCancellation()
-                let state = try deliveryCoordinator.advance(itemID: item.id)
+                let state = try await deliveryCoordinator.advanceAwaitingPublication(itemID: item.id)
+                try requireCurrent(components)
                 switch state.phase {
                 case .collected, .encrypted, .published:
                     continue
@@ -203,7 +231,10 @@ public final class ProductionMailboxDelivery {
             )
         } catch is CancellationError {
             throw CancellationError()
+        } catch let storage as SleepStorageOperationFailure {
+            throw storage
         } catch {
+            try requireCurrent(components)
             throw ProductionMailboxDeliveryPhaseError.initialAdvance
         }
     }
@@ -228,10 +259,14 @@ public final class ProductionMailboxDelivery {
         if try coordinator.state(itemID: item.id)?.phase == .published {
             do {
                 try Task.checkCancellation()
-                _ = try coordinator.advance(itemID: item.id)
+                _ = try await coordinator.advanceAwaitingPublication(itemID: item.id)
+                try requireCurrent(components)
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let storage as SleepStorageOperationFailure {
+                throw storage
             } catch {
+                try requireCurrent(components)
                 throw ProductionMailboxDeliveryPhaseError.initialAdvance
             }
         }
@@ -247,11 +282,14 @@ public final class ProductionMailboxDelivery {
                 )
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let storage as SleepStorageOperationFailure {
+                throw storage
             } catch {
                 throw ProductionMailboxDeliveryPhaseError.consumeAck
             }
         }
-        guard try coordinator.state(itemID: item.id)?.phase == .providerObserved else {
+        let phase = try coordinator.state(itemID: item.id)?.phase
+        guard phase == .published || phase == .providerObserved else {
             return backgroundSummary(
                 phase: .reconcileFIFOHeadAcknowledgment,
                 attemptedCount: 1,
@@ -290,17 +328,14 @@ public final class ProductionMailboxDelivery {
                 let pendingFIFOHeadEnvelopeID = pendingFIFOHeadRecord.envelopeID
                 let hydration: MailboxAckHydrationReport
                 do {
-                    hydration = try await ProductionMailboxAckHydration.make(
-                        lane: ackLane,
-                        candidateFileNames: [pendingFIFOHeadEnvelopeID.hexV1 + ".hba"],
-                        maximumWaits: 1
-                    ).hydrate()
+                    hydration = try await components.acknowledgmentHydrator(lane: ackLane, candidateFileNames: [pendingFIFOHeadEnvelopeID.hexV1 + ".hba"], maximumWaits: 1).hydrate()
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    try self.requireCurrent(components)
                     throw ProductionMailboxDeliveryPhaseError.hydrateAck
                 }
-                try Task.checkCancellation()
+                try self.requireCurrent(components)
                 let report: MailboxAckScanReport
                 do {
                     report = try components.scanner.scanExact(record: pendingFIFOHeadRecord)
@@ -337,17 +372,14 @@ public final class ProductionMailboxDelivery {
                 }
                 let hydration: MailboxAckHydrationReport
                 do {
-                    hydration = try await ProductionMailboxAckHydration.make(
-                        lane: ackLane,
-                        candidateFileNames: window.fileNames,
-                        maximumWaits: 1
-                    ).hydrate()
+                    hydration = try await components.acknowledgmentHydrator(lane: ackLane, candidateFileNames: window.fileNames, maximumWaits: 1).hydrate()
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    try self.requireCurrent(components)
                     throw ProductionMailboxDeliveryPhaseError.hydrateAck
                 }
-                try Task.checkCancellation()
+                try self.requireCurrent(components)
                 let report: MailboxAckScanReport
                 do {
                     report = try components.scanner.scan(window: window)
@@ -365,6 +397,7 @@ public final class ProductionMailboxDelivery {
                 )
             }
         )
+        try requireCurrent(components)
         let hydration = acknowledgment.hydration
         let report = acknowledgment.report
         var finalizedCount = 0
@@ -404,6 +437,8 @@ public final class ProductionMailboxDelivery {
                 }
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let storage as SleepStorageOperationFailure {
+                throw storage
             } catch {
                 throw ProductionMailboxDeliveryPhaseError.consumeAck
             }
@@ -450,7 +485,8 @@ public final class ProductionMailboxDelivery {
                     itemID: item.id
                 )
                 for _ in 0 ..< 4 {
-                    let state = try coordinator.advance(itemID: item.id)
+                    let state = try await coordinator.advanceAwaitingPublication(itemID: item.id)
+                    try requireCurrent(components)
                     switch state.phase {
                     case .collected, .encrypted, .published:
                         continue
@@ -466,7 +502,10 @@ public final class ProductionMailboxDelivery {
             }
         } catch is CancellationError {
             throw CancellationError()
+        } catch let storage as SleepStorageOperationFailure {
+            throw storage
         } catch {
+            try requireCurrent(components)
             throw ProductionMailboxDeliveryPhaseError.initialAdvance
         }
         let ackLane: URL
@@ -483,15 +522,25 @@ public final class ProductionMailboxDelivery {
         }
         let hydration: MailboxAckHydrationReport
         do {
-            hydration = try await ProductionMailboxAckHydration.make(lane: ackLane).hydrate()
+            hydration = try await components.acknowledgmentHydrator(lane: ackLane).hydrate()
+            try requireCurrent(components)
+        } catch MailboxAckEnumerationError.budgetExhausted {
+            return try await deliverPendingWindow(
+                components: components, attemptedCount: items.count, terminalCount: terminalCount
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            try requireCurrent(components)
             throw ProductionMailboxDeliveryPhaseError.hydrateAck
         }
         let report: MailboxAckScanReport
         do {
             report = try components.scanner.scan()
+        } catch MailboxAckEnumerationError.budgetExhausted {
+            return try await deliverPendingWindow(
+                components: components, attemptedCount: items.count, terminalCount: terminalCount
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -539,10 +588,12 @@ public final class ProductionMailboxDelivery {
                     }
                     continue
                 }
+                // A later ACK may arrive first; retain it until the durable FIFO head retires.
+                guard try outbox.pendingItems().first?.id == itemID else { continue }
                 switch event.classification {
                 case .committed, .duplicateIdentical:
                     let disposition = try coordinator.consume(event, itemID: itemID)
-                    if disposition == .ackVerified {
+                    if disposition == .ackVerified || disposition == .duplicateIdentical {
                         _ = try coordinator.finalizeCommitted(itemID: itemID)
                         finalizedCount += 1
                     }
@@ -565,9 +616,27 @@ public final class ProductionMailboxDelivery {
                 }
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let storage as SleepStorageOperationFailure {
+                throw storage
             } catch {
                 throw ProductionMailboxDeliveryPhaseError.consumeAck
             }
+        }
+        do {
+            for item in items {
+                try Task.checkCancellation()
+                guard try outbox.pendingItems().first?.id == item.id else { continue }
+                let coordinator = try coordinator(components: components, itemID: item.id)
+                guard try coordinator.state(itemID: item.id)?.phase == .ackVerified else { break }
+                _ = try coordinator.finalizeCommitted(itemID: item.id)
+                finalizedCount += 1
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let storage as SleepStorageOperationFailure {
+            throw storage
+        } catch {
+            throw ProductionMailboxDeliveryPhaseError.consumeAck
         }
         let remaining: Int
         do {
@@ -589,7 +658,59 @@ public final class ProductionMailboxDelivery {
             scannedFinalCount: report.scannedFinalCount,
             scannedByteCount: report.scannedByteCount,
             ignoredTemporaryCount: report.ignoredTemporaryCount,
-            quarantine: report.quarantine
+            quarantine: report.quarantine,
+            acknowledgmentEnumerationIncomplete: false
+        )
+    }
+
+    @MainActor
+    private func deliverPendingWindow(
+        components: ProductionMailboxComponents,
+        attemptedCount: Int,
+        terminalCount: Int
+    ) async throws -> ProductionMailboxDeliverySummary {
+        try requireCurrent(components)
+        let window = try components.scanner.candidateWindow(
+            maximumEntries: MailboxAckScanner.maximumScanFiles,
+            afterCheckpoint: pendingGenerationStore?.mailboxAckScanCheckpoint(
+                receiverGeneration: components.receiverGeneration
+            ) ?? acknowledgmentCheckpoint
+        )
+        let report = try components.scanner.scan(window: window)
+        var cleanupFailures = 0
+        for event in report.events where event.classification == .committed {
+            try Task.checkCancellation()
+            guard let itemID = try itemID(for: event.envelopeID, signingPublicKey: components.deviceSigningPublicKey)
+            else { continue }
+            let cleanup = try coordinator(components: components, itemID: itemID)
+            guard try cleanup.state(itemID: itemID)?.phase == .committedFinalized else { continue }
+            if !Self.deleteAcknowledgmentAfterDurableCommit({
+                try cleanup.deleteAcknowledgment(for: event, itemID: itemID, scanReport: report)
+            }) { cleanupFailures += 1 }
+        }
+        try requireCurrent(components)
+        acknowledgmentCheckpoint = window.nextCheckpoint
+        if let checkpoint = window.nextCheckpoint {
+            try pendingGenerationStore?.persistMailboxAckScanCheckpoint(
+                checkpoint, receiverGeneration: components.receiverGeneration
+            )
+        }
+        let summary = try await reconcilePendingFIFOHeadAcknowledgment(
+            afterAcknowledgmentCheckpoint: window.nextCheckpoint
+        )
+        try requireCurrent(components)
+        return ProductionMailboxDeliverySummary(
+            attemptedCount: attemptedCount,
+            finalizedCount: summary.finalizedCount,
+            waitingCount: summary.waitingCount,
+            terminalCount: terminalCount + summary.terminalCount,
+            ackCleanupFailureCount: summary.ackCleanupFailureCount + cleanupFailures,
+            hydration: summary.hydration,
+            scannedFinalCount: summary.scannedFinalCount + report.scannedFinalCount,
+            scannedByteCount: summary.scannedByteCount + report.scannedByteCount,
+            ignoredTemporaryCount: summary.ignoredTemporaryCount,
+            quarantine: summary.quarantine,
+            acknowledgmentEnumerationIncomplete: true
         )
     }
 
@@ -643,7 +764,18 @@ public final class ProductionMailboxDelivery {
         components: ProductionMailboxComponents,
         itemID: String
     ) throws -> OutboxDeliveryCoordinator {
-        let transition = try sleepStore?.loadPendingTransition()
+        var transition = try withSleepStorageOrigin { try sleepStore?.loadPendingTransition() }
+        // Reuse the Sleep journal's frozen bytes before publishing an enqueue/save crash window.
+        if let sleepStore, let pending = transition, pending.outboxItemID == nil,
+           pending.receiverBindingID == components.identity.opaqueBinding,
+           pending.connectionGeneration == settingsStore.receiverSettingsGenerationToken,
+           let item = try outbox.pendingItem(id: itemID),
+           item.receiverIdentity == pending.receiverBindingID,
+           try Data(contentsOf: item.fileURL) == pending.payload {
+            let tracked = pending.assigningOutboxItemID(itemID)
+            try withSleepStorageOrigin { try sleepStore.savePendingTransition(tracked) }
+            transition = tracked
+        }
         let resetEpoch = transition?.outboxItemID == itemID
             ? transition?.manifest.baselineResetEpoch
             : nil
@@ -673,11 +805,12 @@ public final class ProductionMailboxDelivery {
             transport: components.transport,
             scanner: components.scanner,
             ownership: OutboxDeliveryOwnershipV1(
-                receiverGeneration: settingsStore.receiverSettingsGenerationToken,
+                receiverGeneration: components.receiverGeneration,
                 resetEpoch: resetEpoch,
                 ackContext: components.ackContext
             ),
-            finalizer: finalizer
+            finalizer: finalizer,
+            fault: components.coordinatorFault
         )
     }
 
@@ -689,6 +822,14 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.makeComponents
         }
+    }
+
+    private func requireCurrent(_ components: ProductionMailboxComponents) throws {
+        try Task.checkCancellation()
+        guard settingsStore.receiverSettingsGenerationToken == components.receiverGeneration else {
+            throw CancellationError()
+        }
+        try outbox.requireUploadAdmission()
     }
 
     private func backgroundPendingItems(
@@ -799,10 +940,6 @@ public final class ProductionMailboxDelivery {
     }
 
     private func makeComponents() throws -> ProductionMailboxComponents {
-        try ProductionMailboxComponents.make(
-            settingsStore: settingsStore,
-            outbox: outbox,
-            keyStore: keyStore
-        )
+        try componentsFactory(settingsStore, outbox, keyStore)
     }
 }

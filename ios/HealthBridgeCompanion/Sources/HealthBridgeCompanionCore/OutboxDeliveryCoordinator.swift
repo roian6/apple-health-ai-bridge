@@ -80,6 +80,31 @@ public final class OutboxDeliveryCoordinator: MailboxAckDurableFinalizationVerif
         return .ignoredMailboxOwned
     }
 
+    @MainActor
+    @discardableResult
+    public func advanceAwaitingPublication(itemID: String) async throws -> FileOutboxDeliveryStateV1 {
+        try Task.checkCancellation()
+        try validateCurrentOwnership()
+        guard let current = try state(itemID: itemID),
+              current.phase == .encrypted
+                || (current.phase == .retryableFailure && current.retryFrom == .encrypted) else {
+            return try advance(itemID: itemID)
+        }
+        let owned = try ownedState(itemID: itemID)
+        let result: DeliveryTransportResult
+        do {
+            result = try await transport.publishEnvelopeAwaitingCompletion(itemID: itemID)
+        } catch {
+            try Task.checkCancellation()
+            try validateCurrentOwnership()
+            throw error
+        }
+        try Task.checkCancellation()
+        try validateCurrentOwnership()
+        try outbox.requireUploadAdmission()
+        return try persistPublication(result, itemID: itemID, current: owned)
+    }
+
     func ownedState(itemID: String) throws -> FileOutboxDeliveryStateV1 {
         guard let item = try outbox.pendingItem(id: itemID)
             ?? outbox.mailboxBoundItemsForAckScanning().first(where: { $0.id == itemID })
@@ -131,7 +156,17 @@ public final class OutboxDeliveryCoordinator: MailboxAckDurableFinalizationVerif
         itemID: String,
         current: FileOutboxDeliveryStateV1
     ) throws -> FileOutboxDeliveryStateV1 {
-        switch try transport.publishEnvelope(itemID: itemID) {
+        try persistPublication(
+            transport.publishEnvelope(itemID: itemID), itemID: itemID, current: current
+        )
+    }
+
+    private func persistPublication(
+        _ result: DeliveryTransportResult,
+        itemID: String,
+        current: FileOutboxDeliveryStateV1
+    ) throws -> FileOutboxDeliveryStateV1 {
+        switch result {
         case .published:
             return try persist(
                 itemID: itemID,

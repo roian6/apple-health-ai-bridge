@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import pytest
+
 from health_bridge.receiver import batch_acceptance
+from health_bridge.receiver.delivery_acceptance import (
+    DeliveryAcceptanceFaultPoint,
+    DeliveryAcceptanceService,
+)
 from health_bridge.receiver.source_binding import SourcePrincipalMismatchError
-from health_bridge.receiver.tokens import create_receiver_token
+from health_bridge.receiver.tokens import ReceiverTokenPrincipal, create_receiver_token
+from health_bridge.storage.database import (
+    connect_readonly_database,
+    initialize_database,
+)
 from tests.contract.delivery_v1_support import BATCH
 from tests.receiver.delivery_acceptance_support import (
+    NOW_MS,
     RequestSpec,
+    connection,
+    enroll_connection,
+    fault_at,
     opened_receipt,
     request,
     service,
+    with_phone_source,
 )
 from tests.receiver.test_legacy_http_contract import (
     FIXTURE_PATH,
@@ -22,10 +38,36 @@ from tests.receiver.test_legacy_http_contract import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
-
     from health_bridge.contract import HealthBridgeBatchV1
-    from health_bridge.receiver.tokens import ReceiverTokenPrincipal
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_mailbox_commits_installation_association_atomically(
+    tmp_path: Path, rollback: bool
+) -> None:
+    db = tmp_path / "receiver.sqlite"
+    initialize_database(db)
+    principal = ReceiverTokenPrincipal(installation_id_hash="a" * 64)
+    trusted = replace(connection(), source_principal=principal)
+    enroll_connection(db, trusted)
+    acceptance = DeliveryAcceptanceService(db, trusted, lambda: NOW_MS)
+    upload = request(RequestSpec(payload=with_phone_source(BATCH)))
+
+    if rollback:
+        with pytest.raises(RuntimeError, match="before_commit"):
+            _ = acceptance.accept(
+                upload, fault_at(DeliveryAcceptanceFaultPoint.BEFORE_COMMIT)
+            )
+    else:
+        assert opened_receipt(acceptance.accept(upload).ack_bytes).result == "committed"
+
+    with connect_readonly_database(db) as database:
+        assert database.execute(
+            "select receiver_installation_id_hash from sync_runs"
+        ).fetchall() == ([] if rollback else [("a" * 64,)])
+        assert database.execute("select count(*) from samples").fetchone() == (
+            0 if rollback else 1,
+        )
 
 
 def test_direct_and_envelope_flows_share_the_batch_binding_boundary(

@@ -1,20 +1,46 @@
 import CryptoKit
 import Foundation
 
+public struct MailboxProviderLocation: Sendable {
+    public let providerRoot: URL
+    public let localRecordURL: URL
+
+    public init(providerRoot: URL, localRecordURL: URL) {
+        self.providerRoot = providerRoot
+        self.localRecordURL = localRecordURL
+    }
+}
+
 struct ProductionMailboxComponents {
     let identity: MailboxConnectionIdentityV1
+    let receiverGeneration: String
     let deviceSigningPublicKey: Curve25519.Signing.PublicKey
     let ackContext: MailboxAckContext
     let transport: MailboxTransport
     let ackLookup: FileOutboxMailboxAckLookup
     let scanner: MailboxAckScanner
     let locate: () throws -> MailboxResolvedLocatorV1
+    let makeHydrator: (URL, [String]?, Int) -> sending MailboxAckHydrator
+    let coordinatorFault: OutboxDeliveryCoordinator.Fault
+
+    func acknowledgmentHydrator(
+        lane: URL, candidateFileNames: [String]? = nil, maximumWaits: Int = 100
+    ) -> sending MailboxAckHydrator {
+        makeHydrator(lane, candidateFileNames, maximumWaits)
+    }
 
     static func make(
         settingsStore: ReceiverSettingsStore,
         outbox: FileOutbox,
-        keyStore: MailboxKeyStore
+        keyStore: MailboxKeyStore,
+        providerLocation: MailboxProviderLocation? = nil,
+        locate fixtureLocator: (() throws -> MailboxResolvedLocatorV1)? = nil,
+        publisher fixturePublisher: (any MailboxEnvelopePublishing)? = nil,
+        observe: MailboxTransport.Observe? = nil,
+        makeHydrator: ((URL, [String]?, Int) -> sending MailboxAckHydrator)? = nil,
+        coordinatorFault: @escaping OutboxDeliveryCoordinator.Fault = { _ in }
     ) throws -> Self {
+        let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         guard let record = try settingsStore.currentConnectionRecordV2(),
               record.activation == .paired(activeTransport: .mailbox),
               case .available(let identity) = record.mailboxIdentity,
@@ -61,11 +87,28 @@ struct ProductionMailboxComponents {
             deviceSigningPublicKey: deviceSigning,
             deviceSigningKeyID: identity.deviceSigningKeyID
         )
-        let locate = {
-            try MailboxLocatorV1.resolve(
+        let locate = fixtureLocator ?? { () throws -> MailboxResolvedLocatorV1 in
+            if let providerLocation {
+                return try MailboxLocatorV1.resolve(
+                    providerRoot: providerLocation.providerRoot,
+                    containerIdentifier: HealthBridgeAppIdentity.ubiquityContainerIdentifier,
+                    receiverComponent: identity.receiverID,
+                    deviceComponent: identity.deviceID,
+                    localRecordURL: providerLocation.localRecordURL
+                )
+            }
+            return try MailboxLocatorV1.resolve(
                 receiverComponent: identity.receiverID,
                 deviceComponent: identity.deviceID
             )
+        }
+        let publisher: any MailboxEnvelopePublishing
+        if let fixturePublisher {
+            publisher = fixturePublisher
+        } else if providerLocation != nil {
+            publisher = POSIXMailboxEnvelopePublisher()
+        } else {
+            publisher = FileProviderMailboxEnvelopePublisher()
         }
         let transport = MailboxTransport(
             outbox: outbox,
@@ -81,13 +124,14 @@ struct ProductionMailboxComponents {
             ),
             sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keyStore),
             locate: locate,
-            publisher: FileProviderMailboxEnvelopePublisher(),
+            publisher: publisher,
             envelopeID: { Data((0 ..< 16).map { _ in UInt8.random(in: .min ... .max) }) },
             nowMilliseconds: { Int64(Date().timeIntervalSince1970 * 1_000) },
             isCancelled: {
                 withUnsafeCurrentTask { task in task?.isCancelled ?? false }
+                    || settingsStore.receiverSettingsGenerationToken != receiverGeneration
             },
-            observe: ProductionMailboxProviderObserver.observe
+            observe: observe ?? ProductionMailboxProviderObserver.observe
         )
         let ackLookup = FileOutboxMailboxAckLookup(
             outbox: outbox,
@@ -101,12 +145,18 @@ struct ProductionMailboxComponents {
         )
         return Self(
             identity: identity,
+            receiverGeneration: receiverGeneration,
             deviceSigningPublicKey: deviceSigning,
             ackContext: ackContext,
             transport: transport,
             ackLookup: ackLookup,
             scanner: scanner,
-            locate: locate
+            locate: locate,
+            makeHydrator: makeHydrator ?? { lane, names, waits in
+                ProductionMailboxAckHydration.make(lane: lane,
+                    candidateFileNames: names, maximumWaits: waits)
+            },
+            coordinatorFault: coordinatorFault
         )
     }
 }

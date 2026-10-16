@@ -1,20 +1,621 @@
 import ipaddress
+import json
+import multiprocessing
 import os
+import plistlib
 import re
+import shlex
 import shutil
+import socket
 import sqlite3
 import stat
+import subprocess
 import sys
+from collections.abc import Iterator
+from dataclasses import replace
+from multiprocessing.connection import Connection
 from pathlib import Path
 from subprocess import CompletedProcess, run
+from threading import Thread
+from types import SimpleNamespace
 from typing import ClassVar, Literal, cast
+from urllib.request import Request
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+from typer.testing import CliRunner
 
 import health_bridge.cli_setup as cli_setup_module
+from health_bridge import __version__, cli_setup_runtime
+from health_bridge import cli as cli_module
+from health_bridge.cli import app
+from health_bridge.cli_setup_runtime import run_control as native_run_control
+from health_bridge.contract import HealthBridgeBatchV1
+from health_bridge.launchd.artifacts import (
+    load_owned_launch_agent_request,
+    load_runnable_launch_agent_request,
+)
+from health_bridge.launchd.models import LaunchdServiceRequest, service_paths
+from health_bridge.mailbox.helper_lifecycle import HelperResult, HelperStatusCode
+from health_bridge.receiver import transports
+from health_bridge.receiver.invitations import redeem_pairing_invitation
+from health_bridge.receiver.pairing_setup_page import (
+    invitation_page_route,
+    read_invitation_page,
+)
+from health_bridge.receiver.server import ReceiverHTTPServer, build_receiver_server
+from tests.receiver.test_pairing_redeem_server import open_http_response
+from tests.receiver.test_receiver_source_binding import post_batch, with_source_key
 
 TEST_PRIVATE_BIND_HOST = ".".join(("192", "168", "50", "9"))  # noqa: FLY002
+
+
+def ready_setup_helper(*, home: Path, expected_version: str) -> HelperResult:
+    assert home == Path.home()
+    assert expected_version == __version__
+    return HelperResult(code=HelperStatusCode.READY)
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(
+        "PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}"
+    )
+    executable = home / "bin/health-bridge"
+    executable.parent.mkdir(mode=0o700)
+    _ = executable.write_bytes(
+        (Path(sys.executable).parent / "health-bridge").read_bytes()
+    )
+    executable.chmod(0o700)
+    monkeypatch.setattr(sys, "argv", [str(executable)])
+
+
+def mac_control(
+    command: list[str], servers: list[ReceiverHTTPServer], threads: list[Thread]
+) -> CompletedProcess[str]:
+    manifest = (
+        Path.home() / "Library/LaunchAgents" / f"{command[-1].rsplit('/', 1)[-1]}.plist"
+    )
+    if command[1] == "print":
+        return CompletedProcess(
+            command,
+            0 if servers else 113,
+            f"path = {manifest}\nstate = running\npid = 12345\n" if servers else "",
+            "",
+        )
+    assert command[1] == "bootstrap"
+    document = TypeAdapter(dict[str, JsonValue]).validate_python(
+        plistlib.loads(Path(command[-1]).read_bytes())
+    )
+    arguments = TypeAdapter(list[str]).validate_python(document["ProgramArguments"])
+    request = load_runnable_launch_agent_request(Path(arguments[-1]))
+    server = build_receiver_server(
+        request.db_path,
+        host=request.host,
+        port=request.port,
+        setup_page=request.setup_page,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    servers.append(server)
+    threads.append(thread)
+    return CompletedProcess(command, 0, "", "")
+
+
+@pytest.fixture(autouse=True)
+def control_plane(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[list[str]]]:
+    calls: list[list[str]] = []
+    servers: list[ReceiverHTTPServer] = []
+    threads: list[Thread] = []
+    serve: dict[str, JsonValue] = {}
+
+    def control(
+        command: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        if command[0] not in {"systemctl", "tailscale"}:
+            if command[0] != "/bin/launchctl":
+                return run(
+                    command,
+                    capture_output=capture_output,
+                    text=text,
+                    timeout=timeout,
+                    check=check,
+                )
+            calls.append(command)
+            return mac_control(command, servers, threads)
+        calls.append(command)
+        output = ""
+        if command[:3] == ["tailscale", "status", "--json"]:
+            output = json.dumps(
+                {
+                    "BackendState": "Running",
+                    "Self": {"DNSName": "synthetic.tailnet.ts.net."},
+                }
+            )
+        elif command[:3] == ["tailscale", "serve", "status"]:
+            output = json.dumps(serve)
+        elif command[:3] == ["tailscale", "serve", "--bg"]:
+            port = command[3].split("=")[1]
+            serve.update(
+                {
+                    "TCP": {port: {"HTTPS": True}},
+                    "Web": {
+                        f"synthetic.tailnet.ts.net:{port}": {
+                            "Handlers": {"/": {"Proxy": command[-1]}}
+                        }
+                    },
+                }
+            )
+        elif "show" in command:
+            unit = Path.home() / ".config/systemd/user" / command[-1]
+            output = (
+                f"FragmentPath={unit if unit.exists() else ''}\nDropInPaths=\n"
+                f"LoadState={'loaded' if unit.exists() else 'not-found'}\n"
+            )
+        elif "start" in command:
+            unit = Path.home() / ".config/systemd/user" / command[-1]
+            line = next(
+                line
+                for line in unit.read_text().splitlines()
+                if line.startswith("ExecStart=")
+            )
+            argv = shlex.split(line.removeprefix("ExecStart="))
+            server = build_receiver_server(
+                Path(argv[argv.index("--db") + 1]),
+                host="127.0.0.1",
+                port=int(argv[argv.index("--port") + 1]),
+                setup_page=Path(argv[argv.index("--setup-page") + 1]),
+            )
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            servers.append(server)
+            threads.append(thread)
+        code = (
+            int(not servers)
+            if any(part in command for part in ("is-active", "is-enabled"))
+            else 0
+        )
+        return CompletedProcess(command, code, output, "")
+
+    monkeypatch.setattr(subprocess, "run", control)
+    yield calls
+    for server, thread in zip(servers, threads, strict=True):
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def unused_receiver_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return TypeAdapter(tuple[str, int]).validate_python(listener.getsockname())[1]
+
+
+def test_mac_control_uses_installed_tailscale_app_without_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    binary = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+    def which(_: str) -> None:
+        return None
+
+    def is_file(path: Path) -> bool:
+        return str(path) == binary
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(Path, "is_file", is_file)
+    commands: list[list[str]] = []
+
+    def run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert native_run_control(["tailscale", "status", "--json"]).returncode == 0
+    assert commands == [[binary, "status", "--json"]]
+
+
+def test_setup_m2_unit_passes_native_systemd_validation(tmp_path: Path) -> None:
+    if sys.platform != "linux" or shutil.which("systemd-analyze") is None:
+        pytest.skip("Native systemd validator is unavailable on this platform")
+    _, _, args = _setup_args(tmp_path)
+    assert _run_cli(*args).returncode == 0
+    unit = Path.home() / ".config/systemd/user/health-bridge-receiver.service"
+    result = run(
+        ["systemd-analyze", "--user", "verify", str(unit)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_setup_m2_rerun_accepts_systemd_link_to_owned_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, args = _setup_args(tmp_path)
+    assert _run_cli(*args).returncode == 0
+    unit = Path.home() / ".config/systemd/user/health-bridge-receiver.service"
+    alias = Path.home() / "manager-linked.service"
+    alias.symlink_to(unit)
+    original = cli_setup_runtime.run_control
+
+    def linked_fragment(command: list[str]) -> CompletedProcess[str]:
+        result = original(command)
+        if "show" in command:
+            result.stdout = result.stdout.replace(
+                f"FragmentPath={unit}", f"FragmentPath={alias}"
+            )
+        return result
+
+    monkeypatch.setattr(cli_setup_runtime, "run_control", linked_fragment)
+    result = _run_cli(*args)
+    assert result.returncode == 0, result.stderr
+
+
+def test_setup_explicit_unsupported_host_preserves_preparation_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_plane: list[list[str]]
+) -> None:
+    monkeypatch.setattr(sys, "platform", "freebsd")
+    _, _, args = _setup_args(tmp_path)
+    result = _run_cli(*args)
+    assert result.returncode == 0, result.stderr
+    assert (
+        SetupCliOutput.model_validate_json(result.stdout).receiver_service_status
+        == "prepared"
+    )
+    assert not control_plane
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_setup_m2_discovers_route_and_starts_supervised_receiver(
+    tmp_path: Path,
+    control_plane: list[list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+) -> None:
+    platform_context = SimpleNamespace(platform=platform, argv=sys.argv)
+    monkeypatch.setattr(cli_module, "sys", platform_context)
+    monkeypatch.setattr(cli_setup_runtime, "sys", platform_context)
+    _, _, args = _setup_args(tmp_path)
+    del args[1:3]
+    result = _run_cli(*args)
+    assert result.returncode == 0, result.stderr
+    payload = SetupCliOutput.model_validate_json(result.stdout)
+    assert payload.receiver_service_status == "supervised_healthy"
+    assert payload.private_route_status == "ready"
+    assert payload.pairing_status == "pending"
+    assert payload.data_receipt_status == "not_received"
+    assert payload.receiver_url.startswith("https://synthetic.tailnet.ts.net")
+    assert any("enable" in call or "bootstrap" in call for call in control_plane)
+    assert any("start" in call or "bootstrap" in call for call in control_plane)
+    original_page = Path(payload.setup_page).read_bytes()
+    control_plane.clear()
+    rerun = _run_cli(*args)
+    assert rerun.returncode == 0, rerun.stderr
+    assert Path(payload.setup_page).read_bytes() == original_page
+    assert not any(
+        any(
+            action in call
+            for action in ("start", "--bg", "bootstrap", "kickstart", "bootout")
+        )
+        for call in control_plane
+    )
+
+
+def test_setup_explicit_mac_direct_starts_owned_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_plane: list[list[str]]
+) -> None:
+    platform_context = SimpleNamespace(platform="darwin", argv=sys.argv)
+    monkeypatch.setattr(cli_module, "sys", platform_context)
+    monkeypatch.setattr(cli_setup_runtime, "sys", platform_context)
+    _, page, args = _setup_args(tmp_path)
+    result = _run_cli(*args, "--service-name", "health-bridge-qa")
+    assert result.returncode == 0, result.stderr
+    assert (
+        SetupCliOutput.model_validate_json(result.stdout).receiver_service_status
+        == "supervised_healthy"
+    )
+    original = page.read_bytes()
+    control_plane.clear()
+    result = _run_cli(*args, "--service-name", "health-bridge-qa")
+    assert result.returncode == 0, result.stderr
+    assert page.read_bytes() == original
+    assert all(call[1] == "print" for call in control_plane)
+    args[args.index("--receiver-port") + 1] = str(unused_receiver_port())
+    result = _run_cli(*args, "--service-name", "health-bridge-other")
+    assert result.returncode == 1
+    assert "another owned LaunchAgent" in result.stderr
+    assert all(call[1] == "print" for call in control_plane)
+
+
+def _overlapping_mac_setup(
+    request: cli_setup_module.SetupRequest, channel: Connection, pause: bool
+) -> None:
+    real_scan = cli_setup_runtime.require_unique_agent_database
+    service_name = "health-bridge-race-a" if pause else "health-bridge-race-b"
+    bootstrapped: list[str] = []
+
+    def scan(agent: LaunchdServiceRequest) -> None:
+        real_scan(agent)
+        channel.send_bytes(b"scanned")
+        assert channel.poll(20), "parent did not release ownership scan"
+        assert channel.recv_bytes() == b"release"
+
+    def control(command: list[str], **_kwargs: JsonValue) -> CompletedProcess[str]:
+        assert command[0] == "/bin/launchctl"
+        if command[1] == "print":
+            return CompletedProcess(command, 113, "", "")
+        assert command[1] == "bootstrap"
+        document = TypeAdapter(dict[str, JsonValue]).validate_python(
+            plistlib.loads(Path(command[-1]).read_bytes())
+        )
+        arguments = TypeAdapter(list[str]).validate_python(document["ProgramArguments"])
+        owned = load_runnable_launch_agent_request(Path(arguments[-1]))
+        assert owned.db_path == request.db_path
+        bootstrapped.append(owned.label)
+        return CompletedProcess(command, 0, "", "")
+
+    with channel, pytest.MonkeyPatch.context() as patch:
+        patch.setattr(subprocess, "run", control)
+        if pause:
+            patch.setattr(cli_setup_runtime, "require_unique_agent_database", scan)
+        try:
+            _ = cli_setup_runtime.start_mac_agent(request, service_name)
+        except (ValueError, RuntimeError) as exc:
+            channel.send_bytes(f"rejected: {exc}".encode())
+        else:
+            assert bootstrapped == [service_name]
+            channel.send_bytes(b"installed")
+
+
+def test_mac_setup_serializes_same_database_across_processes(tmp_path: Path) -> None:
+    # Given: distinct labels and free ports share one private home, DB and page.
+    with socket.socket() as first, socket.socket() as second:
+        first.bind(("127.0.0.1", 0))
+        second.bind(("127.0.0.1", 0))
+        ports = [
+            TypeAdapter(tuple[str, int]).validate_python(listener.getsockname())[1]
+            for listener in (first, second)
+        ]
+    request = cli_setup_module.SetupRequest(
+        db_path=tmp_path / "private/health.sqlite",
+        label="synthetic-phone",
+        receiver_url="https://receiver.healthbridge.internal/v1/batches",
+        setup_page_path=tmp_path / "private/pair.html",
+        receiver_host="127.0.0.1",
+        receiver_port=ports[0],
+        executable=sys.argv[0],
+    )
+    context = multiprocessing.get_context("spawn")
+    parent_a, child_a = context.Pipe()
+    parent_b, child_b = context.Pipe()
+    process_a = context.Process(
+        target=_overlapping_mac_setup, args=(request, child_a, True)
+    )
+    process_b = context.Process(
+        target=_overlapping_mac_setup,
+        args=(replace(request, receiver_port=ports[1]), child_b, False),
+    )
+
+    # When: A pauses after its real scan; B attempts installation before A resumes.
+    try:
+        process_a.start()
+        child_a.close()
+        assert parent_a.poll(20), "A did not finish its ownership scan"
+        assert parent_a.recv_bytes() == b"scanned"
+        process_b.start()
+        child_b.close()
+        assert parent_b.poll(20), "B did not finish its installation attempt"
+        outcome_b = parent_b.recv_bytes()
+        parent_a.send_bytes(b"release")
+        assert parent_a.poll(20), "A did not finish installation"
+        outcome_a = parent_a.recv_bytes()
+        for process in (process_a, process_b):
+            process.join(5)
+            assert process.exitcode == 0
+    finally:
+        for process in (process_a, process_b):
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            if process.pid is not None:
+                process.close()
+        for channel in (parent_a, child_a, parent_b, child_b):
+            channel.close()
+
+    # Then: ownership records and successful bootstrap agree on one installation.
+    owned = [
+        load_owned_launch_agent_request(config)
+        for config in service_paths(Path.home()).state_dir.glob("*/receiver.json")
+    ]
+    assert len(owned) == 1, f"owned installations: {[agent.label for agent in owned]}"
+    assert owned[0].db_path == request.db_path
+    assert outcome_a == b"installed"
+    assert outcome_b.startswith(b"rejected:"), outcome_b
+
+
+@pytest.mark.parametrize("existing", ["foreign", "incompatible"])
+def test_setup_m2_refuses_existing_service_without_replacing_it(
+    tmp_path: Path, control_plane: list[list[str]], existing: str
+) -> None:
+    db, page, args = _setup_args(tmp_path)
+    unit = Path.home() / ".config/systemd/user/health-bridge-receiver.service"
+    if existing == "foreign":
+        unit.parent.mkdir(parents=True)
+        _ = unit.write_text("[Service]\nExecStart=/usr/bin/false\n")
+    else:
+        assert _run_cli(*args).returncode == 0
+        args[args.index("--receiver-port") + 1] = str(unused_receiver_port())
+    original_unit = unit.read_bytes()
+    original_page = page.read_bytes() if page.exists() else None
+    control_plane.clear()
+    result = _run_cli(*args)
+    assert result.returncode == 1
+    assert unit.read_bytes() == original_unit
+    assert (page.read_bytes() if page.exists() else None) == original_page
+    assert not any("start" in call or "enable" in call for call in control_plane)
+    if existing == "foreign":
+        assert not db.exists()
+
+
+def test_setup_m2_missing_tailscale_install_has_one_next_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(_command: list[str], **_kwargs: JsonValue) -> CompletedProcess[str]:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    db, page, args = _setup_args(tmp_path)
+    del args[1:3]
+    result = _run_cli(*args)
+    assert result.returncode == 1
+    assert "Install Tailscale" in result.stderr
+    assert not db.exists()
+    assert not page.exists()
+
+
+@pytest.mark.parametrize("upload", ["none", "empty", "health"])
+def test_setup_m2_active_rerun_preserves_invitation_identity_and_service(
+    tmp_path: Path, control_plane: list[list[str]], upload: str
+) -> None:
+    db, page, args = _setup_args(tmp_path)
+    assert _run_cli(*args).returncode == 0
+    original = page.read_bytes()
+    _, invitation = read_invitation_page(page)
+    _ = redeem_pairing_invitation(
+        db,
+        installation_id="00000000-0000-4000-8000-000000000001",
+        device_credential="hb_" + "a" * 64,
+        platform="ios",
+        invitation_secret=invitation.invitation_secret,
+    )
+    origin = f"http://127.0.0.1:{args[args.index('--receiver-port') + 1]}"
+    if upload != "none":
+        batch = with_source_key(
+            HealthBridgeBatchV1.model_validate_json(
+                Path("fixtures/health_bridge_batch_v1.synthetic.json").read_bytes()
+            ),
+            "apple_health.phone",
+        )
+        if upload == "empty":
+            batch = batch.model_copy(
+                update={
+                    "samples": (),
+                    "workouts": (),
+                    "sleep_sessions": (),
+                }
+            )
+        assert post_batch(origin + "/v1/batches", "hb_" + "a" * 64, batch) == 202
+    control_plane.clear()
+    result = _run_cli(*args)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["pairing_status"] == "paired"
+    receipt = "received" if upload == "health" else "not_received"
+    assert json.loads(result.stdout)["data_receipt_status"] == receipt
+    with open_http_response(
+        Request(
+            origin + invitation_page_route(invitation),
+            headers={"Accept": "application/json"},
+        )
+    ) as response:
+        assert json.loads(response.read()) == {
+            "pairing_status": "paired",
+            "data_receipt_status": receipt,
+        }
+    assert page.read_bytes() == original
+    with sqlite3.connect(db) as connection:
+        assert connection.execute(
+            "select count(*) from pairing_invitations"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "select count(*) from receiver_tokens where revoked_at is null"
+        ).fetchone() == (1,)
+    assert not any("start" in call or "restart" in call for call in control_plane)
+
+
+@pytest.mark.parametrize("logged_in", [False, True])
+def test_setup_m2_missing_login_or_occupied_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane: list[list[str]],
+    logged_in: bool,
+) -> None:
+    original_run = subprocess.run
+    occupied = {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {
+            "synthetic.tailnet.ts.net:443": {
+                "Handlers": {"/other": {"Proxy": "http://127.0.0.1:34567"}}
+            }
+        },
+    }
+
+    def control(
+        command: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        if command[:3] == ["tailscale", "status", "--json"] and not logged_in:
+            return CompletedProcess(command, 0, '{"BackendState":"NeedsLogin"}', "")
+        if command[:3] == ["tailscale", "serve", "status"] and not any(
+            "--bg" in call for call in control_plane
+        ):
+            return CompletedProcess(command, 0, json.dumps(occupied), "")
+        return original_run(
+            command,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+        )
+
+    monkeypatch.setattr(subprocess, "run", control)
+    db, _, args = _setup_args(tmp_path)
+    del args[1:3]
+    result = _run_cli(*args)
+    if logged_in:
+        assert result.returncode == 0, result.stderr
+        assert ":8443/" in json.loads(result.stdout)["receiver_url"]
+        mutations = [call for call in control_plane if "--bg" in call]
+        assert len(mutations) == 1
+        assert "--https=8443" in mutations[0]
+    else:
+        assert result.returncode == 1
+        assert "Log in to Tailscale" in result.stderr
+        assert not db.exists()
+        assert not any("--bg" in call or "start" in call for call in control_plane)
+
+
+def test_setup_saves_database_and_reuses_pending_invitation(tmp_path: Path) -> None:
+    db_path, setup_page, args = _setup_args(tmp_path)
+    first = _run_cli(*args)
+    assert first.returncode == 0
+    original_page = setup_page.read_bytes()
+    second = _run_cli(*args)
+    assert second.returncode == 0
+    assert setup_page.read_bytes() == original_page
+    implicit = _run_cli("status", "--json")
+    explicit = _run_cli("status", "--json", "--db", str(db_path))
+    assert implicit.returncode == 0
+    assert implicit.stdout == explicit.stdout
+    payload = SetupCliOutput.model_validate_json(second.stdout)
+    assert "--setup-page" in payload.receiver_start_command
 
 
 class AccessDescriptorOutput(BaseModel):
@@ -57,9 +658,15 @@ class SetupCliOutput(BaseModel):
     registrar_plans: list[RegistrarPlanOutput]
     detected_mcp_clients: list[str]
     configured_mcp_clients: list[str]
-    client_configuration_status: Literal["not_requested", "configured_and_verified"]
+    client_configuration_status: Literal[
+        "not_requested", "configuration_prepared", "configured_and_verified"
+    ]
     next_steps: list[str]
     warning: str
+    receiver_service_status: Literal["prepared", "supervised_healthy"]
+    private_route_status: Literal["ready", "explicit_unverified"]
+    pairing_status: Literal["pending", "paired"]
+    data_receipt_status: Literal["received", "not_received"]
 
 
 def _assert_owner_only(path: Path) -> None:
@@ -67,13 +674,8 @@ def _assert_owner_only(path: Path) -> None:
 
 
 def _run_cli(*args: str, env: dict[str, str] | None = None) -> CompletedProcess[str]:
-    return run(
-        ["health-bridge", *args],
-        capture_output=True,
-        check=False,
-        text=True,
-        env=env,
-    )
+    result = CliRunner().invoke(app, list(args), env=env, catch_exceptions=False)
+    return CompletedProcess(list(args), result.exit_code, result.stdout, result.stderr)
 
 
 def _write_fake_client(bin_dir: Path, name: str, log_path: Path) -> None:
@@ -112,6 +714,8 @@ def _setup_args(tmp_path: Path) -> tuple[Path, Path, list[str]]:
             str(db_path),
             "--setup-page",
             str(setup_page),
+            "--receiver-port",
+            str(unused_receiver_port()),
             "--json",
         ],
     )
@@ -161,27 +765,23 @@ def test_setup_default_detects_but_never_configures_clients(tmp_path: Path) -> N
         "--host",
         "127.0.0.1",
         "--port",
-        "8765",
+        args[args.index("--receiver-port") + 1],
     ]
     assert payload.local_mcp_status == "verified"
     assert payload.detected_mcp_clients == ["hermes"]
     assert payload.configured_mcp_clients == []
     assert payload.client_configuration_status == "not_requested"
-    assert len(payload.next_steps) == 6
-    assert "approved service manager" in payload.next_steps[0]
-    assert "start" in payload.next_steps[0].lower()
-    assert "http://127.0.0.1:8765/health" in payload.next_steps[1]
-    assert '{"status":"ok"}' in payload.next_steps[1]
-    assert "physical iPhone" in payload.next_steps[2]
-    assert payload.receiver_health_url in payload.next_steps[2]
-    pairing_handoff = payload.next_steps[3]
-    assert "receiver computer" in pairing_handoff
-    assert "trusted screen" in pairing_handoff
+    assert payload.receiver_service_status == "supervised_healthy"
+    assert payload.private_route_status == "explicit_unverified"
+    assert len(payload.next_steps) == 3
+    pairing_handoff = payload.next_steps[0]
+    assert "On a computer" in pairing_handoff
     assert "iPhone Camera" in pairing_handoff
     assert "Open setup_page on the iPhone" not in pairing_handoff
-    assert "first receiver upload ACK" in payload.next_steps[4]
-    assert "After the first receiver upload ACK" in payload.next_steps[5]
-    assert "MCP" in payload.next_steps[5]
+    assert "Allow Health Access" in payload.next_steps[1]
+    assert "Automatic Sync" in payload.next_steps[1]
+    assert "Start Automatic Sync" not in payload.next_steps[1]
+    assert "MCP" in payload.next_steps[2]
     assert not log_path.exists()
 
     access = payload.access_descriptors[0]
@@ -251,6 +851,9 @@ def test_setup_provisions_explicit_mailbox_only_on_supported_mac_topology(
     setup_page = tmp_path / "private/pair.html"
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        cli_setup_module, "read_helper_status", ready_setup_helper, raising=False
+    )
 
     manifest = cli_setup_module.build_setup_manifest(
         cli_setup_module.SetupRequest(
@@ -274,12 +877,15 @@ def test_setup_provisions_explicit_mailbox_only_on_supported_mac_topology(
         "--icloud-container-identifier",
         "iCloud.dev.example.HealthBridgeCompanion",
     ]
-    assert "Encrypted iCloud Mailbox (Beta)" in manifest.warning
-    assert "No VPN" in manifest.warning
-    assert "Mac only" in manifest.warning
-    assert "best-effort/eventual" in manifest.warning
-    assert "mailbox deliveries are imported" in manifest.next_steps[4]
-    assert "ACK after its database commit" in manifest.next_steps[4]
+    assert "iCloud Drive" in manifest.warning
+    assert "after pairing" in manifest.warning
+    assert "same Apple Account" in manifest.warning
+    assert "Delivery may be delayed" in manifest.warning
+    assert "iCloud deliveries can be saved" in manifest.next_steps[4]
+    assert manifest.receiver_service_status == "prepared"
+    summary = cli_setup_module.render_setup_summary(manifest)
+    assert "not started" in summary
+    assert shlex.join(manifest.receiver_start_command) in summary
     with sqlite3.connect(db_path) as connection:
         invitation = cast(
             "tuple[str] | None",
@@ -288,7 +894,40 @@ def test_setup_provisions_explicit_mailbox_only_on_supported_mac_topology(
     assert invitation == ("mailbox",)
 
 
-def test_setup_bootstraps_mailbox_hierarchy_before_creating_invitation(
+def test_prepare_mailbox_transport_without_receiver_url_with_ready_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given a ready helper and existing synthetic topology, isolate URL policy.
+    mailbox_root = (
+        Path.home()
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion"
+        / "Documents/HealthBridgeMailbox/v1"
+    )
+    mailbox_root.mkdir(parents=True)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_setup_module, "read_helper_status", ready_setup_helper)
+    request = cli_setup_module.SetupRequest(
+        db_path=tmp_path / "private/health.sqlite",
+        label="synthetic-iphone",
+        receiver_url="",
+        setup_page_path=tmp_path / "private/pair.html",
+        receiver_host="127.0.0.1",
+        receiver_port=8765,
+        executable="health-bridge",
+        transport="icloud-mailbox",
+        mailbox_root=mailbox_root,
+        icloud_container_identifier="iCloud.dev.example.HealthBridgeCompanion",
+    )
+
+    # When choosing mailbox without a phone-facing receiver route.
+    selected = cli_setup_module.prepare_setup_transport(request)
+
+    # Then ready mailbox prerequisites suffice to select the transport.
+    assert selected is transports.ReceiverTransport.MAILBOX
+
+
+def test_setup_waits_for_phone_to_create_mailbox_hierarchy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -303,6 +942,9 @@ def test_setup_bootstraps_mailbox_hierarchy_before_creating_invitation(
     mailbox_root = documents / "HealthBridgeMailbox/v1"
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        cli_setup_module, "read_helper_status", ready_setup_helper, raising=False
+    )
 
     manifest = cli_setup_module.build_setup_manifest(
         cli_setup_module.SetupRequest(
@@ -320,12 +962,118 @@ def test_setup_bootstraps_mailbox_hierarchy_before_creating_invitation(
     )
 
     assert manifest.selected_transport == "mailbox"
-    assert mailbox_root.is_dir()
+    assert not mailbox_root.exists()
 
 
-def test_setup_configures_only_explicitly_selected_client(tmp_path: Path) -> None:
+@pytest.mark.parametrize("missing", ["helper", "topology", "native-capability"])
+def test_mailbox_setup_prerequisites_precede_all_private_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane: list[list[str]],
+    missing: str,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    documents = (
+        Path.home()
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion/Documents"
+    )
+    if missing != "topology":
+        documents.mkdir(parents=True)
+    else:
+        documents.parent.mkdir(parents=True)
+        documents.symlink_to(tmp_path, target_is_directory=True)
+    if missing != "helper":
+        monkeypatch.setattr(
+            cli_setup_module, "read_helper_status", ready_setup_helper, raising=False
+        )
+    db = tmp_path / "private/health.sqlite"
+    args = [
+        "setup",
+        "--json",
+        "--db",
+        str(db),
+        "--transport",
+        "icloud-mailbox",
+        "--mailbox-root",
+        str(documents / "HealthBridgeMailbox/v1"),
+        "--icloud-container-identifier",
+        "iCloud.dev.example.HealthBridgeCompanion",
+    ]
+    if missing != "native-capability":
+        args.extend(
+            ["--receiver-url", "https://receiver.healthbridge.internal/v1/batches"]
+        )
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1, result.output
+    assert "rerun" in result.output.lower()
+    assert not db.parent.exists()
+    assert not (documents / "HealthBridgeMailbox").exists()
+    assert not (Path.home() / "Library/LaunchAgents").exists()
+    assert not (
+        Path.home() / "Library/Application Support/HealthBridge/launchd"
+    ).exists()
+    assert control_plane == []
+
+
+def test_prepared_mailbox_setup_supervises_and_reuses_owned_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane: list[list[str]],
+) -> None:
+    platform_context = SimpleNamespace(platform="darwin", argv=sys.argv)
+    for module in (cli_module, cli_setup_module, cli_setup_runtime, transports):
+        monkeypatch.setattr(module, "sys", platform_context)
+    monkeypatch.setattr(
+        cli_setup_module, "read_helper_status", ready_setup_helper, raising=False
+    )
+    root = (
+        Path.home()
+        / "Library/Mobile Documents/iCloud~dev~example~HealthBridgeCompanion"
+        / "Documents/HealthBridgeMailbox/v1"
+    )
+    root.mkdir(parents=True, mode=0o700)
+    for directory in (Path.home() / "Library").rglob("*"):
+        if directory.is_dir():
+            directory.chmod(0o700)
+    (Path.home() / "Library").chmod(0o700)
+    db = tmp_path / "private/health.sqlite"
+    args = [
+        "setup",
+        "--json",
+        "--db",
+        str(db),
+        "--transport",
+        "icloud-mailbox",
+        "--mailbox-root",
+        str(root),
+        "--icloud-container-identifier",
+        "iCloud.dev.example.HealthBridgeCompanion",
+        "--receiver-url",
+        "https://receiver.healthbridge.internal/v1/batches",
+        "--receiver-port",
+        str(unused_receiver_port()),
+    ]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["receiver_service_status"] == "supervised_healthy"
+    paths = service_paths(Path.home(), "health-bridge-receiver")
+    owned = load_owned_launch_agent_request(paths.config)
+    assert owned.mailbox_root == root
+    assert (
+        owned.icloud_container_identifier == "iCloud.dev.example.HealthBridgeCompanion"
+    )
+    original = paths.config.read_bytes(), paths.manifest.read_bytes()
+    control_plane.clear()
+    resumed = CliRunner().invoke(app, ["setup", "--json"])
+    assert resumed.exit_code == 0, resumed.output
+    assert original == (paths.config.read_bytes(), paths.manifest.read_bytes())
+    assert not any("bootstrap" in command for command in control_plane)
+
+
+def test_setup_redirected_selected_client_does_not_auto_consent(tmp_path: Path) -> None:
     env, log_path = _client_env(tmp_path, "hermes", "openclaw")
     _db_path, _setup_page, args = _setup_args(tmp_path)
+    args.remove("--json")
 
     completed = _run_cli(
         *args,
@@ -335,20 +1083,15 @@ def test_setup_configures_only_explicitly_selected_client(tmp_path: Path) -> Non
     )
 
     assert completed.returncode == 0, completed.stderr
-    payload = SetupCliOutput.model_validate_json(completed.stdout)
-    assert payload.detected_mcp_clients == ["hermes", "openclaw"]
-    assert payload.configured_mcp_clients == ["hermes"]
-    assert payload.client_configuration_status == "configured_and_verified"
-    logged = log_path.read_text(encoding="utf-8").splitlines()
-    assert len(logged) == 2
-    assert "hermes|mcp add health-bridge --command" in logged[0]
-    assert "hermes|mcp test health-bridge" in logged[1]
-    assert all("openclaw" not in line for line in logged)
+    assert not log_path.exists()
+    assert _db_path.is_file()
+    assert _setup_page.is_file()
 
 
 def test_setup_accepts_repeated_explicit_client_configuration(tmp_path: Path) -> None:
     env, log_path = _client_env(tmp_path, "hermes", "openclaw")
     _db_path, _setup_page, args = _setup_args(tmp_path)
+    args.remove("--json")
 
     completed = _run_cli(
         *args,
@@ -360,27 +1103,25 @@ def test_setup_accepts_repeated_explicit_client_configuration(tmp_path: Path) ->
     )
 
     assert completed.returncode == 0, completed.stderr
-    payload = SetupCliOutput.model_validate_json(completed.stdout)
-    assert payload.configured_mcp_clients == ["hermes", "openclaw"]
-    logged = log_path.read_text(encoding="utf-8").splitlines()
-    assert len(logged) == 4
-    assert any("openclaw|mcp add health-bridge" in line for line in logged)
-    assert any("openclaw|mcp probe health-bridge" in line for line in logged)
+    assert not log_path.exists()
+    assert _db_path.is_file()
+    assert _setup_page.is_file()
 
 
 def test_unknown_client_is_rejected_before_core_side_effects(tmp_path: Path) -> None:
     db_path, setup_page, args = _setup_args(tmp_path)
+    args.remove("--json")
 
-    completed = _run_cli(*args, "--configure-client", "cursor")
+    completed = _run_cli(*args, "--configure-client", "unknown-fixture-client")
 
     assert completed.returncode == 1
-    assert "No built-in registrar for: cursor" in completed.stderr
+    assert "No built-in registrar for: unknown-fixture-client" in completed.stderr
     assert "local stdio MCP" in completed.stderr
     assert not db_path.exists()
     assert not setup_page.exists()
 
 
-def test_missing_explicit_client_cli_is_rejected_before_core_side_effects(
+def test_missing_client_does_not_prevent_core_setup_in_redirected_mode(
     tmp_path: Path,
 ) -> None:
     env = os.environ.copy()
@@ -390,16 +1131,16 @@ def test_missing_explicit_client_cli_is_rejected_before_core_side_effects(
     assert health_bridge is not None
     env["PATH"] = f"{Path(health_bridge).parent}{os.pathsep}{empty_bin}"
     db_path, setup_page, args = _setup_args(tmp_path)
+    args.remove("--json")
 
     completed = _run_cli(*args, "--configure-client", "openclaw", env=env)
 
-    assert completed.returncode == 1
-    assert "Requested MCP client CLI is not installed: openclaw" in completed.stderr
-    assert not db_path.exists()
-    assert not setup_page.exists()
+    assert completed.returncode == 0
+    assert db_path.is_file()
+    assert setup_page.is_file()
 
 
-def test_setup_human_output_states_that_configuration_is_not_automatic(
+def test_setup_captured_output_withholds_hosted_handoff(
     tmp_path: Path,
 ) -> None:
     db_path, setup_page, args = _setup_args(tmp_path)
@@ -408,26 +1149,39 @@ def test_setup_human_output_states_that_configuration_is_not_automatic(
     completed = _run_cli(*args)
 
     assert completed.returncode == 0, completed.stderr
-    assert "Health Bridge core setup prepared." in completed.stdout
-    assert "no configuration is automatic" in completed.stdout
-    assert "Private pairing page (open only after both health checks pass)" in (
-        completed.stdout
-    )
-    assert "trusted screen" in completed.stdout
-    assert "iPhone Camera" in completed.stdout
-    assert "Open setup_page on the iPhone" not in completed.stdout
-    ordered_markers = (
-        "approved service manager",
-        "http://127.0.0.1:8765/health",
-        "physical iPhone",
-        "Private pairing page (open only after both health checks pass)",
-        "first receiver upload ACK",
-        "After the first receiver upload ACK",
-    )
-    positions = [completed.stdout.index(marker) for marker in ordered_markers]
-    assert positions == sorted(positions)
+    assert "running" in completed.stdout.lower()
+    assert "ACK" not in completed.stdout
+    assert "supervised_healthy" not in completed.stdout
     assert str(db_path) not in completed.stdout
-    assert str(setup_page) in completed.stdout
+    assert str(setup_page) not in completed.stdout
+    assert len(completed.stdout.splitlines()) <= 8
+    assert not re.search(
+        r"https://receiver.healthbridge.internal/setup/[a-f0-9]{64}", completed.stdout
+    )
+
+
+@pytest.mark.parametrize("failure", ["sqlite", "timeout"])
+def test_setup_expected_readback_errors_preserve_prepared_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    db, page, args = _setup_args(tmp_path)
+
+    def fail(
+        _manifest: cli_setup_module.SetupManifest,
+    ) -> cli_setup_module.SetupManifest:
+        if failure == "sqlite":
+            message = "synthetic private detail"
+            raise sqlite3.OperationalError(message)
+        raise subprocess.TimeoutExpired(["synthetic-private-command"], 30)
+
+    monkeypatch.setattr(cli_module, "verify_local_mcp", fail)
+    result = _run_cli(*args)
+
+    assert result.returncode == 1
+    assert "synthetic" not in result.stderr
+    assert "original setup command" in result.stderr
+    assert db.exists()
+    assert page.exists()
 
 
 def test_setup_page_contains_custom_scheme_qr_and_manual_code(
@@ -440,9 +1194,10 @@ def test_setup_page_contains_custom_scheme_qr_and_manual_code(
     assert completed.returncode == 0, completed.stderr
     setup_html = setup_page.read_text(encoding="utf-8")
     assert 'href="healthbridge://pair?payload=' in setup_html
-    assert "Scan with iPhone Camera" in setup_html
-    assert "Use a code instead" in setup_html
-    assert "temporary, single-use invitation" in setup_html
+    assert "Scan the QR code with iPhone Camera" in setup_html
+    assert "To connect with a code" in setup_html
+    assert "single-use invitation" in setup_html
+    assert "Sharing it before use" in setup_html
 
 
 @pytest.mark.parametrize(
@@ -567,7 +1322,8 @@ def test_setup_accepts_numeric_lan_url_with_reachable_bind_and_guidance(
 ) -> None:
     _db_path, _setup_page, args = _setup_args(tmp_path)
     private_host = ".".join(("192", "168", "50", "9"))  # noqa: FLY002
-    args[args.index("--receiver-url") + 1] = f"http://{private_host}:8765/v1/batches"
+    port = args[args.index("--receiver-port") + 1]
+    args[args.index("--receiver-url") + 1] = f"http://{private_host}:{port}/v1/batches"
     args.extend(("--receiver-host", "0.0.0.0"))  # noqa: S104 - test bind input
     args.append("--allow-nonlocal-receiver-address")
 
@@ -575,7 +1331,7 @@ def test_setup_accepts_numeric_lan_url_with_reachable_bind_and_guidance(
 
     assert completed.returncode == 0, completed.stderr
     payload = SetupCliOutput.model_validate_json(completed.stdout)
-    assert payload.receiver_url == f"http://{private_host}:8765/v1/batches"
+    assert payload.receiver_url == f"http://{private_host}:{port}/v1/batches"
     assert "Numeric LAN addresses are supported" in payload.warning
     assert "Local Network access" in payload.warning
 
@@ -585,7 +1341,8 @@ def test_setup_accepts_plain_http_shared_address_with_compatibility_warning(
 ) -> None:
     _db_path, _setup_page, args = _setup_args(tmp_path)
     shared_host = ".".join(("100", "100", "50", "9"))  # noqa: FLY002
-    args[args.index("--receiver-url") + 1] = f"http://{shared_host}:8765/v1/batches"
+    port = args[args.index("--receiver-port") + 1]
+    args[args.index("--receiver-url") + 1] = f"http://{shared_host}:{port}/v1/batches"
     args.extend(("--receiver-host", "0.0.0.0"))  # noqa: S104 - test bind input
     args.append("--allow-nonlocal-receiver-address")
 
@@ -593,7 +1350,7 @@ def test_setup_accepts_plain_http_shared_address_with_compatibility_warning(
 
     assert completed.returncode == 0, completed.stderr
     payload = SetupCliOutput.model_validate_json(completed.stdout)
-    assert payload.receiver_url == f"http://{shared_host}:8765/v1/batches"
+    assert payload.receiver_url == f"http://{shared_host}:{port}/v1/batches"
     assert "shared address space" in payload.warning
     assert "may reject plain HTTP" in payload.warning
     assert "HTTPS/MagicDNS" in payload.warning
@@ -604,7 +1361,8 @@ def test_setup_rejects_nonlocal_numeric_http_receiver_before_side_effects(
 ) -> None:
     db_path, setup_page, args = _setup_args(tmp_path)
     private_host = ".".join(("10", "0", "0", "104"))  # noqa: FLY002
-    args[args.index("--receiver-url") + 1] = f"http://{private_host}:8765/v1/batches"
+    port = args[args.index("--receiver-port") + 1]
+    args[args.index("--receiver-url") + 1] = f"http://{private_host}:{port}/v1/batches"
     args.extend(("--receiver-host", "0.0.0.0"))  # noqa: S104 - test bind input
 
     completed = _run_cli(*args)
@@ -712,13 +1470,12 @@ def test_setup_rejects_direct_http_url_with_different_receiver_port(
 def test_setup_accepts_matching_custom_direct_http_port(tmp_path: Path) -> None:
     _db_path, _setup_page, args = _setup_args(tmp_path)
     private_host = ".".join(("192", "168", "50", "9"))  # noqa: FLY002
-    args[args.index("--receiver-url") + 1] = f"http://{private_host}:9999/v1/batches"
+    port = args[args.index("--receiver-port") + 1]
+    args[args.index("--receiver-url") + 1] = f"http://{private_host}:{port}/v1/batches"
     args.extend(
         (
             "--receiver-host",
             "0.0.0.0",  # noqa: S104 - test bind input
-            "--receiver-port",
-            "9999",
             "--allow-nonlocal-receiver-address",
         )
     )
@@ -727,7 +1484,7 @@ def test_setup_accepts_matching_custom_direct_http_port(tmp_path: Path) -> None:
 
     assert completed.returncode == 0, completed.stderr
     payload = SetupCliOutput.model_validate_json(completed.stdout)
-    assert payload.receiver_start_command[-1] == "9999"
+    assert payload.receiver_start_command[-1] == port
 
 
 def test_setup_rejects_explicit_zero_url_port_before_private_side_effects(

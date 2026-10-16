@@ -132,18 +132,24 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
         public let reason: AutomaticSyncReason
         public let diagnosticRunID: UUID
         public let bootstrapBeforeRun: Bool
+        public let deliveryObservationID: UUID?
 
         fileprivate init(
             reason: AutomaticSyncReason,
             diagnosticRunID: UUID,
-            bootstrapBeforeRun: Bool
+            bootstrapBeforeRun: Bool,
+            deliveryObservationID: UUID? = nil
         ) {
             self.reason = reason
             self.diagnosticRunID = diagnosticRunID
             self.bootstrapBeforeRun = bootstrapBeforeRun
+            self.deliveryObservationID = deliveryObservationID
         }
 
         fileprivate func coalescing(_ newer: Self) -> Self {
+            // A delivery wake must never replace collection or manual work.
+            if deliveryObservationID != nil { return newer }
+            if newer.deliveryObservationID != nil { return self }
             let existingTypeCodes = reason.observerTypeCodes
             let newerTypeCodes = newer.reason.observerTypeCodes
             let coalescedReason: AutomaticSyncReason
@@ -319,6 +325,16 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
     }
 
     @MainActor
+    public func requestDeliveryReconciliation(observationID: UUID) {
+        _ = requestRunTask(for: Opportunity(
+            reason: .observerBatch(typeCodes: []),
+            diagnosticRunID: UUID(),
+            bootstrapBeforeRun: false,
+            deliveryObservationID: observationID
+        ))
+    }
+
+    @MainActor
     public func cancelActiveOwner() {
         trailingOpportunity = nil
         activeTask?.cancel()
@@ -370,6 +386,7 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
     @MainActor
     private func performSingleOpportunity(_ opportunity: Opportunity) async throws {
         try await performOpportunity(opportunity) { [weak self] in
+            guard opportunity.deliveryObservationID == nil else { return true }
             guard let self else { return false }
             return try await self.processStableSnapshot(reason: opportunity.reason)
         }

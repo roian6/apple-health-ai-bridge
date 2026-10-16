@@ -91,6 +91,12 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     }
 
     private func finalizeCursor(_ checkpoint: FileOutboxCursorCheckpoint) throws {
+        for cursor in checkpoint.additionalCursors ?? [] {
+            try cursorStore.saveCursorValue(
+                cursor.cursorValue, receiverBindingID: checkpoint.receiverIdentity,
+                sourceKey: cursor.sourceKey, cursorKind: cursor.cursorKind
+            )
+        }
         if try cursorStore.cursorValue(
             receiverBindingID: checkpoint.receiverIdentity,
             sourceKey: checkpoint.sourceKey,
@@ -164,13 +170,13 @@ public final class OutboxDeliverySleepFinalizer: OutboxDeliveryCommitFinalizing 
     ) throws -> Bool {
         try validate(context)
         let sleepFinalized: Bool
-        if let current = try store.loadPendingTransition() {
+        if let current = try withSleepStorageOrigin { try store.loadPendingTransition() } {
             guard current == pendingTransition else {
                 throw OutboxDeliveryCoordinatorError.ownershipMismatch
             }
             sleepFinalized = false
         } else {
-            sleepFinalized = try store.loadManifest() == pendingTransition.manifest
+            sleepFinalized = try withSleepStorageOrigin { try store.loadManifest() } == pendingTransition.manifest
         }
         guard sleepFinalized else { return false }
         return try transactionFinalizer?.isFinalized(context) ?? true
@@ -178,16 +184,16 @@ public final class OutboxDeliverySleepFinalizer: OutboxDeliveryCommitFinalizing 
 
     public func finalize(_ context: OutboxDeliveryFinalizationContext) throws {
         try validate(context)
-        if let current = try store.loadPendingTransition() {
+        if let current = try withSleepStorageOrigin { try store.loadPendingTransition() } {
             guard current == pendingTransition else {
                 throw OutboxDeliveryCoordinatorError.ownershipMismatch
             }
-            if try store.loadManifest() != pendingTransition.manifest {
-                try store.saveManifest(pendingTransition.manifest)
+            if try withSleepStorageOrigin { try store.loadManifest() } != pendingTransition.manifest {
+                try withSleepStorageOrigin { try store.saveManifest(pendingTransition.manifest) }
             }
-            try store.clearPendingTransition(id: pendingTransition.id)
+            try withSleepStorageOrigin { try store.clearPendingTransition(id: pendingTransition.id) }
         } else {
-            guard try store.loadManifest() == pendingTransition.manifest else {
+            guard try withSleepStorageOrigin { try store.loadManifest() } == pendingTransition.manifest else {
                 throw OutboxDeliveryCoordinatorError.finalizationIncomplete
             }
         }

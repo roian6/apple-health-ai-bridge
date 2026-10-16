@@ -8,6 +8,10 @@ enum MailboxAckFileError: Error, Equatable {
     case unavailable
 }
 
+public enum MailboxAckEnumerationError: Error, Equatable, Sendable {
+    case budgetExhausted
+}
+
 struct MailboxAckFileSnapshot {
     let bytes: Data
     let identity: MailboxAckFileIdentity
@@ -41,8 +45,12 @@ enum MailboxAckFileReader {
 
     static func enumerate(
         directory: Int32,
-        maximumNames: Int
+        maximumNames: Int,
+        maximumRawEntries: Int = MailboxAckScanner.maximumScanFiles
     ) throws -> MailboxAckLaneEnumeration {
+        guard maximumNames > 0, maximumRawEntries > 0 else {
+            throw MailboxAckFileError.unavailable
+        }
         let duplicate = dup(directory)
         guard duplicate >= 0, let stream = fdopendir(duplicate) else {
             if duplicate >= 0 { _ = close(duplicate) }
@@ -52,7 +60,18 @@ enum MailboxAckFileReader {
         var heap = MailboxAckNameHeap(capacity: maximumNames)
         var temporaryCount = 0
         var invalidCount = 0
-        while let entry = readdir(stream) {
+        var inspectedEntryCount = 0
+        while true {
+            try Task.checkCancellation()
+            guard inspectedEntryCount < maximumRawEntries else {
+                throw MailboxAckEnumerationError.budgetExhausted
+            }
+            errno = 0
+            guard let entry = readdir(stream) else {
+                guard errno == 0 else { throw MailboxAckFileError.unavailable }
+                break
+            }
+            inspectedEntryCount += 1
             let name = withUnsafePointer(to: entry.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) {
                     String(cString: $0)

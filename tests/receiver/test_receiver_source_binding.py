@@ -9,12 +9,15 @@ from typing import TYPE_CHECKING, cast
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import pytest
 from pydantic import TypeAdapter
 
 if TYPE_CHECKING:
     from http.client import HTTPResponse
 
 from health_bridge.contract import HealthBridgeBatchV1
+from health_bridge.ingest import ingest_batch, ingest_fixture
+from health_bridge.receiver import invitations
 from health_bridge.receiver.invitations import (
     create_pairing_invitation,
     redeem_pairing_invitation,
@@ -28,6 +31,119 @@ TOKEN_A = "hb_" + "a" * 64
 TOKEN_B = "hb_" + "b" * 64
 ERROR_BODY_ADAPTER = TypeAdapter(dict[str, str])
 COUNT_ROW_ADAPTER = TypeAdapter(tuple[int])
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "samples",
+        "workouts",
+        "sleep_sessions",
+        "empty",
+        "cursor",
+        "deletion",
+        "tombstoned",
+        "fixture",
+        "fixture_connection_source",
+        "fixture_then_empty",
+        "fixture_then_other_device",
+        "fixture_then_authenticated",
+        "other_device",
+        "failed",
+    ],
+)
+def test_setup_progress_requires_connection_observations(
+    tmp_path: Path, kind: str
+) -> None:
+    db = tmp_path / "receiver.sqlite"
+    pair(db, installation_id=INSTALLATION_A, token=TOKEN_A, suffix="a")
+    pair(db, installation_id=INSTALLATION_B, token=TOKEN_B, suffix="b")
+    fixture = HealthBridgeBatchV1.model_validate_json(
+        Path("fixtures/health_bridge_batch_v1.synthetic.json").read_bytes()
+    )
+    batch = with_source_key(fixture, "apple_health.phone")
+    if kind == "tombstoned":
+        batch = batch.model_copy(
+            update={
+                "samples": batch.samples[:1],
+                "workouts": (),
+                "sleep_sessions": (),
+                "deleted_records": (
+                    batch.deleted_records[0].model_copy(
+                        update={
+                            "client_record_id": batch.samples[0].client_record_id,
+                        }
+                    ),
+                ),
+            }
+        )
+    if kind in {"samples", "workouts", "sleep_sessions", "empty", "cursor", "deletion"}:
+        batch = batch.model_copy(
+            update={
+                "samples": batch.samples if kind == "samples" else (),
+                "workouts": batch.workouts if kind == "workouts" else (),
+                "sleep_sessions": batch.sleep_sessions
+                if kind == "sleep_sessions"
+                else (),
+                "deleted_records": batch.deleted_records if kind == "deletion" else (),
+                "sync": batch.sync.model_copy(
+                    update={"cursors": batch.sync.cursors if kind == "cursor" else ()}
+                ),
+            }
+        )
+    if kind in {
+        "fixture_connection_source",
+        "fixture_then_empty",
+        "fixture_then_other_device",
+        "fixture_then_authenticated",
+    }:
+        input_path = tmp_path / "synthetic-connection-fixture.json"
+        _ = input_path.write_text(
+            with_source_key(
+                fixture, canonical_source_key(INSTALLATION_A)
+            ).model_dump_json()
+        )
+        _ = ingest_fixture(db, input_path)
+        if kind != "fixture_connection_source":
+            if kind == "fixture_then_empty":
+                batch = batch.model_copy(
+                    update={
+                        "samples": (),
+                        "workouts": (),
+                        "sleep_sessions": (),
+                        "deleted_records": (),
+                    }
+                )
+            with running_receiver(db) as url:
+                token = TOKEN_B if kind == "fixture_then_other_device" else TOKEN_A
+                assert post_batch(url, token, batch) == 202
+    elif kind == "fixture":
+        _ = ingest_batch(db, fixture, "synthetic.json")
+    else:
+        with running_receiver(db) as url:
+            if kind == "failed":
+                with pytest.raises(HTTPError) as error:
+                    _ = post_batch(url, TOKEN_A, fixture)
+                assert error.value.code == 403
+                error.value.close()
+            else:
+                assert (
+                    post_batch(
+                        url, TOKEN_B if kind == "other_device" else TOKEN_A, batch
+                    )
+                    == 202
+                )
+
+    progress = invitations.pairing_setup_progress(db, "hbi_a_synthetic_secret")
+
+    assert progress is not None
+    assert progress.pairing_status == "paired"
+    assert progress.data_receipt_status == (
+        "received"
+        if kind
+        in {"samples", "workouts", "sleep_sessions", "fixture_then_authenticated"}
+        else "not_received"
+    )
 
 
 def canonical_source_key(installation_id: str) -> str:

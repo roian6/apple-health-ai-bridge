@@ -630,8 +630,26 @@ def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> Non
     handler = runtime[handler_start:handler_end]
     assert "engine.requestRun(" in handler
     assert "bootstrapBeforeRun: true" in handler
-    assert handler.index("engine.requestRun(") < handler.index(
-        "BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded"
+    assert handler.index("try? await engine.requestRun(") < handler.index(
+        "backgroundRefreshScheduler.scheduleNextRefreshIfNeeded"
+    )
+    default_start = runtime.index("self.backgroundRefreshScheduler = ")
+    default_end = runtime.index("\n", default_start)
+    native_default = runtime[default_start:default_end]
+    assert native_default.endswith(
+        "backgroundRefreshScheduler ?? NativeBackgroundRefreshScheduler()"
+    )
+    scheduler = (
+        AUTOMATIC_SYNC_RUNTIME.parent / "BackgroundRefreshScheduler.swift"
+    ).read_text(encoding="utf-8")
+    adapter_start = scheduler.index("final class NativeBackgroundRefreshScheduler")
+    adapter_end = scheduler.index(
+        "@MainActor\nenum BackgroundRefreshScheduler", adapter_start
+    )
+    native_adapter = scheduler[adapter_start:adapter_end]
+    assert (
+        "BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)"
+        in native_adapter
     )
     background_task = app[app.index(".backgroundTask(") :]
     # Executable cancellation-boundary tests cover the shared lifecycle owner.

@@ -5,7 +5,7 @@ from typing import ClassVar, Final, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
-from health_bridge.storage.database import connect_readonly_database
+from health_bridge.storage.database import connect_live_readonly_database
 from health_bridge.storage.sqlite_rows import fetch_one_int, fetch_optional_sync_status
 
 SOURCE_COUNT_SQL: Final = "select count(*) from sources"
@@ -117,6 +117,7 @@ SYNC_CURSOR_STATUS_SQL: Final = """
 select sources.source_key, sync_cursors.cursor_kind, sync_cursors.updated_at
 from sync_cursors
 join sources on sources.source_id = sync_cursors.source_id
+where sync_cursors.cursor_kind not like 'daily_projection_%'
 order by sync_cursors.updated_at desc, sources.source_key, sync_cursors.cursor_kind
 """
 RECEIVER_STATUS_SQL: Final = """
@@ -310,7 +311,7 @@ class BridgeStatus:
 
 
 def read_status(db_path: Path) -> BridgeStatus:
-    with connect_readonly_database(db_path) as connection:
+    with connect_live_readonly_database(db_path) as connection:
         counts = _read_counts(connection)
         row = fetch_optional_sync_status(
             connection,
@@ -325,7 +326,7 @@ def read_status(db_path: Path) -> BridgeStatus:
 
 
 def read_status_snapshot(db_path: Path) -> BridgeStatusSnapshot:
-    with connect_readonly_database(db_path) as connection:
+    with connect_live_readonly_database(db_path) as connection:
         counts = _read_counts(connection)
         latest_sync = _read_latest_sync(connection)
         receiver = _read_receiver_status(connection)

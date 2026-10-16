@@ -4,6 +4,40 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class MailboxQAHarnessTests: XCTestCase {
+    @MainActor
+    func testOverlappingAdvanceDoesNotPublishOrApplyStaleState() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let provider = root.appendingPathComponent("provider")
+        try FileManager.default.createDirectory(at: provider, withIntermediateDirectories: true)
+        let fixture = try QAPairingFixture()
+        let publisher = HeldQAPublisher()
+        let harness = try MailboxQAHarness(
+            applicationSupportRoot: root.appendingPathComponent("support"),
+            providerRoot: provider, containerIdentifier: "iCloud.dev.example.healthbridge.mailboxqa",
+            pairing: fixture.record, envelopeID: { fixture.envelopeID },
+            observeEnvelope: { _, _ in true }, publisher: { _ in publisher }
+        )
+        _ = try harness.advance()
+        _ = try harness.advance()
+        let first = Task { try await harness.advanceAwaitingPublication() }
+        let entered = await XCTWaiter.fulfillment(of: [publisher.entered], timeout: 2)
+        XCTAssertEqual(entered, .completed)
+        do {
+            _ = try await harness.advanceAwaitingPublication()
+            XCTFail("A second advance must be rejected while publication owns the harness")
+        } catch {
+            XCTAssertEqual(error as? MailboxQAHarnessError, .invalidState)
+        }
+        XCTAssertEqual(publisher.calls, 1)
+        publisher.release?.resume()
+        publisher.release = nil
+        let completed = try await first.value
+        XCTAssertEqual(completed.lastPhase, .published)
+        let observed = try await harness.advanceAwaitingPublication()
+        XCTAssertEqual(observed.lastPhase, .providerObserved)
+    }
+
     func testPairingCompletionRejectsUnknownFieldsAndWrongCanonicalKeyID() throws {
         let receiverSigning = Curve25519.Signing.PrivateKey()
         let receiverAgreement = Curve25519.KeyAgreement.PrivateKey()
@@ -400,4 +434,27 @@ private func publishAck(
         to: lane.appendingPathComponent(name),
         options: [.withoutOverwriting]
     )
+}
+
+
+@MainActor
+private final class HeldQAPublisher: MailboxEnvelopePublishing {
+    let entered = XCTestExpectation(description: "QA publication held")
+    var release: CheckedContinuation<Void, Never>?
+    var calls = 0
+
+    nonisolated func publish(_ envelope: Data, finalName: String, locator: MailboxResolvedLocatorV1) throws -> URL {
+        throw MailboxPublicationExecutionError.asynchronousPublicationRequired
+    }
+
+    func publishAwaitingCompletion(_ envelope: Data, finalName: String, locator: MailboxResolvedLocatorV1) async throws -> URL {
+        calls += 1
+        if calls == 1 {
+            await withCheckedContinuation { continuation in
+                release = continuation
+                entered.fulfill()
+            }
+        }
+        return try POSIXMailboxEnvelopePublisher().publish(envelope, finalName: finalName, locator: locator)
+    }
 }

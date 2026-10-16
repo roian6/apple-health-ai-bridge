@@ -323,6 +323,7 @@ def test_install_bootstrap_failure_rolls_back_new_generation_and_retries(
     assert request.paths.state_dir.is_dir()
     assert request.paths.manifest.parent.is_dir()
     assert request.db_path.is_file()
+    assert request.mailbox_root is not None
     assert request.mailbox_root.is_dir()
 
     recovered = install_launch_agent(request, adapter)
@@ -367,6 +368,7 @@ def test_uninstall_removes_service_after_runtime_targets_are_moved_or_deleted(
     request = service_request(tmp_path)
     _ = write_launch_agent_artifacts(request, activate=False)
     moved_database = request.db_path.with_name("moved-health.sqlite")
+    assert request.mailbox_root is not None
     moved_mailbox = request.mailbox_root.with_name("moved-v1")
     _ = request.db_path.rename(moved_database)
     _ = request.mailbox_root.rename(moved_mailbox)

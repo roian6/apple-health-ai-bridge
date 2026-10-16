@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         DistributionVerificationRequest,
     )
 
+from health_bridge import __version__
 from health_bridge.cli import app
 from health_bridge.mailbox import helper_lifecycle
 from health_bridge.mailbox.helper_lifecycle import (
@@ -65,7 +66,7 @@ def allow_synthetic_distribution_policy(
 
 BUNDLE_ID = "com.example.HealthBridgeMailboxAckPublisher"
 CONTAINER_ID = "iCloud.com.example.HealthBridgeMailboxAckPublisher"
-VERSION = "1.1.2"
+VERSION = __version__
 TAG = f"receiver-v{VERSION}"
 TAG_OBJECT = "1" * 40
 COMMIT = "2" * 40
@@ -593,6 +594,30 @@ def test_uninstall_activation_failure_preserves_complete_ready_generation(
     assert paths.app.is_dir()
     assert paths.manifest.is_file()
     assert paths.ownership.is_file()
+
+
+def test_setup_readiness_can_require_matching_receiver_version(tmp_path: Path) -> None:
+    archive, manifest = _release(tmp_path)
+    home = tmp_path / "synthetic-home"
+    verifier = _verifier([])
+    _ = install_helper(
+        archive, manifest, home=home, platform="darwin", verifier=verifier
+    )
+    paths = HelperPaths.production(home)
+    before = paths.manifest.read_bytes(), paths.ownership.read_bytes()
+    assert (
+        read_helper_status(
+            home=home, platform="darwin", verifier=verifier, expected_version=VERSION
+        ).code
+        is HelperStatusCode.READY
+    )
+    assert (
+        read_helper_status(
+            home=home, platform="darwin", verifier=verifier, expected_version="0.0.0"
+        ).code
+        is HelperStatusCode.HELPER_DRIFT
+    )
+    assert before == (paths.manifest.read_bytes(), paths.ownership.read_bytes())
 
 
 def test_uninstall_race_never_deletes_replacement_generation(

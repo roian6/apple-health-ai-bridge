@@ -14,6 +14,7 @@ from health_bridge.launchd.models import (
     LaunchdServiceResult,
 )
 from health_bridge.private_files import require_private_parent
+from health_bridge.receiver.transports import select_receiver_transport
 
 _CONTROL_CHARACTERS: Final = frozenset(chr(value) for value in (*range(32), 127))
 
@@ -32,12 +33,28 @@ def validate_launch_agent(request: LaunchdServiceRequest) -> LaunchdServiceResul
         allow_root_owner=False,
         owner_only=True,
     )
-    _validate_existing_path(
-        request.mailbox_root,
-        kind="directory",
-        allow_root_owner=False,
-        owner_only=True,
-    )
+    if request.mailbox_root is not None:
+        _ = select_receiver_transport(
+            "icloud-mailbox",
+            mailbox_root=request.mailbox_root,
+            icloud_container_identifier=request.icloud_container_identifier,
+            platform="darwin",
+            home=request.home,
+        )
+    if request.mailbox_root is not None and request.mailbox_root.exists():
+        _validate_existing_path(
+            request.mailbox_root,
+            kind="directory",
+            allow_root_owner=False,
+            owner_only=True,
+        )
+    if request.setup_page is not None:
+        _validate_existing_path(
+            request.setup_page,
+            kind="file",
+            allow_root_owner=False,
+            owner_only=True,
+        )
     return LaunchdServiceResult(code=LaunchdServiceCode.VALID)
 
 
@@ -59,14 +76,25 @@ def validate_launch_agent_structure(
 def _validate_request_values(request: LaunchdServiceRequest) -> None:
     if request.uid < 0 or request.uid != os.geteuid():
         raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
-    if request.host != "127.0.0.1" or not 1 <= request.port <= MAX_TCP_PORT:
+    hosts = {"127.0.0.1", "0.0.0.0"}  # nosec B104 - validates explicit LAN pairing access; # noqa: S104
+    if request.host not in hosts or not 1 <= request.port <= MAX_TCP_PORT:
+        raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
+    if (request.mailbox_root is None) != (request.icloud_container_identifier is None):
         raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
     for value in (
         str(request.executable),
         str(request.db_path),
-        str(request.mailbox_root),
         str(request.home),
-        request.icloud_container_identifier,
+        *(
+            str(path)
+            for path in (request.mailbox_root, request.setup_page)
+            if path is not None
+        ),
+        *(
+            (request.icloud_container_identifier,)
+            if request.icloud_container_identifier is not None
+            else ()
+        ),
     ):
         if not value or any(character in _CONTROL_CHARACTERS for character in value):
             raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
@@ -75,8 +103,9 @@ def _validate_request_values(request: LaunchdServiceRequest) -> None:
         request.db_path,
         request.mailbox_root,
         request.home,
+        request.setup_page,
     ):
-        if not path.is_absolute():
+        if path is not None and not path.is_absolute():
             raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
 
 
@@ -110,6 +139,8 @@ def _validate_existing_path(
 
 
 def _validate_expected_mailbox_topology(request: LaunchdServiceRequest) -> None:
+    if request.icloud_container_identifier is None:
+        return
     component = request.icloud_container_identifier.replace(".", "~")
     if Path(component).name != component or component in {"", ".", ".."}:
         raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)

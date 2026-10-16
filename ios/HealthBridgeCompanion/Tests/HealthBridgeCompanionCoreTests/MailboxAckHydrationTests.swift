@@ -138,14 +138,16 @@ final class MailboxAckHydrationTests: XCTestCase {
             scannedFinalCount: 4,
             scannedByteCount: 2_048,
             ignoredTemporaryCount: 3,
-            quarantine: quarantine
+            quarantine: quarantine,
+            acknowledgmentEnumerationIncomplete: false
         )
 
         XCTAssertEqual(
             summary.ackDiagnosticLine,
             "Mailbox ACK diagnostics: hydration eligible=7, downloadRequests=6, "
                 + "remainingUnavailable=2, skippedUnverifiableIdentity=1; scan finalCount=4, "
-                + "byteCount=2048, ignoredTemporaryCount=3; cleanupFailures=1; quarantine invalidName=1, "
+                + "byteCount=2048, ignoredTemporaryCount=3, incompleteEnumeration=false; "
+                + "cleanupFailures=1; quarantine invalidName=1, "
                 + "unsafeEntry=0, oversize=0, authenticationFailed=2, unknownEnvelope=0, "
                 + "stale=1, bindingConflict=0, suppressed=0."
         )

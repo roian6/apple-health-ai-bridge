@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum, unique
 from pathlib import Path
@@ -110,27 +111,33 @@ class LaunchdServicePaths:
 class LaunchdServiceRequest:
     executable: Path
     db_path: Path
-    mailbox_root: Path
-    icloud_container_identifier: str
+    mailbox_root: Path | None
+    icloud_container_identifier: str | None
     home: Path
     uid: int
     host: str = "127.0.0.1"
     port: int = 8765
+    label: str = LAUNCH_AGENT_LABEL
+    setup_page: Path | None = None
 
     @property
     def paths(self) -> LaunchdServicePaths:
-        return service_paths(self.home)
+        return service_paths(self.home, self.label)
 
 
-def service_paths(home: Path) -> LaunchdServicePaths:
+def service_paths(home: Path, label: str = LAUNCH_AGENT_LABEL) -> LaunchdServicePaths:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", label) is None:
+        raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
     state_dir = home / SERVICE_STATE_RELATIVE
+    if label != LAUNCH_AGENT_LABEL:
+        state_dir /= label
     return LaunchdServicePaths(
         state_dir=state_dir,
         config=state_dir / "receiver.json",
         ownership=state_dir / "ownership.json",
         stdout_log=state_dir / "receiver.stdout.log",
         stderr_log=state_dir / "receiver.stderr.log",
-        manifest=home / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist",
+        manifest=home / "Library/LaunchAgents" / f"{label}.plist",
     )
 
 
@@ -145,10 +152,12 @@ class LaunchdServiceConfig(BaseModel):
     schema_version: Literal[1]
     executable: Path
     db_path: Path
-    mailbox_root: Path
-    icloud_container_identifier: str
+    mailbox_root: Path | None
+    icloud_container_identifier: str | None
     host: str
     port: int
+    label: str = LAUNCH_AGENT_LABEL
+    setup_page: Path | None = None
 
 
 class LaunchdOwnershipRecord(BaseModel):

@@ -93,6 +93,7 @@ struct OutboxDeliveryHarness {
         locate: (() throws -> MailboxResolvedLocatorV1)? = nil,
         observed: Bool = false,
         observe: ((URL, String) throws -> Bool)? = nil,
+        isCancelled: @escaping () -> Bool = { false },
         ownership selectedOwnership: OutboxDeliveryOwnershipV1? = nil,
         finalizer: any OutboxDeliveryCommitFinalizing,
         fault: @escaping OutboxDeliveryCoordinator.Fault = { _ in }
@@ -113,6 +114,7 @@ struct OutboxDeliveryHarness {
                 sealer: sealer,
                 publisher: publisher,
                 locate: locate,
+                isCancelled: isCancelled,
                 observe: observe ?? { _, _ in observed }
             ),
             scanner: scanner,

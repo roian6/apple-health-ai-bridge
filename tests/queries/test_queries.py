@@ -378,7 +378,9 @@ def test_get_daily_summary_returns_observations_without_interpretation(
 
     # Then
     assert result.days[0].date == "2026-06-01"
-    assert result.days[0].sample_totals["steps"] == 4321.0
+    assert "steps" not in result.days[0].sample_totals
+    assert result.days[0].daily_projection_status["steps"] == "legacy_unknown"
+    assert result.days[0].sample_statistics["steps"].total == 4321.0
     assert result.days[0].sample_statistics["steps"].aggregation == "sum"
     assert result.days[2].workout_count == 1
     assert result.days[3].sleep_session_count == 1
@@ -515,12 +517,17 @@ def test_get_daily_summary_distinguishes_raw_sample_sums_from_daily_aggregates(
 
     # Then
     day = result.days[0]
-    assert day.sample_totals["steps"] == 12824.0
-    assert day.sample_totals["distance_walking_running"] == 9000.0
+    assert "steps" not in day.sample_totals
+    assert "distance_walking_running" not in day.sample_totals
+    assert day.sample_statistics["steps"].total == 12824.0
+    assert day.sample_statistics["distance_walking_running"].total == 9000.0
     assert day.sample_total_semantics["steps"] == "mixed_sum_semantics"
     assert day.sample_total_semantics["distance_walking_running"] == "daily_aggregate"
-    assert day.daily_activity_totals["steps"] == 11824.0
-    assert day.daily_activity_totals["distance_walking_running"] == 9000.0
+    assert day.daily_activity_totals == {}
+    assert day.daily_projection_status == {
+        "steps": "legacy_unknown",
+        "distance_walking_running": "legacy_unknown",
+    }
 
 
 def test_get_daily_summary_uses_calendar_day_metadata_for_daily_aggregates(
@@ -567,7 +574,9 @@ def test_get_daily_summary_uses_calendar_day_metadata_for_daily_aggregates(
     # Then
     day = result.days[0]
     assert day.date == "2026-06-25"
-    assert day.daily_activity_totals["steps"] == 9684.0
+    assert day.daily_activity_totals == {}
+    assert day.daily_projection_status["steps"] == "legacy_unknown"
+    assert day.sample_statistics["steps"].total == 9684.0
     assert day.sample_total_semantics["steps"] == "daily_aggregate"
     assert day.sample_counts["steps"] == 1
 

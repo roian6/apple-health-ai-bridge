@@ -292,7 +292,7 @@ def test_production_mailbox_ui_is_truthful_about_readiness_and_holds() -> None:
     assert "Receiver rejected" in view_model
     assert "signed ACK" not in view_model
     assert 'viewModel.usesMailboxTransport ? "Check Mailbox Folder"' in content
-    assert "pending secure delivery item(s)" in content
+    assert "return viewModel.pendingSyncSummary" in content
 
 
 def test_public_documents_entitlements_are_cloud_documents_only() -> None:

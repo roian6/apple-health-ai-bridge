@@ -3,11 +3,23 @@ from __future__ import annotations
 import importlib.util
 import io
 import tarfile
+import tomllib
 import zipfile
 from pathlib import Path
 from typing import Protocol, cast
 
 import pytest
+
+
+def test_official_skill_is_in_installed_package() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    assert (
+        project["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"][
+            "skills/health-bridge/SKILL.md"
+        ]
+        == "health_bridge/skills/health-bridge/SKILL.md"
+    )
+    assert Path("skills/health-bridge/SKILL.md").read_text().startswith("---\n")
 
 
 class PackageSmokeModule(Protocol):

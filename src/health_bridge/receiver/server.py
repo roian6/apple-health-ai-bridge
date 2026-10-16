@@ -1,11 +1,11 @@
+import hmac
 import json
 
 # noqa: RUF100 -- no-excuse marker "# noqa: SIZE_OK": cohesive HTTP framing and mappings.
 import sqlite3
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,10 +21,7 @@ from health_bridge.mailbox.connections import (
     MailboxConnectionErrorCode,
     MailboxConnectionStore,
 )
-from health_bridge.receiver._mailbox_key_models import (
-    MailboxKeyStoreError,
-    strict_base64url_decode,
-)
+from health_bridge.receiver._mailbox_key_models import MailboxKeyStoreError
 from health_bridge.receiver.batch_acceptance import BatchAcceptanceInput
 from health_bridge.receiver.direct_http_acceptance import (
     DirectBatchAccepted,
@@ -36,20 +33,26 @@ from health_bridge.receiver.direct_http_acceptance import (
 )
 from health_bridge.receiver.invitations import (
     PairingInvitationError,
-    PairingRedemptionCompletion,
+    pairing_setup_progress,
     redeem_pairing_invitation,
 )
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.mailbox_pairing import (
-    MailboxPairingCompletion,
-    provision_mailbox_connection,
+    MailboxProvisioningTransaction,
+    MailboxTransportUnavailableError,
+    pairing_completion_fields,
 )
 from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
+from health_bridge.receiver.pairing_setup_page import (
+    invitation_page_route,
+    read_invitation_page,
+    render_hosted_setup_page,
+    render_pairing_setup_page,
+)
 from health_bridge.receiver.tokens import (
     ReceiverTokenPrincipal,
     authenticate_receiver_token_principal,
 )
-from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import (
     database_lifecycle_lock,
     initialize_database,
@@ -63,8 +66,8 @@ MAX_PAIRING_REDEEM_BYTES: Final = 4_096
 PAIRING_REDEEM_LIMIT: Final = 5
 PAIRING_REDEEM_WINDOW_SECONDS: Final = 60
 PAIRING_REDEEM_MAX_CLIENTS: Final = 1_024
-JsonPayloadValue: TypeAlias = bool | int | str
-JsonPayload: TypeAlias = dict[str, JsonPayloadValue]
+JsonPayloadValue: TypeAlias = bool | int | str | None
+JsonPayload: TypeAlias = Mapping[str, JsonPayloadValue]
 
 
 class PairingRedeemRequest(BaseModel):
@@ -138,8 +141,10 @@ class ReceiverHTTPServer(ThreadingHTTPServer):
         mailbox_key_store: MailboxKeyStore | None = None,
         mailbox_connection_store: MailboxConnectionStore | None = None,
         mailbox_worker: MailboxRuntimeWorker | None = None,
+        setup_page: Path | None = None,
     ) -> None:
         self.db_path: Path = db_path
+        self.setup_page: Path | None = setup_page
         self.mailbox_key_store: MailboxKeyStore | None = mailbox_key_store
         self.mailbox_connection_store: MailboxConnectionStore | None = (
             mailbox_connection_store
@@ -159,44 +164,6 @@ class ReceiverHTTPServer(ThreadingHTTPServer):
         """Suppress socketserver's default traceback and client-address dump."""
 
 
-@dataclass
-class _MailboxProvisioningTransaction:
-    key_store: MailboxKeyStore | None
-    connection_store: MailboxConnectionStore | None
-    device_signing_public_key: str | None
-    device_agreement_public_key: str | None
-    completion: MailboxPairingCompletion | None = None
-
-    def __call__(self, redemption: PairingRedemptionCompletion) -> None:
-        match redemption.transport:
-            case ReceiverTransport.DIRECT:
-                return
-            case ReceiverTransport.MAILBOX:
-                pass
-        if self.key_store is None or self.connection_store is None:
-            raise MailboxTransportUnavailableError
-        if (
-            self.device_signing_public_key is None
-            or self.device_agreement_public_key is None
-        ):
-            raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED)
-        _validate_mailbox_public_keys(
-            self.device_signing_public_key,
-            self.device_agreement_public_key,
-        )
-        self.completion = provision_mailbox_connection(
-            connection_store=self.connection_store,
-            key_store=self.key_store,
-            installation_id_hash=redemption.installation_id_hash,
-            device_signing_public_key=self.device_signing_public_key,
-            device_agreement_public_key=self.device_agreement_public_key,
-        )
-
-
-class MailboxTransportUnavailableError(Exception):
-    pass
-
-
 class ReceiverRequestHandler(BaseHTTPRequestHandler):
     @property
     def receiver_server(self) -> ReceiverHTTPServer:
@@ -212,6 +179,9 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path.startswith("/setup/"):
+            self._serve_setup_page(path)
+            return
         if path != "/health":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
@@ -356,38 +326,7 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 {"error": "pairing_temporarily_unavailable"},
             )
             return
-        response: JsonPayload = {
-            "schema_id": "health_bridge.receiver_pairing_completion.v1",
-            "schema_version": "1.0.0",
-            "label": completion.label,
-            "receiver_url": completion.receiver_url,
-        }
-        if mailbox_completion is not None:
-            response.update(
-                {
-                    "mailbox_protocol_version": 1,
-                    "mailbox_receiver_id": mailbox_completion.receiver_id,
-                    "mailbox_device_id": mailbox_completion.device_id,
-                    "mailbox_receiver_binding_id": (
-                        mailbox_completion.receiver_binding_id
-                    ),
-                    "mailbox_connection_generation": (
-                        mailbox_completion.connection_generation
-                    ),
-                    "mailbox_receiver_signing_public_key": (
-                        mailbox_completion.receiver_signing_public_key
-                    ),
-                    "mailbox_receiver_agreement_public_key": (
-                        mailbox_completion.receiver_agreement_public_key
-                    ),
-                    "mailbox_receiver_signing_key_id": (
-                        mailbox_completion.receiver_signing_key_id
-                    ),
-                    "mailbox_receiver_agreement_key_id": (
-                        mailbox_completion.receiver_agreement_key_id
-                    ),
-                }
-            )
+        response = pairing_completion_fields(completion, mailbox_completion)
         self._send_json(HTTPStatus.OK, response)
 
     def _authorize_batch_request(self) -> ReceiverTokenPrincipal | None:
@@ -455,6 +394,78 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(content_length)
 
+    def _serve_setup_page(self, path: str) -> None:
+        page_path = self.receiver_server.setup_page
+        status = HTTPStatus.NOT_FOUND
+        if page_path is not None:
+            try:
+                page, invitation = read_invitation_page(page_path)
+                progress = None
+                if hmac.compare_digest(path, invitation_page_route(invitation)):
+                    progress = pairing_setup_progress(
+                        self.receiver_server.db_path, invitation.invitation_secret
+                    )
+            except (sqlite3.Error, BlockingIOError):
+                status = HTTPStatus.SERVICE_UNAVAILABLE
+            except (OSError, ValueError):
+                pass
+            else:
+                if progress is not None:
+                    if self.headers.get("Accept") == "application/json":
+                        self._send_json(
+                            HTTPStatus.OK,
+                            {
+                                "pairing_status": progress.pairing_status,
+                                "data_receipt_status": progress.data_receipt_status,
+                            },
+                            {
+                                "Cache-Control": "no-store",
+                                "Referrer-Policy": "no-referrer",
+                            },
+                        )
+                        return
+                    self._send_setup_html(
+                        HTTPStatus.OK,
+                        render_hosted_setup_page(page, invitation, progress),
+                    )
+                    return
+        if self.headers.get("Accept") != "application/json":
+            message = (
+                (
+                    "The receiver could not read connection progress. "
+                    "Check the receiver computer, then reload this page."
+                )
+                if status == HTTPStatus.SERVICE_UNAVAILABLE
+                else None
+            )
+            self._send_setup_html(
+                status, render_pairing_setup_page(None, "", unavailable_message=message)
+            )
+            return
+        self._send_json(
+            status,
+            {"error": "progress_unavailable"},
+            {
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
+
+    def _send_setup_html(self, status: HTTPStatus, page: str) -> None:
+        body = page.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.end_headers()
+            _ = self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def _send_json(
         self,
         status: HTTPStatus,
@@ -479,13 +490,14 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return
 
 
-def build_receiver_server(
+def build_receiver_server(  # noqa: PLR0913 - explicit transport and page dependencies.
     db_path: Path,
     host: str,
     port: int,
     *,
     mailbox_key_store: MailboxKeyStore | None = None,
     mailbox_connection_store: MailboxConnectionStore | None = None,
+    setup_page: Path | None = None,
 ) -> ReceiverHTTPServer:
     initialize_database(db_path)
     return ReceiverHTTPServer(
@@ -494,25 +506,15 @@ def build_receiver_server(
         db_path=db_path,
         mailbox_key_store=mailbox_key_store,
         mailbox_connection_store=mailbox_connection_store,
+        setup_page=setup_page,
     )
-
-
-def _validate_mailbox_public_keys(
-    device_signing_public_key: str,
-    device_agreement_public_key: str,
-) -> None:
-    try:
-        _ = strict_base64url_decode(device_signing_public_key, 32)
-        _ = strict_base64url_decode(device_agreement_public_key, 32)
-    except MailboxKeyStoreError as exc:
-        raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED) from exc
 
 
 def _mailbox_provisioning_transaction(
     server: ReceiverHTTPServer,
     payload: PairingRedeemRequest,
-) -> _MailboxProvisioningTransaction:
-    return _MailboxProvisioningTransaction(
+) -> MailboxProvisioningTransaction:
+    return MailboxProvisioningTransaction(
         key_store=server.mailbox_key_store,
         connection_store=server.mailbox_connection_store,
         device_signing_public_key=payload.device_signing_public_key,
@@ -538,10 +540,16 @@ def serve_receiver(  # noqa: PLR0913 - transport dependencies are explicit.
     mailbox_key_store: MailboxKeyStore | None = None,
     mailbox_connection_store: MailboxConnectionStore | None = None,
     mailbox_root: Path | None = None,
+    setup_page: Path | None = None,
 ) -> None:
     initialize_database(db_path)
     worker = (
-        MailboxRuntimeWorker(db_path=db_path, mailbox_root=mailbox_root)
+        MailboxRuntimeWorker(
+            db_path=db_path,
+            mailbox_root=mailbox_root,
+            pairing_keys=mailbox_key_store,
+            pairing_connections=mailbox_connection_store,
+        )
         if mailbox_root is not None
         else None
     )
@@ -555,6 +563,7 @@ def serve_receiver(  # noqa: PLR0913 - transport dependencies are explicit.
                 mailbox_key_store=mailbox_key_store,
                 mailbox_connection_store=mailbox_connection_store,
                 mailbox_worker=worker,
+                setup_page=setup_page,
             )
             if worker is not None
             else ReceiverHTTPServer(
@@ -563,6 +572,7 @@ def serve_receiver(  # noqa: PLR0913 - transport dependencies are explicit.
                 db_path=db_path,
                 mailbox_key_store=mailbox_key_store,
                 mailbox_connection_store=mailbox_connection_store,
+                setup_page=setup_page,
             )
         ) as server,
     ):

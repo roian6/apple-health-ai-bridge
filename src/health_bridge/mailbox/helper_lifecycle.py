@@ -288,6 +288,7 @@ def read_helper_status(
     home: Path | None = None,
     platform: str | None = None,
     verifier: PlatformVerifier | None = None,
+    expected_version: str | None = None,
 ) -> HelperResult:
     if (sys.platform if platform is None else platform) != "darwin":
         return HelperResult(code=HelperStatusCode.UNSUPPORTED_HOST)
@@ -311,7 +312,7 @@ def read_helper_status(
         manifest_is_supported = (
             manifest.distribution_identity is not None
             or __version__ in _LEGACY_V1_INSTALL_VERSIONS
-        )
+        ) and (expected_version is None or manifest.bundle.version == expected_version)
         if manifest_is_supported:
             if (
                 hashlib.sha256(raw_manifest).hexdigest() != ownership.manifest_sha256

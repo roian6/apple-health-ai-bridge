@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 from typing import Final, TypeAlias
 
@@ -27,8 +28,40 @@ SOURCES_SQL: Final = (
 SYNC_CURSORS_SQL: Final = (
     "select sources.source_key, sync_cursors.cursor_kind, sync_cursors.updated_at "
     "from sync_cursors join sources on sources.source_id = sync_cursors.source_id "
+    "where sync_cursors.cursor_kind not like 'daily_projection_%' "
     "order by sources.source_key, sync_cursors.cursor_kind"
 )
+
+
+def connection_has_observations(
+    connection: sqlite3.Connection, installation_id_hash: str
+) -> bool:
+    """Require a confirmed health-data upload and observations still stored."""
+    # Receiver invitations import this query; defer receiver package initialization.
+    from health_bridge.receiver.source_binding import (  # noqa: PLC0415
+        PHONE_SOURCE_PREFIX,
+    )
+
+    return (
+        connection.execute(
+            """
+        select 1 from sources
+        where source_key = ? and exists (
+            select 1 from sync_runs where receiver_installation_id_hash = ?
+                and status = 'succeeded'
+                and (sample_count > 0 or workout_count > 0 or sleep_session_count > 0)
+        ) and (
+            exists (select 1 from samples where samples.source_id = sources.source_id)
+            or exists (select 1 from workouts
+                where workouts.source_id = sources.source_id)
+            or exists (select 1 from sleep_sessions
+                where sleep_sessions.source_id = sources.source_id)
+        ) limit 1
+        """,
+            (PHONE_SOURCE_PREFIX + installation_id_hash, installation_id_hash),
+        ).fetchone()
+        is not None
+    )
 
 
 def explain_sources(db_path: Path) -> SourcesResult:

@@ -43,6 +43,40 @@ private struct MailboxLocatorRecordV1: Codable {
 }
 
 public enum MailboxLocatorV1 {
+    static func resolvePairing(invitationID: String) throws -> MailboxResolvedLocatorV1 {
+        guard let provider = FileManager.default.url(forUbiquityContainerIdentifier: HealthBridgeAppIdentity.ubiquityContainerIdentifier) else {
+            throw MailboxLocatorError.containerUnavailable
+        }
+        return try resolvePairing(invitationID: invitationID, providerRoot: provider)
+    }
+
+    static func resolvePairing(invitationID: String, providerRoot: URL) throws -> MailboxResolvedLocatorV1 {
+        _ = try MailboxLayoutV1.opaqueComponent(invitationID)
+        _ = try directoryIdentity(at: providerRoot)
+        let relative = "HealthBridgeMailbox/v1/pairing/\(invitationID)"
+        var directory = providerRoot
+        for part in ["Documents", "HealthBridgeMailbox", "v1", "pairing", invitationID] {
+            directory.appendPathComponent(part, isDirectory: true)
+            try ensureDirectory(at: directory, fileManager: .default)
+        }
+        return MailboxResolvedLocatorV1(
+            containerIdentifier: HealthBridgeAppIdentity.ubiquityContainerIdentifier,
+            providerRoot: providerRoot, deviceRoot: directory, relativeDevicePath: relative,
+            lanes: [:], deviceRootIdentity: try directoryIdentity(at: directory), laneIdentities: [:]
+        )
+    }
+
+    static func revalidatePairing(_ locator: MailboxResolvedLocatorV1) throws {
+        var directory = locator.providerRoot
+        for part in ["Documents"] + locator.relativeDevicePath.split(separator: "/").map(String.init) {
+            directory.appendPathComponent(part, isDirectory: true)
+            _ = try directoryIdentity(at: directory)
+        }
+        guard (try? directoryIdentity(at: locator.deviceRoot)) == locator.deviceRootIdentity else {
+            throw MailboxLocatorError.pathReplaced
+        }
+    }
+
     #if !HEALTH_BRIDGE_MAILBOX_QA
     public static func resolve(
         receiverComponent: String,
@@ -190,10 +224,14 @@ public enum MailboxLocatorV1 {
             _ = try directoryIdentity(at: url)
         }
         do {
-            try fileManager.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: url.path
-            )
+            let permissions = try fileManager.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+            // Reapplying the same mode changes directory state and invalidates ACK scan checkpoints.
+            if permissions?.uint16Value != 0o700 {
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o700],
+                    ofItemAtPath: url.path
+                )
+            }
         } catch {
             throw MailboxLocatorError.storageFailure
         }

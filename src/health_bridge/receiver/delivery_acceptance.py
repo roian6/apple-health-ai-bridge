@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from typing import TYPE_CHECKING, assert_never, final
+from typing import TYPE_CHECKING, Literal, assert_never, final
+
+from pydantic import TypeAdapter
 
 from health_bridge.contract.delivery_v1 import DeliveryProtocolError, DeliveryReceiptV1
 from health_bridge.receiver._delivery_acceptance_crypto import (
@@ -80,13 +82,10 @@ class DeliveryAcceptanceService:
                 claims,
                 self._connection,
             )
-        except DeliveryProtocolError as exc:
+            prepared = self._prepared_batch(request, claims, plaintext)
+        except (DeliveryProtocolError, DeliveryTerminalError) as exc:
             if exc.code == "authentication_failed":
                 raise
-            return self._terminal(claims, exc.code)
-        try:
-            prepared = self._prepared_batch(request, claims, plaintext)
-        except DeliveryTerminalError as exc:
             return self._terminal(claims, exc.code)
         digest = hashlib.sha256(prepared.exact_bytes).digest()
         self._fault(fault_hook, DeliveryAcceptanceFaultPoint.BEFORE_CLAIM)
@@ -101,6 +100,13 @@ class DeliveryAcceptanceService:
                 )
                 if existing is not None:
                     return self._existing(existing, claims, digest, fault_hook)
+                enrollment_error = self._enrollment_error(database)
+                if enrollment_error is not None:
+                    return (
+                        self._retryable(claims)
+                        if enrollment_error == "storage_unavailable"
+                        else self._terminal(claims, enrollment_error)
+                    )
                 self._fault(fault_hook, DeliveryAcceptanceFaultPoint.AFTER_CLAIM)
                 ingested = BatchAcceptanceCore.commit_in_connection(
                     database,
@@ -127,6 +133,41 @@ class DeliveryAcceptanceService:
             return self._retryable(claims)
         self._fault(fault_hook, DeliveryAcceptanceFaultPoint.AFTER_COMMIT)
         return self._publish(receipt, claims, replayed=False, fault_hook=fault_hook)
+
+    def _enrollment_error(
+        self, database: sqlite3.Connection
+    ) -> Literal["key_revoked", "storage_unavailable"] | None:
+        digest = self._connection.enrollment_digest()
+        matched = TypeAdapter[tuple[int] | None](tuple[int] | None).validate_python(
+            database.execute(
+                """select case when redemption.mailbox_enrollment_sha256 = ?
+                then 1 else 0 end
+                from pairing_invitation_redemptions redemption
+                join pairing_invitations invitation using (pairing_invitation_id)
+                join receiver_devices device using (receiver_device_id)
+                join receiver_tokens token using (receiver_token_id)
+                join receiver_token_devices mapping
+                  on mapping.receiver_token_id = redemption.receiver_token_id
+                 and mapping.receiver_device_id = redemption.receiver_device_id
+                where invitation.transport = 'mailbox'
+                  and invitation.redeemed_at is not null
+                  and device.revoked_at is null and token.revoked_at is null
+                  and (redemption.mailbox_enrollment_sha256 = ? or
+                    (redemption.mailbox_enrollment_sha256 is null
+                     and device.installation_id_hash = ?))
+                order by redemption.mailbox_enrollment_sha256 is null limit 1""",
+                (
+                    digest,
+                    digest,
+                    self._connection.source_principal.installation_id_hash,
+                ),
+            ).fetchone()
+        )
+        if matched == (1,):
+            return None
+        # Old consent is retained, but only authenticated peer replay may bind it.
+        # Keep queued work retryable while that original handshake is recovered.
+        return "storage_unavailable" if matched == (0,) else "key_revoked"
 
     def _identity_error(
         self,

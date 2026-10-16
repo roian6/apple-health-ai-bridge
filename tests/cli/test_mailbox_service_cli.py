@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from subprocess import run
+from types import SimpleNamespace
 from typing import Final
 
 import pytest
@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 import health_bridge.cli_launchd as cli_launchd_module
 import health_bridge.cli_receiver as cli_receiver_module
+from health_bridge import cli, cli_setup, cli_setup_interactive, cli_setup_runtime
 from health_bridge.cli import app
 from health_bridge.launchd import (
     LaunchctlAdapter,
@@ -24,11 +25,14 @@ from health_bridge.launchd.adapters import LaunchctlResult
 from health_bridge.launchd.models import LAUNCH_AGENT_LABEL
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.mailbox.helper_lifecycle import HelperResult, HelperStatusCode
+from health_bridge.receiver import transports
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
+from tests.cli import test_setup_cli
 from tests.launchd.support import service_request
 
 ANSI_SGR_PATTERN: Final = re.compile(r"\x1b\[[0-9;]*m")
+setup_control_plane = test_setup_cli.control_plane
 
 
 def _service_args(tmp_path: Path) -> tuple[list[str], Path, Path]:
@@ -204,6 +208,7 @@ def test_status_json_survives_missing_obsolete_runtime_targets(
     _ = write_launch_agent_artifacts(request, activate=False)
     request.executable.unlink()
     request.db_path.unlink()
+    assert request.mailbox_root is not None
     request.mailbox_root.rmdir()
     monkeypatch.setattr(sys, "platform", "darwin")
 
@@ -343,8 +348,10 @@ def test_receiver_start_loads_owned_service_config_into_supported_runtime(
         mailbox_key_store: MailboxKeyStore | None,
         mailbox_connection_store: MailboxConnectionStore | None,
         mailbox_root: Path | None,
+        setup_page: Path | None = None,
     ) -> None:
         del mailbox_key_store, mailbox_connection_store
+        assert setup_page is None
         captured.update(
             db_path=db_path,
             host=host,
@@ -398,7 +405,20 @@ def test_receiver_start_loads_owned_service_config_into_supported_runtime(
     }
 
 
-def test_direct_setup_does_not_create_launch_agent_state(tmp_path: Path) -> None:
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_direct_setup_creates_only_its_platform_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    monkeypatch.setattr(cli, "human_terminal", lambda: False)
+    platform_sys = SimpleNamespace(platform=platform, argv=sys.argv)
+    for module in (
+        cli,
+        cli_setup,
+        cli_setup_runtime,
+        cli_setup_interactive,
+        transports,
+    ):
+        monkeypatch.setattr(module, "sys", platform_sys)
     home = tmp_path / "synthetic-home"
     database = home / "private/health.sqlite"
     setup_page = home / "private/pair.html"
@@ -406,9 +426,16 @@ def test_direct_setup_does_not_create_launch_agent_state(tmp_path: Path) -> None
     env = os.environ.copy()
     env["HOME"] = str(home)
 
-    result = run(
+    executable = home / "bin/health-bridge"
+    executable.parent.mkdir(mode=0o700)
+    _ = executable.write_bytes(
+        Path(sys.executable).with_name("health-bridge").read_bytes()
+    )
+    executable.chmod(0o700)
+    platform_sys.argv = [str(executable)]
+    result = CliRunner().invoke(
+        app,
         [
-            str(Path(sys.executable).with_name("health-bridge")),
             "setup",
             "--receiver-url",
             "https://receiver.healthbridge.internal/v1/batches",
@@ -416,16 +443,20 @@ def test_direct_setup_does_not_create_launch_agent_state(tmp_path: Path) -> None
             str(database),
             "--setup-page",
             str(setup_page),
+            "--receiver-port",
+            str(test_setup_cli.unused_receiver_port()),
             "--transport",
             "direct",
             "--json",
         ],
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert not (home / "Library/LaunchAgents").exists()
-    assert not (home / "Library/Application Support/HealthBridge/launchd").exists()
+    assert result.exit_code == 0, result.output
+    assert (home / "Library/LaunchAgents").exists() == (platform == "darwin")
+    assert (home / "Library/Application Support/HealthBridge/launchd").exists() == (
+        platform == "darwin"
+    )
+    assert (home / ".config/systemd/user/health-bridge-receiver.service").exists() == (
+        platform == "linux"
+    )

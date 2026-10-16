@@ -1452,7 +1452,7 @@ def test_receiver_error_descriptions_never_embed_response_bodies() -> None:
     view_model = Path(
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
-    describe_start = view_model.index("private func describe(_ error: Error) -> String")
+    describe_start = view_model.index("    func describe(_ error: Error) -> String {")
     describe_body = view_model[describe_start:]
     assert "case .unsuccessfulStatusCode(let statusCode, _):" in describe_body
     assert "String(data: responseBody" not in describe_body

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import plistlib
 import stat
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from health_bridge.cli_launchd import LAUNCHCTL_TIMEOUT_SECONDS
@@ -9,10 +11,36 @@ from health_bridge.launchd import (
     render_launch_agent_plist,
     write_launch_agent_artifacts,
 )
+from health_bridge.launchd.artifacts import load_runnable_launch_agent_request
 from tests.launchd.support import service_request
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
+
+
+def test_direct_config_round_trips_scoped_owned_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = service_request(tmp_path)
+    page = request.db_path.parent / "pairing.html"
+    page.touch(mode=0o600)
+    request = replace(
+        request,
+        mailbox_root=None,
+        icloud_container_identifier=None,
+        label="health-bridge-qa",
+        setup_page=page,
+    )
+    monkeypatch.setenv("HOME", str(request.home))
+
+    _ = write_launch_agent_artifacts(request, activate=False)
+
+    assert load_runnable_launch_agent_request(request.paths.config) == request
+    assert request.paths.manifest.name == "health-bridge-qa.plist"
+    assert request.paths.state_dir.name == "health-bridge-qa"
+    assert str(page).encode() not in request.paths.manifest.read_bytes()
 
 
 def test_rendered_launch_agent_uses_private_config_and_shell_free_argv(
@@ -61,6 +89,7 @@ def test_rendered_launch_agent_contains_no_private_receiver_configuration(
 
     assert str(request.db_path).encode() not in rendered
     assert str(request.mailbox_root).encode() not in rendered
+    assert request.icloud_container_identifier is not None
     assert request.icloud_container_identifier.encode() not in rendered
     assert b"token" not in rendered.lower()
     assert b"receiver_id" not in rendered.lower()
@@ -69,9 +98,29 @@ def test_rendered_launch_agent_contains_no_private_receiver_configuration(
 
 def test_service_artifacts_render_as_parseable_owner_only_files(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = service_request(tmp_path)
+    monkeypatch.setenv("HOME", str(request.home))
     _ = write_launch_agent_artifacts(request, activate=False)
+    legacy_config = json.dumps(
+        {
+            "schema_id": "health_bridge.launchd.receiver",
+            "schema_version": 1,
+            "executable": str(request.executable),
+            "db_path": str(request.db_path),
+            "mailbox_root": str(request.mailbox_root),
+            "icloud_container_identifier": request.icloud_container_identifier,
+            "host": request.host,
+            "port": request.port,
+        },
+        separators=(",", ":"),
+    ).encode()
+    assert request.paths.config.read_bytes() == legacy_config
+    original = request.paths.ownership.read_bytes()
+    loaded = load_runnable_launch_agent_request(request.paths.config)
+    _ = write_launch_agent_artifacts(loaded, activate=False)
+    assert request.paths.ownership.read_bytes() == original
 
     _ = cast(
         "dict[str, object]",

@@ -41,6 +41,7 @@ class ReceiverServer(Protocol):
         mailbox_key_store: MailboxKeyStore | None,
         mailbox_connection_store: MailboxConnectionStore | None,
         mailbox_root: Path | None,
+        setup_page: Path | None = None,
     ) -> None: ...
 
 
@@ -52,6 +53,7 @@ class ReceiverStartOptions:
     mailbox_root: Path | None
     icloud_container_identifier: str | None
     service_config: Path | None
+    setup_page: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,7 @@ def run_receiver_start(
     port = options.port
     mailbox_root = options.mailbox_root
     container_identifier = options.icloud_container_identifier
+    setup_page = options.setup_page
     if options.service_config is not None:
         if (
             db is not None
@@ -79,6 +82,7 @@ def run_receiver_start(
             or container_identifier is not None
             or host != DEFAULT_RECEIVER_HOST
             or port != DEFAULT_RECEIVER_PORT
+            or options.setup_page is not None
         ):
             typer.echo(
                 "Service configuration cannot be combined with receiver options.",
@@ -95,6 +99,7 @@ def run_receiver_start(
         port = service_request.port
         mailbox_root = service_request.mailbox_root
         container_identifier = service_request.icloud_container_identifier
+        setup_page = service_request.setup_page
     if db is None:
         typer.echo("Receiver start requires --db.", err=True)
         raise typer.Exit(code=2)
@@ -125,6 +130,7 @@ def run_receiver_start(
             mailbox_key_store=mailbox_key_store,
             mailbox_connection_store=mailbox_connection_store,
             mailbox_root=mailbox_root,
+            setup_page=setup_page,
         )
     except KeyboardInterrupt:
         raise typer.Exit(code=0) from None

@@ -60,6 +60,17 @@ public struct MailboxKeyRecoveryAuthorization: Equatable, Sendable {
         self.pendingOutboxCount = pendingOutboxCount
         self.operationIsActive = operationIsActive
     }
+
+    public var rejectionReason: MailboxKeyRecoveryError? {
+        guard receiverActivationIsUnpaired else { return .receiverActivationNotUnpaired }
+        guard !pendingPairingExists, !terminalTransitionIsPending else {
+            return .pairingOrTerminalTransitionPending
+        }
+        guard let pendingOutboxCount else { return .outboxStatusUnavailable }
+        guard pendingOutboxCount == 0 else { return .outboxNotEmpty }
+        guard !operationIsActive else { return .operationActive }
+        return nil
+    }
 }
 
 public enum MailboxKeyRecoveryError: Error, Equatable, Sendable {
@@ -163,8 +174,8 @@ public final class MailboxKeyStore: MailboxSigningIdentityProviding {
     public func resetLostKeyMaterial(
         authorization: MailboxKeyRecoveryAuthorization
     ) throws {
-        try Self.requireRecoveryAuthorization(authorization)
         try persistence.exclusively {
+            if let refusal = authorization.rejectionReason { throw refusal }
             let lostIsProven: Bool
             do {
                 _ = try persistence.readState()
@@ -302,27 +313,6 @@ public final class MailboxKeyStore: MailboxSigningIdentityProviding {
         }
         if let provisioning = writes.provisioning {
             try persistence.write(provisioning)
-        }
-    }
-
-    private static func requireRecoveryAuthorization(
-        _ authorization: MailboxKeyRecoveryAuthorization
-    ) throws {
-        guard authorization.receiverActivationIsUnpaired else {
-            throw MailboxKeyRecoveryError.receiverActivationNotUnpaired
-        }
-        guard !authorization.pendingPairingExists,
-              !authorization.terminalTransitionIsPending else {
-            throw MailboxKeyRecoveryError.pairingOrTerminalTransitionPending
-        }
-        guard let pendingOutboxCount = authorization.pendingOutboxCount else {
-            throw MailboxKeyRecoveryError.outboxStatusUnavailable
-        }
-        guard pendingOutboxCount == 0 else {
-            throw MailboxKeyRecoveryError.outboxNotEmpty
-        }
-        guard !authorization.operationIsActive else {
-            throw MailboxKeyRecoveryError.operationActive
         }
     }
 }

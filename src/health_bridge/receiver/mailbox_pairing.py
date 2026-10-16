@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from uuid import UUID
 
 from health_bridge.contract._delivery_common import key_id
+from health_bridge.contract._hbjcs1 import hbjcs1_encode
 from health_bridge.mailbox.connections import (
     MailboxConnectionError,
     MailboxConnectionErrorCode,
@@ -16,8 +19,20 @@ from health_bridge.receiver._mailbox_key_models import (
     MailboxKeyStoreError,
     strict_base64url_decode,
 )
+from health_bridge.receiver.invitations import (
+    PairingRedemptionCompletion,
+    redeem_pairing_invitation,
+)
+from health_bridge.receiver.mailbox_bootstrap import (
+    BootstrapDescriptor,
+    open_pairing_request,
+    seal_pairing_completion,
+)
+from health_bridge.receiver.transports import ReceiverTransport
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 
 _RECEIVER_ID_DOMAIN: Final = b"health-bridge/mailbox/v1/receiver-id\0"
@@ -106,3 +121,122 @@ def provision_mailbox_connection(
 
 
 __all__ = ["MailboxPairingCompletion", "provision_mailbox_connection"]
+
+
+@dataclass
+class MailboxProvisioningTransaction:
+    key_store: MailboxKeyStore | None
+    connection_store: MailboxConnectionStore | None
+    device_signing_public_key: str | None
+    device_agreement_public_key: str | None
+    completion: MailboxPairingCompletion | None = None
+    validate_request: Callable[[], None] | None = None
+
+    def __call__(self, redemption: PairingRedemptionCompletion) -> str | None:
+        match redemption.transport:
+            case ReceiverTransport.DIRECT:
+                return None
+            case ReceiverTransport.MAILBOX:
+                pass
+        if self.key_store is None or self.connection_store is None:
+            raise MailboxTransportUnavailableError
+        if (
+            self.device_signing_public_key is None
+            or self.device_agreement_public_key is None
+        ):
+            raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED)
+        _validate_mailbox_public_keys(
+            self.device_signing_public_key,
+            self.device_agreement_public_key,
+        )
+        self.completion = provision_mailbox_connection(
+            connection_store=self.connection_store,
+            key_store=self.key_store,
+            installation_id_hash=redemption.installation_id_hash,
+            device_signing_public_key=self.device_signing_public_key,
+            device_agreement_public_key=self.device_agreement_public_key,
+        )
+        if self.validate_request is not None:
+            self.validate_request()
+        trusted = self.connection_store.load(
+            Path(self.completion.receiver_id) / self.completion.device_id
+        )
+        return trusted.enrollment_digest()
+
+
+class MailboxTransportUnavailableError(Exception):
+    pass
+
+
+def _validate_mailbox_public_keys(
+    device_signing_public_key: str,
+    device_agreement_public_key: str,
+) -> None:
+    try:
+        _ = strict_base64url_decode(device_signing_public_key, 32)
+        _ = strict_base64url_decode(device_agreement_public_key, 32)
+    except MailboxKeyStoreError as exc:
+        raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED) from exc
+
+
+def pairing_completion_fields(
+    completion: PairingRedemptionCompletion,
+    mailbox: MailboxPairingCompletion | None,
+) -> dict[str, str | int | bool | None]:
+    fields: dict[str, str | int | bool | None] = {
+        "schema_id": "health_bridge.receiver_pairing_completion.v1",
+        "schema_version": "1.0.0",
+        "label": completion.label,
+        "receiver_url": completion.receiver_url,
+    }
+    if mailbox is not None:
+        fields["mailbox_protocol_version"] = 1
+        fields.update(
+            {
+                "mailbox_receiver_id": mailbox.receiver_id,
+                "mailbox_device_id": mailbox.device_id,
+                "mailbox_receiver_binding_id": mailbox.receiver_binding_id,
+                "mailbox_connection_generation": mailbox.connection_generation,
+                "mailbox_receiver_signing_public_key": (
+                    mailbox.receiver_signing_public_key
+                ),
+                "mailbox_receiver_agreement_public_key": (
+                    mailbox.receiver_agreement_public_key
+                ),
+                "mailbox_receiver_signing_key_id": mailbox.receiver_signing_key_id,
+                "mailbox_receiver_agreement_key_id": mailbox.receiver_agreement_key_id,
+            }
+        )
+    return fields
+
+
+def redeem_native_pairing(
+    db_path: Path,
+    encoded_request: bytes,
+    descriptor: BootstrapDescriptor,
+    receiver: tuple[MailboxKeyStore, MailboxConnectionStore],
+    *,
+    validate_request: Callable[[], None] | None = None,
+) -> bytes:
+    keys, connections = receiver
+    request = open_pairing_request(encoded_request, descriptor, keys)
+    provisioning = MailboxProvisioningTransaction(
+        key_store=keys,
+        connection_store=connections,
+        device_signing_public_key=request.device_signing_public_key,
+        device_agreement_public_key=request.device_agreement_public_key,
+        validate_request=validate_request,
+    )
+    completion = redeem_pairing_invitation(
+        db_path,
+        installation_id=request.installation_id,
+        device_credential=request.device_credential,
+        platform=request.platform,
+        invitation_secret=request.invitation_secret,
+        native_invitation_id=str(UUID(hex=descriptor.invitation_id)),
+        before_commit=provisioning,
+    )
+    plaintext = hbjcs1_encode(
+        dict(pairing_completion_fields(completion, provisioning.completion))
+    )
+    return seal_pairing_completion(plaintext, encoded_request, keys)

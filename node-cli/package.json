@@ -1,0 +1,15 @@
+{
+  "name": "apple-health-ai-bridge",
+  "version": "0.1.0",
+  "description": "Local-first Apple Health receiver setup and read-only AI connection CLI",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/roian6/apple-health-ai-bridge.git", "directory": "node-cli" },
+  "homepage": "https://github.com/roian6/apple-health-ai-bridge",
+  "bugs": { "url": "https://github.com/roian6/apple-health-ai-bridge/issues" },
+  "publishConfig": { "access": "public", "provenance": true },
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "bin": { "health-bridge": "health-bridge.mjs" },
+  "files": ["health-bridge.mjs", "backend-pin.json", "skills/health-bridge/SKILL.md"],
+  "scripts": { "test": "node --test launcher.test.mjs provenance.test.mjs" }
+}

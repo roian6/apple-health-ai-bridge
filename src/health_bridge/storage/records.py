@@ -6,6 +6,7 @@ from pydantic import TypeAdapter
 
 from health_bridge.contract import HealthBridgeBatchV1
 from health_bridge.storage.catalog import source_id, upsert_catalog
+from health_bridge.storage.daily_projections import DailyProjectionIngest
 from health_bridge.storage.sleep import (
     plan_sleep_baseline_resets,
     upsert_sleep_sessions,
@@ -64,7 +65,9 @@ def upsert_batch_records(
 ) -> None:
     upsert_catalog(connection, batch)
     sleep_reset_plan = plan_sleep_baseline_resets(connection, batch)
-    _upsert_samples(connection, batch)
+    daily_projections = DailyProjectionIngest(connection, batch)
+    daily_projections.prepare()
+    _upsert_samples(connection, batch, daily_projections)
     _upsert_workouts(connection, batch)
     upsert_sleep_sessions(connection, batch, sleep_reset_plan)
     upsert_sync_state(
@@ -74,7 +77,11 @@ def upsert_batch_records(
     )
 
 
-def _upsert_samples(connection: sqlite3.Connection, batch: HealthBridgeBatchV1) -> None:
+def _upsert_samples(
+    connection: sqlite3.Connection,
+    batch: HealthBridgeBatchV1,
+    daily_projections: DailyProjectionIngest,
+) -> None:
     for sample in batch.samples:
         canonical_type_code = canonical_sample_type_code(sample.type_code)
         canonical_client_record_id = canonical_sample_client_record_id(
@@ -114,8 +121,11 @@ def _upsert_samples(connection: sqlite3.Connection, batch: HealthBridgeBatchV1) 
                 legacy_key=(sample.type_code, sample.client_record_id),
                 canonical_key=(canonical_type_code, canonical_client_record_id),
             )
+        metadata = daily_projections.metadata(sample)
+        if metadata is None:
+            continue
         metadata_json = json.dumps(
-            sample.metadata,
+            metadata,
             sort_keys=True,
             separators=(",", ":"),
         )

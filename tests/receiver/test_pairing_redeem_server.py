@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from collections.abc import Generator
@@ -21,14 +22,23 @@ from health_bridge.mailbox.connections import (
     MailboxConnectionStore,
     strict_base64url_encode,
 )
-from health_bridge.receiver.invitations import create_pairing_invitation
+from health_bridge.receiver.invitations import (
+    create_pairing_invitation,
+    revoke_pairing_invitation,
+)
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
+from health_bridge.receiver.pairing import (
+    create_receiver_pairing_invitation_bundle,
+    pairing_deep_link,
+)
+from health_bridge.receiver.pairing_setup_page import render_pairing_setup_page
 from health_bridge.receiver.server import (
     PairingRedeemRateLimiter,
     build_receiver_server,
     server_port,
 )
 from health_bridge.receiver.tokens import authenticate_receiver_token_principal
+from health_bridge.storage.database import connect_database, connect_readonly_database
 
 SYNTHETIC_INSTALLATION_ID = "00000000-0000-4000-8000-000000000001"
 SYNTHETIC_DEVICE_CREDENTIAL = "hb_" + "a" * 64
@@ -63,6 +73,7 @@ def running_receiver(
     *,
     mailbox_key_store: MailboxKeyStore | None = None,
     mailbox_connection_store: MailboxConnectionStore | None = None,
+    setup_page: Path | None = None,
 ) -> Generator[str, None, None]:
     server = build_receiver_server(
         db_path,
@@ -70,6 +81,7 @@ def running_receiver(
         port=0,
         mailbox_key_store=mailbox_key_store,
         mailbox_connection_store=mailbox_connection_store,
+        setup_page=setup_page,
     )
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -79,6 +91,133 @@ def running_receiver(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "invalidate",
+    [
+        "redeem",
+        "revoke",
+        "expire",
+        "redeemed_expire",
+        "redeemed_revoke",
+        "token_revoke",
+        "device_revoke",
+        "blocked",
+        "read_failure",
+    ],
+)
+def test_hosted_page_requires_live_invitation_and_get_does_not_redeem(
+    tmp_path: Path,
+    invalidate: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "receiver.sqlite"
+    bundle = create_receiver_pairing_invitation_bundle(
+        db_path,
+        label="synthetic",
+        receiver_url="https://health.example.test/v1/batches",
+    )
+    page = tmp_path / "pair.html"
+    _ = page.write_text(render_pairing_setup_page(bundle, pairing_deep_link(bundle)))
+    capability = hashlib.sha256(
+        ("health-bridge-setup:" + bundle.invitation_secret).encode()
+    ).hexdigest()
+    route = "/setup/" + capability
+    with (
+        running_receiver(db_path) as origin,
+        open_http_error(Request(origin + route)) as rejected,
+    ):
+        assert rejected.code == 404
+    with running_receiver(db_path, setup_page=page) as origin:
+        for path in ("/setup", "/setup/invalid"):
+            with open_http_error(Request(origin + path)) as rejected:
+                assert rejected.code == 404
+        with open_http_response(Request(origin + route)) as response:
+            assert response.status == 200
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert 'href="healthbridge://pair?payload=' in response.read().decode()
+        with sqlite3.connect(db_path) as connection:
+            before = list(connection.iterdump())
+        with open_http_response(
+            Request(origin + route, headers={"Accept": "application/json"})
+        ) as response:
+            assert json.loads(response.read()) == {
+                "pairing_status": "pending",
+                "data_receipt_status": "not_received",
+            }
+        with sqlite3.connect(db_path) as connection:
+            assert list(connection.iterdump()) == before
+        if invalidate in {
+            "redeem",
+            "redeemed_expire",
+            "redeemed_revoke",
+            "token_revoke",
+            "device_revoke",
+        }:
+            request = Request(
+                origin + "/v1/pairing/redeem",
+                data=redeem_body(invitation_secret=bundle.invitation_secret),
+                headers={"Content-Type": "application/json"},
+            )
+            with open_http_response(request) as response:
+                assert response.status == 200
+        invalidate_setup_invitation(db_path, bundle.invitation_id, invalidate)
+        if invalidate == "read_failure":
+
+            def fail_read(_db: Path, _secret: str) -> None:
+                message = "synthetic private database error"
+                raise sqlite3.OperationalError(message)
+
+            monkeypatch.setattr(
+                receiver_server_module, "pairing_setup_progress", fail_read
+            )
+        if invalidate == "redeem":
+            with open_http_response(Request(origin + route)) as response:
+                paired_page = response.read().decode()
+                assert 'href="healthbridge://pair?payload=' not in paired_page
+                assert "<svg" not in paired_page
+                assert "Allow Health Access" in paired_page
+            with open_http_response(
+                Request(origin + route, headers={"Accept": "application/json"})
+            ) as response:
+                assert json.loads(response.read()) == {
+                    "pairing_status": "paired",
+                    "data_receipt_status": "not_received",
+                }
+        else:
+            with open_http_error(Request(origin + route)) as rejected:
+                assert rejected.code == (503 if invalidate == "read_failure" else 404)
+                assert b"healthbridge://pair?payload=" not in rejected.read()
+            with open_http_error(
+                Request(origin + route, headers={"Accept": "application/json"})
+            ) as rejected:
+                assert rejected.code == (503 if invalidate == "read_failure" else 404)
+                assert json.loads(rejected.read()) == {"error": "progress_unavailable"}
+    assert capsys.readouterr().err == ""
+
+
+def invalidate_setup_invitation(db: Path, invitation_id: str, mode: str) -> None:
+    if mode == "revoke":
+        revoke_pairing_invitation(db, invitation_id)
+    changes = {
+        "expire": "update pairing_invitations set expires_at = ?",
+        "redeemed_expire": "update pairing_invitations set expires_at = ?",
+        "redeemed_revoke": "update pairing_invitations set revoked_at = ?",
+        "token_revoke": "update receiver_tokens set revoked_at = ?",
+        "device_revoke": "update receiver_devices set revoked_at = ?",
+    }
+    with sqlite3.connect(db) as connection:
+        if statement := changes.get(mode):
+            _ = connection.execute(statement, ("2000-01-01T00:00:00Z",))
+        if mode == "blocked":
+            statement = (
+                "update pairing_invitations "
+                "set failed_attempt_count = max_failed_attempts"
+            )
+            _ = connection.execute(statement)
 
 
 def redeem_body(
@@ -832,3 +971,35 @@ def open_http_error(request: Request) -> HTTPError:
 
 def open_http_response(request: Request) -> HTTPResponse:
     return cast("HTTPResponse", urlopen(request, timeout=5))
+
+
+@pytest.mark.parametrize("held_reader", [False, True])
+def test_hosted_progress_retries_real_database_contention(
+    tmp_path: Path, held_reader: bool
+) -> None:
+    db = tmp_path / "receiver.sqlite"
+    bundle = create_receiver_pairing_invitation_bundle(
+        db, label="synthetic", receiver_url="https://health.example.test/v1/batches"
+    )
+    page = tmp_path / "pair.html"
+    _ = page.write_text(render_pairing_setup_page(bundle, pairing_deep_link(bundle)))
+    route = (
+        "/setup/"
+        + hashlib.sha256(
+            ("health-bridge-setup:" + bundle.invitation_secret).encode()
+        ).hexdigest()
+    )
+    with running_receiver(db, setup_page=page) as origin:
+        held = connect_readonly_database if held_reader else connect_database
+        with (
+            held(db),
+            open_http_error(
+                Request(origin + route, headers={"Accept": "application/json"})
+            ) as response,
+        ):
+            assert response.code == 503
+        with open_http_response(
+            Request(origin + route, headers={"Accept": "application/json"})
+        ) as response:
+            assert response.status == 200
+            assert json.loads(response.read())["pairing_status"] == "pending"

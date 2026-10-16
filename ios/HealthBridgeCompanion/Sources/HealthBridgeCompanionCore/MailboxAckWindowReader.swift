@@ -20,7 +20,7 @@ extension MailboxAckFileReader {
         directory: Int32,
         maximumEntries: Int,
         afterCheckpoint: String?,
-        strategy: MailboxAckWindowEnumerationStrategy = .automatic
+        strategy: MailboxAckWindowEnumerationStrategy = .bulkOnly
     ) throws -> MailboxAckLaneWindowEnumeration {
         guard 1 ... MailboxAckScanner.maximumScanFiles ~= maximumEntries else {
             throw MailboxAckFileError.unavailable

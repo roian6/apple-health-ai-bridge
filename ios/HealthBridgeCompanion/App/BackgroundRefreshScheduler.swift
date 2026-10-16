@@ -2,6 +2,23 @@ import BackgroundTasks
 import Foundation
 
 @MainActor
+protocol BackgroundRefreshScheduling: AnyObject {
+    func noteRequestConsumed()
+    func cancelPendingRefresh()
+    func scheduleNextRefreshIfNeeded(viewModel: HealthBridgeCompanionViewModel)
+}
+
+/// Preserve native admission, registration, coalescing and diagnostics.
+@MainActor
+final class NativeBackgroundRefreshScheduler: BackgroundRefreshScheduling {
+    func noteRequestConsumed() { BackgroundRefreshScheduler.noteRequestConsumed() }
+    func cancelPendingRefresh() { BackgroundRefreshScheduler.cancelPendingRefresh() }
+    func scheduleNextRefreshIfNeeded(viewModel: HealthBridgeCompanionViewModel) {
+        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+    }
+}
+
+@MainActor
 enum BackgroundRefreshScheduler {
     private static let requests = BackgroundRefreshRequestCoalescer()
 

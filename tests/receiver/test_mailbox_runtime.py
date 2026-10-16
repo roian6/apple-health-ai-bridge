@@ -26,7 +26,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from health_bridge.mailbox.connections import MailboxConnectionStore
     from health_bridge.mailbox.filesystem import MailboxDirectoryHandle
+    from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 
 
 RECEIVER_ID = "02" * 16
@@ -656,7 +658,16 @@ def test_serve_receiver_owns_mailbox_worker_lifecycle(
     events: list[str] = []
 
     class FakeWorker:
-        def __init__(self, *, db_path: Path, mailbox_root: Path) -> None:
+        def __init__(
+            self,
+            *,
+            db_path: Path,
+            mailbox_root: Path,
+            pairing_keys: MailboxKeyStore | None = None,
+            pairing_connections: MailboxConnectionStore | None = None,
+        ) -> None:
+            assert pairing_keys is None
+            assert pairing_connections is None
             assert db_path == tmp_path / "receiver.sqlite"
             assert mailbox_root == tmp_path / "mailboxes"
 

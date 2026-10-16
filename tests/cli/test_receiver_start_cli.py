@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -9,9 +10,11 @@ from typer.testing import CliRunner
 import health_bridge.cli_receiver as cli_receiver_module
 from health_bridge.cli import app
 from health_bridge.launchd import LaunchdServiceError, LaunchdServiceErrorCode
+from health_bridge.launchd.artifacts import write_launch_agent_artifacts
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
+from tests.launchd.support import service_request
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,15 +34,35 @@ def test_receiver_start_help_preserves_supported_options() -> None:
         "--mailbox-root",
         "--icloud-container-identifier",
         "--service-config",
+        "--setup-page",
     ):
         assert option in plain
 
 
+@pytest.mark.parametrize("configured", [False, True])
 def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    configured: bool,
 ) -> None:
     database = tmp_path / "health.sqlite"
+    page: Path | None = None
+    arguments = ["--db", str(database)]
+    if configured:
+        request = service_request(tmp_path)
+        database = request.db_path
+        page = database.parent / "pairing.html"
+        page.touch(mode=0o600)
+        request = replace(
+            request,
+            mailbox_root=None,
+            icloud_container_identifier=None,
+            setup_page=page,
+            label="health-bridge-qa",
+        )
+        monkeypatch.setenv("HOME", str(request.home))
+        _ = write_launch_agent_artifacts(request, activate=False)
+        arguments = ["--service-config", str(request.paths.config)]
     captured: dict[str, object] = {}
 
     def select_transport(
@@ -66,6 +89,7 @@ def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
         mailbox_key_store: MailboxKeyStore | None,
         mailbox_connection_store: MailboxConnectionStore | None,
         mailbox_root: Path | None,
+        setup_page: Path | None = None,
     ) -> None:
         captured.update(
             db_path=db_path,
@@ -74,6 +98,7 @@ def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
             mailbox_key_store=mailbox_key_store,
             mailbox_connection_store=mailbox_connection_store,
             mailbox_root=mailbox_root,
+            setup_page=setup_page,
         )
 
     monkeypatch.setattr(
@@ -87,7 +112,7 @@ def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
     )
     monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve_receiver)
 
-    result = CliRunner().invoke(app, ["receiver", "start", "--db", str(database)])
+    result = CliRunner().invoke(app, ["receiver", "start", *arguments])
 
     assert result.exit_code == 0, (result.output, result.exception)
     assert captured == {
@@ -100,6 +125,7 @@ def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
         "mailbox_key_store": None,
         "mailbox_connection_store": None,
         "mailbox_root": None,
+        "setup_page": page,
     }
 
 

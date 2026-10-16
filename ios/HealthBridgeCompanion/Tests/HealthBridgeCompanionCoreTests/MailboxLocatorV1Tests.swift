@@ -32,6 +32,50 @@ struct MailboxLocatorV1Tests {
         ).sorted() == MailboxLaneV1.allCases.map(\.rawValue).sorted())
     }
 
+    @Test("publishes the first pairing request without delivery lanes and retries identical bytes")
+    func publishPairingRequestWithoutDeliveryLanes() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let locator = try MailboxLocatorV1.resolvePairing(
+            invitationID: receiver,
+            providerRoot: fixture.providerRoot
+        )
+        let request = Data("synthetic-pairing-request".utf8)
+        let publisher = FileProviderMailboxEnvelopePublisher()
+
+        #expect(locator.lanes.isEmpty)
+        try await publisher.publishPairingRequest(request, locator: locator)
+        let finalURL = locator.deviceRoot.appendingPathComponent("request.hbp")
+        #expect(try Data(contentsOf: finalURL) == request)
+        try await publisher.publishPairingRequest(request, locator: locator)
+        #expect(try Data(contentsOf: finalURL) == request)
+        #expect(try FileManager.default.contentsOfDirectory(
+            atPath: locator.deviceRoot.path
+        ) == ["request.hbp"])
+    }
+
+    @Test("pairing publication rejects a replaced invitation directory")
+    func publishPairingRequestWhenDirectoryIsReplaced() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let locator = try MailboxLocatorV1.resolvePairing(
+            invitationID: receiver,
+            providerRoot: fixture.providerRoot
+        )
+        let preserved = fixture.root.appending(path: "preserved-pairing", directoryHint: .isDirectory)
+        try FileManager.default.moveItem(at: locator.deviceRoot, to: preserved)
+        try FileManager.default.createDirectory(at: locator.deviceRoot, withIntermediateDirectories: false)
+
+        await #expect(throws: MailboxLocatorError.pathReplaced) {
+            try await FileProviderMailboxEnvelopePublisher().publishPairingRequest(
+                Data("synthetic-pairing-request".utf8), locator: locator
+            )
+        }
+        #expect(!FileManager.default.fileExists(
+            atPath: locator.deviceRoot.appendingPathComponent("request.hbp").path
+        ))
+    }
+
     @Test("fails closed when the ubiquitous container is unavailable")
     func resolveWhenAccountOrContainerIsLost() throws {
         let fixture = try Fixture()

@@ -52,6 +52,7 @@ FORBIDDEN_SOURCE_PARTS: Final = (
 )
 QA_SOURCE_MEMBERS: Final = frozenset(
     {
+        "HealthBridgeAppIdentity.swift",
         "DeliveryProtocolV1.swift",
         "DeliveryProtocolV1Ack.swift",
         "DeliveryProtocolV1AckAuthentication.swift",

@@ -16,12 +16,12 @@ receiver creates a 20-minute single-use invitation
   the credential hash
 → receiver returns a completion acknowledgement without the credential
 → app promotes the staged credential to active settings and clears pending pairing state
-→ Health permissions and Sync Now happen after pairing
+→ the user chooses Health read permissions and starts automatic sync after pairing
 ```
 
 QR, the `healthbridge://pair` link, and manual server-plus-code entry are delivery methods for the **same invitation**. They are not separate authentication systems.
 
-Pairing is not proof of sync by itself. A release claim needs a receiver-side sync run and redacted local status/MCP output after the user grants Health read permission and taps the primary sync action.
+Pairing is not proof of sync by itself. A release claim needs actual receiver-side observations and redacted CLI/status output after the user grants Health read permission and starts sync. Automatic delivery, OFF preservation and recovery require their own real-device verification.
 
 ## Supported pairing methods
 
@@ -37,45 +37,19 @@ Use these in order:
 
 The manual code uses an unambiguous `5-5-5` shape. Its public selector allows the receiver to count failures against the correct invitation; the remaining 10 characters provide 50 bits of secret entropy and are stored with a salted memory-hard hash.
 
-## Create a setup page
+## Open the connection page
 
-First prepare the real receiver route by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
+Use the [setup guide](setup.md) for installation and receiver readiness. The unreleased onboarding candidate starts the owned supervised receiver and prints a private live connection URL; it no longer asks you to assemble a service or transfer an HTML file. Released `receiver-v1.1.2` users must follow its version-pinned guide instead.
 
-For normal onboarding, run the route-specific `health-bridge setup` command in that guide. Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
+Open the connection page on the receiver computer and scan its QR with iPhone Camera. On the iPhone, open the same page in Safari and tap **Open in Health Bridge**. If the phone cannot reach the private route, resolve that connectivity before trying another invitation. The page reports receiver readiness, pairing and the first received upload separately.
 
-Then derive the phone-facing health endpoint:
+An invitation lasts 20 minutes and works once. Re-run setup to obtain its current connection URL when the invitation expires; do not keep sharing an old page or link. These URLs and codes remain private. In Companion 1.1.1, pairing is followed by **Allow Health Access** or **Review Permissions** and the user's Apple Health read-permission choices. The user separately enables **Automatic Sync** when desired; an existing OFF setting is not overridden by receiver setup or re-pairing.
 
-```bash
-: "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
-PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
-```
+Expert `receiver create-pairing` and `dev device-session` commands remain available for explicit recovery or isolated QA. Raw secret-output modes are not the normal onboarding path. See [the CLI and contributor references](../CONTRIBUTING.md) rather than duplicating their setup commands here.
 
-Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page.
+## Direct receiver URL requirements
 
-If that setup invitation expired during verification, create a fresh QR-first page from the already verified batch URL. The new same-label invitation rotates the previous active one:
-
-```bash
-health-bridge receiver create-pairing \
-  --db ~/.local/share/health-bridge/health.sqlite \
-  --label iPhone \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --format setup-page \
-  --setup-page ~/.local/share/health-bridge/iphone-setup.html
-```
-
-The development-only device-session helper can also create invitation-based setup material while keeping stdout secret-redacted:
-
-```bash
-uv run health-bridge dev device-session \
-  --db .tmp/device.sqlite \
-  --label ios-companion \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --setup-page .tmp/ios-companion-device-session.html
-```
-
-Generated setup pages are mode `0600`. Open them only on trusted devices and delete them after pairing or expiry.
-
-## Receiver URL requirements
+The native iCloud candidate exchanges encrypted pairing files through iCloud Drive and does not require a receiver URL, HTTPS, or a tunnel. It requires companion and helper builds that support native pairing; availability in an already released app is not implied. The URL and manual-code rules below describe retained Direct and URL-based pairing.
 
 Common working shapes:
 
@@ -215,6 +189,9 @@ uv run health-bridge receiver revoke-device \
 
 `revoke-device` fails closed if the reference is malformed, absent, already revoked, or not unique. It never requires or prints the bearer credential, installation ID, installation hash, or token hash. Legacy v1 credentials that have no device mapping continue to use `receiver revoke-token --token-prefix ...`.
 
+Receiver upgrades keep existing device records, keys, and health data. An older mailbox connection may need its original pairing exchange replayed to confirm the exact peer. Until then, new deliveries stay pending rather than being accepted from a trust file alone. Native pairing retries the retained request automatically. Keep the original pairing material for a legacy URL-based mailbox retry; do not delete keys, the database, or queued uploads to force recovery. A revoked device still cannot enroll or deliver using its old credential.
+
+
 ## Legacy v1 compatibility
 
 Already paired devices and existing `/v1/batches` bearer credentials continue to work. The iOS parser accepts v1 pairing material during the migration window.
@@ -255,19 +232,13 @@ command remains `health-bridge setup --transport icloud-mailbox`; there is no
 separate hidden mailbox pairing command. Direct remains the default and never
 falls back to mailbox delivery.
 
-1. Keep the receiver running.
-2. Verify `/health` using the exact base URL the iPhone will reach.
-3. Generate a fresh invitation setup page.
-4. Open it on a trusted screen.
-5. Scan the QR with iPhone Camera.
-6. If QR cannot be used, tap the setup-page button or paste its link inside Health Bridge.
-7. If link handoff is unavailable, enter the displayed server address and invitation code.
-8. Confirm that Health Bridge reports the connection as saved.
-9. Grant only the Apple Health read permissions the user wants.
-10. Tap the primary app action and verify receiver-side aggregate sync evidence.
-11. Delete the setup page after pairing or expiry.
+1. Run setup for the selected transport and keep its owned receiver running.
+2. Open the private connection page printed by setup on a trusted screen, then scan its QR or use its Open button on the iPhone.
+3. For Direct, verify the phone-facing receiver URL and use the displayed server address and code if link handoff is unavailable. Native iCloud needs neither that URL nor a tunnel.
+4. Confirm the connection is saved, choose Apple Health read permissions, and separately enable **Automatic Sync** when wanted. Existing OFF consent remains unchanged.
+5. Keep the live page open until it reports stored records; confirm local CLI/MCP access from the setup terminal. Re-run setup to resume the same paired receiver without issuing another invitation.
 
-If pairing reports invalid/unavailable, generate a new invitation. That generic result intentionally does not reveal whether the old invitation was mistyped, expired, revoked, locked, used, or unknown.
+An expired unused invitation needs a new setup link. A delayed native completion can be retried with the same pending request; do not delete pairing state or provider files as a recovery step. Manually exported Direct invitation files are private capabilities and can be removed after handoff or expiry.
 
 ## Security rules
 

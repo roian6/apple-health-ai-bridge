@@ -9,7 +9,7 @@ from typing import cast
 ROOT = Path(__file__).parents[2]
 
 
-def test_receiver_1_1_2_preserves_ios_1_1_1_build_50() -> None:
+def test_current_coordinated_candidate_uses_ios_1_1_2_build_62() -> None:
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = cast("dict[str, object]", tomllib.load(handle)["project"])
     component_versions = cast(
@@ -31,16 +31,16 @@ def test_receiver_1_1_2_preserves_ios_1_1_1_build_50() -> None:
         / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
     ).read_text()
 
-    assert project["version"] == "1.1.2"
-    assert '__version__: Final = "1.1.2"' in package_init
-    assert server["version"] == "1.1.2"
-    assert receiver == {"release_tag": "receiver-v1.1.2", "version": "1.1.2"}
-    assert component_versions["release_scope"] == "receiver"
-    assert helper_info["CFBundleShortVersionString"] == "1.1.2"
+    assert project["version"] == "1.1.3"
+    assert '__version__: Final = "1.1.3"' in package_init
+    assert server["version"] == "1.1.3"
+    assert receiver == {"release_tag": "receiver-v1.1.3", "version": "1.1.3"}
+    assert component_versions["release_scope"] == "coordinated"
+    assert helper_info["CFBundleShortVersionString"] == "1.1.3"
     assert helper_info["CFBundleVersion"] == "1"
-    assert ios == {"build": "50", "marketing_version": "1.1.1"}
-    assert ios_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert ios_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
+    assert ios == {"build": "62", "marketing_version": "1.1.2"}
+    assert ios_project.count("MARKETING_VERSION = 1.1.2;") == 2
+    assert ios_project.count("CURRENT_PROJECT_VERSION = 62;") == 2
 
 
 def test_receiver_1_1_1_release_notes_are_receiver_only_and_helper_bound() -> None:

@@ -37,7 +37,6 @@ def test_qa_pairing_provisions_both_key_families_without_production_store() -> N
         assert required in receiver
     assert "ReceiverSettingsStore" not in client
     assert "MailboxConnectionStore.production" not in receiver
-    assert "server.mailbox_root / receiver_id.hex()" not in receiver
     assert "(mailbox_path / lane).mkdir" not in receiver
     assert '"hb_" + base64URL' in client
     assert "isPrivateReceiverHost" in client
@@ -52,6 +51,7 @@ def test_qa_pairing_is_immutable_and_harness_actions_are_ordered() -> None:
     models = (core / "MailboxQAModels.swift").read_text(encoding="utf-8")
 
     # When / Then: only explicit cleanup deletes state and actions are machine-owned.
+    assert "@MainActor\nfinal class MailboxQAInvocation" in invocation
     assert invocation.count("SecItemDelete") == 1
     assert "case .cleanup" in invocation
     assert "errSecDuplicateItem" in invocation

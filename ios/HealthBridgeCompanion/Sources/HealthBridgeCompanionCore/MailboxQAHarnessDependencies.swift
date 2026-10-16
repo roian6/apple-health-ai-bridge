@@ -12,7 +12,7 @@ extension MailboxQAHarness {
                 identityProvider: signer
             ),
             locate: { self.locator },
-            publisher: MailboxQAPublisherFactory.publisher(fault: fault),
+            publisher: publisher(fault),
             envelopeID: envelopeID,
             nowMilliseconds: { Int64(Date().timeIntervalSince1970 * 1_000) },
             isCancelled: { false },

@@ -912,6 +912,13 @@ def start(  # noqa: PLR0913 -- Typer exposes six independent receiver options.
             help="Owner-only mailbox LaunchAgent receiver configuration.",
         ),
     ] = None,
+    setup_page: Annotated[
+        Path | None,
+        typer.Option(
+            "--setup-page",
+            help="Enable invitation-protected hosting of this private pairing page.",
+        ),
+    ] = None,
 ) -> None:
     run_receiver_start(
         ReceiverStartOptions(
@@ -921,6 +928,7 @@ def start(  # noqa: PLR0913 -- Typer exposes six independent receiver options.
             mailbox_root=mailbox_root,
             icloud_container_identifier=icloud_container_identifier,
             service_config=service_config,
+            setup_page=setup_page,
         ),
         ReceiverStartDependencies(
             load_service_config=load_runnable_launch_agent_request,

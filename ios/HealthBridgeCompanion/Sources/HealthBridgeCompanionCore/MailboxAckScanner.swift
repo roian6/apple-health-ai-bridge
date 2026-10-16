@@ -4,6 +4,7 @@ import Foundation
 
 public final class MailboxAckScanner {
     public static let maximumScanFiles = 10_000
+    public static let maximumEnumerationEntries = 2 * maximumScanFiles
     public static let maximumScanBytes: Int64 = 2 * 1024 * 1024 * 1024
     typealias Locate = () throws -> MailboxResolvedLocatorV1
     typealias Fault = (MailboxAckScanBoundary) throws -> Void
@@ -171,7 +172,7 @@ public final class MailboxAckScanner {
     func candidateWindow(
         maximumEntries: Int,
         afterCheckpoint: String?,
-        strategy: MailboxAckWindowEnumerationStrategy = .automatic
+        strategy: MailboxAckWindowEnumerationStrategy = .bulkOnly
     ) throws -> MailboxAckCandidateWindow {
         guard 1 ... Self.maximumScanFiles ~= maximumEntries else {
             throw MailboxAckScannerError.invalidContext
@@ -316,8 +317,13 @@ public final class MailboxAckScanner {
         do {
             enumeration = try MailboxAckFileReader.enumerate(
                 directory: directory,
-                maximumNames: Self.maximumScanFiles
+                maximumNames: Self.maximumScanFiles,
+                maximumRawEntries: Self.maximumEnumerationEntries
             )
+        } catch let error as MailboxAckEnumerationError {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw MailboxAckScannerError.unsafeMailbox
         }

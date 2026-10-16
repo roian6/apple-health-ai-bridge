@@ -57,13 +57,13 @@ final class MailboxQAInvocation {
                     available: UIApplication.shared.isProtectedDataAvailable
                 )
                 stage = "advance"
-                var state = try harness.advance(fault: request.fault)
+                var state = try await harness.advanceAwaitingPublication(fault: request.fault)
                 if request.fault == nil {
                     for _ in 0..<15 where state.lastPhase != .providerObserved {
                         if state.lastPhase == .published {
                             try await Task.sleep(nanoseconds: 2_000_000_000)
                         }
-                        state = try harness.advance()
+                        state = try await harness.advanceAwaitingPublication()
                     }
                 }
                 try writeOutput(

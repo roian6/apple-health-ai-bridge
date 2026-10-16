@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Final, cast, final
 
 from health_bridge.contract._delivery_common import MAX_ENVELOPE_BYTES
-from health_bridge.mailbox.filesystem import MailboxDirectoryHandle, read_final_at
+from health_bridge.mailbox.filesystem import (
+    MailboxDirectoryHandle,
+    read_final,
+    read_final_at,
+)
 from health_bridge.mailbox.helper_lifecycle import HelperError, require_ready_helper
 from health_bridge.mailbox.publication import PublicationState
 from health_bridge.private_files import (
@@ -25,6 +29,7 @@ from health_bridge.private_files import (
     ensure_private_directory,
     write_private_text_file,
 )
+from health_bridge.receiver.mailbox_bootstrap import MAX_PAIRING_BYTES
 
 PROTOCOL_VERSION: Final = 1
 DEFAULT_HELPER_APP_NAME: Final = "HealthBridgeMailboxAckPublisher.app"
@@ -81,6 +86,83 @@ class NativeAckPublisher:
         if config.timeout_seconds <= 0:
             raise ValueError
         self._config = config
+
+    def require_native_pairing(self) -> None:
+        _require_executable(self._config.helper_executable)
+        try:
+            # Checked native helper; fixed argv is passed without a shell.
+            result = subprocess.run(  # nosec B603
+                [str(self._config.helper_executable), "--native-pairing-v1"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=self._config.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise NativeAckPublicationError("native pairing helper timed out") from exc
+        if (
+            result.returncode != 0
+            or result.stdout.strip() != b"native-pairing-v1:available"
+        ):
+            raise NativeAckPublicationError(
+                "native pairing helper capability unavailable"
+            )
+
+    def publish_pairing(self, directory: Path, payload: bytes) -> None:
+        self.require_native_pairing()
+        invitation = directory.name
+        _require_opaque_component(invitation)
+        if len(payload) > MAX_PAIRING_BYTES or not payload:
+            raise NativeAckPublicationError("invalid pairing completion size")
+        request_id = secrets.token_hex(16)
+        root = self._config.protocol_root
+        for lane in (root, root / "requests", root / "staging", root / "receipts"):
+            ensure_private_directory(lane)
+            _require_owner_private_directory(lane)
+        source = root / "staging" / f"{request_id}.hbp"
+        request_path = root / "requests" / f"{request_id}.json"
+        receipt_path = root / "receipts" / f"{request_id}.json"
+        request = {
+            "version": 1,
+            "requestID": request_id,
+            "invitationID": invitation,
+            "byteCount": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        try:
+            _write_private_bytes(source, payload)
+            write_private_text_file(
+                request_path, json.dumps(request, separators=(",", ":"))
+            )
+            try:
+                # Checked native helper; this request ID is generated locally.
+                result = subprocess.run(  # nosec B603
+                    [str(self._config.helper_executable), f"pairing:{request_id}"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=self._config.timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise NativeAckPublicationError(
+                    "native pairing helper timed out"
+                ) from exc
+            if result.returncode != 0 or _read_receipt(receipt_path) != {
+                **request,
+                "published": True,
+                "bootstrapVersion": 1,
+            }:
+                raise NativeAckPublicationError("native pairing publication failed")
+            final = read_final(
+                directory / "completion.hbp", maximum_bytes=MAX_PAIRING_BYTES
+            )
+            if final.content != payload:
+                raise NativeAckPublicationError("native pairing completion mismatch")
+        finally:
+            for path in (source, request_path, receipt_path):
+                _unlink_protocol_file(path)
 
     def __call__(
         self,

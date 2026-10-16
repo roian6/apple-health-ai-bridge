@@ -11,7 +11,9 @@ public final class MailboxQAHarness {
     let signer: MailboxQASigningIdentity
     let envelopeID: () -> Data
     let observeEnvelope: (URL, String) throws -> Bool
+    let publisher: (MailboxQAFault?) -> any MailboxEnvelopePublishing
     private var state: MailboxQADurableStateV1
+    private var advanceInProgress = false
 
     public convenience init(
         applicationSupportRoot: URL,
@@ -35,13 +37,15 @@ public final class MailboxQAHarness {
         containerIdentifier: String,
         pairing: MailboxQAPairingRecordV1,
         envelopeID: @escaping () -> Data,
-        observeEnvelope: @escaping (URL, String) throws -> Bool
+        observeEnvelope: @escaping (URL, String) throws -> Bool,
+        publisher: @escaping (MailboxQAFault?) -> any MailboxEnvelopePublishing = MailboxQAPublisherFactory.publisher
     ) throws {
         try pairing.validate()
         self.applicationSupportRoot = applicationSupportRoot
         self.pairing = pairing
         self.envelopeID = envelopeID
         self.observeEnvelope = observeEnvelope
+        self.publisher = publisher
         try FileManager.default.createDirectory(
             at: applicationSupportRoot,
             withIntermediateDirectories: true,
@@ -114,6 +118,31 @@ public final class MailboxQAHarness {
     public func advance(
         fault: MailboxQAFault? = nil
     ) throws -> MailboxQADurableStateV1 {
+        guard !advanceInProgress else { throw MailboxQAHarnessError.invalidState }
+        advanceInProgress = true
+        defer { advanceInProgress = false }
+        let (item, coordinator) = try prepareAdvance(fault: fault)
+        let updated = try coordinator.advance(itemID: item.id)
+        return try finishAdvance(item: item, updated: updated)
+    }
+
+    @MainActor
+    @discardableResult
+    public func advanceAwaitingPublication(
+        fault: MailboxQAFault? = nil
+    ) async throws -> MailboxQADurableStateV1 {
+        guard !advanceInProgress else { throw MailboxQAHarnessError.invalidState }
+        advanceInProgress = true
+        defer { advanceInProgress = false }
+        let (item, coordinator) = try prepareAdvance(fault: fault)
+        let updated = try await coordinator.advanceAwaitingPublication(itemID: item.id)
+        try Task.checkCancellation()
+        return try finishAdvance(item: item, updated: updated)
+    }
+
+    private func prepareAdvance(
+        fault: MailboxQAFault?
+    ) throws -> (FileOutboxItem, OutboxDeliveryCoordinator) {
         guard state.lastPhase != .committedFinalized else {
             throw MailboxQAHarnessError.invalidState
         }
@@ -134,7 +163,13 @@ public final class MailboxQAHarness {
             }
             state.faultInjectionCount += 1
         }
-        let updated = try coordinator.advance(itemID: item.id)
+        return (item, coordinator)
+    }
+
+    private func finishAdvance(
+        item: FileOutboxItem,
+        updated: FileOutboxDeliveryStateV1
+    ) throws -> MailboxQADurableStateV1 {
         try observe(updated.phase)
         if let binding = try outbox.mailboxBinding(for: item.id) {
             if let previous = state.envelopeSHA256,
@@ -149,6 +184,7 @@ public final class MailboxQAHarness {
 
     @discardableResult
     public func scanAndFinalize() throws -> MailboxQADurableStateV1 {
+        guard !advanceInProgress else { throw MailboxQAHarnessError.invalidState }
         guard let itemID = state.itemID else {
             throw MailboxQAHarnessError.invalidState
         }
@@ -220,6 +256,7 @@ public final class MailboxQAHarness {
     }
 
     public func removeQAProviderArtifacts() throws {
+        guard !advanceInProgress else { throw MailboxQAHarnessError.invalidState }
         let finalized = state.lastPhase == .committedFinalized
             && state.finalizationCount == 1
         let pristine = state.lastPhase == nil

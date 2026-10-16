@@ -44,6 +44,8 @@ A type can produce records only when the companion implements its reader and pay
 
 Daily activity aggregates remain an internal derived projection. They use HealthKit statistics for completed local-day totals such as steps, distance, energy, exercise time, stand time, flights, and basal energy. In-progress local-day statistics are not published as daily totals; current-day raw, source-attributed samples remain separate. These aggregates are not a second user-selectable sync scope.
 
+Read-only daily summaries consider an aggregate eligible for a completed total only when its interval covers the full calendar day and any explicit `aggregation_completeness` marker is exactly `complete`. Local-day records require matching `calendar_day` and IANA `time_zone_identifier` metadata; day boundaries follow that zone's rules, including daylight saving changes. Legacy records without a completeness marker use the same coverage check. Records without either calendar or timezone metadata qualify only with UTC midnight-to-next-midnight coverage for the reported day. Invalid or partial records remain stored and retain their observed sums, counts, and representation provenance in `sample_total_semantics`. Eligible totals remain in `last_known_daily_activity_totals`; only fresh, causally scoped statistics also enter current `daily_activity_totals`. Legacy records without that confidence stay `legacy_unknown`, even when their full-day coverage is valid. Missing or ineligible totals remain unknown; a qualifying explicit zero is retained without inferring zero from absence.
+
 ## Pairing and authorization boundary
 
 Pairing invitations are temporary and single-use. Redemption produces a device credential stored in the iOS Keychain and hashed by the receiver.

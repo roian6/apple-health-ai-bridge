@@ -9,12 +9,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, assert_never, cast
+from typing import Any, BinaryIO, Final, Literal, assert_never, cast
 
+from pydantic import TypeAdapter
 from release_versions import (
     ReleaseError,
     canonical_receiver_tag,
@@ -500,7 +502,7 @@ def _validate_component_version_index(
         raise ReleaseError(message)
 
 
-def _git_output(repo: Path, *args: str) -> str:
+def _git_bytes(repo: Path, *args: str) -> bytes:
     if GIT_EXECUTABLE is None:
         message = "Git executable is required for trusted transition validation"
         raise ReleaseError(message)
@@ -509,12 +511,15 @@ def _git_output(repo: Path, *args: str) -> str:
         cwd=repo,
         capture_output=True,
         check=False,
-        text=True,
     )
     if completed.returncode != 0:
         message = "trusted release commit could not be resolved"
         raise ReleaseError(message)
-    return completed.stdout.strip()
+    return completed.stdout
+
+
+def _git_output(repo: Path, *args: str) -> str:
+    return _git_bytes(repo, *args).decode("utf-8").strip()
 
 
 def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
@@ -723,8 +728,99 @@ def create_manifest(request: ManifestRequest) -> None:
         "release_version": versions.project_version,
         "schema_id": "health_bridge.release.v3",
     }
+    node = _node_launcher_metadata(request.repo, request.dist, versions, request.tag)
+    if node is not None:
+        payload["schema_id"] = "health_bridge.release.v4"
+        payload["node_launcher"] = node
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
     _atomic_write(request.output, encoded)
+
+
+def _node_launcher_source(repo: Path) -> dict[str, object] | None:
+    path = "node-cli/package.json"
+    if not _git_output(repo, "ls-tree", "HEAD", "--", path):
+        return None
+    return TypeAdapter(dict[str, object]).validate_json(
+        _git_output(repo, "show", f"HEAD:{path}")
+    )
+
+
+def _node_launcher_metadata(
+    repo: Path, dist: Path, versions: ReleaseVersions, tag: str
+) -> dict[str, object] | None:
+    package = _node_launcher_source(repo)
+    if package is None:
+        return None
+    engines = TypeAdapter(dict[str, str]).validate_python(package.get("engines"))
+    name, version = package.get("name"), package.get("version")
+    if (
+        name != "apple-health-ai-bridge"
+        or not isinstance(version, str)
+        or not isinstance(engines.get("node"), str)
+    ):
+        message = "node launcher source identity or runtime is invalid"
+        raise ReleaseError(message)
+    _ = parse_semantic_version(version, surface="node launcher")
+    archive = dist / f"{name}-{version}.tgz"
+    if archive.is_symlink() or not archive.is_file():
+        message = "node launcher archive must be a regular file"
+        raise ReleaseError(message)
+    expected_members = {
+        "package/package.json",
+        "package/backend-pin.json",
+        "package/health-bridge.mjs",
+        "package/skills/health-bridge/SKILL.md",
+    }
+    wheel = dist / f"apple_health_ai_bridge-{versions.project_version}-py3-none-any.whl"
+    release_url = "https://github.com/roian6/apple-health-ai-bridge/releases/download"
+    expected_pin = {
+        "name": "apple-health-ai-bridge",
+        "version": versions.project_version,
+        "sha256": _sha256(wheel),
+        "url": f"{release_url}/{tag}/{wheel.name}",
+    }
+    try:
+        with tarfile.open(archive, "r:gz") as packed:
+            members = packed.getmembers()
+            if (
+                len(members) != len(expected_members)
+                or {member.name for member in members} != expected_members
+                or any(not member.isfile() for member in members)
+            ):
+                message = "node launcher archive payload file set is not exact"
+                raise ReleaseError(message)
+            for filename, expected in (
+                ("package/package.json", package),
+                ("package/backend-pin.json", expected_pin),
+            ):
+                # The exact regular member set was validated above.
+                stream = cast("BinaryIO", packed.extractfile(filename))
+                with stream:
+                    actual = TypeAdapter(dict[str, object]).validate_json(stream.read())
+                if actual != expected:
+                    message = "node launcher package or backend pin differs from source"
+                    raise ReleaseError(message)
+            for relative, source in (
+                ("health-bridge.mjs", "node-cli/health-bridge.mjs"),
+                ("skills/health-bridge/SKILL.md", "skills/health-bridge/SKILL.md"),
+            ):
+                stream = cast("BinaryIO", packed.extractfile(f"package/{relative}"))
+                if stream.read() != _git_bytes(repo, "show", f"HEAD:{source}"):
+                    message = "node launcher body differs from source HEAD"
+                    raise ReleaseError(message)
+    except tarfile.TarError as exc:
+        message = "node launcher archive is invalid"
+        raise ReleaseError(message) from exc
+    return {
+        "package": name,
+        "version": version,
+        "requires_node": engines["node"],
+        "artifact": {
+            "filename": archive.name,
+            "sha256": _sha256(archive),
+            "bytes": archive.stat().st_size,
+        },
+    }
 
 
 def _metadata_artifact_records(payload: object) -> dict[str, tuple[str, int]]:
@@ -736,6 +832,12 @@ def _metadata_artifact_records(payload: object) -> dict[str, tuple[str, int]]:
     if not isinstance(artifacts, list) or not artifacts:
         message = "release metadata has invalid Python artifact entries"
         raise ReleaseError(message)
+    if isinstance(payload, dict) and "node_launcher" in payload:
+        node = payload["node_launcher"]
+        if not isinstance(node, dict) or "artifact" not in node:
+            message = "release metadata has invalid node launcher artifact"
+            raise ReleaseError(message)
+        artifacts = [*artifacts, node["artifact"]]
     expected: dict[str, tuple[str, int]] = {}
     for artifact in artifacts:
         if not isinstance(artifact, dict):
@@ -799,6 +901,7 @@ def _expected_git_identity(
 
 def _validate_release_metadata(
     repo: Path,
+    dist: Path,
     payload: object,
     versions: ReleaseVersions,
     *,
@@ -814,11 +917,18 @@ def _validate_release_metadata(
         "release_version",
         "schema_id",
     }
+    node = _node_launcher_metadata(repo, dist, versions, expected_git["tag"])
+    if node is not None:
+        expected_top_level.add("node_launcher")
     if not isinstance(payload, dict) or set(payload) != expected_top_level:
         message = "release metadata top-level schema is not exact"
         raise ReleaseError(message)
+    expected_schema = (
+        "health_bridge.release.v4" if node is not None else "health_bridge.release.v3"
+    )
     if (
-        payload.get("schema_id") != "health_bridge.release.v3"
+        payload.get("schema_id") != expected_schema
+        or (node is not None and payload.get("node_launcher") != node)
         or payload.get("release_scope") != _release_scope(versions)
         or payload.get("release_version") != versions.project_version
         or payload.get("batch_contract") != _batch_contract(repo)
@@ -839,11 +949,11 @@ def _validate_release_metadata(
     ):
         message = "release metadata Python package or runtime contract is invalid"
         raise ReleaseError(message)
-    records = _metadata_artifact_records(payload)
-    if set(records) != _expected_python_artifact_names(versions):
+    python_records = _metadata_artifact_records({"python": python})
+    if set(python_records) != _expected_python_artifact_names(versions):
         message = "release metadata artifact file set is not exact"
         raise ReleaseError(message)
-    return records
+    return _metadata_artifact_records(payload)
 
 
 def _exact_regular_file_names(
@@ -876,6 +986,7 @@ def create_checksums(request: ChecksumRequest) -> None:
     payload = json.loads(metadata.read_text(encoding="utf-8"))
     expected_artifacts = _validate_release_metadata(
         request.repo,
+        request.dist,
         payload,
         versions,
         expected_git=expected_git,
@@ -942,6 +1053,7 @@ def _verify_packet_metadata(
     )
     records = _validate_release_metadata(
         request.repo,
+        request.dist,
         payload,
         versions,
         expected_git=expected_git,
@@ -976,6 +1088,9 @@ def verify_packet(request: PacketVerificationRequest) -> None:
         "release-notes.md",
         "SHA256SUMS",
     }
+    node = _node_launcher_metadata(request.repo, request.dist, versions, request.tag)
+    if node is not None:
+        expected_names.add(f"{node['package']}-{node['version']}.tgz")
     present_names = _exact_regular_file_names(request.dist)
     if present_names != expected_names:
         message = "downloaded release packet file set is not exact"
@@ -1017,6 +1132,7 @@ def _validate_helper_packet(
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     records = _validate_release_metadata(
         request.repo,
+        request.dist,
         payload,
         versions,
         expected_git=expected_git,
@@ -1157,6 +1273,7 @@ def verify_core_draft(request: DraftVerificationRequest) -> None:
     )
     records = _validate_release_metadata(
         request.repo,
+        request.dist,
         metadata_payload,
         versions,
         expected_git=_expected_git_identity(
@@ -1230,6 +1347,7 @@ def verify_release_state(
     )
     artifact_records = _validate_release_metadata(
         request.repo,
+        request.dist,
         metadata_payload,
         versions,
         expected_git=expected_git,
@@ -1245,7 +1363,7 @@ def verify_release_state(
             message = f"release metadata artifact mismatch: {name}"
             raise ReleaseError(message)
     remote_assets = _release_asset_records(payload)
-    expected_names = _expected_python_artifact_names(versions) | {
+    expected_names = set(artifact_records) | {
         "SHA256SUMS",
         "release-metadata.json",
     }

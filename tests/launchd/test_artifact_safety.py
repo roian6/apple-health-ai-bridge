@@ -359,6 +359,7 @@ def test_manifest_publication_failure_rolls_back_only_new_service_artifacts(
     assert code == "unsafe_filesystem"
     assert sibling.read_bytes() == b"foreign"
     assert request.db_path.is_file()
+    assert request.mailbox_root is not None
     assert request.mailbox_root.is_dir()
     for path in (
         request.paths.config,
@@ -403,6 +404,7 @@ def test_fresh_manifest_publication_failure_leaves_empty_private_directories(
     assert all(path.stat().st_size == 0 for path in request.paths.state_dir.iterdir())
     assert request.paths.manifest.parent.is_dir()
     assert request.db_path.is_file()
+    assert request.mailbox_root is not None
     assert request.mailbox_root.is_dir()
 
 
@@ -414,6 +416,7 @@ def test_owned_installation_load_ignores_missing_runtime_targets(
     _ = write_launch_agent_artifacts(request, activate=False)
     request.executable.unlink()
     request.db_path.unlink()
+    assert request.mailbox_root is not None
     request.mailbox_root.rmdir()
     monkeypatch.setenv("HOME", str(request.home))
 

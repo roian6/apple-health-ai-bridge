@@ -12,12 +12,17 @@ from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter
 
+from health_bridge.queries.sources import connection_has_observations
 from health_bridge.receiver.tokens import (
     create_receiver_token_in_connection,
     hash_receiver_token,
 )
 from health_bridge.receiver.transports import ReceiverTransport
-from health_bridge.storage.database import connect_database, initialize_database
+from health_bridge.storage.database import (
+    connect_database,
+    connect_readonly_database,
+    initialize_database,
+)
 
 INVITATION_CODE_ALPHABET: Final = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 INVITATION_CODE_SELECTOR_LENGTH: Final = 5
@@ -147,8 +152,8 @@ class ReceiverDeviceSummary:
 class IssuedPairingInvitation:
     invitation_id: str
     label: str
-    receiver_url: str
-    redeem_url: str
+    receiver_url: str | None
+    redeem_url: str | None
     invitation_secret: str
     invitation_code: str
     created_at: str
@@ -159,7 +164,7 @@ class IssuedPairingInvitation:
 @dataclass(frozen=True, slots=True)
 class PairingRedemptionCompletion:
     label: str
-    receiver_url: str
+    receiver_url: str | None
     installation_id_hash: str
     transport: ReceiverTransport
 
@@ -168,7 +173,7 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
     db_path: Path,
     *,
     label: str,
-    receiver_url: str,
+    receiver_url: str | None,
     transport: ReceiverTransport | Literal["direct", "mailbox"] = (
         ReceiverTransport.DIRECT
     ),
@@ -177,8 +182,11 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
 ) -> IssuedPairingInvitation:
-    normalized_url = _validate_receiver_url(receiver_url)
     selected_transport = ReceiverTransport(transport)
+    if receiver_url is None and selected_transport is ReceiverTransport.MAILBOX:
+        normalized_url = ""
+    else:
+        normalized_url = _validate_receiver_url(receiver_url or "")
     issued_at = _normalized_now(now)
     if not INVITATION_MIN_TTL <= expires_in <= INVITATION_MAX_TTL:
         message = "Pairing invitation expiry must be between 10 and 30 minutes."
@@ -246,8 +254,8 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
         return IssuedPairingInvitation(
             invitation_id=invitation_id,
             label=label,
-            receiver_url=normalized_url,
-            redeem_url=_redeem_url(normalized_url),
+            receiver_url=normalized_url or None,
+            redeem_url=_redeem_url(normalized_url) if normalized_url else None,
             invitation_secret=secret,
             invitation_code=code,
             created_at=issued_at_text,
@@ -268,15 +276,17 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
     now: datetime | None = None,
-    before_commit: Callable[[PairingRedemptionCompletion], None] | None = None,
+    before_commit: Callable[[PairingRedemptionCompletion], str | None] | None = None,
+    native_invitation_id: str | None = None,
 ) -> PairingRedemptionCompletion:
     if (invitation_secret is None) == (invitation_code is None):
         message = "Provide exactly one pairing invitation credential."
         raise PairingInvitationError(message)
-    normalized_installation_id = _normalize_installation_id(installation_id)
-    normalized_device_credential = _normalize_device_credential(device_credential)
     normalized_platform = _normalize_platform(platform)
-    installation_id_hash = _hash_installation_id(normalized_installation_id)
+    normalized_device_credential = _normalize_device_credential(device_credential)
+    installation_id_hash = _hash_installation_id(
+        _normalize_installation_id(installation_id)
+    )
     device_credential_hash = hash_receiver_token(normalized_device_credential)
     timestamp = _format_utc(_normalized_now(now))
 
@@ -333,6 +343,7 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
             revoked_at,
             _transport,
         ) = lookup
+        _require_native_invitation(lookup, native_invitation_id)
         if redeemed_at is not None:
             completion = INVITATION_RESULT_ROW_ADAPTER.validate_python(
                 connection.execute(
@@ -347,6 +358,8 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
                 completion,
                 installation_id_hash,
                 before_commit,
+                connection,
+                invitation_id,
             )
             connection.commit()
             return result
@@ -407,23 +420,162 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
             completion,
             installation_id_hash,
             before_commit,
+            connection,
+            invitation_id,
         )
 
 
 def _finish_redemption(
     completion: InvitationResultRow,
     installation_id_hash: str,
-    before_commit: Callable[[PairingRedemptionCompletion], None] | None,
+    before_commit: Callable[[PairingRedemptionCompletion], str | None] | None,
+    connection: sqlite3.Connection,
+    invitation_id: str,
 ) -> PairingRedemptionCompletion:
     result = PairingRedemptionCompletion(
         label=completion[0],
-        receiver_url=completion[1],
+        receiver_url=completion[1] or None,
         installation_id_hash=installation_id_hash,
         transport=ReceiverTransport(completion[2]),
     )
     if before_commit is not None:
-        before_commit(result)
+        enrollment = before_commit(result)
+        if result.transport is ReceiverTransport.MAILBOX and enrollment is not None:
+            updated = connection.execute(
+                """update pairing_invitation_redemptions
+                set mailbox_enrollment_sha256 = ?
+                where pairing_invitation_id = ? and
+                (mailbox_enrollment_sha256 is null or mailbox_enrollment_sha256 = ?)""",
+                (enrollment, invitation_id, enrollment),
+            )
+            if updated.rowcount != 1:
+                raise PairingInvitationError(GENERIC_INVITATION_ERROR)
     return result
+
+
+def pairing_invitation_is_pending(db_path: Path, secret: str) -> bool:
+    with connect_readonly_database(db_path) as connection:
+        row = INVITATION_LOOKUP_ROW_ADAPTER.validate_python(
+            connection.execute(
+                LOOKUP_BY_SECRET_SQL, (_hash_invitation_secret(secret),)
+            ).fetchone()
+        )
+    return (
+        row is not None
+        and row[5] < row[6]
+        and row[7] > _format_utc(_normalized_now(None))
+        and row[8] is None
+        and row[9] is None
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SetupProgress:
+    pairing_status: Literal["pending", "paired"] = "pending"
+    data_receipt_status: Literal["not_received", "received"] = "not_received"
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveSetupPairing:
+    invitation_id: str
+    label: str
+    receiver_url: str | None
+    transport: Literal["direct", "mailbox"]
+    progress: SetupProgress
+
+
+def active_setup_pairings(
+    connection: sqlite3.Connection, invitation_id: str | None = None
+) -> list[ActiveSetupPairing]:
+    rows = TypeAdapter(
+        list[tuple[str, str, Literal["direct", "mailbox"], str, str]]
+    ).validate_python(
+        connection.execute(
+            """select invitation.invitation_label, invitation.receiver_url,
+            invitation.transport, device.installation_id_hash,
+            redemption.pairing_invitation_id
+        from pairing_invitation_redemptions redemption
+        join pairing_invitations invitation using (pairing_invitation_id)
+        join receiver_devices device using (receiver_device_id)
+        join receiver_tokens token using (receiver_token_id)
+        join receiver_token_devices mapping
+            on mapping.receiver_token_id = redemption.receiver_token_id
+            and mapping.receiver_device_id = redemption.receiver_device_id
+        where device.revoked_at is null and token.revoked_at is null
+            and (? is null or redemption.pairing_invitation_id = ?)
+        order by redemption.pairing_invitation_id""",
+            (invitation_id, invitation_id),
+        ).fetchall()
+    )
+    return [
+        ActiveSetupPairing(
+            invitation_id,
+            label,
+            url or None,
+            transport,
+            SetupProgress(
+                pairing_status="paired",
+                data_receipt_status="received"
+                if connection_has_observations(connection, installation)
+                else "not_received",
+            ),
+        )
+        for label, url, transport, installation, invitation_id in rows
+    ]
+
+
+def local_setup_pairing(
+    db_path: Path,
+    invitation_secret: str | None = None,
+    *,
+    invitation_ids: tuple[str, ...] | None = None,
+) -> ActiveSetupPairing | None:
+    """Read retained local ownership; this does not grant browser access."""
+    with connect_readonly_database(db_path) as connection:
+        invitation_id = None
+        if invitation_secret is not None:
+            row = INVITATION_LOOKUP_ROW_ADAPTER.validate_python(
+                connection.execute(
+                    LOOKUP_BY_SECRET_SQL, (_hash_invitation_secret(invitation_secret),)
+                ).fetchone()
+            )
+            if row is None:
+                return None
+            invitation_id = row[0]
+        paired = active_setup_pairings(connection, invitation_id)
+        if invitation_ids is not None:
+            paired = [pair for pair in paired if pair.invitation_id in invitation_ids]
+    if len({(pair.receiver_url, pair.transport, pair.label) for pair in paired}) > 1:
+        message = (
+            "Active pairings use different configurations; "
+            "retain their original setup options."
+        )
+        raise ValueError(message)
+    return next(
+        (pair for pair in paired if pair.progress.data_receipt_status == "received"),
+        paired[0] if paired else None,
+    )
+
+
+def pairing_setup_progress(db_path: Path, secret: str) -> SetupProgress | None:
+    """Authorize bounded readback without consuming or extending an invitation."""
+    with connect_readonly_database(db_path) as connection:
+        row = INVITATION_LOOKUP_ROW_ADAPTER.validate_python(
+            connection.execute(
+                LOOKUP_BY_SECRET_SQL, (_hash_invitation_secret(secret),)
+            ).fetchone()
+        )
+        if (
+            row is None
+            or row[9] is not None
+            or row[7] <= _format_utc(_normalized_now(None))
+            or row[5] >= row[6]
+        ):
+            return None
+        if row[8] is None:
+            return SetupProgress()
+        paired = active_setup_pairings(connection, row[0])
+        return paired[0].progress if paired else None
 
 
 def revoke_pairing_invitation(db_path: Path, invitation_id: str) -> None:
@@ -703,3 +855,15 @@ def _normalized_now(value: datetime | None) -> datetime:
 
 def _format_utc(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _require_native_invitation(
+    lookup: InvitationLookupRow, expected_id: str | None
+) -> None:
+    if expected_id is not None and (
+        lookup[0] != expected_id
+        or lookup[2] != ""
+        or lookup[10] != "mailbox"
+        or lookup[9] is not None
+    ):
+        raise PairingInvitationError(GENERIC_INVITATION_ERROR)

@@ -349,7 +349,7 @@ struct ContentView: View {
         if viewModel.syncPresentationIsActive && viewModel.canSendConnectionTest { return "Syncing" }
         if viewModel.statusIsError { return syncErrorTitle }
         if !viewModel.canSendConnectionTest { return "Not Connected" }
-        if viewModel.pendingOutboxCount > 0 { return "Waiting to Send" }
+        if viewModel.pendingOutboxCount > 0 { return "Sync Pending" }
         if viewModel.backgroundSyncEnabled { return "Ready to Sync" }
         if viewModel.healthPermissionsRequested { return "Ready to Sync" }
         return "Allow Health Access"
@@ -369,10 +369,7 @@ struct ContentView: View {
         if !viewModel.canSendConnectionTest { return "Connect this iPhone before syncing." }
         if viewModel.setupState == .pairedNeedsHealthPermission { return "Open Apple Health and allow the data you want to sync." }
         if viewModel.pendingOutboxCount > 0 {
-            if viewModel.usesMailboxTransport {
-                return "\(viewModel.pendingOutboxCount) pending secure delivery item(s) are waiting for receiver confirmation."
-            }
-            return "\(viewModel.pendingOutboxCount) pending sync item(s) will send when Health Bridge is reachable."
+            return viewModel.pendingSyncSummary
         }
         if viewModel.backgroundSyncEnabled { return viewModel.automaticSyncScopeSummary }
         return "Use Sync Now to update your allowed Apple Health data."
@@ -579,6 +576,7 @@ private struct ReceiverSettingsView: View {
                 .foregroundStyle(.secondary)
 
             if viewModel.mailboxKeyDiagnosticState == .lost {
+                let refusal = viewModel.mailboxKeyRecoveryRefusal
                 Button(role: .destructive) {
                     showMailboxKeyResetConfirmation = true
                 } label: {
@@ -587,7 +585,12 @@ private struct ReceiverSettingsView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
-                .disabled(!viewModel.canResetLostMailboxConnectionKey)
+                .disabled(refusal != nil)
+                if let refusal {
+                    Text(viewModel.describe(refusal))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             PrimaryButton(

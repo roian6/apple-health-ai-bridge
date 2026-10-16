@@ -1,5 +1,7 @@
 import sqlite3
+import subprocess  # nosec B404
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Final, Literal
 
@@ -7,6 +9,8 @@ import typer
 from pydantic import ValidationError
 
 from health_bridge import __version__
+from health_bridge.cli_config import config_path, resolve_database, save_database
+from health_bridge.cli_connect import connect
 from health_bridge.cli_dev import (
     AppReviewDemoRequest,
     DevDeviceSessionRequest,
@@ -31,12 +35,23 @@ from health_bridge.cli_setup import (
     validate_requested_clients,
     verify_local_mcp,
 )
+from health_bridge.cli_setup_interactive import (
+    browser_policy,
+    finish_interactively,
+    guide_request,
+    human_terminal,
+    require_client_mode,
+    resume_request,
+    saved_request,
+)
+from health_bridge.cli_setup_runtime import setup_direct
 from health_bridge.dev_validation import (
     anchored_step_validation_json,
     read_anchored_step_validation_snapshot,
 )
 from health_bridge.ingest import MALFORMED_JSON_SUMMARY
 from health_bridge.ingest import ingest_fixture as ingest_fixture_batch
+from health_bridge.launchd import LaunchdServiceError
 from health_bridge.status import read_status, read_status_markdown, read_status_snapshot
 from health_bridge.storage import initialize_database
 
@@ -45,6 +60,7 @@ app = typer.Typer(
     help="Local-first Apple Health context bridge for read-only CLI and MCP access.",
     invoke_without_command=True,
 )
+_ = app.command()(connect)
 app.add_typer(query_app, name="query")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(receiver_app, name="receiver")
@@ -63,8 +79,6 @@ DEFAULT_APP_REVIEW_DEMO_SETUP_PAGE: Final = Path(
 DEFAULT_APP_REVIEW_DEMO_FIXTURE: Final = Path(
     "fixtures/health_bridge_batch_v1.synthetic.json"
 )
-DEFAULT_USER_DB: Final = Path.home() / ".local/share/health-bridge/health.sqlite"
-DEFAULT_USER_SETUP_PAGE: Final = Path.home() / ".local/share/health-bridge/pairing.html"
 
 
 @app.callback()
@@ -101,37 +115,48 @@ def init(
     typer.echo(f"initialized: {db}")
 
 
-@app.command()
+@app.command(
+    help=(
+        "Connect your iPhone and save selected Apple Health data on this computer "
+        "for read-only access."
+    )
+)
 def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
+    ctx: typer.Context,
     receiver_url: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--receiver-url",
             help=(
-                "Exact phone-reachable /v1/batches URL from a configured private "
-                "route; documentation hostnames are rejected."
+                "Advanced: this computer's prepared address ending in /v1/batches, "
+                "reachable from your iPhone. Default: use its Tailscale connection."
             ),
         ),
-    ],
+    ] = None,
     db: Annotated[
-        Path,
-        typer.Option("--db", help="Private local Apple Health SQLite path."),
-    ] = DEFAULT_USER_DB,
+        Path | None,
+        typer.Option(
+            "--db", help="File on this computer for saved health records (SQLite)."
+        ),
+    ] = None,
     setup_page: Annotated[
-        Path,
-        typer.Option("--setup-page", help="Private iPhone pairing page path."),
-    ] = DEFAULT_USER_SETUP_PAGE,
+        Path | None,
+        typer.Option(
+            "--setup-page",
+            help="Advanced: file for the private iPhone connection page.",
+        ),
+    ] = None,
     label: Annotated[
         str,
-        typer.Option("--label", help="Human-readable iPhone label."),
+        typer.Option("--label", help="Name for this iPhone connection."),
     ] = "iPhone",
     transport: Annotated[
         Literal["direct", "icloud-mailbox"],
         typer.Option(
             "--transport",
             help=(
-                "Choose Direct/Tailscale-compatible delivery or explicit "
-                "Encrypted iCloud Mailbox (Beta)."
+                "Send data directly over your connection (direct), or through "
+                "iCloud Drive to a Mac (icloud-mailbox, Beta)."
             ),
         ),
     ] = "direct",
@@ -139,19 +164,28 @@ def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
         Path | None,
         typer.Option(
             "--mailbox-root",
-            help="Existing macOS iCloud Documents HealthBridgeMailbox/v1 path.",
+            help=(
+                "Advanced: HealthBridgeMailbox/v1 folder in the app's Mac "
+                "iCloud Documents. Guided setup finds it from the helper."
+            ),
         ),
     ] = None,
     icloud_container_identifier: Annotated[
         str | None,
         typer.Option(
             "--icloud-container-identifier",
-            help="Expected iCloud container identifier for the mailbox root.",
+            help=(
+                "Advanced: app iCloud container ID. Guided setup reads it "
+                "from the matching helper."
+            ),
         ),
     ] = None,
     receiver_host: Annotated[
         str,
-        typer.Option("--receiver-host", help="Receiver bind host."),
+        typer.Option(
+            "--receiver-host",
+            help="Advanced: listen on 127.0.0.1, or 0.0.0.0 for same-network access.",
+        ),
     ] = "127.0.0.1",
     receiver_port: Annotated[
         int,
@@ -159,7 +193,7 @@ def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
             "--receiver-port",
             min=1,
             max=65535,
-            help="Receiver bind port (1-65535).",
+            help="Advanced: port Health Bridge listens on (1-65535).",
         ),
     ] = 8765,
     allow_nonlocal_receiver_address: Annotated[
@@ -177,42 +211,159 @@ def setup(  # noqa: PLR0913 - Typer exposes each setup input as an option.
         typer.Option(
             "--configure-client",
             help=(
-                "Explicitly configure and verify this MCP client. Repeat for more "
-                "than one; omission never modifies client settings."
+                "Optional: save and check connection settings for this AI app (MCP). "
+                "Repeat for multiple apps. Default: keep AI app settings unchanged."
             ),
         ),
     ] = None,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit a secret-redacted setup manifest."),
+        typer.Option(
+            "--json",
+            help="Output setup details as JSON without private connection links.",
+        ),
+    ] = False,
+    service_name: Annotated[
+        str,
+        typer.Option(
+            "--service-name",
+            help="Advanced: name for Health Bridge's background process.",
+        ),
+    ] = "health-bridge-receiver",
+    allow_loopback_receiver: Annotated[
+        bool,
+        typer.Option(
+            "--allow-loopback-receiver",
+            help="Advanced: local synthetic QA only; no phone access.",
+        ),
+    ] = False,
+    no_input: Annotated[
+        bool,
+        typer.Option(
+            "--no-input",
+            help=(
+                "Prepare without questions, waiting for the phone, opening "
+                "pages or changing AI apps."
+            ),
+        ),
+    ] = False,
+    interactive: Annotated[
+        bool,
+        typer.Option(
+            "--interactive",
+            help="Guide setup in your terminal with questions and phone progress.",
+        ),
+    ] = False,
+    no_browser: Annotated[
+        bool,
+        typer.Option(
+            "--no-browser", help="Show the setup URL without opening a browser."
+        ),
     ] = False,
 ) -> None:
+    _ = ctx.with_resource(browser_policy(not no_browser))
+    require_client_mode(json_output or no_input, configure_clients)
+    guided = human_terminal() and not (json_output or no_input)
+    if interactive and not guided and not (json_output or no_input):
+        message = (
+            "Open a terminal and rerun your original setup command to answer "
+            "setup questions."
+        )
+        raise typer.BadParameter(message)
     executable = str(Path(sys.argv[0]).resolve(strict=False))
+    if db is None:
+        db = (
+            resolve_database(None)
+            if config_path().exists()
+            else Path.home() / ".local/share/health-bridge/health.sqlite"
+        )
+    db = db.absolute()
+    setup_page = (setup_page or db.parent / "pairing.html").absolute()
+    starting = False
     try:
         requested_clients = validate_requested_clients(configure_clients or ())
-        manifest = build_setup_manifest(
-            SetupRequest(
-                db_path=db,
-                label=label,
-                receiver_url=receiver_url,
-                setup_page_path=setup_page,
-                receiver_host=receiver_host,
-                receiver_port=receiver_port,
-                executable=executable,
-                allow_nonlocal_receiver_address=allow_nonlocal_receiver_address,
-                transport=transport,
-                mailbox_root=mailbox_root,
-                icloud_container_identifier=icloud_container_identifier,
-            )
+        request = SetupRequest(
+            db_path=db,
+            label=label,
+            receiver_url=receiver_url or "",
+            setup_page_path=setup_page,
+            receiver_host=receiver_host,
+            receiver_port=receiver_port,
+            executable=executable,
+            allow_nonlocal_receiver_address=allow_nonlocal_receiver_address,
+            transport=transport,
+            mailbox_root=mailbox_root,
+            icloud_container_identifier=icloud_container_identifier,
+            allow_loopback_receiver=allow_loopback_receiver,
+        )
+        explicit = {
+            name
+            for name in ctx.params
+            if str(ctx.get_parameter_source(name)) == "ParameterSource.COMMANDLINE"
+        }
+        request, saved_service = saved_request(request, explicit)
+        if saved_service is not None and "service_name" not in explicit:
+            service_name = saved_service
+        request = resume_request(request, explicit)
+        request = guide_request(request, guided, explicit)
+        starting = True
+        manifest = (
+            setup_direct(request, service_name)
+            if sys.platform in {"linux", "darwin"} or not request.receiver_url
+            else build_setup_manifest(request)
+        )
+        save_database(
+            db, replace(request, receiver_url=manifest.receiver_url), service_name
         )
         manifest = verify_local_mcp(manifest)
+        if guided:
+            finish_interactively(manifest, requested_clients)
+            return
         manifest = configure_mcp_clients(manifest, requested_clients)
-    except (RuntimeError, ValueError) as exc:
+        output = (
+            manifest.model_dump_json()
+            if json_output
+            else render_setup_summary(manifest, reveal_invitation=guided)
+        )
+    except (EOFError, KeyboardInterrupt, typer.Abort):
+        message = (
+            (
+                "Setup paused during its start check. Any Health Bridge process "
+                "already started keeps running. "
+            )
+            if starting
+            else "Setup paused before starting a new Health Bridge process. "
+        )
+        message += (
+            "Your existing connection and saved data are kept. "
+            "Rerun your original setup command when you are ready to continue."
+        )
+        typer.echo(message)
+        return
+    except sqlite3.Error as exc:
+        message = (
+            "Health Bridge could not open its saved-data file. Check that your account "
+            "can read and write that file, then rerun your original setup command."
+        )
+        typer.echo(message, err=True)
+        raise typer.Exit(code=1) from exc
+    except subprocess.TimeoutExpired as exc:
+        message = (
+            "A setup check took too long. Any existing background process and saved "
+            "data are kept. Rerun your original setup command to check again."
+        )
+        typer.echo(message, err=True)
+        raise typer.Exit(code=1) from exc
+    except LaunchdServiceError as exc:
+        message = str(exc).replace("Mailbox LaunchAgent", "Receiver LaunchAgent")
+        typer.echo(
+            f"{message} Inspect the receiver service before retrying setup.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
-    output = (
-        manifest.model_dump_json() if json_output else render_setup_summary(manifest)
-    )
     typer.echo(output)
 
 
@@ -252,9 +403,9 @@ def ingest_fixture(
 @app.command()
 def status(
     db: Annotated[
-        Path,
+        Path | None,
         typer.Option("--db", help="User-owned SQLite database path."),
-    ],
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option(
@@ -283,6 +434,7 @@ def status(
     if output is not None and not (json_output or markdown_output):
         typer.echo("--output requires --json or --markdown.", err=True)
         raise typer.Exit(code=1)
+    db = resolve_database(db)
     if json_output:
         _emit_or_write(read_status_snapshot(db).model_dump_json(), output)
         return

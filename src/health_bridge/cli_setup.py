@@ -3,30 +3,52 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import shlex
 import shutil
 import socket
 import subprocess  # nosec B404
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 from urllib.parse import ParseResult, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from health_bridge import __version__
 from health_bridge.cli_dev import (
     DevDeviceSessionRequest,
     build_dev_device_session_manifest,
+    receiver_health_url,
+)
+from health_bridge.connect_adapters import ADAPTERS
+from health_bridge.connect_wizard import connection_wizard
+from health_bridge.mailbox.helper_lifecycle import HelperStatusCode, read_helper_status
+from health_bridge.mailbox.native_ack_publication import default_native_ack_publisher
+from health_bridge.receiver.invitations import active_setup_pairings
+from health_bridge.receiver.pairing import PAIRING_INVITATION_SCHEMA_ID
+from health_bridge.receiver.pairing_setup_page import (
+    invitation_page_route,
+    read_invitation_page,
 )
 from health_bridge.receiver.transports import (
+    MAILBOX_HOST_UNAVAILABLE_ERROR,
     PublicReceiverTransport,
     ReceiverTransport,
+    ReceiverTransportSelectionError,
     select_receiver_transport,
+)
+from health_bridge.storage.database import (
+    connect_readonly_database,
+    initialize_database,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
-    from pathlib import Path
 
-ClientConfigurationStatus = Literal["not_requested", "configured_and_verified"]
+ClientConfigurationStatus = Literal[
+    "not_requested", "configuration_prepared", "configured_and_verified"
+]
 LocalMcpStatus = Literal["prepared", "verified"]
 MIN_RECEIVER_PORT = 1
 MAX_RECEIVER_PORT = 65535
@@ -94,15 +116,30 @@ class McpClientRegistrarPlan(BaseModel):
     verify_command: list[str]
 
 
+def require_native_setup(request: SetupRequest) -> None:
+    if request.transport != "icloud-mailbox" or request.receiver_url:
+        return
+    if request.receiver_host != "127.0.0.1":
+        message = "Native mailbox setup requires loopback access."
+        raise ValueError(message)
+    try:
+        default_native_ack_publisher().require_native_pairing()
+    except OSError as exc:
+        message = "Rerun setup with a native-pairing helper and available iCloud Drive."
+        raise ValueError(message) from exc
+
+
 class SetupManifest(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, strict=True)
 
     schema_id: str = "health_bridge.onboarding"
     schema_version: int = 2
     db: str
-    receiver_url: str
-    receiver_health_url: str
+    receiver_url: str | None
+    receiver_health_url: str | None
     setup_page: str
+    local_setup_url: str = Field(default="", exclude=True)
+    paired_invitation_ids: tuple[str, ...] = Field(default=(), exclude=True)
     pairing_schema_id: str
     invitation_expires_at: str
     selected_transport: ReceiverTransport
@@ -116,13 +153,19 @@ class SetupManifest(BaseModel):
     client_configuration_status: ClientConfigurationStatus
     next_steps: list[str]
     warning: str
+    receiver_service_status: Literal["prepared", "supervised_healthy"] = "prepared"
+    private_route_status: Literal["explicit_unverified", "ready", "not_required"] = (
+        "explicit_unverified"
+    )
+    pairing_status: Literal["pending", "paired"] = "pending"
+    data_receipt_status: Literal["not_received", "received"] = "not_received"
 
 
 @dataclass(frozen=True, slots=True)
 class SetupRequest:
     db_path: Path
     label: str
-    receiver_url: str
+    receiver_url: str | None
     setup_page_path: Path
     receiver_host: str
     receiver_port: int
@@ -131,6 +174,7 @@ class SetupRequest:
     transport: PublicReceiverTransport = "direct"
     mailbox_root: Path | None = None
     icloud_container_identifier: str | None = None
+    allow_loopback_receiver: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +231,7 @@ def validate_requested_clients(requested: Iterable[str]) -> tuple[str, ...]:
     names = tuple(
         dict.fromkeys(name.strip().lower() for name in requested if name.strip())
     )
-    available = {registrar.name: registrar for registrar in _REGISTRARS}
+    available = ADAPTERS
     unknown = [name for name in names if name not in available]
     if unknown:
         supported = ", ".join(sorted(available))
@@ -197,12 +241,6 @@ def validate_requested_clients(requested: Iterable[str]) -> tuple[str, ...]:
             f"Built-in registrars: {supported}."
         )
         raise ValueError(message)
-    missing = [
-        name for name in names if shutil.which(available[name].executable) is None
-    ]
-    if missing:
-        message = f"Requested MCP client CLI is not installed: {', '.join(missing)}"
-        raise RuntimeError(message)
     return names
 
 
@@ -432,8 +470,25 @@ def _validated_url_port(request: SetupRequest, parsed: ParseResult) -> int | Non
     return url_port
 
 
-def _setup_transport_notice(request: SetupRequest) -> str:
-    parsed = urlparse(request.receiver_url)
+def _loopback_notice(request: SetupRequest) -> str:
+    if request.allow_loopback_receiver and request.receiver_url == (
+        f"http://127.0.0.1:{request.receiver_port}/v1/batches"
+    ):
+        return "Loopback QA only: this URL cannot be reached from an iPhone."
+    message = (
+        "Receiver URL cannot use a loopback host; it would point at the iPhone itself."
+    )
+    raise ValueError(message)
+
+
+def setup_transport_notice(request: SetupRequest) -> str:
+    if request.transport == "icloud-mailbox" and not request.receiver_url:
+        return "Initial pairing uses encrypted iCloud files."
+    return _http_setup_transport_notice(request)
+
+
+def _http_setup_transport_notice(request: SetupRequest) -> str:
+    parsed = urlparse(request.receiver_url or "")
     host = parsed.hostname
     url_port = _validated_url_port(request, parsed)
     if parsed.scheme not in {"http", "https"} or host is None:
@@ -447,11 +502,7 @@ def _setup_transport_notice(request: SetupRequest) -> str:
         message = "Receiver URL must end at /v1/batches without query or fragment data."
         raise ValueError(message)
     if _is_loopback_host(host):
-        message = (
-            "Receiver URL cannot use a loopback host; it would point at the "
-            "iPhone itself."
-        )
-        raise ValueError(message)
+        return _loopback_notice(request)
     if _is_unusable_ip_destination(host):
         message = "Receiver URL must use a reachable unicast destination."
         raise ValueError(message)
@@ -505,31 +556,88 @@ def _local_receiver_health_url(receiver_host: str, receiver_port: int) -> str:
     return f"http://{health_host}:{receiver_port}/health"
 
 
-def build_setup_manifest(request: SetupRequest) -> SetupManifest:
-    selected_transport = select_receiver_transport(
-        request.transport,
-        mailbox_root=request.mailbox_root,
-        icloud_container_identifier=request.icloud_container_identifier,
-    )
-    transport_notice = _setup_transport_notice(request)
-    if selected_transport is ReceiverTransport.MAILBOX:
-        transport_notice = (
-            "Encrypted iCloud Mailbox (Beta) selected. No VPN is required for "
-            "mailbox delivery; it is Mac only and best-effort/eventual, not "
-            f"instant sync. {transport_notice}"
-        )
-    session = build_dev_device_session_manifest(
-        DevDeviceSessionRequest(
-            db_path=request.db_path,
-            label=request.label,
-            receiver_url=request.receiver_url,
-            setup_page_path=request.setup_page_path,
-            receiver_host=request.receiver_host,
-            receiver_port=request.receiver_port,
-            watch_seconds=7200,
-            transport=selected_transport,
+def prepare_setup_transport(request: SetupRequest) -> ReceiverTransport:
+    if request.transport == "icloud-mailbox":
+        if sys.platform != "darwin":
+            raise ValueError(MAILBOX_HOST_UNAVAILABLE_ERROR)
+        helper = read_helper_status(home=Path.home(), expected_version=__version__)
+        if helper.code is not HelperStatusCode.READY:
+            message = (
+                "iCloud needs a verified signed helper matching Health Bridge "
+                f"{__version__}. "
+                "Rerun your original setup command in a terminal to select "
+                "matching local "
+                "release files or choose another connection. The matching helper "
+                "release is not publicly available yet."
+            )
+            raise ValueError(message)
+    _ = setup_transport_notice(request)
+    try:
+        return select_receiver_transport(
+            request.transport,
             mailbox_root=request.mailbox_root,
             icloud_container_identifier=request.icloud_container_identifier,
+        )
+    except ReceiverTransportSelectionError as exc:
+        if request.transport == "direct":
+            raise
+        message = (
+            "Health Bridge's iCloud Drive folder is not ready on this Mac. "
+            "Check that iCloud Drive is on and the app's Documents folder has "
+            "appeared, then rerun your original setup command. "
+            f"Details: {exc.message}"
+        )
+        raise ReceiverTransportSelectionError(message) from exc
+
+
+def build_setup_manifest(request: SetupRequest) -> SetupManifest:
+    selected_transport = prepare_setup_transport(request)
+    native = (
+        selected_transport is ReceiverTransport.MAILBOX and not request.receiver_url
+    )
+    if native:
+        require_native_setup(request)
+        request = replace(request, receiver_url=None)
+    transport_notice = setup_transport_notice(request)
+    if selected_transport is ReceiverTransport.MAILBOX:
+        transport_notice = (
+            "iCloud Drive will carry health data to this Mac after pairing. "
+            "Use the same Apple Account on both devices and stay logged in on "
+            f"the Mac. Delivery may be delayed. {transport_notice}"
+        )
+    initialize_database(request.db_path)
+    with connect_readonly_database(request.db_path) as connection:
+        paired = active_setup_pairings(connection)
+        received = any(
+            pair.progress.data_receipt_status == "received" for pair in paired
+        )
+    if paired and any(
+        (pair.receiver_url, pair.transport)
+        != (request.receiver_url, selected_transport.value)
+        for pair in paired
+    ):
+        message = (
+            "This iPhone already uses a different computer address or delivery choice. "
+            "Rerun your original setup command without the new connection options "
+            "to use your saved connection."
+        )
+        raise ValueError(message)
+    session = (
+        None
+        if paired
+        else build_dev_device_session_manifest(
+            DevDeviceSessionRequest(
+                db_path=request.db_path,
+                label=request.label,
+                receiver_url=request.receiver_url,
+                setup_page_path=request.setup_page_path,
+                receiver_host=request.receiver_host,
+                receiver_port=request.receiver_port,
+                watch_seconds=7200,
+                transport=selected_transport,
+                mailbox_root=request.mailbox_root,
+                icloud_container_identifier=request.icloud_container_identifier,
+            )
         )
     )
     receiver_start_command = [
@@ -538,6 +646,8 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         "start",
         "--db",
         str(request.db_path),
+        "--setup-page",
+        str(request.setup_page_path),
         "--host",
         request.receiver_host,
         "--port",
@@ -569,32 +679,32 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         )
         for registrar in _REGISTRARS
     ]
-    mailbox_sync_parts = (
-        "Connect the app, allow read access to all supported Apple Health types",
-        "you want to share, enable Automatic Sync, keep the receiver process",
-        "running so mailbox deliveries are imported, and require the first",
-        "receiver ACK after its database commit.",
-    )
-    direct_sync_parts = (
-        "Connect the app, allow read access to all supported Apple Health types",
-        "you want to share, enable Automatic Sync, and require the first receiver",
-        "upload ACK.",
-    )
-    mailbox_sync_step = " ".join(mailbox_sync_parts)
-    direct_sync_step = " ".join(direct_sync_parts)
     sync_step = (
-        mailbox_sync_step
-        if selected_transport is ReceiverTransport.MAILBOX
-        else direct_sync_step
+        "In Health Bridge for AI (companion app), tap Allow Health Access, choose "
+        "read permissions, then turn on Automatic Sync. Sync Now is optional."
     )
+    if selected_transport is ReceiverTransport.MAILBOX:
+        sync_step += (
+            " Keep this Mac awake and logged in so iCloud deliveries can be saved."
+        )
     return SetupManifest(
         db=str(request.db_path),
-        receiver_url=session.receiver_url,
-        receiver_health_url=session.receiver_health_url,
-        setup_page=session.setup_page,
-        pairing_schema_id=session.pairing_schema_id,
-        invitation_expires_at=session.invitation_expires_at,
+        receiver_url=request.receiver_url,
+        receiver_health_url=receiver_health_url(request.receiver_url),
+        setup_page=str(request.setup_page_path),
+        local_setup_url=(
+            local_receiver_health_url.removesuffix("/health")
+            + invitation_page_route(read_invitation_page(request.setup_page_path)[1])
+        )
+        if native and session
+        else "",
+        pairing_schema_id=PAIRING_INVITATION_SCHEMA_ID,
+        invitation_expires_at=session.invitation_expires_at if session else "",
+        paired_invitation_ids=tuple(pair.invitation_id for pair in paired),
+        pairing_status="paired" if paired else "pending",
+        data_receipt_status="received" if received else "not_received",
         selected_transport=selected_transport,
+        private_route_status="not_required" if native else "explicit_unverified",
         receiver_start_command=receiver_start_command,
         access_descriptors=[access],
         local_mcp_self_test_command=[
@@ -611,34 +721,42 @@ def build_setup_manifest(request: SetupRequest) -> SetupManifest:
         client_configuration_status="not_requested",
         next_steps=[
             (
-                "Put receiver_start_command under an approved service manager, "
-                "then start the receiver."
+                "Start Health Bridge's background process on this computer "
+                "using receiver_start_command."
             ),
             (
-                'On the receiver host, require {"status":"ok"} from the local '
-                f"health check at {local_receiver_health_url}."
+                'On this computer, check for {"status":"ok"} at '
+                f"{local_receiver_health_url}."
             ),
             (
-                "On the physical iPhone, require the same response from the exact "
-                f"phone-facing health URL: {session.receiver_health_url}."
+                "".join(
+                    (
+                        "On your iPhone, open this address in Safari ",
+                        "and check for the same ",
+                        f"response: {receiver_health_url(request.receiver_url)}.",
+                    )
+                )
+                if not native
+                else "Scan this Mac's QR with your iPhone. Pairing uses iCloud Drive."
             ),
             (
-                "Private pairing page (open only after both health checks pass): on "
-                f"the receiver computer, open {session.setup_page} on a trusted "
-                "screen, then scan its QR with iPhone Camera and open the setup link. "
-                "If the receiver is headless, securely copy the HTML file to a trusted "
-                "local screen; do not publish it or place it on a public web server."
+                "Open the private connection page shown in your terminal. On "
+                "a computer, "
+                "scan its QR with iPhone Camera. On the iPhone, tap its Open button."
             ),
             sync_step,
             (
-                "After the first receiver upload ACK, use access_descriptors for a "
-                "same-host stdio MCP client, or query the database with the direct CLI."
+                "Run health-bridge query synced-metrics on this computer to see saved "
+                "kinds of data and dates. To use AI, give it command access here and "
+                "the Health Bridge Skill. Optional MCP settings are in "
+                "access_descriptors."
             ),
         ],
         warning=(
-            "The private setup page contains a temporary single-use invitation. "
-            "Do not put it in chat, Git, logs, or a public web server; delete it "
-            f"after pairing or expiry. {transport_notice}"
+            "Keep this single-use invitation private. Sharing it before use "
+            "lets someone else connect an iPhone. Progress stays available "
+            "until the link expires. "
+            f"{transport_notice}"
         ),
     )
 
@@ -658,17 +776,19 @@ def configure_mcp_clients(
     names = validate_requested_clients(requested)
     if not names:
         return manifest
-    plans = {plan.name: plan for plan in manifest.registrar_plans}
-    configured: list[str] = []
-    for name in names:
-        plan = plans[name]
-        _run_command(plan.add_command, f"{name} MCP registration")
-        _run_command(plan.verify_command, f"{name} MCP verification")
-        configured.append(name)
+    prepared: list[str] = []
+    verified = connection_wizard(Path(manifest.db), names, prepared_clients=prepared)
+    status: ClientConfigurationStatus = "not_requested"
+    if prepared:
+        status = (
+            "configured_and_verified"
+            if set(prepared) == set(verified)
+            else "configuration_prepared"
+        )
     return manifest.model_copy(
         update={
-            "configured_mcp_clients": configured,
-            "client_configuration_status": "configured_and_verified",
+            "configured_mcp_clients": prepared,
+            "client_configuration_status": status,
         }
     )
 
@@ -686,19 +806,51 @@ def _run_command(command: list[str], action: str) -> None:
         raise RuntimeError(message)
 
 
-def render_setup_summary(manifest: SetupManifest) -> str:
-    detected = ", ".join(manifest.detected_mcp_clients) or "none"
-    configured = ", ".join(manifest.configured_mcp_clients) or "none"
+def render_setup_summary(
+    manifest: SetupManifest, *, reveal_invitation: bool = True
+) -> str:
     lines = [
-        "Health Bridge core setup prepared.",
-        f"Configured phone-facing health URL: {manifest.receiver_health_url}",
-        f"Local MCP self-test: {manifest.local_mcp_status}",
-        f"Detected client adapters: {detected} (no configuration is automatic)",
-        f"Configured clients: {configured}",
-        "",
+        "Health Bridge is running."
+        if manifest.receiver_service_status == "supervised_healthy"
+        else "Health Bridge is prepared, but its background process has not started."
     ]
-    lines.extend(
-        f"{index}. {step}" for index, step in enumerate(manifest.next_steps, start=1)
+    if manifest.receiver_service_status == "prepared":
+        message = (
+            "Start saving data on this computer: "
+            f"{shlex.join(manifest.receiver_start_command)}"
+        )
+        lines.append(message)
+    if manifest.pairing_status == "pending" and reveal_invitation:
+        _, invitation = read_invitation_page(Path(manifest.setup_page))
+        origin = (manifest.receiver_health_url or "").removesuffix("/health")
+        connection_url = manifest.local_setup_url or origin + invitation_page_route(
+            invitation
+        )
+        lines.append(f"Open your private connection page: {connection_url}")
+        message = (
+            "On a computer screen, scan its QR with iPhone Camera. On your "
+            "iPhone, tap its Open button."
+        )
+        lines.append(message)
+    elif manifest.pairing_status == "pending":
+        command = shlex.join([manifest.access_descriptors[0].command, "setup"])
+        message = f"Run {command} in your terminal to open the iPhone connection page."
+        lines.append(message)
+    elif manifest.data_receipt_status == "received":
+        lines.append("iPhone connected. Health records are saved on this computer.")
+    else:
+        lines.append("iPhone connected. No health records saved yet.")
+        message = (
+            "In Health Bridge for AI (companion app), tap Allow Health Access, "
+            "choose the kinds of data it may read, then turn on Automatic Sync."
+        )
+        lines.append(message)
+    if manifest.data_receipt_status == "received":
+        command = shlex.join(
+            [manifest.access_descriptors[0].command, "query", "synced-metrics"]
+        )
+        lines.append(f"See saved kinds of data and their dates: {command}")
+    lines.append(
+        "Your AI needs command access to this computer to use the Health Bridge Skill."
     )
-    lines.extend(("", manifest.warning))
     return "\n".join(lines)

@@ -163,8 +163,13 @@ enum ProductionMailboxAckHydration {
             do {
                 names = try MailboxAckFileReader.enumerate(
                     directory: directory,
-                    maximumNames: MailboxAckScanner.maximumScanFiles
+                    maximumNames: MailboxAckScanner.maximumScanFiles,
+                    maximumRawEntries: MailboxAckScanner.maximumEnumerationEntries
                 ).finalNames
+            } catch let error as MailboxAckEnumerationError {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw MailboxAckScannerError.unsafeMailbox
             }

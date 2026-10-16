@@ -17,73 +17,52 @@ The iPhone app syncs the records you allow to a macOS or Linux computer you cont
 
 ## Set up the bridge
 
-You need:
+> **Unreleased onboarding preview.** Until the immutable `receiver-v1.1.3` release and its assets are published and verified, this is an unreleased preview; use the [published Receiver/CLI 1.1.2 guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md). Direct/Tailscale retains Companion 1.1.1 compatibility. iCloud-native first pairing requires the updated companion and matching signed helper; those updates are not published yet. There is no published npm/PyPI install target yet for this preview; the versioned guide uses exact GitHub release assets rather than assuming registry availability.
 
-- an iPhone running iOS 18 or later;
-- a macOS or Linux computer that will run the receiver and store the private database; native Windows is not currently supported;
-- for continuous sync, a stable private HTTPS route that the physical iPhone can reach away from the local network; for an explicit local-only evaluation, a same-LAN route with the limitation below;
-- an MCP client on the receiver machine, or a terminal for direct CLI access;
-- [`uv`](https://docs.astral.sh/uv/) for the receiver package.
+You need an iPhone running iOS 18 or later and an awake macOS or Linux receiver computer; native Windows is not currently supported. Use an existing Tailscale connection on both devices, keep your own working private route, or choose iCloud on a compatible Mac once its updated app and helper are available. The [setup guide](docs/setup.md) is the single installation reference for those options.
 
 Enable Automatic Sync once you have paired the app. iOS controls background scheduling, so delivery timing is best-effort rather than real-time or guaranteed at a specific moment.
 
-### 1. Install the iPhone app
+### 1. Run setup once
 
-Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) on your iPhone. TestFlight remains available for beta builds and prerelease testing through the [official install page](https://healthbridge.chanhyo.dev/install/).
-
-### 2. Prepare the receiver route
-
-The project does not give you a receiver URL. The URL is the private address by which the iPhone reaches your receiver computer, and it must exist before core setup can create pairing material.
-
-- **Already use Tailscale:** use the private Tailscale Serve HTTPS path documented in the [setup guide](docs/setup.md#route-a-already-use-tailscale). Tailscale is an option for existing users, not a product requirement.
-- **Agent-assisted private HTTPS ingress:** use the setup guide's agent-assisted path. The setup agent must inspect first, show every proposed DNS, tunnel, proxy, firewall, and service change, and wait for approval before applying it.
-- **Local network only:** supported as a deliberate local-only fallback, but automatic sync stops when the iPhone leaves that network.
-
-Do not copy a sample hostname, expose receiver port `8765` directly to the public internet, or publish the pairing page. Follow the complete [receiver setup guide](docs/setup.md) to produce and verify the real route.
-
-### 3. Install and run setup
-
-Install the current signed receiver release:
+After installing the candidate command on PATH, run:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.2"
+health-bridge setup
 ```
 
-The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configured `/v1/batches` URL. Only then run:
+In a human terminal, setup detects your environment and offers recommended setup or an existing private URL. It prepares or resumes the supervised receiver, opens the **private connection page** when a desktop browser is available, and follows the iPhone through connection and stored records. Use arrows and Enter, or numbered choices in a plain terminal. You can leave and rerun setup without resetting your receiver or data.
+
+`--no-input` and `--json` prepare without prompts, waiting, browser actions or client configuration. Captured output omits the private invitation; return to a human terminal for phone connection. Client configuration is an explicit choice after a real read-only coverage query; CLI/Skill access needs no client changes.
+
+If you used the one-shot npm command in the setup guide, keep that exact runner prefix for later commands; it does not install a command on PATH.
+
+### 2. Connect the iPhone and start automatic sync
+
+Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806), or keep your compatible installed companion. TestFlight remains available for beta builds.
+
+Scan the connection page's QR with iPhone Camera, or open the page in Safari and tap **Open in Health Bridge**. If you install the app first, return to the same page to connect. In the app, tap **Allow Health Access**, choose Apple Health read permissions, then turn on **Automatic Sync**, which starts OFF. **Sync Now** can test delivery immediately.
+
+The same page shows the connection, then confirms a health-data upload with records still stored. It remains available until the invitation's original expiry. This does not prove every type or future background delivery; iOS controls background timing.
+
+### 3. Ask your AI about the stored data
+
+On the receiver computer, your AI can use the packaged [Health Bridge Skill](skills/health-bridge/SKILL.md) and CLI:
 
 ```bash
-health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
+health-bridge status --json
+health-bridge query synced-metrics
 ```
 
-For the deliberate Route C local-network-only fallback, use the same real LAN URL and the required non-loopback bind:
+Setup remembers the database, so normal reads do not repeat `--db`. An AI elsewhere can use an existing approved SSH connection. It should check coverage and observation dates, then run the smallest query needed for your question. MCP remains an optional read-only interface, not an additional onboarding requirement.
 
-```bash
-health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --receiver-host 0.0.0.0 \
-  --receiver-port 8765
-```
-
-`health-bridge setup` creates the private SQLite database and single-use pairing page, prepares the receiver command, emits a canonical same-host stdio MCP descriptor, verifies the local MCP server, and detects client adapters without modifying them.
-
-A successful local MCP check does not prove receiver readiness or phone reachability. Put the printed receiver command under the host's approved service manager, start it, require `{"status":"ok"}` from the printed local `/health` URL, and then require the same response from the exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C uses HTTP only on the same trusted LAN.
-
-Adding a client creates another process that can read the private health database, so setup never does that automatically. Use an explicit `--configure-client <name>` only after choosing the client.
+For example: “Summarize the sleep records stored for the last seven days and tell me about gaps.”
 
 ### Delivery transports
 
-Direct is the default transport, including direct private HTTPS and trusted-LAN setups. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta; a Direct failure never switches transports automatically.
+Direct remains available for private HTTPS and trusted-LAN setups; a Direct failure never switches transports automatically. The unreleased native iCloud option uses the user's iCloud container and a compatible Mac receiver without inbound HTTPS or a relay. It requires the updated companion and matching signed helper described in the [mailbox service guide](docs/icloud-mailbox-service.md).
 
-The Beta applies application-layer encryption and signatures before an envelope reaches the user's iCloud container. The user's Mac receiver decrypts and commits accepted batches, then returns an encrypted, signed ACK; the app advances committed local progress only after validating a committed ACK. The iCloud container and receiver remain user-owned. Mailbox ACK publication also requires the exact signed, notarized macOS helper published with Receiver/CLI `1.1.2`; users verify and explicitly install it before the optional per-user LaunchAgent. Follow the [mailbox service guide](docs/icloud-mailbox-service.md).
-
-### 4. Pair and sync
-
-1. Continue only after the supervised receiver, local health check, and physical-iPhone health check all pass.
-2. On the receiver computer, open the generated pairing HTML on a trusted screen. For a headless receiver, securely copy that one file to a trusted local screen; never publish it or place it on a web server.
-3. Scan the QR with iPhone Camera, open the setup link, and connect the companion app.
-4. Tap **Allow Health Access** and review Apple’s native authorization sheet.
-5. Enable **Automatic Sync**.
-6. Wait for the first successful receiver upload, then ask your agent about your data.
+Mailbox envelopes are encrypted and signed before publication. The receiver decrypts and commits accepted batches, then returns an encrypted, signed ACK. The app advances committed local progress only after validating a committed ACK.
 
 ## What is supported
 
@@ -138,13 +117,13 @@ If the command returns `recovery-required`, do not restart the receiver. Review 
 
 The repository contains independently released components. Always include the component label rather than referring to an unlabeled “repo version.”
 
-| Surface | Current version | Identifier |
+| Surface | Source candidate | Identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.2` | signed tag `receiver-v1.1.2` |
-| iOS Companion | `1.1.1` | App Store build `50` |
+| Receiver/CLI | `1.1.3` | planned signed tag `receiver-v1.1.3` |
+| iOS Companion | `1.1.2` | source candidate build `62`, not yet published |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
+This source candidate is a coordinated Receiver/CLI 1.1.3 and Companion 1.1.2/build 62 release; the published companion remains 1.1.1 until Apple distribution is verified. These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
 
 User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with the signed mailbox helper and its public manifest, SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, helper source tree, Git tree, and Batch Protocol together. Existing `v1.0.0`, `v1.0.1`, and `receiver-v1.1.0` releases remain immutable; current and future receiver releases use component-scoped tags such as `receiver-v1.1.2`.
 

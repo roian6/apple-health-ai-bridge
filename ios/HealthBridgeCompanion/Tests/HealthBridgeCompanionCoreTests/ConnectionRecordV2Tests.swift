@@ -3,6 +3,111 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class ConnectionRecordV2Tests: XCTestCase {
+
+    @MainActor
+    func testMailboxTerminalCancellationConvergesCanonicalTransportShape() throws {
+        let suiteName = "MailboxTerminalCancellation.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tokens = ConnectionV2CapturingTokenStore()
+        let pending = ConnectionV2CapturingTokenStore()
+        let cancellation = ConnectionV2CapturingTokenStore()
+        let settings = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokens)
+        let identity = syntheticMailboxIdentity(connectionGeneration: 1)
+        try settings.saveMailboxPairing(
+            receiverURLString: "https://inactive.synthetic.test/v1/batches",
+            bearerToken: "synthetic-inactive-token", mailboxIdentity: identity,
+            expectedGeneration: "g0"
+        )
+        let original = try XCTUnwrap(settings.currentConnectionRecordV2())
+        XCTAssertEqual(original.activation, .paired(activeTransport: .mailbox))
+        XCTAssertEqual(original.transportConfigurations, [
+            .directHTTP(activation: .inactive, configuration: DirectHTTPConnectionConfigurationV1(
+                receiverURLString: "https://inactive.synthetic.test/v1/batches",
+                bearerToken: "synthetic-inactive-token")),
+            .mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1()),
+        ])
+        let state = ReceiverPairingStateStore(pendingStore: pending,
+            installationIDStore: ConnectionV2CapturingTokenStore(), cancellationStore: cancellation)
+        let coordinator = ReceiverPairingCoordinator(client: ReceiverClient(),
+            stateStore: state, settingsStore: settings)
+        let generation = settings.receiverSettingsGenerationToken
+        XCTAssertThrowsError(try settings.clearReceiverSettings(expectedGeneration: generation)) {
+            XCTAssertEqual($0 as? ReceiverSettingsRecordError, .transportSwitchRequiresCommittedEmptyOutbox)
+        }
+        XCTAssertEqual(try coordinator.cancelPendingPairing(expectedGeneration: generation), .completed)
+        XCTAssertTrue(try settings.receiverSettingsAreCleared())
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertNil(settings.terminalCancellationExpectedGeneration)
+        XCTAssertNil(try state.loadPending())
+        XCTAssertEqual(settings.receiverSettingsGenerationToken, "g2")
+        let cold = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokens)
+        XCTAssertTrue(try cold.receiverSettingsAreCleared())
+        XCTAssertEqual(cold.activeTransport, nil)
+        XCTAssertEqual(try cold.currentConnectionRecordV2()?.activation, .unpaired)
+    }
+
+    @MainActor
+    func testMailboxTerminalCancellationPersistenceFailureRetainsRecordAndMarker() throws {
+        let suiteName = "MailboxTerminalCancellationFailure.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tokens = ConnectionV2CapturingTokenStore()
+        let state = ReceiverPairingStateStore(pendingStore: ConnectionV2CapturingTokenStore(),
+            installationIDStore: ConnectionV2CapturingTokenStore(),
+            cancellationStore: ConnectionV2CapturingTokenStore())
+        let settings = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokens)
+        try settings.saveMailboxPairing(receiverURLString: nil, bearerToken: "",
+            mailboxIdentity: syntheticMailboxIdentity(connectionGeneration: 1), expectedGeneration: "g0")
+        let record = try settings.currentConnectionRecordV2()
+        let generation = settings.receiverSettingsGenerationToken
+        let coordinator = ReceiverPairingCoordinator(client: ReceiverClient(),
+            stateStore: state, settingsStore: settings)
+        tokens.shouldFailSave = true
+        XCTAssertThrowsError(try coordinator.cancelPendingPairing(expectedGeneration: generation))
+        XCTAssertEqual(try settings.currentConnectionRecordV2(), record)
+        XCTAssertEqual(settings.receiverSettingsGenerationToken, generation)
+        XCTAssertTrue(try state.hasPendingCancellation())
+        XCTAssertEqual(settings.terminalCancellationExpectedGeneration, generation)
+        tokens.shouldFailSave = false
+        XCTAssertTrue(try coordinator.finishPendingCancellationIfNeeded(expectedGeneration: generation))
+        XCTAssertTrue(try settings.receiverSettingsAreCleared())
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertNil(settings.terminalCancellationExpectedGeneration)
+    }
+    func testMailboxOnlyPairingRemainsReadyAcrossRestartWithoutDirectCredentials() throws {
+        let suiteName = "ConnectionRecordV2Tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tokens = ConnectionV2CapturingTokenStore()
+        let backup = ConnectionV2CapturingTokenStore()
+        let store = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokens, preCutoverBackupStore: backup)
+        let identity = syntheticMailboxIdentity(connectionGeneration: 1)
+
+        try store.saveMailboxPairing(receiverURLString: nil, bearerToken: "", mailboxIdentity: identity, expectedGeneration: "g0")
+        let restarted = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokens, preCutoverBackupStore: backup)
+
+        XCTAssertEqual(try restarted.ensureAtomicConnectionRecord(), identity.opaqueBinding)
+        XCTAssertTrue(restarted.hasActiveMailboxConnection)
+        XCTAssertEqual(restarted.receiverURLString, "")
+        XCTAssertEqual(try restarted.loadBearerToken(), "")
+        XCTAssertEqual(try restarted.currentConnectionRecordV2()?.transportConfigurations, [
+            .mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1()),
+        ])
+        XCTAssertTrue(ReceiverOutboxAdmissionPolicy.isReady(
+            pendingReceiverIdentities: [identity.opaqueBinding], currentBindingID: restarted.receiverBindingID,
+            hasBearerToken: false, hasMailboxIdentity: restarted.hasActiveMailboxConnection
+        ))
+        XCTAssertFalse(ReceiverOutboxAdmissionPolicy.isReady(
+            pendingReceiverIdentities: ["another-binding"], currentBindingID: restarted.receiverBindingID,
+            hasBearerToken: false, hasMailboxIdentity: restarted.hasActiveMailboxConnection
+        ))
+        XCTAssertEqual(CompanionSetupState.evaluate(CompanionSetupSnapshot(
+            receiverURLString: "", hasBearerToken: false, hasMailboxIdentity: restarted.hasActiveMailboxConnection,
+            healthPermissionsRequested: true, isSyncing: false, statusIsError: false, pendingOutboxCount: 0
+        )), .ready)
+    }
+
     func testLegacyV1BootstrapPreservesPrimaryBytes() throws {
         let suiteName = "ConnectionRecordV2Tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

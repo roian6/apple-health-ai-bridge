@@ -9,16 +9,52 @@ CORE = IOS / "Sources/HealthBridgeCompanionCore"
 
 def test_each_automatic_healthkit_query_has_typed_start_and_result_seams() -> None:
     source = (IOS / "App/HealthBridgeCompanionViewModel.swift").read_text()
-    for query in (
-        "let changes: HealthKitAnchoredStepChanges",
-        "let aggregates: [HealthKitDailyActivityAggregate]",
-        "let changes = try await HealthKitWorkoutReader",
-        "let changes: HealthKitAnchoredSleepChanges",
-        "let changes = try await reader.readAnchoredQuantityChanges",
+    for query, query_end in (
+        (
+            "let changes: HealthKitAnchoredStepChanges",
+            "try requireCurrentReceiverSyncProgressScope(progressScope)",
+        ),
+        (
+            "let aggregates: [HealthKitDailyActivityAggregate]",
+            "try requireCurrentReceiverSyncProgressScope(progressScope)",
+        ),
+        (
+            "let changes = try await HealthKitWorkoutReader",
+            "guard !changes.workouts.isEmpty",
+        ),
+        (
+            "let changes: HealthKitAnchoredSleepChanges",
+            "try Task.checkCancellation()",
+        ),
+        (
+            "let changes: HealthKitAnchoredQuantityChanges",
+            "try requireCurrentReceiverSyncProgressScope(progressScope)",
+        ),
     ):
-        start = source.index(query)
-        assert "noteAutomaticSyncQueryStarted(" in source[start - 180 : start]
-        assert "noteAutomaticSyncQueryResult(" in source[start : start + 900]
+        query_start = source.index(query)
+        read_start = source.rindex("failureStage = .read", 0, query_start)
+        read_end = source.index(query_end, query_start)
+        # Structural read boundaries include predicate/lineage preparation without
+        # borrowing another lane's diagnostics or relying on character windows.
+        read = source[read_start:read_end]
+        assert read.count("noteAutomaticSyncQueryStarted(") == 1
+        assert read.count("noteAutomaticSyncQueryResult(") == 1
+        assert (
+            read.index("noteAutomaticSyncQueryStarted(")
+            < read.index(query)
+            < read.index("noteAutomaticSyncQueryResult(")
+        )
+        if query == "let changes: HealthKitAnchoredQuantityChanges":
+            assert (
+                read.index("noteAutomaticSyncQueryStarted(")
+                < read.index("let initialCoverageStart")
+                < read.index(query)
+                < read.index("if let readAnchoredQuantityChanges {")
+                < read.index("changes = try await readAnchoredQuantityChanges(")
+                < read.index("} else {")
+                < read.index("changes = try await reader.readAnchoredQuantityChanges(")
+                < read.index("noteAutomaticSyncQueryResult(")
+            )
 
 
 def test_local_outbox_evidence_is_not_payload_or_receiver_proof() -> None:

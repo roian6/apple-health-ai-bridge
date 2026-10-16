@@ -1,129 +1,29 @@
-# Agent-Assisted Receiver and MCP Setup
+# Agent-assisted Health Bridge setup
 
-Apple Health AI Bridge is designed so a local AI agent can handle most receiver, database, and MCP setup work for a user. This document explains what agents can safely automate and where platform or user-owned boundaries remain.
+Use the [setup guide](setup.md) as the single receiver installation and phone-handoff reference. The supervised receiver setup described there is an unreleased candidate whose Direct/Tailscale path retains Companion 1.1.1 compatibility; iCloud-native first pairing needs the updated companion and matching signed helper; public `receiver-v1.1.2` users must use its linked version-pinned guide instead. Do not invent a working npm/PyPI install command for an unpublished package.
 
-## What an agent can usually handle
+## Start with the requested outcome
 
-A capable local agent can:
+If the user asks to **read existing data**, use the installed [Health Bridge Skill](../skills/health-bridge/SKILL.md) and read-only CLI on the receiver computer. Start with `health-bridge status --json` and `health-bridge query synced-metrics`. Setup remembers the database. An existing approved SSH connection can be used when the agent runs elsewhere; missing access is not permission to move or recreate the receiver.
 
-- check prerequisites such as Git, `uv`, and Python;
-- clone the repository and run `uv sync --all-extras --dev`;
-- initialize a local SQLite database;
-- ingest synthetic fixtures;
-- start or supervise the local receiver;
-- verify `/health` from the machine that runs the receiver;
-- generate private setup material when the user is ready for real-device testing;
-- write MCP client configuration snippets;
-- run redacted `status`, `query`, and `mcp smoke` commands;
-- run public release audit and test gates;
-- summarize failures without copying real health values or secrets into public places.
+If the user asks to **install or connect the bridge**, inspect the host, existing receiver and private route first. Prefer the working setup already present. Preview the bounded installation/service/network changes once and obtain approval before executing them; do not turn that into a second configuration wizard.
 
-## Synthetic first
+## Run the shared setup path
 
-Agents should start with the synthetic path before touching real-device setup:
+After the chosen candidate installation, `health-bridge setup` explicitly creates or reuses the supervised per-user receiver and remembers its database. The default discovers an existing logged-in Tailscale installation and prepares private Serve. An explicitly supplied working `--receiver-url` preserves that ingress; the CLI does not select or install a tunnel provider for the user.
 
-```bash
-uv sync --all-extras --dev
-uv run health-bridge init --db .tmp/quickstart.sqlite
-uv run health-bridge ingest-fixture \
-  --db .tmp/quickstart.sqlite \
-  --input fixtures/health_bridge_batch_v1.synthetic.json
-uv run health-bridge status --db .tmp/quickstart.sqlite --markdown
-uv run health-bridge mcp smoke --db .tmp/quickstart.sqlite
-```
+Tailscale is the connection app on both the computer and iPhone: use the same account and keep it enabled on the iPhone. On a Mac, the iCloud choice reuses a matching helper and its known Documents folder. Missing helpers can be installed only from user-selected matching signed release files with explicit approval; the 1.1.3 helper assets are not publicly available yet. Return to connection choices or pause when those files are unavailable. The candidate uses iCloud for first pairing as well as data delivery, without a phone-facing receiver URL. This path requires the updated companion; the currently published app does not implement it. Do not ask users to reconstruct flags for information guided setup already discovers.
 
-This proves the local Python/SQLite/MCP path without an iPhone and without private pairing material.
+Follow the printed private connection URL. The same page handles QR or same-iPhone opening, app installation and return, pairing and a confirmed health-data upload with observations still stored. Progress is available only until the original invitation expiry and while the redeemed device/token remain active. For later checks, rerun the same setup invocation or read the remembered database. Do not report localhost reachability or an accepted empty batch as successful iPhone delivery.
 
-## Receiver setup pattern
+The user installs or keeps the compatible companion, opens/scans the connection page and chooses Apple Health read permissions through **Allow Health Access**, then turns on **Automatic Sync** for ongoing delivery. It starts OFF; **Sync Now** is only an optional immediate test. Those phone actions cannot be replaced by a synthetic upload. Existing paired-device identity and stored health data remain intact.
 
-For local-only smoke testing on the same machine, keep the receiver running in one terminal:
+## Boundaries
 
-```bash
-uv run health-bridge init --db .tmp/device.sqlite
-uv run health-bridge receiver start --db .tmp/device.sqlite --host 127.0.0.1 --port 8765
-```
+- Treat actual package installation, persistent services, client registration, pairing changes, network exposure and data removal as scoped mutations, not read-only discovery. Ask only for approval needed by the next actual change.
+- The agent must not create a provider account, activate a paid plan, accept terms, start a trial or incur charges without previewing the effect and obtaining explicit approval for each account/billing action. Existing login is not approval.
+- Never install, re-sign or access a personal iPhone merely to make a QA gate pass. Signing, trust and Health permission prompts remain user-owned.
+- Keep private connection links, QR codes, credentials, database paths and raw health values out of public reports. Summarize stored coverage and actual observation dates.
+- Do not reset data, replace a connection, modify queues/cursors or turn Automatic Sync on to repair a read request. Missing observations are not zero activity.
 
-Then verify from another terminal:
-
-```bash
-curl -fsS http://127.0.0.1:8765/health
-uv run health-bridge status --db .tmp/device.sqlite --markdown
-```
-
-For a physical iPhone, prepare the real receiver route first by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback. Do not put a sample hostname into pairing material.
-
-For Route B, an agent must not create a provider account, activate a paid plan, incur charges, accept provider terms, or start a trial unless each action and its price or future billing effect was previewed and the user gave explicit approval for each. Existing login access or approval of the overall topology is not approval for those account or billing actions.
-
-After the selected route sets `HEALTH_BRIDGE_RECEIVER_URL`, run the matching setup command. Routes A and B keep loopback:
-
-```bash
-uv run health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --db .tmp/device.sqlite \
-  --setup-page .tmp/ios-companion-device-session.html
-```
-
-Route C instead repeats its required LAN bind:
-
-```bash
-uv run health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --db .tmp/device.sqlite \
-  --setup-page .tmp/ios-companion-device-session.html \
-  --receiver-host 0.0.0.0 \
-  --receiver-port 8765
-```
-
-Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL. Then derive the phone-facing endpoint:
-
-```bash
-PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
-```
-
-Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only then open the private setup page generated by `setup`. If its invitation expired during verification, follow [the documented fresh-invitation recovery](setup.md#start-and-verify-the-receiver).
-
-The generated setup page contains a temporary, single-use invitation and remains private until pairing or expiry. Do not paste it into public issues, docs, chat, logs, or commits. Use `health-bridge setup` for normal physical-iPhone onboarding. `dev device-session` remains a development/QA helper; expert receiver commands such as `health-bridge receiver create-token` and `health-bridge receiver create-pairing --format json|deeplink` require explicit secret-output flags and should not be used by agents unless the user asked for raw secret material. New pairing defaults to invitation v2; long-lived bearer material is available only through explicit `--legacy-v1` compatibility.
-
-See [`self-build.md`](self-build.md) for the full Mac/iPhone handoff sequence and [`pairing.md`](pairing.md) for the QR-first pairing/fallback matrix.
-
-## MCP setup pattern
-
-A local MCP client can launch the read-only server like this:
-
-```json
-{
-  "command": "uv",
-  "args": ["run", "health-bridge", "mcp", "start", "--db", ".tmp/quickstart.sqlite"],
-  "cwd": "/absolute/path/to/apple-health-ai-bridge"
-}
-```
-
-If the client cannot set `cwd`, use `uv --directory`:
-
-```json
-{
-  "command": "uv",
-  "args": ["--directory", "/absolute/path/to/apple-health-ai-bridge", "run", "health-bridge", "mcp", "start", "--db", ".tmp/quickstart.sqlite"]
-}
-```
-
-The MCP surface is intentionally read-only. It exposes fixed tools for status, context Markdown, synced metric coverage, timeseries, workouts, sleep, daily summaries, sources, and supported type metadata.
-
-## Boundaries agents cannot remove
-
-Agents can reduce setup burden, but they cannot fully remove Apple platform and local-network constraints. These cases may still require user action or a future product surface:
-
-- the user only has an iPhone and no always-on computer for a receiver;
-- Apple Developer Program enrollment and App Store Connect approval;
-- physical TestFlight install, Health permission, and local network permission taps;
-- Mac/Xcode signing or keychain approval that requires GUI interaction;
-- sleeping laptops, firewalls, router rules, corporate networks, or VPN/private-network misconfiguration;
-- receiver host changes after pairing;
-- support situations where the agent cannot access the user’s local machine;
-- non-agent users who expect a normal app install and setup wizard.
-
-## Product implication
-
-Near-term accessibility should focus on the App Store plus clear agent-assisted setup docs. A desktop/tray receiver app should be reconsidered when repeated setup feedback shows receiver/MCP friction that local agents cannot solve.
-
-Hosted relay, manual export import, and Shortcuts fallback remain outside near-term scope unless the project explicitly changes direction.
+Synthetic contributor checks live in [CONTRIBUTING.md](../CONTRIBUTING.md); app builds and signed-device handoff live in [self-build.md](self-build.md). Reuse those references instead of adding an agent-specific installation stack. MCP remains optional and read-only.

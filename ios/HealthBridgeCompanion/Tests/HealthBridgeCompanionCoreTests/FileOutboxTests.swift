@@ -3,6 +3,17 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class FileOutboxTests: XCTestCase {
+    func testDailyProjectionOrderPersistsBeforeReadAcrossRestart() throws {
+        let directory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = try FileOutbox(directory: directory).reserveDailyProjectionObservation()
+        let restarted = try FileOutbox(directory: directory)
+        let second = try restarted.reserveDailyProjectionObservation()
+        XCTAssertEqual(first.namespace, second.namespace)
+        XCTAssertGreaterThan(second.sequence, first.sequence)
+        XCTAssertTrue(try restarted.pendingItems().isEmpty)
+    }
+
     func testReceiverBoundEnqueueIfAbsentReusesCrashWindowPayload() throws {
         let directory = temporaryOutboxDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

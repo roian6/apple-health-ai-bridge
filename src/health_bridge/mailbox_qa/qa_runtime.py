@@ -106,8 +106,10 @@ class QAReceiverRequestHandler(ReceiverRequestHandler):
             _require_namespace(request.namespace, self.qa_server.namespace)
             responses: list[dict[str, bool | int | str]] = []
 
-            def provision(_completion: PairingRedemptionCompletion) -> None:
-                responses.append(provision_qa_mailbox(self.qa_server, request))
+            def provision(_completion: PairingRedemptionCompletion) -> str:
+                response, enrollment = provision_qa_mailbox(self.qa_server, request)
+                responses.append(response)
+                return enrollment
 
             _ = redeem_pairing_invitation(
                 self.qa_server.db_path,
@@ -137,7 +139,7 @@ class QAReceiverRequestHandler(ReceiverRequestHandler):
 def provision_qa_mailbox(
     server: QAReceiverHTTPServer,
     request: QAPairingRedeemRequest,
-) -> dict[str, bool | int | str]:
+) -> tuple[dict[str, bool | int | str], str]:
     key_store = MailboxKeyStore.for_testing(
         state_dir=server.runtime_root / "private/receiver-keys",
         anchor_dir=server.runtime_root / "private/receiver-anchor",
@@ -204,7 +206,7 @@ def provision_qa_mailbox(
         server.runtime_root / "private/pairing" / f"{anchor_name}.hbjcs1",
         hbjcs1_encode(document).decode("utf-8"),
     )
-    return {
+    response: dict[str, bool | int | str] = {
         "v": 1,
         "kind": "health_bridge.mailbox_qa_pairing_completion.v1",
         "namespace": server.namespace,
@@ -223,6 +225,10 @@ def provision_qa_mailbox(
             identity.agreement_public_key,
         ),
     }
+    trusted = connection_store.load(
+        server.mailbox_root / receiver_id.hex() / device_id.hex()
+    )
+    return response, trusted.enrollment_digest()
 
 
 def _require_namespace(candidate: str, expected: str) -> None:

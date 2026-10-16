@@ -82,6 +82,41 @@ public final class MailboxTransport: DeliveryTransport {
         return try publish(finalized) == nil ? .retryable : .published
     }
 
+    @MainActor
+    func publishEnvelopeAwaitingCompletion(itemID: String) async throws -> DeliveryTransportResult {
+        try checkPublicationAdmission()
+        guard let item = try outbox.pendingItem(id: itemID),
+              item.receiverIdentity == context.receiverBindingID,
+              let binding = item.mailboxBinding else {
+            throw MailboxTransportError.itemUnavailable
+        }
+        let finalized = try loadFinalizedEnvelope(itemID: item.id, binding: binding)
+        guard let locator = try resolvedLocator() else { return .retryable }
+        try checkPublicationAdmission()
+        do {
+            _ = try await publisher.publishAwaitingCompletion(
+                finalized.bytes,
+                finalName: try finalName(for: finalized),
+                locator: locator
+            )
+        } catch {
+            try checkPublicationAdmission()
+            if let publicationError = error as? MailboxPublicationError {
+                switch publicationError {
+                case .retryable: return .retryable
+                case .conflict: throw MailboxTransportError.destinationConflict
+                case .unsafeDestination: throw MailboxTransportError.unsafeDestination
+                }
+            }
+            throw error
+        }
+        try checkPublicationAdmission()
+        guard try outbox.pendingItem(id: itemID)?.mailboxBinding == binding else {
+            throw MailboxTransportError.bindingMismatch
+        }
+        return .published
+    }
+
     func observeEnvelope(itemID: String) throws -> DeliveryTransportResult {
         try checkCancellation()
         try validateContext()
@@ -116,6 +151,7 @@ public final class MailboxTransport: DeliveryTransport {
     }
 
     func validateOwnership(_ ownership: OutboxDeliveryOwnershipV1) throws {
+        try checkCancellation()
         try validateContext()
         guard ownership.receiverID == context.receiverID,
               ownership.deviceID == context.deviceID,
@@ -315,6 +351,13 @@ public final class MailboxTransport: DeliveryTransport {
 
     private func checkCancellation() throws {
         if isCancelled() { throw CancellationError() }
+    }
+
+    private func checkPublicationAdmission() throws {
+        try Task.checkCancellation()
+        try checkCancellation()
+        try outbox.requireUploadAdmission()
+        try validateContext()
     }
 
     private static func sha256(_ data: Data) -> String {

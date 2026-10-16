@@ -1,4 +1,5 @@
 import base64
+import json
 import re
 import sqlite3
 import time
@@ -6,20 +7,26 @@ from binascii import Error as BinasciiError
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Final, TypeAlias
+from typing import ClassVar, Final, TypeAlias, overload
 from urllib.parse import urlparse, urlunparse
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from health_bridge.ingest import ingest_fixture
 from health_bridge.private_files import write_private_text_file
-from health_bridge.receiver.invitations import revoke_pairing_invitation
+from health_bridge.receiver.invitations import (
+    pairing_invitation_is_pending,
+    revoke_pairing_invitation,
+)
 from health_bridge.receiver.pairing import (
     create_receiver_pairing_bundle,
     create_receiver_pairing_invitation_bundle,
     pairing_deep_link,
 )
-from health_bridge.receiver.pairing_setup_page import render_pairing_setup_page
+from health_bridge.receiver.pairing_setup_page import (
+    read_invitation_page,
+    render_pairing_setup_page,
+)
 from health_bridge.receiver.tokens import revoke_receiver_token
 from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import connect_database, initialize_database
@@ -83,8 +90,8 @@ class DevDeviceSessionManifest(BaseModel):
 
     db: str
     label: str
-    receiver_url: str
-    receiver_health_url: str
+    receiver_url: str | None
+    receiver_health_url: str | None
     setup_page: str
     pairing_schema_id: str
     invitation_expires_at: str
@@ -178,7 +185,7 @@ class SyncRunWatchTimeoutEvent(BaseModel):
 class DevDeviceSessionRequest:
     db_path: Path
     label: str
-    receiver_url: str
+    receiver_url: str | None
     setup_page_path: Path
     receiver_host: str
     receiver_port: int
@@ -209,21 +216,46 @@ def build_dev_device_session_manifest(
 ) -> DevDeviceSessionManifest:
     initialize_database(request.db_path)
     baseline_sync_run_id = max_sync_run_id(request.db_path)
-    bundle = create_receiver_pairing_invitation_bundle(
-        request.db_path,
-        label=request.label,
-        receiver_url=request.receiver_url,
-        transport=request.transport,
-    )
-    deep_link = pairing_deep_link(bundle)
     try:
-        write_private_text_file(
-            request.setup_page_path,
-            render_pairing_setup_page(bundle, deep_link),
+        _, pending = read_invitation_page(request.setup_page_path)
+    except (OSError, ValueError):
+        pending = None
+    if (
+        pending is not None
+        and pairing_invitation_is_pending(request.db_path, pending.invitation_secret)
+        and (
+            pending.label != request.label
+            or pending.receiver_url != request.receiver_url
+            or pending.transport != request.transport
         )
-    except OSError as exc:
-        revoke_pairing_invitation(request.db_path, bundle.invitation_id)
-        raise RuntimeError(SETUP_PAGE_WRITE_FAILURE_MESSAGE) from exc
+    ):
+        message = (
+            "Existing pending pairing uses different configuration; "
+            "resume it with the original setup options."
+        )
+        raise ValueError(message)
+    if not (
+        pending is not None
+        and pending.label == request.label
+        and pending.receiver_url == request.receiver_url
+        and pending.transport == request.transport
+        and pairing_invitation_is_pending(request.db_path, pending.invitation_secret)
+    ):
+        bundle = create_receiver_pairing_invitation_bundle(
+            request.db_path,
+            label=request.label,
+            receiver_url=request.receiver_url,
+            transport=request.transport,
+        )
+        try:
+            write_private_text_file(
+                request.setup_page_path,
+                render_pairing_setup_page(bundle, pairing_deep_link(bundle)),
+            )
+        except OSError as exc:
+            revoke_pairing_invitation(request.db_path, bundle.invitation_id)
+            raise RuntimeError(SETUP_PAGE_WRITE_FAILURE_MESSAGE) from exc
+        pending = bundle.qr_payload()
 
     receiver_start_command = [
         "uv",
@@ -288,8 +320,8 @@ def build_dev_device_session_manifest(
         receiver_url=request.receiver_url,
         receiver_health_url=receiver_health_url(request.receiver_url),
         setup_page=str(request.setup_page_path),
-        pairing_schema_id=bundle.schema_id,
-        invitation_expires_at=bundle.expires_at,
+        pairing_schema_id=pending.schema_id,
+        invitation_expires_at=pending.expires_at,
         baseline_sync_run_id=baseline_sync_run_id,
         receiver_start_command=receiver_start_command,
         receiver_systemd_command=receiver_systemd_command,
@@ -530,29 +562,13 @@ def build_dev_receiver_systemd_manifest(
         raise ValueError(INVALID_SYSTEMD_SERVICE_NAME_MESSAGE)
     if _has_whitespace(db_path) or _has_whitespace(working_directory):
         raise ValueError(INVALID_SYSTEMD_WHITESPACE_PATH_MESSAGE)
+    command = (
+        "uv run health-bridge receiver start "
+        f"--db {db_path} --host {host} --port {port}"
+    )
     service_file_name = f"{service_name}.service"
     unit_path = f"~/.config/systemd/user/{service_file_name}"
-    unit_text = "\n".join(
-        [
-            "[Unit]",
-            "Description=Health Bridge local receiver",
-            "After=network-online.target",
-            "",
-            "[Service]",
-            "Type=simple",
-            f"WorkingDirectory={working_directory}",
-            (
-                "ExecStart=uv run health-bridge receiver start "
-                f"--db {db_path} --host {host} --port {port}"
-            ),
-            "Restart=on-failure",
-            "RestartSec=5",
-            "",
-            "[Install]",
-            "WantedBy=default.target",
-            "",
-        ]
-    )
+    unit_text = render_receiver_systemd_unit(command, str(working_directory))
     return DevReceiverSystemdManifest(
         service_name=service_name,
         unit_path=unit_path,
@@ -580,11 +596,52 @@ def build_dev_receiver_systemd_manifest(
     )
 
 
+def render_receiver_systemd_unit(
+    command: str, directory: str, *, installed: bool = False
+) -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=Health Bridge local receiver",
+            "After=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            f"WorkingDirectory={directory}",
+            f"ExecStart={command}",
+            *(["UMask=0077"] if installed else []),
+            "Restart=on-failure",
+            "RestartSec=5",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+    )
+
+
+def systemd_argument(value: str) -> str:
+    if not value.isprintable():
+        message = "Receiver service arguments cannot contain control characters."
+        raise ValueError(message)
+    return json.dumps(value.replace("%", "%%").replace("$", "$$"))
+
+
 def _has_whitespace(value: Path | str) -> bool:
     return any(character.isspace() for character in str(value))
 
 
-def receiver_health_url(receiver_url: str) -> str:
+@overload
+def receiver_health_url(receiver_url: str) -> str: ...
+
+
+@overload
+def receiver_health_url(receiver_url: None) -> None: ...
+
+
+def receiver_health_url(receiver_url: str | None) -> str | None:
+    if receiver_url is None:
+        return None
     parsed = urlparse(receiver_url)
     return urlunparse((parsed.scheme, parsed.netloc, "/health", "", "", ""))
 

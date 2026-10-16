@@ -1,4 +1,117 @@
 import Foundation
+import CryptoKit
+
+public struct MailboxBootstrapDescriptor: Codable, Equatable, Sendable {
+    public let version: Int
+    public let invitationID: String
+    public let receiverSigningPublicKey: String
+    public let receiverAgreementPublicKey: String
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case invitationID = "invitation_id"
+        case receiverSigningPublicKey = "receiver_signing_public_key"
+        case receiverAgreementPublicKey = "receiver_agreement_public_key"
+    }
+
+    func validate() throws {
+        guard version == 1, let id = Data(hexV1: invitationID), id.count == 16,
+              id.hexV1 == invitationID,
+              Data(strictBase64URL: receiverSigningPublicKey, count: 32) != nil,
+              Data(strictBase64URL: receiverAgreementPublicKey, count: 32) != nil else {
+            throw ReceiverPairingBundleError.unsupportedTransport
+        }
+    }
+}
+
+enum NativeMailboxPairing {
+    static let domain = Data("health-bridge/mailbox-pairing/v1/".utf8)
+
+    static func seal(_ pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> Data {
+        guard let bootstrap = pending.mailboxBootstrap, let secret = pending.invitationSecret,
+              let invitationID = Data(hexV1: bootstrap.invitationID) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        try bootstrap.validate()
+        let identity = try keys.loadOrCreate()
+        let plaintext = try DeliveryProtocolV1.encodeMetadata(.object([
+            "invitation_secret": .string(secret), "installation_id": .string(pending.installationID),
+            "device_credential": .string(pending.deviceCredential), "platform": .string(pending.platform),
+            "device_signing_public_key": .string(identity.signingPublicKey.base64URLEncodedString()),
+            "device_agreement_public_key": .string(identity.agreementPublicKey.base64URLEncodedString()),
+        ]))
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let receiver = try Curve25519.KeyAgreement.PublicKey(rawRepresentation:
+            DeliveryProtocolV1.unb64(bootstrap.receiverAgreementPublicKey, length: 32))
+        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: receiver)
+        let key = DeliveryProtocolV1.hkdf(shared, salt: invitationID, info: domain + Data("request/key".utf8), count: 32)
+        let nonce = AES.GCM.Nonce()
+        let nonceData = nonce.withUnsafeBytes { Data($0) }
+        var fields: [String: HBJCS1Value] = [
+            "v": .integer(1), "kind": .string("request"), "invitation_id": .string(bootstrap.invitationID),
+            "sender_signing_public_key": .string(identity.signingPublicKey.base64URLEncodedString()),
+            "ephemeral_public_key": .string(ephemeral.publicKey.rawRepresentation.base64URLEncodedString()),
+            "nonce": .string(nonceData.base64URLEncodedString()),
+        ]
+        let box = try AES.GCM.seal(plaintext, using: SymmetricKey(data: key), nonce: nonce,
+            authenticating: domain + Data("request/aad\0".utf8) + DeliveryProtocolV1.encodeMetadata(.object(fields)))
+        fields["ciphertext"] = .string((box.ciphertext + box.tag).base64URLEncodedString())
+        fields["signature"] = .string(try keys.sign(domain + Data("request/signature\0".utf8)
+            + DeliveryProtocolV1.encodeMetadata(.object(fields))).base64URLEncodedString())
+        return try DeliveryProtocolV1.encodeMetadata(.object(fields))
+    }
+
+    static func openCompletion(_ encoded: Data, pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> ReceiverPairingCredential {
+        guard let bootstrap = pending.mailboxBootstrap, let request = pending.sealedRequest,
+              let invitationID = Data(hexV1: bootstrap.invitationID) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        var fields = try DeliveryProtocolV1.object(encoded, fields: [
+            "v", "kind", "invitation_id", "sender_signing_public_key", "request_sha256", "nonce", "ciphertext", "signature",
+        ], limit: 65_536)
+        let digest = Data(SHA256.hash(data: request))
+        guard try DeliveryProtocolV1.integer(fields, "v") == 1,
+              try DeliveryProtocolV1.string(fields, "kind") == "completion",
+              try DeliveryProtocolV1.string(fields, "invitation_id") == bootstrap.invitationID,
+              try DeliveryProtocolV1.string(fields, "request_sha256") == digest.hexV1,
+              try DeliveryProtocolV1.string(fields, "sender_signing_public_key") == bootstrap.receiverSigningPublicKey else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let signature = try DeliveryProtocolV1.unb64(DeliveryProtocolV1.string(fields, "signature"), length: 64)
+        fields.removeValue(forKey: "signature")
+        let signer = try Curve25519.Signing.PublicKey(rawRepresentation:
+            DeliveryProtocolV1.unb64(bootstrap.receiverSigningPublicKey, length: 32))
+        guard try signer.isValidSignature(signature, for: domain + Data("completion/signature\0".utf8)
+            + DeliveryProtocolV1.encodeMetadata(.object(fields))) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let shared = try keys.sharedSecret(with: DeliveryProtocolV1.unb64(bootstrap.receiverAgreementPublicKey, length: 32))
+        let salt = invitationID + digest
+        let key = DeliveryProtocolV1.hkdf(shared, salt: salt, info: domain + Data("completion/key".utf8), count: 32)
+        let nonce = try DeliveryProtocolV1.unb64(DeliveryProtocolV1.string(fields, "nonce"), length: 12)
+        let combined = try DeliveryProtocolV1.unb64(DeliveryProtocolV1.string(fields, "ciphertext"))
+        guard combined.count >= 16,
+              nonce == DeliveryProtocolV1.hkdf(shared, salt: salt, info: domain + Data("completion/nonce".utf8), count: 32).prefix(12) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        fields.removeValue(forKey: "ciphertext")
+        let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: nonce), ciphertext: combined.dropLast(16), tag: combined.suffix(16))
+        let plaintext = try AES.GCM.open(box, using: SymmetricKey(data: key),
+            authenticating: domain + Data("completion/aad\0".utf8) + DeliveryProtocolV1.encodeMetadata(.object(fields)))
+        let payload = try JSONDecoder().decode(PairingCompletionPayload.self, from: plaintext)
+        guard payload.schemaID == ReceiverPairingCredential.supportedSchemaID,
+              payload.schemaVersion == ReceiverPairingCredential.supportedSchemaVersion,
+              payload.receiverURL == nil,
+              payload.mailboxReceiverSigningPublicKey == bootstrap.receiverSigningPublicKey,
+              payload.mailboxReceiverAgreementPublicKey == bootstrap.receiverAgreementPublicKey else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let identity = try ReceiverClient.mailboxConnectionIdentity(payload: payload, pendingPairing: pending,
+            deviceIdentity: keys.loadOrCreate(), required: true)
+        return ReceiverPairingCredential(label: payload.label, receiverURLString: nil,
+            bearerToken: "", tokenPrefix: "", mailboxIdentity: identity)
+    }
+}
 
 public enum ReceiverPairingBundleError: Error, Equatable, LocalizedError {
     case invalidJSON
@@ -109,14 +222,15 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
     public let schemaID: String
     public let schemaVersion: String
     public let label: String
-    public let receiverURLString: String
-    public let redeemURLString: String
+    public let receiverURLString: String?
+    public let redeemURLString: String?
     public let invitationSecret: String
     public let expiresAt: String
     public let transport: ReceiverPairingTransport
+    public let mailboxBootstrap: MailboxBootstrapDescriptor?
     public let mailboxProtocolVersion: Int?
-    public let receiverURL: URL
-    public let redeemURL: URL
+    public let receiverURL: URL?
+    public let redeemURL: URL?
 
     public init(jsonData: Data) throws {
         let payload: InvitationPairingPayload
@@ -138,10 +252,23 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         default:
             throw ReceiverPairingBundleError.unsupportedTransport
         }
-        let receiverURL = try validatedHTTPURL(payload.receiverURL)
-        let redeemURL = try validatedHTTPURL(payload.redeemURL)
-        guard urlOrigin(receiverURL) == urlOrigin(redeemURL) else {
-            throw ReceiverPairingBundleError.crossOriginRedeemURL
+        let receiverURL: URL?
+        let redeemURL: URL?
+        if let bootstrap = payload.mailboxBootstrap {
+            guard transport == .mailbox, payload.receiverURL == nil, payload.redeemURL == nil else {
+                throw ReceiverPairingBundleError.unsupportedTransport
+            }
+            try bootstrap.validate()
+            receiverURL = nil
+            redeemURL = nil
+        } else {
+            let receiver = try validatedHTTPURL(payload.receiverURL ?? "")
+            let redeem = try validatedHTTPURL(payload.redeemURL ?? "")
+            guard urlOrigin(receiver) == urlOrigin(redeem) else {
+                throw ReceiverPairingBundleError.crossOriginRedeemURL
+            }
+            receiverURL = receiver
+            redeemURL = redeem
         }
         guard !payload.invitationSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ReceiverPairingBundleError.emptyInvitationSecret
@@ -154,6 +281,7 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         self.invitationSecret = payload.invitationSecret
         self.expiresAt = payload.expiresAt
         self.transport = transport
+        self.mailboxBootstrap = payload.mailboxBootstrap
         self.mailboxProtocolVersion = payload.mailboxProtocolVersion
         self.receiverURL = receiverURL
         self.redeemURL = redeemURL
@@ -306,12 +434,13 @@ private struct InvitationPairingPayload: Decodable {
     let schemaID: String
     let schemaVersion: String
     let label: String
-    let receiverURL: String
-    let redeemURL: String
+    let receiverURL: String?
+    let redeemURL: String?
     let invitationSecret: String
     let expiresAt: String
     let transport: ReceiverPairingTransport?
     let mailboxProtocolVersion: Int?
+    let mailboxBootstrap: MailboxBootstrapDescriptor?
 
     enum CodingKeys: String, CodingKey {
         case schemaID = "schema_id"
@@ -323,6 +452,7 @@ private struct InvitationPairingPayload: Decodable {
         case expiresAt = "expires_at"
         case transport
         case mailboxProtocolVersion = "mailbox_protocol_version"
+        case mailboxBootstrap = "mailbox_bootstrap"
     }
 }
 

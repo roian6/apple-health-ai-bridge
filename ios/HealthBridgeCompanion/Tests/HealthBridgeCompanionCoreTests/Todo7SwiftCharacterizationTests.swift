@@ -93,7 +93,7 @@ final class Todo7SwiftCharacterizationTests: XCTestCase {
         }
         XCTAssertEqual(invitation.invitationSecret, "hbi_synthetic_replacement")
         try settings.save(
-            receiverURLString: invitation.receiverURLString,
+            receiverURLString: try XCTUnwrap(invitation.receiverURLString),
             bearerToken: "synthetic-redeemed-device-credential"
         )
         let currentGeneration = settings.receiverSettingsGenerationToken
@@ -105,7 +105,7 @@ final class Todo7SwiftCharacterizationTests: XCTestCase {
         XCTAssertEqual(try settings.loadBearerToken(), "synthetic-redeemed-device-credential")
 
         try settings.save(
-            receiverURLString: invitation.receiverURLString,
+            receiverURLString: try XCTUnwrap(invitation.receiverURLString),
             bearerToken: "synthetic-redeemed-device-credential"
         )
         XCTAssertEqual(settings.receiverSettingsGenerationToken, currentGeneration)

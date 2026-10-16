@@ -2,12 +2,14 @@
 
 Apple Health AI Bridge contains independently released components. Always include the component name when presenting a version; the phrase “repository version” is intentionally avoided because a Git checkout is identified by a commit or tag, not by a single product version.
 
-## Current compatibility
+## Source-candidate compatibility
+
+Receiver/CLI 1.1.3 and Companion 1.1.2/build 62 below form a coordinated source candidate, not published install targets. The last published receiver remains 1.1.2 and the published companion remains 1.1.1 until the new immutable release assets and Apple distribution are verified.
 
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.2` | Release tag `receiver-v1.1.2` |
-| iOS Companion | `1.1.1` | Source candidate build `50` |
+| Receiver/CLI | `1.1.3` | Release tag `receiver-v1.1.3` |
+| iOS Companion | `1.1.2` | Source candidate build `62` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). The index declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
@@ -30,13 +32,13 @@ Release notes use the same tag in their filename and install examples.
 
 ### iOS Companion
 
-The user-visible app version is Xcode `MARKETING_VERSION`. App Store Connect and TestFlight additionally require a monotonically increasing `CURRENT_PROJECT_VERSION` build number. Display both when identifying an installed build:
+The user-visible app version is Xcode `MARKETING_VERSION`. App Store Connect and TestFlight additionally require a monotonically increasing `CURRENT_PROJECT_VERSION` build number. Display both when identifying an installed build. For example, the historical published build is:
 
 ```text
 iOS Companion 1.1.1 (build 50)
 ```
 
-An iOS source or distribution checkpoint may use a component-scoped tag such as:
+A historical iOS source or distribution checkpoint may use a component-scoped tag such as:
 
 ```text
 ios-v1.1.1-build.50
@@ -67,8 +69,8 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.1.2
-Compatible iOS Companion 1.1.1 (build 50)
+Receiver/CLI 1.1.3
+Compatible iOS Companion 1.1.2 (build 62)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```
 

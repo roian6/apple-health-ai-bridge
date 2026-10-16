@@ -13,10 +13,18 @@ final class HealthBridgeCompanionApplicationRuntime {
 
     init(
         viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel(),
-        backgroundLaunchPreparation: (@MainActor () -> Void)? = nil
+        backgroundDeliveryCoordinator: HealthKitBackgroundDeliveryCoordinator? = nil,
+        mailboxChangeObserver: (any MailboxChangeObserving)? = nil,
+        backgroundLaunchPreparation: (@MainActor () -> Void)? = nil,
+        backgroundRefreshScheduler: (any BackgroundRefreshScheduling)? = nil
     ) {
         self.viewModel = viewModel
-        let automaticSyncRuntime = AutomaticSyncRuntime(viewModel: viewModel)
+        let automaticSyncRuntime = AutomaticSyncRuntime(
+            viewModel: viewModel,
+            backgroundDeliveryCoordinator: backgroundDeliveryCoordinator,
+            mailboxChangeObserver: mailboxChangeObserver,
+            backgroundRefreshScheduler: backgroundRefreshScheduler
+        )
         self.automaticSyncRuntime = automaticSyncRuntime
         viewModel.installAutomaticSyncRuntime(automaticSyncRuntime)
         self.backgroundLaunchPreparation = backgroundLaunchPreparation ?? {
@@ -45,6 +53,13 @@ final class HealthBridgeCompanionApplicationRuntime {
     }
 }
 
+#if HEALTH_BRIDGE_UNIT_TEST_HOST
+@main
+@MainActor
+struct HealthBridgeCompanionApp: App {
+    var body: some Scene { WindowGroup { EmptyView() } }
+}
+#else
 @main
 @MainActor
 struct HealthBridgeCompanionApp: App {
@@ -90,3 +105,5 @@ struct HealthBridgeCompanionApp: App {
         }
     }
 }
+
+#endif

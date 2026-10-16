@@ -25,19 +25,16 @@ def test_pairing_setup_page_embeds_qr_and_direct_link_without_plaintext_token(
 
     # Then
     assert "<!doctype html>" in html.lower()
-    assert "HealthBridge Companion Pairing" in html
+    assert "Connect Health Bridge for AI (companion app)" in html
     assert "<svg" in html
     assert pairing_url in html
     assert "maintainer-iphone" in html
     assert bundle.token_prefix in html
     assert "Delete this setup page after pairing" in html
-    assert "Recommended pairing methods" in html
-    assert "Best default" in html
     assert "iPhone Camera" in html
-    assert "Already on the iPhone" in html
-    assert "Paste setup link in Health Bridge" in html
-    assert "trusted screen" in html
-    assert "receiver URL must be reachable from the iPhone" in html
+    assert "Paste this setup link in Health Bridge" in html
+    assert "Viewing this on your computer?" in html
+    assert "Already on your iPhone?" in html
     assert "Copy setup link" in html
     assert bundle.bearer_token not in html
 

@@ -98,6 +98,8 @@ class DailyObservation(QueryModel):
     sample_totals: dict[str, float]
     sample_total_semantics: dict[str, str]
     daily_activity_totals: dict[str, float]
+    last_known_daily_activity_totals: dict[str, float] = Field(default_factory=dict)
+    daily_projection_status: dict[str, str] = Field(default_factory=dict)
     sample_counts: dict[str, int]
     sample_statistics: dict[str, DailySampleStatistic]
     workout_count: int

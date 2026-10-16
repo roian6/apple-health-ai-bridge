@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -5,11 +6,15 @@ from pathlib import Path
 from typing import Final
 
 from health_bridge.private_files import (
-    ensure_private_file,
+    PRIVATE_FILE_MODE,
     repair_private_file_mode,
 )
 from health_bridge.storage._database_lock_files import (
     SQLITE_PRIVATE_SIDECAR_SUFFIXES,
+    close_database_lock_fd,
+    open_database_lock_fd,
+    require_live_readable_database,
+    require_path_identity,
     require_quiescent_database,
 )
 from health_bridge.storage._database_locks import (
@@ -32,6 +37,7 @@ from health_bridge.storage._migration_backup_files import DELIVERY_RECEIPT_MIGRA
 
 __all__ = [
     "connect_database",
+    "connect_live_readonly_database",
     "connect_readonly_database",
     "database_access_lock",
     "database_lifecycle_lock",
@@ -49,17 +55,43 @@ MIGRATION_IDS: Final = (
     "007_sleep_baseline_namespaces",
     DELIVERY_RECEIPT_MIGRATION_ID,
     "009_pairing_transport",
+    "010_receiver_installation",
+    "011_mailbox_enrollment",
 )
 
 
+def _protect_database_file(
+    db_path: Path,
+    *,
+    create: bool,
+    database_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    fd = open_database_lock_fd(
+        db_path, create=create, database_identity=database_identity
+    )
+    try:
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        opened = os.fstat(fd)
+        require_path_identity(db_path, opened)
+        identity = (opened.st_dev, opened.st_ino)
+    finally:
+        close_database_lock_fd(fd)
+    return identity
+
+
 def _protect_database_files(db_path: Path) -> tuple[int, int]:
-    identity = ensure_private_file(db_path)
+    identity = _protect_database_file(db_path, create=True)
     for suffix in SQLITE_PRIVATE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{db_path}{suffix}")
         if not sidecar.exists() and not sidecar.is_symlink():
             continue
         try:
-            repair_private_file_mode(sidecar)
+            if suffix == "-shm":
+                _ = _protect_database_file(
+                    sidecar, create=False, database_identity=identity
+                )
+            else:
+                repair_private_file_mode(sidecar)
         except FileNotFoundError:
             continue
     return identity
@@ -104,6 +136,46 @@ def exclusive_database_maintenance(db_path: Path) -> Generator[None, None, None]
     ):
         require_quiescent_database(db_path)
         yield
+
+
+@contextmanager
+def connect_live_readonly_database(
+    db_path: Path,
+) -> Generator[sqlite3.Connection, None, None]:
+    """Read one consistent transaction alongside ordinary receiver writers.
+
+    Maintenance remains excluded; SQLite handles writer concurrency with a
+    bounded busy timeout. Existing WAL shared memory may be updated by SQLite.
+    Use connect_readonly_database for a quiescent, immutable snapshot instead.
+    """
+    parent_identity = db_path.parent.stat(follow_symlinks=False)
+    with (
+        database_lifecycle_lock(
+            db_path,
+            exclusive=False,
+            create=False,
+            nonblocking=True,
+        ),
+        database_access_lock(
+            db_path,
+            exclusive=False,
+            create=False,
+            nonblocking=True,
+        ) as locked_identity,
+    ):
+        _ = require_live_readable_database(db_path)
+        uri = f"{db_path.resolve(strict=True).as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            require_path_identity(db_path.parent, parent_identity)
+            require_path_identity(db_path, locked_identity)
+            with connection:
+                _ = connection.execute("pragma query_only = on")
+                _ = connection.execute("pragma foreign_keys = on")
+                _ = connection.execute("begin")
+                yield connection
+        finally:
+            connection.close()
 
 
 @contextmanager

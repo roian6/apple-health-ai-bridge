@@ -1,6 +1,6 @@
 # iOS Self-Build Guide
 
-Apple Health AI Bridge can be tried with synthetic data on any development machine. Real Apple Health sync is a separate developer-preview path that needs an iPhone, a Mac with Xcode, signing access for a local development build, and a receiver URL the iPhone can reach.
+Apple Health AI Bridge can be tried with synthetic data on any development machine. Real Apple Health sync is a separate developer-preview path that needs an iPhone, a Mac with Xcode, signing access for a local development build, and compatible receiver and companion builds. Direct needs a receiver URL the iPhone can reach; native iCloud pairing needs the updated companion and Mac helper, with no HTTP URL or tunnel.
 
 The App Store is the normal installation path. This guide remains available for contributors and advanced users who prefer to build and sign the iOS companion themselves.
 
@@ -28,45 +28,13 @@ uv run health-bridge status --db .tmp/quickstart.sqlite --markdown
 uv run health-bridge mcp smoke --db .tmp/quickstart.sqlite
 ```
 
-## 2. Prepare the route and run core setup
+## 2. Use the shared receiver setup
 
-Follow [the receiver route guide](setup.md#what-the-receiver-url-means) before generating pairing material. Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
+Follow the [setup guide](setup.md) for the receiver and phone handoff instead of repeating route preparation or service assembly here. It distinguishes the unreleased supervised-setup candidate from published `receiver-v1.1.2`. The receiver computer and the Mac used to build the app need not be the same host.
 
-After the selected route sets `HEALTH_BRIDGE_RECEIVER_URL`, run exactly one setup command. Routes A and B keep the receiver on loopback:
+For a source checkout of the candidate, `uv run health-bridge setup` runs the same explicit setup operation. It installs/starts the owned per-user receiver, remembers the database and prints the private live connection URL. It does not build, sign or install the companion. Build the app before issuing an invitation when practical; re-run setup if the invitation expires.
 
-```bash
-uv run health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --db .tmp/device.sqlite \
-  --setup-page .tmp/ios-companion-device-session.html
-```
-
-Route C instead repeats its deliberate LAN bind and must never be port-forwarded to the public internet:
-
-```bash
-uv run health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --db .tmp/device.sqlite \
-  --setup-page .tmp/ios-companion-device-session.html \
-  --receiver-host 0.0.0.0 \
-  --receiver-port 8765
-```
-
-Setup creates the private page and prints the exact receiver command, but its same-host MCP smoke does not prove receiver or phone reachability.
-
-## 3. Supervise, start, and verify the receiver
-
-Put the printed receiver command under the approved service manager and start it. Require `{"status":"ok"}` from the printed local health URL first. Then derive the phone-facing endpoint:
-
-```bash
-PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
-```
-
-Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Do not substitute `127.0.0.1` in iPhone setup material; that would point to the iPhone itself.
-
-The setup-generated HTML contains a temporary, single-use invitation—not the long-lived device credential. Keep it private and do not open it for pairing until the app build below is installed. If it expires while building or verifying, follow [the documented fresh-invitation recovery](setup.md#start-and-verify-the-receiver) after both health checks pass.
-
-## 4. Build, install, and launch the companion
+## 3. Build, install, and launch the companion
 
 The helper scripts read local device/signing values from a gitignored file:
 
@@ -100,40 +68,36 @@ open scripts/ios-device-run-local.command
 
 If the wrapper opens a keychain prompt, the human at the Mac must approve it. The scripts do not remove the need for Apple signing, device trust, Health permission, or physical iPhone taps.
 
-## 5. Pair and sync on the iPhone
+## 4. Pair and sync on the iPhone
 
-Follow the current [Pair the iPhone](setup.md#pair-the-iphone) handoff. If the invitation expired while the app was being built, rotate it only after the receiver and both health checks still pass.
+Follow the [phone handoff in the setup guide](setup.md#2-pair-the-iphone-and-start-syncing). Verify the app is your intended isolated development build before opening the private connection URL. If the invitation expired while building, re-run setup rather than modifying saved pairing or app data.
 
 On the iPhone:
 
 1. Open the generated setup page from a trusted path.
 2. Import or open the pairing link in the companion.
 3. Confirm the app shows the paired receiver.
-4. Tap the primary action (`Allow Health access`, `Sync Now`, or `Retry Sync`, depending on state).
-5. Grant only the Apple Health read permissions you want to test.
+4. Tap **Allow Health Access** or **Review Permissions**, grant only the Apple Health read permissions you want to test, then enable **Automatic Sync** when that behavior is in scope.
+5. Verify the first stored observations, automatic delivery, preservation of an existing OFF setting and cold recovery separately. A foreground **Sync Now** result alone does not prove automatic sync.
 
-## 6. Verify redacted local output
+## 5. Verify redacted local output
 
 Back on the receiver machine, verify without printing raw HealthKit values or secrets:
 
 ```bash
-uv run health-bridge status --db .tmp/device.sqlite --markdown
-uv run health-bridge mcp smoke --db .tmp/device.sqlite
+uv run health-bridge status --markdown
+uv run health-bridge query synced-metrics
 ```
 
-For active real-device validation, start a watcher from the secret-redacted manifest's `baseline_sync_run_id`:
+These commands use the database saved by setup. If you deliberately selected a different database, pass that same existing path with `--db`. The setup terminal and connection page distinguish pairing from the first stored records.
 
-```bash
-uv run health-bridge dev watch-sync-runs \
-  --db .tmp/device.sqlite \
-  --after-sync-run-id <baseline_sync_run_id> \
-  --timeout-seconds 3600
-```
+MCP requires the same explicit database path: `uv run health-bridge mcp smoke --db "<database path used by setup>"`. `health-bridge setup --json` reports that path and the exact MCP command without private connection links.
 
 Success means the receiver records a new sync run and local status/MCP output confirms records in aggregate/redacted form. It does not prove guaranteed background freshness; iOS background delivery remains best-effort.
 
 ## Cleanup
 
-- Delete generated setup pages after pairing.
+- Keep the live connection page available while waiting for the first records. Re-run setup to resume; an already paired receiver does not need the obsolete invitation HTML.
+- For manually exported Direct invitation files, remove the private copy when handoff is finished or the invitation expires.
 - Keep `.tmp/`, receiver databases, local logs, and `scripts/ios-device-local.env` out of Git.
 - Revoke old receiver tokens if a setup page or pairing link might have been exposed.

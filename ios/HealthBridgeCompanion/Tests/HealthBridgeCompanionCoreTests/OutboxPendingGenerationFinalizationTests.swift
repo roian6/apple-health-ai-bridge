@@ -3,6 +3,23 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class OutboxPendingGenerationFinalizationTests: XCTestCase {
+    func testDailyOnlyActivityCannotRetireRawObligation() {
+        let retirements = ["basal_energy": 4, "heart_rate": 2]
+        let dailyOnly = FileOutboxFinalizationRecord(
+            cursorCheckpoint: .init(receiverIdentity: "synthetic", sourceKey: "phone",
+                cursorKind: "daily", cursorValue: "opaque"),
+            pendingGenerationRetirements: retirements
+        )
+        XCTAssertEqual(dailyOnly.eligiblePendingGenerationRetirements, ["heart_rate": 2])
+        let both = FileOutboxFinalizationRecord(
+            cursorCheckpoint: .init(receiverIdentity: "synthetic", sourceKey: "phone",
+                cursorKind: "daily", cursorValue: "opaque",
+                cumulativeRawAndDailyCoverage: ["basal_energy"]),
+            pendingGenerationRetirements: retirements
+        )
+        XCTAssertEqual(both.eligiblePendingGenerationRetirements, retirements)
+    }
+
     func testIndependentStagedSequencesFinalizeOwnProgressInFIFOOrder() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("OutboxPendingGenerationTests-\(UUID().uuidString)")

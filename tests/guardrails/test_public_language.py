@@ -134,25 +134,14 @@ def test_guardrail_doc_marks_forbidden_language_examples() -> None:
         assert f'"{phrase}"' in example_section
 
 
-def test_repository_has_no_unpublished_node_wrapper_surface() -> None:
-    removed_paths = (
-        "package.json",
-        "package-lock.json",
-        "tsconfig.json",
-        "src-node",
-        "test-node",
-    )
-    for relative_path in removed_paths:
-        assert not (Path.cwd() / relative_path).exists()
-
-    public_instructions = (
-        Path("README.md"),
-        Path("AGENTS.md"),
-        Path("docs/setup.md"),
-        Path(".github/release/criteria.md"),
-    )
-    for path in public_instructions:
-        assert "npm" not in path.read_text(encoding="utf-8").lower()
+def test_public_install_instructions_do_not_claim_unpublished_packages() -> None:
+    for path in (Path("README.md"), Path("docs/setup.md")):
+        text = path.read_text(encoding="utf-8")
+        assert "unreleased" in text.lower()
+        assert "no published npm/PyPI install target yet" in text
+        assert "blob/receiver-v1.1.2/docs/setup.md" in text
+        assert "npx apple-health-ai-bridge" not in text
+        assert "pip install apple-health-ai-bridge" not in text
 
 
 def test_public_support_privacy_and_security_routes_are_explicit() -> None:
@@ -207,7 +196,11 @@ def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None
     assert "<h1>Apple Health AI Bridge</h1>" in readme
     assert "Health Bridge for AI" not in readme
     assert "open-source project behind" not in readme
-    assert "https://github.com/roian6/apple-health-ai-bridge.git@" in readme
+    assert (
+        "https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md"
+        in readme
+    )
+    assert "Unreleased onboarding preview." in readme
 
 
 def test_readme_does_not_repeat_its_opening_as_a_prompt_list() -> None:
@@ -294,124 +287,48 @@ def test_readme_makes_app_store_primary_without_exposing_maintainer_operations()
     assert "Allow LAN access" in setup_guide
 
 
-def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
-    onboarding_paths = (
-        Path("README.md"),
-        Path("docs/setup.md"),
-        Path("docs/pairing.md"),
-        Path("docs/self-build.md"),
-        Path("docs/agent-assisted-setup.md"),
-    )
-    onboarding_copy = "\n".join(
-        path.read_text(encoding="utf-8") for path in onboarding_paths
-    )
-    setup_guide = Path("docs/setup.md").read_text(encoding="utf-8")
-
-    assert "your-private-host.example" not in onboarding_copy
-    assert "<phone-reachable-private-host>" not in onboarding_copy
-    assert "The project does not issue this URL" in setup_guide
-    assert "Already use Tailscale" in setup_guide
-    assert "Agent-assisted private HTTPS ingress" in setup_guide
-    assert "local-network-only route" in setup_guide
-    assert "Do not expose port 8765 directly to the public internet" in setup_guide
-    assert "If no suitable private route exists" in setup_guide
-    agent_guide = Path("docs/agent-assisted-setup.md").read_text(encoding="utf-8")
-    for safety_copy in (setup_guide, agent_guide):
-        assert "must not create a provider account" in safety_copy
-        assert "activate a paid plan" in safety_copy
-        assert "incur charges" in safety_copy
-        assert "explicit approval for each" in safety_copy
-    assert "## Route C: Local-network-only fallback" in setup_guide
-    assert setup_guide.index("## Route C: Local-network-only fallback") < (
-        setup_guide.index("## Install and run core setup")
-    )
-    assert "--receiver-host 0.0.0.0" in setup_guide
-    assert "--receiver-port 8765" in setup_guide
-    assert "--receiver-host 0.0.0.0" in Path("README.md").read_text(encoding="utf-8")
-
-    for route_handoff in (
+def test_primary_onboarding_uses_one_supervised_setup_and_connection_page() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    setup = Path("docs/setup.md").read_text(encoding="utf-8")
+    primary = readme.split("## Set up the bridge", maxsplit=1)[1].split(
+        "## What is supported", maxsplit=1
+    )[0]
+    for text in (primary, setup):
+        assert "unreleased" in text.lower()
+        assert "receiver-v1.1.2" in text
+        assert "health-bridge setup" in text
+        assert "health-bridge query synced-metrics" in text
+        assert "connection page" in text
+        assert "Allow Health Access" in text
+        assert "Automatic Sync" in text
+        assert "Start Automatic Sync" not in text
+        assert "npx apple-health-ai-bridge" not in text
+        assert "securely copy" not in text
+    assert "does not install an operating-system service" not in setup
+    assert "supervised" in setup
+    assert "remember" in setup
+    assert "--receiver-url" in setup
+    assert "--receiver-host 0.0.0.0" in setup
+    assert "--receiver-port 8765" in setup
+    assert "Already use Tailscale" in setup
+    assert "Agent-assisted private HTTPS ingress" in setup
+    assert "local-network-only route" in setup
+    assert "Do not expose port 8765 directly to the public internet" in setup
+    assert "If no suitable private route exists" in setup
+    assert "must not create a provider account" in setup
+    assert "activate a paid plan" in setup
+    assert "incur charges" in setup
+    assert "explicit approval for each" in setup
+    for path in (
         Path("docs/agent-assisted-setup.md"),
         Path("docs/pairing.md"),
         Path("docs/self-build.md"),
-    ):
-        handoff_copy = route_handoff.read_text(encoding="utf-8")
-        assert "Routes A and B use HTTPS" in handoff_copy
-        assert (
-            "Route C deliberately uses HTTP only on the same trusted LAN"
-            in handoff_copy
-        )
-
-    for path, ordered_steps in (
-        (
-            Path("docs/agent-assisted-setup.md"),
-            (
-                "run the matching setup command",
-                "approved service manager",
-                "printed local health URL",
-                "Open that exact phone-facing `/health` URL on the physical iPhone",
-                "open the private setup page",
-            ),
-        ),
-        (
-            Path("docs/pairing.md"),
-            (
-                "run the route-specific `health-bridge setup` command",
-                "approved service manager",
-                "printed local health URL",
-                "Open that exact phone-facing `/health` URL on the physical iPhone",
-                "open the setup-generated pairing page",
-            ),
-        ),
-        (
-            Path("docs/self-build.md"),
-            (
-                "run exactly one setup command",
-                "approved service manager",
-                "printed local health URL",
-                "Open that exact phone-facing `/health` URL on the physical iPhone",
-                "setup-generated HTML",
-            ),
-        ),
     ):
         text = path.read_text(encoding="utf-8")
-        positions = [text.index(step) for step in ordered_steps]
-        assert positions == sorted(positions), path
-
-    readme = Path("README.md").read_text(encoding="utf-8")
-    route_language = "\n".join(
-        (
-            readme,
-            setup_guide,
-            Path("docs/architecture.md").read_text(encoding="utf-8"),
-        )
-    )
-    assert "agent-managed private HTTPS ingress" not in route_language
-    assert "agent-managed service plan" not in route_language
-
-    for copy, ordered_steps in (
-        (
-            readme,
-            (
-                "Prepare the receiver route",
-                "Install and run setup",
-                "approved service manager",
-                "printed local `/health` URL",
-                "phone-facing `/health` URL",
-                "Pair and sync",
-            ),
-        ),
-        (
-            setup_guide,
-            (
-                "Choose one of the following routes",
-                "Install and run core setup",
-                "Start and verify the receiver",
-                "Pair the iPhone",
-            ),
-        ),
-    ):
-        positions = [copy.index(step) for step in ordered_steps]
-        assert positions == sorted(positions)
+        assert "setup.md" in text
+        assert "approved service manager" not in text
+        assert "your-private-host.example" not in text
+        assert "<phone-reachable-private-host>" not in text
 
 
 def test_contributor_and_release_docs_match_ci_release_gates() -> None:
@@ -454,11 +371,18 @@ def test_current_component_identities_are_explicit() -> None:
     server_manifest = Path("server.json").read_text()
     security = Path("SECURITY.md").read_text()
 
-    assert 'version = "1.1.2"' in pyproject
-    assert '__version__: Final = "1.1.2"' in package_init
-    assert '"version": "1.1.2"' in server_manifest
-    assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
+    assert 'version = "1.1.3"' in pyproject
+    assert '__version__: Final = "1.1.3"' in package_init
+    assert '"version": "1.1.3"' in server_manifest
+    assert xcode_project.count("MARKETING_VERSION = 1.1.2;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 62;") == 2
+    # Bundle metadata is the current release identity; preserve and distinguish
+    # the existing fallback used only when those metadata keys are absent.
+    assert (
+        'Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")'
+        in content_view
+    )
+    assert 'Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")' in content_view
     assert '?? "1.1.1"' in content_view
     assert '?? "50"' in content_view
     assert "pre-1.0" not in security

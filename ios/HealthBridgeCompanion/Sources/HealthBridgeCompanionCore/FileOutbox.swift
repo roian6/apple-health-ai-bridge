@@ -343,25 +343,36 @@ public enum FileOutboxCoreLaneUploadProof: String, Codable, Equatable, Sendable 
     case workouts
 }
 
+public struct DailyProjectionObservationOrder: Codable, Equatable, Sendable {
+    public let namespace: String
+    public let sequence: UInt64
+}
+
 public struct FileOutboxCursorCheckpoint: Codable, Equatable, Sendable {
     public let receiverIdentity: String
     public let sourceKey: String
     public let cursorKind: String
     public let cursorValue: String
     public let coreLaneUploadProof: FileOutboxCoreLaneUploadProof?
+    public let additionalCursors: [HealthBridgeSyncCursor]?
+    public let cumulativeRawAndDailyCoverage: [String]?
 
     public init(
         receiverIdentity: String,
         sourceKey: String,
         cursorKind: String,
         cursorValue: String,
-        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil
+        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil,
+        additionalCursors: [HealthBridgeSyncCursor]? = nil,
+        cumulativeRawAndDailyCoverage: [String]? = nil
     ) {
         self.receiverIdentity = receiverIdentity
         self.sourceKey = sourceKey
         self.cursorKind = cursorKind
         self.cursorValue = cursorValue
         self.coreLaneUploadProof = coreLaneUploadProof
+        self.additionalCursors = additionalCursors
+        self.cumulativeRawAndDailyCoverage = cumulativeRawAndDailyCoverage
     }
 }
 
@@ -372,8 +383,13 @@ public struct FileOutboxFinalizationRecord: Equatable, Sendable {
     public let stepsRawAndDailyCoverage: Bool?
 
     public var eligiblePendingGenerationRetirements: [String: Int] {
-        pendingGenerationRetirements.filter {
-            $0.key != "steps" || stepsRawAndDailyCoverage == true
+        pendingGenerationRetirements.filter { typeCode, _ in
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            if DailyActivityAggregateSyncPolicy.defaultTypeCodes.contains(typeCode), typeCode != "steps" {
+                return cursorCheckpoint?.cumulativeRawAndDailyCoverage?.contains(typeCode) == true
+            }
+            #endif
+            return typeCode != "steps" || stepsRawAndDailyCoverage == true
         }
     }
 
@@ -498,6 +514,7 @@ public final class FileOutbox {
 
         var version: Int
         var nextSequence: UInt64
+        var observationNamespace: String? = nil
         var entries: [SequenceEntry]
 
         static var empty: SequenceManifest {
@@ -738,6 +755,19 @@ public final class FileOutbox {
         if destructiveRecoveryIsRequested { return }
         try recoverMailboxEnvelopeFinalizationIfNeeded()
         _ = try reconciledManifest()
+    }
+
+    /// Reserve before a read; gaps are valid and cannot alias a queued payload revision.
+    public func reserveDailyProjectionObservation() throws -> DailyProjectionObservationOrder {
+        try requireUploadAdmission()
+        var manifest = try reconciledManifest()
+        guard manifest.nextSequence < UInt64.max else { throw SequenceError.exhausted }
+        let namespace = manifest.observationNamespace ?? UUID().uuidString.lowercased()
+        let order = DailyProjectionObservationOrder(namespace: namespace, sequence: manifest.nextSequence)
+        manifest.observationNamespace = namespace
+        manifest.nextSequence += 1
+        try persistManifest(manifest)
+        return order
     }
 
     public func enqueue(
@@ -2426,6 +2456,22 @@ public struct SleepSyncPendingTransition: Codable, Equatable, Sendable {
     }
 }
 
+// Provenance for local Sleep persistence inside delivery helpers that also upload.
+struct SleepStorageOperationFailure: Error {
+    let underlyingError: Error
+}
+
+func withSleepStorageOrigin<T>(_ operation: () throws -> T) throws -> T {
+    do {
+        return try operation()
+    } catch let cancellation as CancellationError {
+        // Preserve typed cancellation for callers that use it to stop work.
+        throw cancellation
+    } catch {
+        throw SleepStorageOperationFailure(underlyingError: error)
+    }
+}
+
 public protocol SleepSyncManifestStoring {
     func loadManifest() throws -> SleepSyncManifest?
     func saveManifest(_ manifest: SleepSyncManifest) throws
@@ -2754,25 +2800,31 @@ public final class KeychainReceiverTokenStore: ReceiverTokenStoring {
 
 public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     public let label: String
-    public let receiverURLString: String
-    public let redeemURLString: String
+    public let receiverURLString: String?
+    public let redeemURLString: String?
     public let invitationSecret: String?
     public let invitationCode: String?
     public let installationID: String
     public let deviceCredential: String
     public let platform: String
+    public let mailboxBootstrap: MailboxBootstrapDescriptor?
+    public let expiresAt: String?
+    public var sealedRequest: Data?
     public let transport: ReceiverPairingTransport
 
     public init(
         label: String,
-        receiverURLString: String,
-        redeemURLString: String,
+        receiverURLString: String?,
+        redeemURLString: String?,
         invitationSecret: String?,
         invitationCode: String?,
         installationID: String,
         deviceCredential: String,
         platform: String,
-        transport: ReceiverPairingTransport = .direct
+        transport: ReceiverPairingTransport = .direct,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil,
+        sealedRequest: Data? = nil
     ) {
         self.label = label
         self.receiverURLString = receiverURLString
@@ -2783,9 +2835,13 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         self.deviceCredential = deviceCredential
         self.platform = platform
         self.transport = transport
+        self.mailboxBootstrap = mailboxBootstrap
+        self.expiresAt = expiresAt
+        self.sealedRequest = sealedRequest
     }
 
     private enum CodingKeys: String, CodingKey {
+        case mailboxBootstrap, expiresAt, sealedRequest
         case label
         case receiverURLString
         case redeemURLString
@@ -2800,9 +2856,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        mailboxBootstrap = try container.decodeIfPresent(MailboxBootstrapDescriptor.self, forKey: .mailboxBootstrap)
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+        sealedRequest = try container.decodeIfPresent(Data.self, forKey: .sealedRequest)
         label = try container.decode(String.self, forKey: .label)
-        receiverURLString = try container.decode(String.self, forKey: .receiverURLString)
-        redeemURLString = try container.decode(String.self, forKey: .redeemURLString)
+        receiverURLString = try container.decodeIfPresent(String.self, forKey: .receiverURLString)
+        redeemURLString = try container.decodeIfPresent(String.self, forKey: .redeemURLString)
         invitationSecret = try container.decodeIfPresent(String.self, forKey: .invitationSecret)
         invitationCode = try container.decodeIfPresent(String.self, forKey: .invitationCode)
         installationID = try container.decode(String.self, forKey: .installationID)
@@ -2828,10 +2887,23 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
                 debugDescription: "Pending pairing transport is inconsistent."
             )
         }
+        if let mailboxBootstrap {
+            try mailboxBootstrap.validate()
+            guard transport == .mailbox, receiverURLString == nil, redeemURLString == nil,
+                  invitationSecret != nil, invitationCode == nil, expiresAt != nil,
+                  (sealedRequest?.count ?? 0) <= 65_536 else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+        } else if receiverURLString == nil || redeemURLString == nil || sealedRequest != nil {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(mailboxBootstrap, forKey: .mailboxBootstrap)
+        try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
+        try container.encodeIfPresent(sealedRequest, forKey: .sealedRequest)
         try container.encode(label, forKey: .label)
         try container.encode(receiverURLString, forKey: .receiverURLString)
         try container.encode(redeemURLString, forKey: .redeemURLString)
@@ -2847,8 +2919,8 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     }
 
     func matches(
-        receiverURLString: String,
-        redeemURLString: String,
+        receiverURLString: String?,
+        redeemURLString: String?,
         invitationSecret: String?,
         invitationCode: String?,
         transport: ReceiverPairingTransport = .direct
@@ -2864,10 +2936,13 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
 
 public enum ReceiverPairingStateError: LocalizedError, Equatable {
     case pendingPairingConflict
+    case invalidSealedRequest
     case legacyCancellationRequiresRetry
 
     public var errorDescription: String? {
         switch self {
+        case .invalidSealedRequest:
+            "The encrypted pairing request must contain 1 to 65,536 bytes. The pending connection has been kept."
         case .pendingPairingConflict:
             "A different pairing is already pending. Resume or cancel it before starting another pairing."
         case .legacyCancellationRequiresRetry:
@@ -2912,7 +2987,9 @@ public final class ReceiverPairingStateStore {
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
             invitationCode: nil,
-            transport: invitation.transport
+            transport: invitation.transport,
+            mailboxBootstrap: invitation.mailboxBootstrap,
+            expiresAt: invitation.expiresAt
         )
     }
 
@@ -2931,6 +3008,20 @@ public final class ReceiverPairingStateStore {
         let encoded = try pendingStore.loadToken()
         guard !encoded.isEmpty else { return nil }
         return try JSONDecoder().decode(ReceiverPendingPairing.self, from: Data(encoded.utf8))
+    }
+
+    public func saveSealedRequest(_ bytes: Data, for pending: ReceiverPendingPairing) throws -> ReceiverPendingPairing {
+        guard !bytes.isEmpty, bytes.count <= 65_536 else {
+            throw ReceiverPairingStateError.invalidSealedRequest
+        }
+        guard try loadPending() == pending, try !hasPendingCancellation() else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        var updated = pending
+        updated.sealedRequest = bytes
+        let data = try JSONEncoder().encode(updated)
+        try pendingStore.saveToken(String(decoding: data, as: UTF8.self))
+        return updated
     }
 
     public func clearPending() throws {
@@ -2979,11 +3070,13 @@ public final class ReceiverPairingStateStore {
 
     private func stage(
         label: String,
-        receiverURLString: String,
-        redeemURLString: String,
+        receiverURLString: String?,
+        redeemURLString: String?,
         invitationSecret: String?,
         invitationCode: String?,
-        transport: ReceiverPairingTransport
+        transport: ReceiverPairingTransport,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil
     ) throws -> ReceiverPendingPairing {
         guard try !hasPendingCancellation() else {
             throw ReceiverPairingStateError.pendingPairingConflict
@@ -2995,7 +3088,7 @@ public final class ReceiverPairingStateStore {
                 invitationSecret: invitationSecret,
                 invitationCode: invitationCode,
                 transport: transport
-            ) else {
+            ), existing.mailboxBootstrap == mailboxBootstrap else {
                 throw ReceiverPairingStateError.pendingPairingConflict
             }
             return existing
@@ -3010,7 +3103,9 @@ public final class ReceiverPairingStateStore {
             installationID: installationID,
             deviceCredential: deviceCredentialGenerator(),
             platform: "ios",
-            transport: transport
+            transport: transport,
+            mailboxBootstrap: mailboxBootstrap,
+            expiresAt: expiresAt
         )
         let encoded = try JSONEncoder().encode(pending)
         guard let string = String(data: encoded, encoding: .utf8) else {
@@ -3046,12 +3141,13 @@ public enum ReceiverOutboxAdmissionPolicy {
     public static func isReady(
         pendingReceiverIdentities: [String?],
         currentBindingID: String?,
-        hasBearerToken: Bool
+        hasBearerToken: Bool,
+        hasMailboxIdentity: Bool = false
     ) -> Bool {
-        if let currentBindingID, hasBearerToken {
+        if let currentBindingID, hasBearerToken || hasMailboxIdentity {
             return pendingReceiverIdentities.allSatisfy { $0 == currentBindingID }
         }
-        guard currentBindingID == nil, !hasBearerToken else {
+        guard currentBindingID == nil, !hasBearerToken, !hasMailboxIdentity else {
             return false
         }
         return pendingReceiverIdentities.isEmpty
@@ -3521,6 +3617,10 @@ public final class ReceiverSettingsStore {
 
     public var receiverURLString: String {
         if let stored = try? loadStoredConnectionRecord() {
+            if case .v2(let record) = stored, record.activation == .paired(activeTransport: .mailbox),
+               directHTTPConfiguration(in: stored) == nil {
+                return ""
+            }
             return directHTTPConfiguration(in: stored)?.receiverURLString
                 ?? Self.defaultReceiverURLString
         }
@@ -3539,13 +3639,21 @@ public final class ReceiverSettingsStore {
     }
 
     public var receiverBindingID: String? {
-        guard let stored = try? loadStoredConnectionRecord(),
-              let direct = directHTTPConfiguration(in: stored),
+        guard let stored = try? loadStoredConnectionRecord() else { return nil }
+        if case .v2(let record) = stored, record.activation == .paired(activeTransport: .mailbox),
+           case .available = record.mailboxIdentity, !record.localScope.bindingID.isEmpty {
+            return record.localScope.bindingID
+        }
+        guard let direct = directHTTPConfiguration(in: stored),
               !direct.bearerToken.isEmpty,
               !localScope(in: stored).bindingID.isEmpty else {
             return nil
         }
         return localScope(in: stored).bindingID
+    }
+
+    public var hasActiveMailboxConnection: Bool {
+        activeTransport == .mailbox && receiverBindingID != nil
     }
 
     public var activeTransport: ReceiverTransportKind? {
@@ -3565,9 +3673,11 @@ public final class ReceiverSettingsStore {
                 try restorePreCutoverV1IfExactMatch(current)
                 record = current
             }
+            if record.activation == .paired(activeTransport: .mailbox), case .available = record.mailboxIdentity {
+                return record.localScope.bindingID
+            }
             return directHTTPConfiguration(in: record)?.bearerToken.isEmpty == false
-                ? record.localScope.bindingID
-                : nil
+                ? record.localScope.bindingID : nil
         }
         let legacyToken = try tokenStore.loadToken()
         let explicitLegacyURL = userDefaults.string(forKey: receiverURLKey)
@@ -3677,7 +3787,7 @@ public final class ReceiverSettingsStore {
     }
 
     public func saveMailboxPairing(
-        receiverURLString: String,
+        receiverURLString: String?,
         bearerToken: String,
         mailboxIdentity: MailboxConnectionIdentityV1,
         expectedGeneration: String
@@ -3686,22 +3796,16 @@ public final class ReceiverSettingsStore {
         guard "g\(previous.localScope.generation)" == expectedGeneration else {
             throw ReceiverSettingsGenerationError.staleGeneration
         }
-        let direct = DirectHTTPConnectionConfigurationV1(
-            receiverURLString: receiverURLString,
-            bearerToken: bearerToken
-        )
+        let configurations: [ReceiverTransportConfigurationV1] = (receiverURLString.map { url in
+            [ReceiverTransportConfigurationV1.directHTTP(activation: .inactive,
+                configuration: DirectHTTPConnectionConfigurationV1(receiverURLString: url, bearerToken: bearerToken))]
+        } ?? []) + [.mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1())]
         if case .paired(activeTransport: .mailbox) = previous.activation {
             let expected = ReceiverConnectionRecordV2(
                 localScope: previous.localScope,
                 mailboxIdentity: .available(mailboxIdentity),
                 activation: .paired(activeTransport: .mailbox),
-                transportConfigurations: [
-                    .directHTTP(activation: .inactive, configuration: direct),
-                    .mailbox(
-                        activation: .active,
-                        configuration: MailboxConnectionConfigurationV1()
-                    ),
-                ]
+                transportConfigurations: configurations
             )
             guard previous == expected else {
                 throw ReceiverSettingsRecordError
@@ -3716,13 +3820,7 @@ public final class ReceiverSettingsStore {
             ),
             mailboxIdentity: .available(mailboxIdentity),
             activation: .paired(activeTransport: .mailbox),
-            transportConfigurations: [
-                .directHTTP(activation: .inactive, configuration: direct),
-                .mailbox(
-                    activation: .active,
-                    configuration: MailboxConnectionConfigurationV1()
-                ),
-            ]
+            transportConfigurations: configurations
         )
         try persist(record)
     }
@@ -3895,7 +3993,7 @@ public final class ReceiverSettingsStore {
         try finishTerminalCancellationIntent()
     }
 
-    private func clearReceiverSettingsForTerminalCancellation(
+    func clearReceiverSettingsForTerminalCancellation(
         expectedGeneration: String
     ) throws {
         let previous = try authoritativeRecordForMutation()

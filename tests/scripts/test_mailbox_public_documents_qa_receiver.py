@@ -129,7 +129,7 @@ def test_public_documents_receiver_root_is_exact_confined_and_app_owned(
         challenge=base64url(b"h" * 32),
     )
     try:
-        completion = provision_qa_mailbox(server, request)
+        completion, _ = provision_qa_mailbox(server, request)
     finally:
         server.server_close()
     assert completion["kind"] == "health_bridge.mailbox_qa_pairing_completion.v1"

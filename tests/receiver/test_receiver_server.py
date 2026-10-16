@@ -44,7 +44,7 @@ def test_receiver_holds_lifecycle_lock_while_idle(
 
     @final
     class IdleServer:
-        def __init__(
+        def __init__(  # noqa: PLR0913 -- Mirrors the receiver server API.
             self,
             *,
             host: str,
@@ -52,8 +52,10 @@ def test_receiver_holds_lifecycle_lock_while_idle(
             db_path: Path,
             mailbox_key_store: object | None = None,
             mailbox_connection_store: object | None = None,
+            setup_page: Path | None = None,
         ) -> None:
             del host, port
+            assert setup_page is None
             assert mailbox_key_store is None
             assert mailbox_connection_store is None
             self.db_path = db_path

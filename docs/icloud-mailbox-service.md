@@ -13,9 +13,20 @@ selected the Beta. It runs the supported `health-bridge receiver start` command
 as an optional per-user macOS LaunchAgent. The receiver remains the only owner
 of mailbox discovery, import, database writes, and acknowledgements.
 
-This service and its signed ACK helper are optional. Direct and Tailscale setups
-do not download, install, validate, or enable either component, and
-`health-bridge setup` never installs them implicitly.
+Mailbox delivery and its signed ACK helper are optional. Direct and Tailscale
+setups do not prepare a mailbox or install its helper. Selecting Mailbox setup
+explicitly opts into the existing owned LaunchAgent lifecycle, after prerequisite
+checks pass. Discovery, validation and pairing-material preparation do not
+install or start a helper or agent. Helper installation remains a separate
+explicit operation.
+
+Before selecting this Beta, use the same Apple account with iCloud Drive on
+the iPhone and Mac, keep the Mac user session active, and prepare the matching
+signed helper and the updated companion. This unreleased candidate exchanges
+first-pairing requests and responses through iCloud, then uses the existing
+encrypted mailbox for data and ACKs. No phone-facing receiver URL, Tailscale or
+prepared HTTPS route is required. The published app and older helpers do not
+implement this first-pairing path.
 
 The iCloud container and receiver are owned and operated by the user. The
 project developer does not have access to either endpoint or the transmitted
@@ -24,16 +35,17 @@ that developer-no-access boundary remains true.
 
 ## Install and verify the signed helper
 
-Download assets and run the commands below only after the immutable `receiver-v1.1.2` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.2`.
+Download assets and run the commands below only after the immutable `receiver-v1.1.3` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.3`.
 
-Use the Receiver/CLI `1.1.2` GitHub Release assets. Download these files with a
+Use the Receiver/CLI `1.1.3` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.2-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.2.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.2.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.2.manifest.json`;
+- `apple_health_ai_bridge-1.1.3-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.1.3.tar.gz`;
+- `apple-health-ai-bridge-0.1.0.tgz`;
+- `HealthBridgeMailboxAckPublisher-1.1.3.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.3.manifest.json`;
 - `release-metadata.json`;
 - `SHA256SUMS`.
 
@@ -43,14 +55,14 @@ explicitly install it:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-uv tool install ./apple_health_ai_bridge-1.1.2-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.1.3-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.2.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.2.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.3.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.3.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.2.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.2.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.3.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.3.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```
@@ -82,29 +94,37 @@ Helper status uses fixed, path-free codes:
 
 ## Create mailbox pairing material
 
-Set the exact values for the user-selected iCloud container and the already
-configured private receiver route. Then run the existing public setup command:
+Normally, run `health-bridge setup` and choose iCloud; guided setup finds the
+matching helper and its Documents folder. For an explicitly selected mailbox
+and container, use the same setup command with these options:
 
 ```bash
-: "${HEALTH_BRIDGE_RECEIVER_URL:?Set the exact private /v1/batches URL}"
 : "${HEALTH_BRIDGE_MAILBOX_ROOT:?Set the existing HealthBridgeMailbox/v1 path}"
 : "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the selected container identifier}"
 health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
   --transport icloud-mailbox \
   --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
   --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER"
 ```
 
-This creates the private database, temporary single-use pairing page, and
-mailbox-aware receiver command. Keep the setup page and its pairing link out of
-chat, logs, Git, and web servers. Pair only after the private redemption route
-and local receiver health check work. iCloud mailbox delivery remains
-best-effort and may be delayed by iCloud and iOS scheduling.
+With the matching helper and mailbox prepared, this creates or reuses the private
+database and temporary invitation, starts or reuses the owned mailbox-aware
+LaunchAgent, and checks local receiver health. Missing prerequisites stop setup
+with a next action; no pairing URL is invented. A healthy owned service is reused.
+
+Open the private connection page on a trusted screen and scan its QR with
+iPhone Camera. If installation is needed, install Health Bridge for AI
+(companion app), return to that page, and tap **Open in Health Bridge for AI**.
+In the app, use **Allow Health Access**, then **Automatic Sync**. **Sync Now** is
+optional. Guided setup observes authenticated nonempty stored records and runs
+a read-only coverage query. Keep pairing material out of chat, logs and Git.
+iCloud delivery remains best-effort and may be delayed by iCloud and iOS scheduling.
 
 ## Before installing the service
 
-Complete mailbox setup first. You need these existing paths:
+The setup command above already manages its owned service. For a separately
+prepared receiver, the advanced service commands below require these paths;
+do not install a second agent for the same database:
 
 - the absolute path to the `health-bridge` executable;
 - the private receiver SQLite database;

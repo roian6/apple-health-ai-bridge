@@ -4,13 +4,14 @@ import Foundation
 extension MailboxAckScanner {
     public func deleteAcknowledgment(
         for event: MailboxAckEvent,
-        durableFinalization: any MailboxAckDurableFinalizationVerifying
+        durableFinalization: any MailboxAckDurableFinalizationVerifying,
+        scanReport: MailboxAckScanReport? = nil
     ) throws {
         guard event.classification == .committed,
               try durableFinalization.isDurablyCommitted(event) else {
             throw MailboxAckScannerError.durableFinalizationRequired
         }
-        let current = try scan()
+        let current = try scanReport ?? scan()
         if current.events.contains(where: {
             $0.classification == .conflict
                 && $0.handle.envelopeID == event.handle.envelopeID

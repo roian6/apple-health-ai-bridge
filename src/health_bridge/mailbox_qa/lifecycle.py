@@ -180,6 +180,7 @@ def create_pairing_material(
     invitation = create_pairing_invitation(
         config.database_path,
         label=f"{config.namespace}-device",
+        transport="mailbox",
         receiver_url=f"http://{config.host}:{config.port}/v1/batches",
     )
     request = {

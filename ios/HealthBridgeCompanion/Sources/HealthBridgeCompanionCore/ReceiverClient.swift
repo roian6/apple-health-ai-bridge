@@ -65,7 +65,7 @@ public struct ReceiverPairingCredential: Equatable, Sendable {
     public static let supportedSchemaVersion = "1.0.0"
 
     public let label: String
-    public let receiverURLString: String
+    public let receiverURLString: String?
     public let bearerToken: String
     public let tokenPrefix: String
     public let mailboxIdentity: MailboxConnectionIdentityV1?
@@ -334,8 +334,8 @@ public final class ReceiverClient: @unchecked Sendable {
         pendingPairing: ReceiverPendingPairing,
         mailboxPublicIdentity: MailboxPublicIdentity? = nil
     ) async throws -> ReceiverPairingCredential {
-        guard let redeemURL = URL(string: pendingPairing.redeemURLString),
-              let expectedReceiverURL = URL(string: pendingPairing.receiverURLString),
+        guard let redeemURL = URL(string: pendingPairing.redeemURLString ?? ""),
+              let expectedReceiverURL = URL(string: pendingPairing.receiverURLString ?? ""),
               ["http", "https"].contains(redeemURL.scheme?.lowercased() ?? ""),
               ["http", "https"].contains(expectedReceiverURL.scheme?.lowercased() ?? ""),
               redeemURL.host != nil,
@@ -392,7 +392,7 @@ public final class ReceiverClient: @unchecked Sendable {
         }
         guard payload.schemaID == ReceiverPairingCredential.supportedSchemaID,
               payload.schemaVersion == ReceiverPairingCredential.supportedSchemaVersion,
-              let returnedReceiverURL = URL(string: payload.receiverURL),
+              let returnedReceiverURL = URL(string: payload.receiverURL ?? ""),
               ["http", "https"].contains(returnedReceiverURL.scheme?.lowercased() ?? ""),
               returnedReceiverURL.host != nil
         else {
@@ -420,7 +420,7 @@ public final class ReceiverClient: @unchecked Sendable {
         )
     }
 
-    private static func mailboxConnectionIdentity(
+    static func mailboxConnectionIdentity(
         payload: PairingCompletionPayload,
         pendingPairing: ReceiverPendingPairing,
         deviceIdentity: MailboxPublicIdentity?,
@@ -610,7 +610,7 @@ public final class ReceiverPairingCoordinator {
 
     public func pendingPairingMatches(_ invitation: ReceiverPairingInvitation) throws -> Bool {
         guard let pending = try stateStore.loadPending() else { return false }
-        return pending.matches(
+        return pending.mailboxBootstrap == invitation.mailboxBootstrap && pending.matches(
             receiverURLString: invitation.receiverURLString,
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
@@ -701,7 +701,13 @@ public final class ReceiverPairingCoordinator {
             return true
         }
         let expectedGeneration = expectedGeneration ?? cancellationGeneration
-        try settingsStore.clearReceiverSettings(expectedGeneration: expectedGeneration)
+        if case .paired(activeTransport: .mailbox) = try settingsStore.currentConnectionRecordV2()?.activation {
+            try settingsStore.clearReceiverSettingsForTerminalCancellation(
+                expectedGeneration: expectedGeneration
+            )
+        } else {
+            try settingsStore.clearReceiverSettings(expectedGeneration: expectedGeneration)
+        }
         try stateStore.clearPending()
         if hasCancellationMarker {
             try stateStore.finishPendingCancellation()
@@ -714,6 +720,60 @@ public final class ReceiverPairingCoordinator {
             }
         }
         return true
+    }
+
+    private func redeemNativePending(
+        _ pending: ReceiverPendingPairing,
+        expectedGeneration: String
+    ) async throws -> ReceiverPairingCredential {
+        var staged = pending
+        guard let bootstrap = staged.mailboxBootstrap else { throw ReceiverPairingRedeemError.invalidResponse }
+        try bootstrap.validate()
+        if staged.sealedRequest == nil {
+            guard let expiry = staged.expiresAt.flatMap({ ISO8601DateFormatter().date(from: $0) }),
+                  expiry > Date() else { throw ReceiverPairingRedeemError.invitationInvalid }
+            staged = try stateStore.saveSealedRequest(NativeMailboxPairing.seal(staged, keys: mailboxKeyStore), for: staged)
+        }
+        guard let request = staged.sealedRequest else { throw ReceiverPairingRedeemError.invalidResponse }
+        try requireCurrentPairing(expectedGeneration, pending: staged)
+        let locator = try MailboxLocatorV1.resolvePairing(invitationID: bootstrap.invitationID)
+        do {
+            try await FileProviderMailboxEnvelopePublisher().publishPairingRequest(request, locator: locator)
+        } catch {
+            try requireCurrentPairing(expectedGeneration, pending: staged)
+            throw error
+        }
+        try requireCurrentPairing(expectedGeneration, pending: staged)
+        let responseURL = locator.deviceRoot.appendingPathComponent("completion.hbp")
+        for _ in 0 ..< 15 {
+            try requireCurrentPairing(expectedGeneration, pending: staged)
+            try MailboxLocatorV1.revalidatePairing(locator)
+            if FileManager.default.fileExists(atPath: responseURL.path) {
+                #if os(iOS)
+                try FileManager.default.startDownloadingUbiquitousItem(at: responseURL)
+                #endif
+                let bytes = try MailboxRegularFileReader.read(responseURL, maximumBytes: 65_536) {
+                    try MailboxLocatorV1.revalidatePairing(locator)
+                }
+                return try NativeMailboxPairing.openCompletion(bytes, pending: staged, keys: mailboxKeyStore)
+            }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        try requireCurrentPairing(expectedGeneration, pending: staged)
+        throw MailboxLocatorError.storageFailure
+    }
+
+    private func requireCurrentPairing(
+        _ expectedGeneration: String,
+        pending: ReceiverPendingPairing
+    ) throws {
+        try Task.checkCancellation()
+        guard settingsStore.receiverSettingsGenerationToken == expectedGeneration,
+              settingsStore.terminalCancellationExpectedGeneration == nil,
+              try !stateStore.hasPendingCancellation(),
+              try stateStore.loadPending() == pending else {
+            throw CancellationError()
+        }
     }
 
     private func complete(
@@ -734,7 +794,9 @@ public final class ReceiverPairingCoordinator {
             } else {
                 mailboxIdentity = nil
             }
-            if let mailboxIdentity {
+            if pending.mailboxBootstrap != nil {
+                credential = try await redeemNativePending(pending, expectedGeneration: expectedGeneration)
+            } else if let mailboxIdentity {
                 credential = try await client.redeem(
                     pendingPairing: pending,
                     mailboxPublicIdentity: mailboxIdentity
@@ -759,7 +821,7 @@ public final class ReceiverPairingCoordinator {
             )
         } else {
             try settingsStore.save(
-                receiverURLString: credential.receiverURLString,
+                receiverURLString: credential.receiverURLString ?? "",
                 bearerToken: credential.bearerToken,
                 expectedGeneration: expectedGeneration,
                 rotateBindingID: true
@@ -794,11 +856,11 @@ private struct PairingErrorPayload: Decodable {
     let error: String
 }
 
-private struct PairingCompletionPayload: Decodable {
+struct PairingCompletionPayload: Decodable {
     let schemaID: String
     let schemaVersion: String
     let label: String
-    let receiverURL: String
+    let receiverURL: String?
     let mailboxProtocolVersion: Int?
     let mailboxReceiverID: String?
     let mailboxDeviceID: String?

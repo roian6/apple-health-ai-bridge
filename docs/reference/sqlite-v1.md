@@ -84,3 +84,14 @@ Pairing and authentication storage rules:
 All future query surfaces should read from SQLite without mutation by default.
 Authentication, pairing redemption, and explicit revocation commands are the
 reviewed mutation exceptions.
+
+Ordinary CLI and MCP queries use a read-only SQLite transaction alongside
+receiver connections. Lifecycle and access locks exclude maintenance, and SQLite
+lock contention has a one-second busy timeout. Queries never write health rows
+or repair file permissions. The default rollback-journal mode needs no reader
+sidecar writes. Live WAL reads require existing private `-wal` and `-shm` files
+at admission; SQLite can update shared memory and manage sidecars as connections
+open and close, so this is not a guarantee of zero filesystem writes. A WAL
+database missing either sidecar must first be prepared by a writer. Operations
+requiring an immutable snapshot retain the exclusive, quiescent reader, which
+refuses active connections and SQLite sidecars.

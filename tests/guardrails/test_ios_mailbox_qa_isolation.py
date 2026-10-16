@@ -18,6 +18,7 @@ BUILD_GUARD = Path("scripts/ios-mailbox-qa-build.sh")
 INSTALL_GUARD = Path("scripts/ios-mailbox-qa-install.sh")
 ROLLBACK_GUARD = Path("scripts/ios-mailbox-qa-rollback.sh")
 CURATED_CORE = {
+    "HealthBridgeAppIdentity.swift",
     "DeliveryProtocolV1.swift",
     "DeliveryProtocolV1Ack.swift",
     "DeliveryProtocolV1AckAuthentication.swift",

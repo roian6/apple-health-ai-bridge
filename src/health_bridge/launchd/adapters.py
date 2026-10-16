@@ -59,6 +59,7 @@ class LaunchctlAdapter:
         uid: int,
         timeout_seconds: float,
         runner: SubprocessRunner = _run_subprocess,
+        label: str = LAUNCH_AGENT_LABEL,
     ) -> None:
         if not launchctl.is_absolute() or uid < 0 or timeout_seconds <= 0:
             raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
@@ -66,6 +67,7 @@ class LaunchctlAdapter:
         self._uid = uid
         self._timeout_seconds = timeout_seconds
         self._runner = runner
+        self._label = label
 
     def inspect(self) -> LaunchctlResult:
         return self._execute("print", self._service_domain())
@@ -83,7 +85,7 @@ class LaunchctlAdapter:
         return f"gui/{self._uid}"
 
     def _service_domain(self) -> str:
-        return f"{self._user_domain()}/{LAUNCH_AGENT_LABEL}"
+        return f"{self._user_domain()}/{self._label}"
 
     def _execute(self, *arguments: str) -> LaunchctlResult:
         try:

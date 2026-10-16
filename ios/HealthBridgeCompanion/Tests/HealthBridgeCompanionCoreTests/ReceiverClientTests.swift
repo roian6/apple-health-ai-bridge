@@ -6,6 +6,67 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class ReceiverClientTests: XCTestCase {
+    @MainActor
+    func testNativePendingRequestReusesExactSealedBytesAndCancellationRejectsLateSave() throws {
+        let invitationJSON = """
+        {"schema_id":"health_bridge.receiver_pairing_invitation.v2","schema_version":"2.0.0",
+         "label":"synthetic-native","invitation_secret":"hbi_synthetic_native",
+         "expires_at":"2099-01-01T00:20:00Z","transport":"mailbox","mailbox_protocol_version":1,
+         "mailbox_bootstrap":{"version":1,"invitation_id":"00112233445566778899aabbccddeeff",
+         "receiver_signing_public_key":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+         "receiver_agreement_public_key":"hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo"}}
+        """
+        let invitation = try ReceiverPairingInvitation(jsonData: Data(invitationJSON.utf8))
+        let pendingTokens = MemoryReceiverTokenStore()
+        let installation = MemoryReceiverTokenStore()
+        let cancellation = MemoryReceiverTokenStore()
+        let state = ReceiverPairingStateStore(pendingStore: pendingTokens, installationIDStore: installation,
+            cancellationStore: cancellation, installationIDGenerator: { syntheticInstallationID },
+            deviceCredentialGenerator: { syntheticDeviceCredential })
+        let keys = MailboxKeyStore(service: repairService(), keychain: RepairSyntheticMailboxKeychain())
+        let staged = try state.stage(invitation: invitation)
+        let original = try pendingTokens.loadToken()
+        for count in [0, 65_537] {
+            XCTAssertThrowsError(try state.saveSealedRequest(Data(repeating: 1, count: count), for: staged))
+            XCTAssertEqual(try pendingTokens.loadToken(), original)
+            XCTAssertEqual(try state.loadPending(), staged)
+        }
+        let boundary = try state.saveSealedRequest(Data(repeating: 1, count: 65_536), for: staged)
+        XCTAssertEqual(try state.loadPending(), boundary)
+        try pendingTokens.saveToken(original)
+        let oversizedInvitation = try ReceiverPairingInvitation(jsonData: Data(
+            invitationJSON.replacingOccurrences(of: "hbi_synthetic_native", with: String(repeating: "a", count: 70_000)).utf8
+        ))
+        let separate = ReceiverPairingStateStore(pendingStore: MemoryReceiverTokenStore(),
+            installationIDStore: installation, cancellationStore: MemoryReceiverTokenStore())
+        let oversizedIntent = try separate.stage(invitation: oversizedInvitation)
+        let oversizedWire = try NativeMailboxPairing.seal(oversizedIntent, keys: keys)
+        XCTAssertGreaterThan(oversizedWire.count, 65_536)
+        XCTAssertThrowsError(try separate.saveSealedRequest(oversizedWire, for: oversizedIntent)) {
+            XCTAssertEqual($0 as? ReceiverPairingStateError, .invalidSealedRequest)
+        }
+        XCTAssertEqual(try separate.loadPending(), oversizedIntent)
+        XCTAssertEqual(try separate.stage(invitation: oversizedInvitation), oversizedIntent)
+        let sealed = try NativeMailboxPairing.seal(staged, keys: keys)
+        let saved = try state.saveSealedRequest(sealed, for: staged)
+        let resumed = ReceiverPairingStateStore(pendingStore: pendingTokens, installationIDStore: installation,
+            cancellationStore: cancellation)
+
+        XCTAssertEqual(try resumed.stage(invitation: invitation), saved)
+        XCTAssertEqual(try resumed.loadPending()?.sealedRequest, sealed)
+        XCTAssertNil(saved.receiverURLString)
+        let suite = "NativePendingTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = ReceiverSettingsStore(userDefaults: defaults, tokenStore: MemoryReceiverTokenStore())
+        let coordinator = ReceiverPairingCoordinator(client: makeClient(), stateStore: resumed,
+            settingsStore: settings, mailboxKeyStore: keys)
+        _ = try coordinator.cancelPendingPairing(expectedGeneration: settings.receiverSettingsGenerationToken)
+        XCTAssertNil(try resumed.loadPending())
+        XCTAssertThrowsError(try resumed.saveSealedRequest(sealed, for: saved))
+        XCTAssertNil(settings.activeTransport)
+    }
+
     override func tearDown() {
         MockURLProtocol.requestHandler = nil
         super.tearDown()

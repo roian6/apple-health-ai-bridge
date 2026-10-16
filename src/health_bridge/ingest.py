@@ -50,6 +50,8 @@ def ingest_batch(
     db_path: Path,
     batch: HealthBridgeBatchV1,
     source_name: str,
+    *,
+    receiver_installation_id_hash: str | None = None,
 ) -> IngestResult:
     initialize_database(db_path)
     try:
@@ -58,6 +60,7 @@ def ingest_batch(
                 connection,
                 batch,
                 source_name,
+                receiver_installation_id_hash=receiver_installation_id_hash,
             )
     except sqlite3.Error:
         failed_result = failed_ingest_result(STORAGE_ERROR_SUMMARY)
@@ -70,12 +73,20 @@ def ingest_batch_in_connection(
     connection: sqlite3.Connection,
     batch: HealthBridgeBatchV1,
     source_name: str,
+    *,
+    receiver_installation_id_hash: str | None = None,
 ) -> TransactionalIngestResult:
     result = _successful_result(batch)
     upsert_batch_records(connection, batch)
     return TransactionalIngestResult(
         result=result,
-        sync_run_id=insert_sync_run(connection, source_name, result, batch),
+        sync_run_id=insert_sync_run(
+            connection,
+            source_name,
+            result,
+            batch,
+            receiver_installation_id_hash=receiver_installation_id_hash,
+        ),
     )
 
 

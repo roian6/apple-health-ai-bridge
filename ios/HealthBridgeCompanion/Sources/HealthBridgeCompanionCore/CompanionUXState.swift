@@ -2,6 +2,7 @@ import Foundation
 
 public struct CompanionSetupSnapshot: Equatable, Sendable {
     public let receiverURLString: String
+    public let hasMailboxIdentity: Bool
     public let hasBearerToken: Bool
     public let healthPermissionsRequested: Bool
     public let isSyncing: Bool
@@ -11,12 +12,14 @@ public struct CompanionSetupSnapshot: Equatable, Sendable {
     public init(
         receiverURLString: String,
         hasBearerToken: Bool,
+        hasMailboxIdentity: Bool = false,
         healthPermissionsRequested: Bool,
         isSyncing: Bool,
         statusIsError: Bool,
         pendingOutboxCount: Int
     ) {
         self.receiverURLString = receiverURLString
+        self.hasMailboxIdentity = hasMailboxIdentity
         self.hasBearerToken = hasBearerToken
         self.healthPermissionsRequested = healthPermissionsRequested
         self.isSyncing = isSyncing
@@ -25,7 +28,7 @@ public struct CompanionSetupSnapshot: Equatable, Sendable {
     }
 
     public var hasCompleteReceiverSettings: Bool {
-        URL(string: receiverURLString) != nil && hasBearerToken
+        hasMailboxIdentity || URL(string: receiverURLString) != nil && hasBearerToken
     }
 }
 

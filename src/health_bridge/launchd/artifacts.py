@@ -282,12 +282,22 @@ def artifacts_are_owned(request: LaunchdServiceRequest) -> bool:
 def load_owned_launch_agent_request(config_path: Path) -> LaunchdServiceRequest:
     home = Path.home().resolve(strict=True)
     paths = service_paths(home)
+    if config_path.parent.parent == paths.state_dir:
+        paths = service_paths(home, config_path.parent.name)
     if config_path != paths.config or not config_path.is_absolute():
         raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
     with ArtifactDirectories.open_paths(paths, create=False) as directories:
         owned = _read_owned_artifacts(paths, directories)
         request = _request_from_owned_config(owned.config.content, home)
+        if request.paths != paths:
+            raise LaunchdServiceError(LaunchdServiceErrorCode.INVALID_CONFIGURATION)
         _ = validate_launch_agent_structure(request)
+        _ = require_owned_artifacts(
+            request,
+            render_launch_agent_plist(request),
+            render_service_config(request),
+            directories=directories,
+        )
     return request
 
 
@@ -501,6 +511,8 @@ def _request_from_owned_config(content: bytes, home: Path) -> LaunchdServiceRequ
         uid=os.geteuid(),
         host=config.host,
         port=config.port,
+        label=config.label,
+        setup_page=config.setup_page,
     )
 
 

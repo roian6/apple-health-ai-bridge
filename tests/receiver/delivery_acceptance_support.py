@@ -15,8 +15,12 @@ from health_bridge.receiver.delivery_acceptance import (
     DeliveryAcceptanceService,
     DeliveryTrustedConnection,
 )
+from health_bridge.receiver.invitations import (
+    create_pairing_invitation,
+    redeem_pairing_invitation,
+)
 from health_bridge.receiver.tokens import ReceiverTokenPrincipal
-from health_bridge.storage.database import initialize_database
+from health_bridge.storage.database import connect_database, initialize_database
 from health_bridge.storage.sqlite_rows import fetch_one_int
 from tests.contract.delivery_v1_support import BATCH
 
@@ -117,7 +121,7 @@ def service(
     revoked: bool = False,
     before_commit_validator: Callable[[], None] | None = None,
 ) -> DeliveryAcceptanceService:
-    initialize_database(db_path)
+    enroll_connection(db_path, connection())
     return DeliveryAcceptanceService(
         db_path,
         connection(revoked=revoked),
@@ -186,3 +190,29 @@ def fault_at(target: DeliveryAcceptanceFaultPoint) -> DeliveryAcceptanceFaultHoo
             raise RuntimeError(target.value)
 
     return inject
+
+
+def enroll_connection(db_path: Path, trusted: DeliveryTrustedConnection) -> None:
+    """Persist consent for a synthetic protocol peer through real redemption."""
+    initialize_database(db_path)
+    with connect_database(db_path) as database:
+        if database.execute(
+            """select 1 from pairing_invitation_redemptions
+            where mailbox_enrollment_sha256 = ?""",
+            (trusted.enrollment_digest(),),
+        ).fetchone():
+            return
+    invitation = create_pairing_invitation(
+        db_path,
+        label="synthetic protocol peer",
+        receiver_url="https://health.example.test/v1/batches",
+        transport="mailbox",
+    )
+    _ = redeem_pairing_invitation(
+        db_path,
+        invitation_secret=invitation.invitation_secret,
+        installation_id="00000000-0000-4000-8000-000000000099",
+        device_credential="hb_" + "z" * 43,
+        platform="ios",
+        before_commit=lambda _: trusted.enrollment_digest(),
+    )

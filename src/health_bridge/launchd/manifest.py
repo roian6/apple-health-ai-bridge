@@ -25,16 +25,23 @@ def service_config(request: LaunchdServiceRequest) -> LaunchdServiceConfig:
         icloud_container_identifier=request.icloud_container_identifier,
         host=request.host,
         port=request.port,
+        label=request.label,
+        setup_page=request.setup_page,
     )
 
 
 def render_service_config(request: LaunchdServiceRequest) -> bytes:
-    return service_config(request).model_dump_json().encode()
+    excluded = set[str]()
+    if request.label == LAUNCH_AGENT_LABEL:
+        excluded.add("label")
+    if request.setup_page is None:
+        excluded.add("setup_page")
+    return service_config(request).model_dump_json(exclude=excluded).encode()
 
 
 def render_launch_agent_plist(request: LaunchdServiceRequest) -> bytes:
     document = {
-        "Label": LAUNCH_AGENT_LABEL,
+        "Label": request.label,
         "ProgramArguments": [
             str(request.executable),
             "receiver",

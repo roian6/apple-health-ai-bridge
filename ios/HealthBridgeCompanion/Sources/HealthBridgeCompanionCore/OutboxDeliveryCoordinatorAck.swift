@@ -10,7 +10,7 @@ extension OutboxDeliveryCoordinator {
         if let proof = current.committedReceipt, proof.matches(event) {
             return .duplicateIdentical
         }
-        guard current.phase == .providerObserved,
+        guard current.phase == .published || current.phase == .providerObserved,
               let item = try outbox.pendingItem(id: itemID),
               let binding = item.mailboxBinding,
               binding.payloadSHA256 == event.receipt.payloadSHA256,
@@ -106,7 +106,8 @@ extension OutboxDeliveryCoordinator {
 
     public func deleteAcknowledgment(
         for event: MailboxAckEvent,
-        itemID: String
+        itemID: String,
+        scanReport: MailboxAckScanReport? = nil
     ) throws {
         try validateCurrentOwnership()
         let current = try ownedState(itemID: itemID)
@@ -115,7 +116,7 @@ extension OutboxDeliveryCoordinator {
             throw OutboxDeliveryCoordinatorError.commitProofRequired
         }
         try fault(.beforeAckDeletion)
-        try scanner.deleteAcknowledgment(for: event, durableFinalization: self)
+        try scanner.deleteAcknowledgment(for: event, durableFinalization: self, scanReport: scanReport)
         try fault(.afterAckDeletion)
     }
 

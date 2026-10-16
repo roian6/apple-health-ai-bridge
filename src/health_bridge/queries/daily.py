@@ -18,9 +18,14 @@ from health_bridge.queries.models import (
     Period,
     SourceUsed,
 )
+from health_bridge.storage.daily_projections import (
+    UNRESOLVED_PREFIX,
+    completed_day_interval,
+    projection_status,
+)
 from health_bridge.timeseries_catalog import timeseries_aggregation_for
 
-SampleDailyRow: TypeAlias = tuple[str, str, str, float, str, str]
+SampleDailyRow: TypeAlias = tuple[str, str, str, float, str, str, str, str | None]
 WorkoutDailyRow: TypeAlias = tuple[str, int]
 SleepDailyRow: TypeAlias = tuple[str, int]
 DailySourceRow: TypeAlias = tuple[str, str, str]
@@ -41,7 +46,11 @@ METADATA_ADAPTER: Final[TypeAdapter[dict[str, object]]] = TypeAdapter(
 SAMPLE_DAILY_SQL: Final = (
     "select coalesce(cast(json_extract(metadata_json, '$.calendar_day') as text), "
     "substr(start_time, 1, 10)) as day, type_code, start_time, value, "
-    "unit, metadata_json from samples where "
+    "unit, metadata_json, end_time, "
+    "(select cursor_value from sync_cursors "
+    "where sync_cursors.source_id=samples.source_id "
+    "and cursor_kind='daily_projection_unresolved:' || samples.type_code) "
+    "from samples where "
     "(start_time >= ? and start_time < ?) "
     "or (json_extract(metadata_json, '$.calendar_day') >= ? "
     "and json_extract(metadata_json, '$.calendar_day') < ?) "
@@ -107,6 +116,13 @@ def get_daily_summary(
             ).fetchall(),
         )
         sources = _sources(source_rows)
+        unresolved = (
+            connection.execute(
+                "select 1 from sync_cursors where cursor_kind like ? limit 1",
+                (UNRESOLVED_PREFIX + "%",),
+            ).fetchone()
+            is not None
+        )
     days = _daily_observations(
         start_date,
         end_date,
@@ -122,7 +138,35 @@ def get_daily_summary(
         period=Period(start=start_date, end=end_date),
         days=days,
         sources_used=sources if observed_count > 0 else (),
-        missing_data_notes=notes_for_count(observed_count),
+        missing_data_notes=notes_for_count(observed_count)
+        + (
+            (
+                (
+                    "A raw correction has unresolved day scope. Older source/type "
+                    "projections are last-known until authoritative statistics "
+                    "replace them. No affected date or zero was inferred."
+                ),
+            )
+            if unresolved
+            else ()
+        )
+        + (
+            (
+                (
+                    "Daily projections marked stale or unknown are last-known "
+                    "observations, excluded from current completed totals. "
+                    "Missing totals are not zero."
+                ),
+            )
+            if any(
+                day.daily_projection_status
+                and any(
+                    status != "fresh" for status in day.daily_projection_status.values()
+                )
+                for day in days
+            )
+            else ()
+        ),
         truncated=False,
     )
 
@@ -138,6 +182,8 @@ def _daily_observations(
     sample_totals: dict[str, dict[str, float]] = {}
     sample_total_semantics: dict[str, dict[str, str]] = {}
     daily_activity_totals: dict[str, dict[str, float]] = {}
+    last_known: dict[str, dict[str, float]] = {}
+    dispositions: dict[str, dict[str, str]] = {}
     sample_counts: dict[str, dict[str, int]] = {}
     sample_rows_by_day_type: dict[str, dict[str, list[SampleDailyRow]]] = {}
     for row in sample_rows:
@@ -153,9 +199,32 @@ def _daily_observations(
                 sample_totals.setdefault(day, {})[type_code] = statistic.total
                 semantics = _sum_semantics_for(rows)
                 sample_total_semantics.setdefault(day, {})[type_code] = semantics
-                daily_total = _daily_aggregate_total(rows)
+                projection_rows = [
+                    row
+                    for row in rows
+                    if _metadata_indicates_daily_aggregate(_metadata(row[5]))
+                ]
+                if not projection_rows:
+                    continue
+                daily_rows = _completed_projection_rows(projection_rows)
+                daily_total = _daily_aggregate_total(daily_rows)
                 if daily_total is not None:
+                    last_known.setdefault(day, {})[type_code] = daily_total
+                statuses = [
+                    projection_status(_metadata(row[5]), row[7]) for row in daily_rows
+                ]
+                status = next(
+                    (value for value in statuses if value != "fresh"),
+                    "fresh" if daily_rows else "legacy_unknown",
+                )
+                dispositions.setdefault(day, {})[type_code] = status
+                if status == "fresh" and daily_total is not None:
                     daily_activity_totals.setdefault(day, {})[type_code] = daily_total
+                    sample_totals[day][type_code] = daily_total + sum(
+                        row[3] for row in rows if row not in projection_rows
+                    )
+                else:
+                    _ = sample_totals[day].pop(type_code, None)
     workout_counts = dict(workout_rows)
     sleep_counts = dict(sleep_rows)
     return tuple(
@@ -164,6 +233,8 @@ def _daily_observations(
             sample_totals=sample_totals.get(day, {}),
             sample_total_semantics=sample_total_semantics.get(day, {}),
             daily_activity_totals=daily_activity_totals.get(day, {}),
+            last_known_daily_activity_totals=last_known.get(day, {}),
+            daily_projection_status=dispositions.get(day, {}),
             sample_counts=sample_counts.get(day, {}),
             sample_statistics=sample_statistics.get(day, {}),
             workout_count=workout_counts.get(day, 0),
@@ -256,16 +327,42 @@ def _sum_semantics_for(rows: list[SampleDailyRow]) -> str:
     return "mixed_sum_semantics"
 
 
+def _completed_projection_rows(rows: list[SampleDailyRow]) -> list[SampleDailyRow]:
+    return [row for row in rows if _is_completed_daily_aggregate(row)]
+
+
 def _daily_aggregate_total(rows: list[SampleDailyRow]) -> float | None:
-    daily_rows = [
-        row for row in rows if _metadata_indicates_daily_aggregate(_metadata(row[5]))
-    ]
+    daily_rows = _completed_projection_rows(rows)
     if not daily_rows:
         return None
     units = {row[4] for row in daily_rows}
     if len(units) != 1:
         return None
     return sum(row[3] for row in daily_rows)
+
+
+def _is_completed_daily_aggregate(row: SampleDailyRow) -> bool:
+    metadata = _metadata(row[5])
+    if not _metadata_indicates_daily_aggregate(metadata) or (
+        "aggregation_completeness" in metadata
+        and metadata["aggregation_completeness"] != "complete"
+    ):
+        return False
+
+    # Missing completeness is compatible only when full-day coverage is proven.
+    calendar_day = metadata.get("calendar_day", row[0])
+    zone_identifier = metadata.get("time_zone_identifier", "UTC")
+    if (
+        ("calendar_day" in metadata) != ("time_zone_identifier" in metadata)
+        or not isinstance(calendar_day, str)
+        or not isinstance(zone_identifier, str)
+        or calendar_day != row[0]
+    ):
+        return False
+    return (
+        completed_day_interval(row[2], row[6], calendar_day, zone_identifier)
+        is not None
+    )
 
 
 def _metadata(metadata_json: str) -> dict[str, object]:

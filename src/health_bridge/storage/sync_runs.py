@@ -8,8 +8,8 @@ INSERT_SYNC_RUN_SQL = (
     "insert into sync_runs (started_at, finished_at, status, schema_id, "
     "schema_version, fixture_name, source_count, health_type_count, sample_count, "
     "workout_count, sleep_session_count, deleted_record_count, sync_cursor_count, "
-    "error_summary, sync_window_start, sync_window_end) "
-    "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "error_summary, sync_window_start, sync_window_end, receiver_installation_id_hash) "
+    "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -18,6 +18,8 @@ def insert_sync_run(
     fixture_name: str,
     result: IngestResult,
     batch: HealthBridgeBatchV1 | None,
+    *,
+    receiver_installation_id_hash: str | None = None,
 ) -> int:
     timestamp = _utc_now()
     schema_id = None if batch is None else batch.schema_id
@@ -43,6 +45,7 @@ def insert_sync_run(
             result.error_summary,
             sync_window_start,
             sync_window_end,
+            receiver_installation_id_hash,
         ),
     )
     sync_run_id = cursor.lastrowid

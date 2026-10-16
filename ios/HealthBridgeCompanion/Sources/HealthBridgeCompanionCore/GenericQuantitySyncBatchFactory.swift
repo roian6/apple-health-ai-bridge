@@ -491,7 +491,8 @@ public enum GenericQuantitySyncBatchFactory {
         generatedAt: Date = Date(),
         maxSamplesPerBatch: Int = defaultMaxSamplesPerBatch,
         includeAnchorCursor: Bool = true,
-        cursorKind: String? = nil
+        cursorKind: String? = nil,
+        includeEmptyObservation: Bool = false
     ) -> [HealthBridgeBatchV1] {
         let source = HealthBridgeAppleHealthSource.phone
         guard let entry = quantityEntries(for: [changes.typeCode]).first else { return [] }
@@ -518,7 +519,7 @@ public enum GenericQuantitySyncBatchFactory {
                     deletedAt: HealthBridgeUTCFormatter.string(from: deletedSample.deletedAt)
                 )
             }
-        guard includeAnchorCursor || !sampleRecords.isEmpty || !deletedRecords.isEmpty else { return [] }
+        guard includeAnchorCursor || includeEmptyObservation || !sampleRecords.isEmpty || !deletedRecords.isEmpty else { return [] }
         let effectiveWindowStart = min(
             changes.windowStart,
             earliestValidSampleStart(from: changes.samples, entriesByTypeCode: entriesByTypeCode)
@@ -776,7 +777,7 @@ public enum DailyActivityAggregateSyncBatchFactory {
                 guard let entry = entriesByTypeCode[canonicalTypeCode],
                       aggregate.isComplete,
                       aggregate.dayStart < aggregate.dayEnd,
-                      aggregate.value > 0,
+                      aggregate.value >= 0,
                       aggregate.value.isFinite
                 else {
                     return nil
@@ -868,5 +869,101 @@ public enum DailyActivityAggregateSyncBatchFactory {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd"
         return formatter.string(from: date)
+    }
+}
+
+/// A scoped observation travels with the exact payload; it is not a permission proof.
+public struct DailyProjectionObservation: Codable, Equatable, Sendable {
+    public struct RawInterval: Codable, Equatable, Sendable {
+        public let clientRecordID: String
+        public let startTime: String
+        public let endTime: String
+
+        public init(clientRecordID: String, start: Date, end: Date) {
+            self.clientRecordID = clientRecordID
+            startTime = HealthBridgeUTCFormatter.string(from: start)
+            endTime = HealthBridgeUTCFormatter.string(from: end)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case clientRecordID = "client_record_id"
+            case startTime = "start_time"
+            case endTime = "end_time"
+        }
+    }
+
+    public static let cursorPrefix = "daily_projection_observation:"
+    public static let coveragePrefix = "daily_projection_raw_coverage:"
+    public let namespace: String
+    public let sequence: UInt64
+    public let typeCode: String
+    public let rawIntervals: [RawInterval]
+    public let rawBaseline: HealthBridgeTimeWindow?
+    public let statisticsWindow: HealthBridgeTimeWindow?
+
+    public init(
+        order: DailyProjectionObservationOrder,
+        typeCode: String,
+        rawIntervals: [RawInterval] = [],
+        rawBaseline: HealthBridgeTimeWindow? = nil,
+        statisticsWindow: HealthBridgeTimeWindow? = nil
+    ) {
+        namespace = order.namespace
+        sequence = order.sequence
+        self.typeCode = GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode)
+        self.rawIntervals = rawIntervals
+        self.rawBaseline = rawBaseline
+        self.statisticsWindow = statisticsWindow
+    }
+
+    public func cursor(sourceKey: String) throws -> HealthBridgeSyncCursor {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return HealthBridgeSyncCursor(
+            sourceKey: sourceKey,
+            cursorKind: Self.cursorPrefix + typeCode,
+            cursorValue: String(decoding: try encoder.encode(self), as: UTF8.self)
+        )
+    }
+
+    public func appending(to batch: HealthBridgeBatchV1, rawProgressKnown: Bool = true) throws -> HealthBridgeBatchV1 {
+        HealthBridgeBatchV1(
+            schemaID: batch.schemaID, schemaVersion: batch.schemaVersion,
+            generatedAt: batch.generatedAt, exportWindow: batch.exportWindow,
+            sources: batch.sources, healthTypes: batch.healthTypes, samples: batch.samples,
+            workouts: batch.workouts, sleepSessions: batch.sleepSessions,
+            deletedRecords: batch.deletedRecords,
+            sync: HealthBridgeSyncContext(
+                syncWindow: batch.sync.syncWindow,
+                cursors: (rawProgressKnown ? batch.sync.cursors : []) + [try cursor(sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey)]
+            )
+        )
+    }
+
+    /// Interval evidence follows its raw chunk; baseline coverage commits only at the end.
+    public func appending(to batches: [HealthBridgeBatchV1]) throws -> [HealthBridgeBatchV1] {
+        let exportedIDs = Set(batches.flatMap { $0.samples.map(\.clientRecordID) })
+        return try batches.enumerated().map { index, batch in
+            let identifiers = Set(batch.samples.map(\.clientRecordID))
+            let last = index == batches.count - 1
+            let scoped = DailyProjectionObservation(
+                order: .init(namespace: namespace, sequence: sequence), typeCode: typeCode,
+                rawIntervals: rawIntervals.filter {
+                    identifiers.contains($0.clientRecordID)
+                        || (last && !exportedIDs.contains($0.clientRecordID))
+                },
+                rawBaseline: last ? rawBaseline : nil,
+                statisticsWindow: statisticsWindow
+            )
+            return try scoped.appending(to: batch)
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case namespace, sequence
+        case typeCode = "type_code"
+        case rawIntervals = "raw_intervals"
+        case rawBaseline = "raw_baseline"
+        case statisticsWindow = "statistics_window"
     }
 }
