@@ -54,12 +54,11 @@ def _ingest_samples(tmp_path: Path, rows: list[SampleInput]) -> Path:
 
 
 def _day(db_path: Path, day: str = DAY) -> DailyObservation:
-    observation = get_daily_summary(
+    return get_daily_summary(
         db_path,
         start_date=day,
         end_date=(date.fromisoformat(day) + timedelta(days=1)).isoformat(),
     ).days[0]
-    return observation
 
 
 def test_completed_total_excludes_partial_but_preserves_observations(

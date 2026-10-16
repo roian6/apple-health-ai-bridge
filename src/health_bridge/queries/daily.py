@@ -11,6 +11,7 @@ from health_bridge.queries._common import (
     source_from_row,
     unique_sources,
 )
+from health_bridge.queries.calendar_coverage import completed_day_interval
 from health_bridge.queries.models import (
     DailyObservation,
     DailySampleStatistic,
@@ -20,7 +21,7 @@ from health_bridge.queries.models import (
 )
 from health_bridge.timeseries_catalog import timeseries_aggregation_for
 
-SampleDailyRow: TypeAlias = tuple[str, str, str, float, str, str]
+SampleDailyRow: TypeAlias = tuple[str, str, str, float, str, str, str]
 WorkoutDailyRow: TypeAlias = tuple[str, int]
 SleepDailyRow: TypeAlias = tuple[str, int]
 DailySourceRow: TypeAlias = tuple[str, str, str]
@@ -41,7 +42,7 @@ METADATA_ADAPTER: Final[TypeAdapter[dict[str, object]]] = TypeAdapter(
 SAMPLE_DAILY_SQL: Final = (
     "select coalesce(cast(json_extract(metadata_json, '$.calendar_day') as text), "
     "substr(start_time, 1, 10)) as day, type_code, start_time, value, "
-    "unit, metadata_json from samples where "
+    "unit, metadata_json, end_time from samples where "
     "(start_time >= ? and start_time < ?) "
     "or (json_extract(metadata_json, '$.calendar_day') >= ? "
     "and json_extract(metadata_json, '$.calendar_day') < ?) "
@@ -257,15 +258,36 @@ def _sum_semantics_for(rows: list[SampleDailyRow]) -> str:
 
 
 def _daily_aggregate_total(rows: list[SampleDailyRow]) -> float | None:
-    daily_rows = [
-        row for row in rows if _metadata_indicates_daily_aggregate(_metadata(row[5]))
-    ]
+    daily_rows = [row for row in rows if _is_completed_daily_aggregate(row)]
     if not daily_rows:
         return None
     units = {row[4] for row in daily_rows}
     if len(units) != 1:
         return None
     return sum(row[3] for row in daily_rows)
+
+
+def _is_completed_daily_aggregate(row: SampleDailyRow) -> bool:
+    metadata = _metadata(row[5])
+    if not _metadata_indicates_daily_aggregate(metadata) or (
+        "aggregation_completeness" in metadata
+        and metadata["aggregation_completeness"] != "complete"
+    ):
+        return False
+
+    calendar_day = metadata.get("calendar_day", row[0])
+    zone_identifier = metadata.get("time_zone_identifier", "UTC")
+    if (
+        ("calendar_day" in metadata) != ("time_zone_identifier" in metadata)
+        or not isinstance(calendar_day, str)
+        or not isinstance(zone_identifier, str)
+        or calendar_day != row[0]
+    ):
+        return False
+    return (
+        completed_day_interval(row[2], row[6], calendar_day, zone_identifier)
+        is not None
+    )
 
 
 def _metadata(metadata_json: str) -> dict[str, object]:

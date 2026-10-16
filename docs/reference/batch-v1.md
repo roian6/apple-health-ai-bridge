@@ -98,6 +98,14 @@ a different legacy UUID reset after a legacy baseline is established. Record
 identity remains in a separate stable namespace, so reset ordering never reuses
 retired `client_record_id` values.
 
+Completed daily totals require exact calendar-day coverage. An explicit
+`aggregation_completeness` marker must equal `complete`; partial or malformed
+markers never qualify. A missing marker is accepted only with full-day coverage.
+When supplied, `calendar_day` and `time_zone_identifier` must appear together
+and match the interval, including daylight-saving transitions. Records with
+neither calendar field use a full UTC day. Raw and partial observations remain
+available as observations; missing completed totals are not zero.
+
 ## Deleted Records
 
 `deleted_records` carries tombstones from a source so later ingest can preserve
