@@ -391,10 +391,10 @@ public final class HealthKitGenericQuantityReader: @unchecked Sendable {
                 }
                 var aggregates: [HealthKitDailyActivityAggregate] = []
                 results.enumerateStatistics(from: start, to: end) { statistics, _ in
-                    guard let sumQuantity = statistics.sumQuantity() else { return }
-                    let rawValue = sumQuantity.doubleValue(for: unit)
-                    let value = HealthKitQuantitySampleMapper.canonicalValue(rawValue, for: entry)
-                    guard value.isFinite, value > 0 else { return }
+                    guard let value = Self.dailyActivityValue(
+                        statistics.sumQuantity()?.doubleValue(for: unit),
+                        for: entry
+                    ) else { return }
                     let calendarDay = Self.calendarDayString(for: statistics.startDate, calendar: calendar)
                     aggregates.append(HealthKitDailyActivityAggregate(
                         typeCode: entry.typeCode,
@@ -410,6 +410,16 @@ public final class HealthKitGenericQuantityReader: @unchecked Sendable {
             }
             return query
         }
+    }
+
+    static func dailyActivityValue(
+        _ rawValue: Double?,
+        for entry: HealthKitTypeCatalogEntry
+    ) -> Double? {
+        guard let rawValue else { return nil }
+        let value = HealthKitQuantitySampleMapper.canonicalValue(rawValue, for: entry)
+        guard value.isFinite, value >= 0 else { return nil }
+        return value
     }
 
     private static func calendarDayString(for date: Date, calendar: Calendar) -> String {

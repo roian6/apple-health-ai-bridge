@@ -58,6 +58,12 @@ Samples represent scalar or interval observations. Required identity fields are
 and `unit`. Ingest uses source plus client record identity for idempotent
 storage.
 
+Completed daily projections accept an explicit finite zero from a HealthKit
+statistics sum and reuse the same day/type record identity as a positive total.
+Negative, nonfinite, incomplete, and unselected aggregates are not published.
+A missing sum or an empty, permission-ambiguous query emits neither a zero nor
+a derived-record tombstone. A raw-sample tombstone removes only its raw identity.
+
 ## Workouts
 
 Workouts use `client_record_id`, `source_key`, `workout_type`, `start_time`,

@@ -215,6 +215,69 @@ final class GenericQuantitySyncBatchFactoryTests: XCTestCase {
         XCTAssertTrue(DailyActivityAggregateSyncPolicy.defaultTypeCodes.contains("stand_time"))
     }
 
+    func testDailyActivityAggregateZeroCorrectsPositiveWithSameIdentity() throws {
+        let start = try date("2026-06-01T00:00:00Z")
+        let end = try date("2026-06-02T00:00:00Z")
+        func batch(_ value: Double) throws -> HealthBridgeBatchV1 {
+            try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+                aggregates: [HealthKitDailyActivityAggregate(
+                    typeCode: "flights_climbed", dayStart: start, dayEnd: end,
+                    value: value, isComplete: true,
+                    calendarDay: "2026-06-01", timeZoneIdentifier: "UTC"
+                )],
+                typeCodes: ["flights_climbed"],
+                windowStart: start, windowEnd: end, generatedAt: end
+            ))
+        }
+
+        let positive = try batch(6)
+        let zero = try batch(0)
+        let original = try XCTUnwrap(positive.samples.first)
+        let correction = try XCTUnwrap(zero.samples.first)
+        XCTAssertEqual(positive.samples.count, 1)
+        XCTAssertEqual(zero.samples.count, 1)
+        XCTAssertEqual(original.value, 6)
+        XCTAssertEqual(correction.value, 0)
+        XCTAssertEqual(correction.clientRecordID, "hk-daily-activity-flights-climbed-20260601")
+        XCTAssertEqual(correction.clientRecordID, original.clientRecordID)
+        XCTAssertEqual(correction.sourceKey, original.sourceKey)
+        XCTAssertEqual(correction.typeCode, original.typeCode)
+        XCTAssertEqual(correction.metadata, original.metadata)
+        XCTAssertEqual(correction.metadata["aggregation_completeness"], "complete")
+        XCTAssertTrue(zero.deletedRecords.isEmpty)
+        XCTAssertEqual(zero.sync.cursors, positive.sync.cursors)
+    }
+
+    func testDailyActivityAggregateRejectsInvalidIncompleteAndUnselectedValues() throws {
+        let start = try date("2026-06-01T00:00:00Z")
+        let end = try date("2026-06-02T00:00:00Z")
+        let rejected: [(String, Double, Bool)] = [
+            ("flights_climbed", -1, true), ("flights_climbed", .nan, true),
+            ("flights_climbed", .infinity, true), ("flights_climbed", -.infinity, true),
+            ("flights_climbed", 0, false), ("flights_climbed", 6, false),
+            ("steps", 0, true), ("steps", 6, true), ("heart_rate", 0, true),
+        ]
+        for (typeCode, value, isComplete) in rejected {
+            let batch = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+                aggregates: [HealthKitDailyActivityAggregate(
+                    typeCode: typeCode, dayStart: start, dayEnd: end,
+                    value: value, isComplete: isComplete,
+                    calendarDay: "2026-06-01", timeZoneIdentifier: "UTC"
+                )],
+                typeCodes: ["flights_climbed"],
+                windowStart: start, windowEnd: end, generatedAt: end
+            ))
+            XCTAssertTrue(batch.samples.isEmpty, "\(typeCode): \(value), complete: \(isComplete)")
+            XCTAssertTrue(batch.deletedRecords.isEmpty)
+        }
+        let unknown = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            aggregates: [], typeCodes: ["flights_climbed"],
+            windowStart: start, windowEnd: end, generatedAt: end
+        ))
+        XCTAssertTrue(unknown.samples.isEmpty)
+        XCTAssertTrue(unknown.deletedRecords.isEmpty)
+    }
+
     func testDailyActivityAggregateFactoryLabelsHealthKitStatisticsTotals() throws {
         let batch = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
             aggregates: [

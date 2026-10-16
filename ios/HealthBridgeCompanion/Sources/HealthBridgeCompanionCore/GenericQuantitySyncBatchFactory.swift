@@ -776,7 +776,7 @@ public enum DailyActivityAggregateSyncBatchFactory {
                 guard let entry = entriesByTypeCode[canonicalTypeCode],
                       aggregate.isComplete,
                       aggregate.dayStart < aggregate.dayEnd,
-                      aggregate.value > 0,
+                      aggregate.value >= 0,
                       aggregate.value.isFinite
                 else {
                     return nil
