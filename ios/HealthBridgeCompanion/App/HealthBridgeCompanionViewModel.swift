@@ -5967,13 +5967,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard let sleepManifestStore else {
             throw CompanionPrivateStorageError.sleepManifestUnavailable
         }
-        try SleepBaselineRejectionRecovery.recover(
-            itemID: rejection.itemID,
-            minimumResetEpoch: rejection.minimumResetEpoch,
-            outbox: outbox,
-            manifestStore: sleepManifestStore,
-            epochStore: sleepResetEpochStore
-        )
+        try withSleepStorageOrigin {
+            try SleepBaselineRejectionRecovery.recover(
+                itemID: rejection.itemID,
+                minimumResetEpoch: rejection.minimumResetEpoch,
+                outbox: outbox,
+                manifestStore: sleepManifestStore,
+                epochStore: sleepResetEpochStore
+            )
+        }
         privateStorageAdmissionReady = true
         refreshPendingOutboxCount()
     }

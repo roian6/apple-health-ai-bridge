@@ -2095,6 +2095,43 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
     }
 
+    func testRejectedSleepRecoveryJournalFailureKeepsErrorPrivate() async throws {
+        try await exerciseRejectedSleepRecoveryFailure(.rejectionPendingSave)
+    }
+
+    func testRejectedSleepRecoveryResetFailureKeepsErrorPrivate() async throws {
+        try await exerciseRejectedSleepRecoveryFailure(.rejectionReset)
+    }
+
+    private func exerciseRejectedSleepRecoveryFailure(_ point: SleepStoreFaultFixture.Point) async throws {
+        let fixture = try SleepStoreFaultFixture(point: point)
+        defer { fixture.cleanUp() }
+        let runtime = try await makeSleepStoreFaultRuntime(fixture)
+        let rejected = fixture.pending.markingRejected(minimumResetEpoch: 2)
+        try fixture.store.base.savePendingTransition(rejected)
+        fixture.store.faultEnabled = true
+
+        await runtime.viewModel.retryPrivateStorage()
+
+        XCTAssertGreaterThan(fixture.store.faultCount, 0)
+        XCTAssertTrue(runtime.viewModel.statusIsError)
+        XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
+        XCTAssertEqual(try fixture.store.base.loadPendingTransition(), rejected)
+        XCTAssertEqual(try fixture.outbox.pendingItems().count, point == .rejectionPendingSave ? 1 : 0)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+
+        fixture.store.faultEnabled = false
+        await runtime.viewModel.retryPrivateStorage()
+        XCTAssertTrue(runtime.viewModel.canSyncSleep)
+        XCTAssertNil(try fixture.store.loadPendingTransition())
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        runtime.automaticSyncRuntime.stopAdmission()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        withExtendedLifetime(runtime) {}
+    }
+
     private func exerciseSleepStoreFailure(_ point: SleepStoreFaultFixture.Point) async throws {
         let fixture = try SleepStoreFaultFixture(point: point)
         defer { fixture.cleanUp() }
@@ -2276,17 +2313,23 @@ private final class FaultingSleepManifestStore: SleepSyncManifestStoring, @unche
     }
     func savePendingTransition(_ transition: SleepSyncPendingTransition) throws {
         try fail(.pendingSave)
+        if transition.rejectedMinimumResetEpoch != nil {
+            try fail(.rejectionPendingSave)
+        }
         try base.savePendingTransition(transition)
     }
     func clearPendingTransition(id: String) throws {
         try fail(.pendingClear)
         try base.clearPendingTransition(id: id)
     }
-    func resetSynchronizationState() throws { try base.resetSynchronizationState() }
+    func resetSynchronizationState() throws {
+        try fail(.rejectionReset)
+        try base.resetSynchronizationState()
+    }
 }
 
 private final class SleepStoreFaultFixture: @unchecked Sendable {
-    enum Point { case pendingSave, manifestSave, pendingClear }
+    enum Point { case pendingSave, manifestSave, pendingClear, rejectionPendingSave, rejectionReset }
     static let privateMarker = "synthetic-private-error-marker"
     let root: URL
     let suiteName: String
@@ -2343,9 +2386,11 @@ private final class SleepStoreFaultFixture: @unchecked Sendable {
             let item = try outbox.enqueue(payload, receiverIdentity: binding)
             itemID = item.id
             let cursorStore = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
-            _ = try OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: cursorStore)
-                .recordDirectReceiverAcceptance(itemID: item.id, receiverBindingID: binding)
-            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            if point == .manifestSave || point == .pendingClear {
+                _ = try OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: cursorStore)
+                    .recordDirectReceiverAcceptance(itemID: item.id, receiverBindingID: binding)
+                XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            }
         }
         pending = SleepSyncPendingTransition(payload: payload, manifest: transition.manifest,
             receiverBindingID: binding, connectionGeneration: settings.receiverSettingsGenerationToken,
