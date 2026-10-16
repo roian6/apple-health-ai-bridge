@@ -4066,10 +4066,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         executionMode: HealthBridgeSyncExecutionMode
     ) {
         guard executionMode == .automatic else { return }
-        let resolvedStage = error is DurablePayloadEnqueueFailure ? .store : stage
+        let storageFailure = error as? SleepStorageOperationFailure
+        let resolvedStage = error is DurablePayloadEnqueueFailure || storageFailure != nil
+            ? .store : stage
+        let underlyingError = storageFailure?.underlyingError ?? error
         let failure = AutomaticSyncDiagnosticFailure.classified(
             stage: resolvedStage,
-            isCancellation: error is CancellationError
+            isCancellation: underlyingError is CancellationError
         )
         backgroundAutomaticSyncFailure = failure
         outbox?.automaticSyncDiagnosticDraft?.noteLaneFailure(failure)
@@ -5098,7 +5101,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             trackedTransition = trackedTransition.assigningOutboxItemID(
                 enqueueResult.item.id
             )
-            try store.savePendingTransition(trackedTransition)
+            try withSleepStorageOrigin {
+                try store.savePendingTransition(trackedTransition)
+            }
             refreshPendingOutboxCount()
             if enqueueResult.wasInserted {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
@@ -5151,8 +5156,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return false
         }
 
-        try store.saveManifest(pendingTransition.manifest)
-        try store.clearPendingTransition(id: pendingTransition.id)
+        try withSleepStorageOrigin {
+            try store.saveManifest(pendingTransition.manifest)
+        }
+        try withSleepStorageOrigin {
+            try store.clearPendingTransition(id: pendingTransition.id)
+        }
         refreshPendingOutboxCount()
         statusIsError = false
         statusMessage = hasRecordChanges
@@ -5851,7 +5860,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return pendingTransition
         }
         let reconciled = pendingTransition.assigningOutboxItemID(item.id)
-        try store.savePendingTransition(reconciled)
+        try withSleepStorageOrigin {
+            try store.savePendingTransition(reconciled)
+        }
         return reconciled
     }
 
@@ -6337,6 +6348,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func describe(_ error: Error) -> String {
+        if error is SleepStorageOperationFailure {
+            return "Private Sleep synchronization state could not be persisted. Retry when private storage is available."
+        }
         if let preflightError = error as? ReceiverPairingPreflightError {
             switch preflightError {
             case .mailboxKey(let failure):

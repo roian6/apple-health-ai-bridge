@@ -2063,6 +2063,115 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         ))
     }
 
+    func testAutomaticSleepPendingSaveFailureKeepsDurablePayloadForRetry() async throws {
+        try await exerciseSleepStoreFailure(.pendingSave)
+    }
+
+    func testAutomaticSleepManifestSaveFailureAfterACKMakesNoNetworkRequest() async throws {
+        try await exerciseSleepStoreFailure(.manifestSave)
+    }
+
+    func testAutomaticSleepPendingClearFailureAfterACKMakesNoNetworkRequest() async throws {
+        try await exerciseSleepStoreFailure(.pendingClear)
+    }
+
+    func testAutomaticSleepStoreCancellationRetainsPendingState() async throws {
+        let fixture = try SleepStoreFaultFixture(point: .manifestSave)
+        defer { fixture.cleanUp() }
+        let runtime = try await makeSleepStoreFaultRuntime(fixture)
+        fixture.store.failure = CancellationError()
+        fixture.store.faultEnabled = true
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["sleep_analysis"]))
+        XCTAssertEqual(recordedSleepFailure(runtime.viewModel)?.category, .cancellation)
+        XCTAssertEqual(recordedSleepFailure(runtime.viewModel)?.stage, .transport)
+        XCTAssertEqual(try fixture.store.loadPendingTransition(), fixture.pending)
+        XCTAssertEqual(try fixture.store.loadManifest(), fixture.reservation)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertTrue(runtime.viewModel.canSyncSleep)
+        fixture.store.faultEnabled = false
+        _ = await runtime.viewModel.syncRecentSleepSessions()
+        XCTAssertNil(try fixture.store.loadPendingTransition())
+        XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
+    }
+
+    private func exerciseSleepStoreFailure(_ point: SleepStoreFaultFixture.Point) async throws {
+        let fixture = try SleepStoreFaultFixture(point: point)
+        defer { fixture.cleanUp() }
+        let runtime = try await makeSleepStoreFaultRuntime(fixture)
+        fixture.store.faultEnabled = true
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["sleep_analysis"]))
+        XCTAssertEqual(recordedSleepFailure(runtime.viewModel), AutomaticSyncDiagnosticFailure(
+            stage: .store, category: .operationFailed
+        ))
+        XCTAssertGreaterThan(fixture.store.faultCount, 0)
+        XCTAssertEqual(try fixture.store.loadPendingTransition(), fixture.pending)
+        XCTAssertEqual(try fixture.store.loadManifest(), point == .pendingClear
+            ? fixture.pending.manifest : fixture.reservation)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertTrue(runtime.viewModel.canSyncSleep)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
+        XCTAssertFalse(fixture.diagnostics.latestRecord?.latestLaneSummary.contains(SleepStoreFaultFixture.privateMarker) ?? true)
+        if point == .pendingSave {
+            let item = try XCTUnwrap(try fixture.outbox.pendingItems().first)
+            XCTAssertEqual(try Data(contentsOf: item.fileURL), fixture.pending.payload)
+        } else {
+            XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        }
+        _ = await runtime.viewModel.syncRecentSleepSessions()
+        XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
+        fixture.store.faultEnabled = false
+        let expectedManifest = fixture.reservation
+        fixture.recorder.setBeforeResponse { payload, _ in
+            XCTAssertEqual(payload, fixture.pending.payload)
+            XCTAssertEqual(try fixture.store.base.loadManifest(), expectedManifest)
+            XCTAssertNotNil(try fixture.store.base.loadPendingTransition())
+        }
+        _ = await runtime.viewModel.syncRecentSleepSessions()
+        XCTAssertNil(try fixture.store.loadPendingTransition())
+        XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(fixture.recorder.invocationCount, point == .pendingSave ? 1 : 0)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, point == .pendingSave ? [fixture.pending.payload] : [])
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(),
+            point == .pendingSave ? [:] : fixture.generations)
+    }
+
+    private func recordedSleepFailure(_ viewModel: HealthBridgeCompanionViewModel) -> AutomaticSyncDiagnosticFailure? {
+        Mirror(reflecting: viewModel).children.first {
+            $0.label == "backgroundAutomaticSyncFailure"
+        }?.value as? AutomaticSyncDiagnosticFailure
+    }
+
+    private func makeSleepStoreFaultRuntime(_ fixture: SleepStoreFaultFixture) async throws -> HealthBridgeCompanionApplicationRuntime {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PayloadFenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        fixture.session = session
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let viewModel = try makeViewModel(
+            root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { "synthetic-issue64-installation" }
+            ),
+            outbox: fixture.outbox, receiverClient: ReceiverClient(session: session),
+            automaticSyncDiagnosticStore: fixture.diagnostics,
+            sleepManifestStore: fixture.store,
+            readAnchoredSleepChanges: { _, _, receivedAt in
+                XCTFail("Pending delivery failure must not reach a HealthKit query.")
+                throw CancellationError()
+            },
+            automaticSyncEligibleTypeCodesForTesting: ["sleep_analysis"],
+            scheduleDirectBackgroundUploads: { 0 }
+        )
+        await viewModel.bootstrap()
+        XCTAssertTrue(viewModel.canSyncSleep)
+        return HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+    }
+
     private func makeViewModel(
         root: URL,
         defaults: UserDefaults,
@@ -2071,6 +2180,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         outbox: FileOutbox,
         receiverClient: ReceiverClient = ReceiverClient(),
         automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore(),
+        sleepManifestStore: (any SleepSyncManifestStoring)? = nil,
         readAnchoredSleepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
@@ -2109,7 +2219,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 fileURL: root.appendingPathComponent("cursors.json")
             ),
             cursorStoreFileURL: root.appendingPathComponent("cursors.json"),
-            sleepManifestStore: try FileSleepSyncManifestStore(
+            sleepManifestStore: try sleepManifestStore ?? FileSleepSyncManifestStore(
                 fileURL: root.appendingPathComponent("sleep.json")
             ),
             sleepManifestFileURL: root.appendingPathComponent("sleep.json"),
@@ -2130,6 +2240,125 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             terminalRecoveryDrainTimeoutNanoseconds: terminalRecoveryDrainTimeoutNanoseconds
         )
+    }
+}
+
+private final class FaultingSleepManifestStore: SleepSyncManifestStoring, @unchecked Sendable {
+    let base: FileSleepSyncManifestStore
+    let point: SleepStoreFaultFixture.Point
+    var faultEnabled = false
+    var faultCount = 0
+    var failure: Error = CocoaError(.fileWriteUnknown, userInfo: [
+        NSLocalizedDescriptionKey: SleepStoreFaultFixture.privateMarker,
+        NSFilePathErrorKey: "/synthetic/" + SleepStoreFaultFixture.privateMarker,
+        NSUnderlyingErrorKey: NSError(domain: "synthetic.private", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: SleepStoreFaultFixture.privateMarker
+        ]),
+    ])
+
+    init(base: FileSleepSyncManifestStore, point: SleepStoreFaultFixture.Point) {
+        self.base = base
+        self.point = point
+    }
+
+    private func fail(_ point: SleepStoreFaultFixture.Point) throws {
+        if faultEnabled && self.point == point {
+            faultCount += 1
+            throw failure
+        }
+    }
+
+    func loadManifest() throws -> SleepSyncManifest? { try base.loadManifest() }
+    func loadPendingTransition() throws -> SleepSyncPendingTransition? { try base.loadPendingTransition() }
+    func saveManifest(_ manifest: SleepSyncManifest) throws {
+        try fail(.manifestSave)
+        try base.saveManifest(manifest)
+    }
+    func savePendingTransition(_ transition: SleepSyncPendingTransition) throws {
+        try fail(.pendingSave)
+        try base.savePendingTransition(transition)
+    }
+    func clearPendingTransition(id: String) throws {
+        try fail(.pendingClear)
+        try base.clearPendingTransition(id: id)
+    }
+    func resetSynchronizationState() throws { try base.resetSynchronizationState() }
+}
+
+private final class SleepStoreFaultFixture: @unchecked Sendable {
+    enum Point { case pendingSave, manifestSave, pendingClear }
+    static let privateMarker = "synthetic-private-error-marker"
+    let root: URL
+    let suiteName: String
+    let defaults: UserDefaults
+    let settings: ReceiverSettingsStore
+    let background: BackgroundSyncSettingsStore
+    let generations: [String: Int]
+    let diagnostics: AutomaticSyncDiagnosticStore
+    let outbox: FileOutbox
+    let store: FaultingSleepManifestStore
+    let reservation: SleepSyncManifest
+    let pending: SleepSyncPendingTransition
+    let recorder = PayloadFenceNetworkRecorder()
+    var session: URLSession?
+
+    init(point: Point) throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("Synthetic-Issue64-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        suiteName = "Synthetic.Issue64.SleepStore.\(UUID())"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        settings = ReceiverSettingsStore(userDefaults: defaults, tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(), synchronize: { true })
+        try settings.save(receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-issue64-credential", rotateBindingID: true)
+        background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        try background.markPendingObserverTypeCodes(["sleep_analysis"])
+        generations = try background.loadPendingObserverTypeCodeGenerations()
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        diagnostics = AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json"))
+        outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        outbox.automaticSyncDiagnosticStore = diagnostics
+        let base = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
+        store = FaultingSleepManifestStore(base: base, point: point)
+        reservation = SleepSyncBatchFactory.makeManifestReservation(
+            receiverSettingsGeneration: settings.receiverSettingsGenerationToken,
+            historyDepth: HealthHistoryDepthSelectionStore(userDefaults: defaults).historyDepth, historyStartDate: nil,
+            sourceKey: "apple_health.phone.synthetic-issue64-installation", baselineResetEpoch: 1)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: reservation,
+            changes: HealthKitAnchoredSleepChanges(addedSamples: [], deletedSamples: [],
+                anchorCursorValue: "synthetic-issue64-anchor", receivedAt: date),
+            receiverSettingsGeneration: settings.receiverSettingsGenerationToken,
+            historyDepth: reservation.historyDepth, historyStartDate: nil, generatedAt: date))
+        let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let binding = try XCTUnwrap(settings.receiverBindingID)
+        var itemID: String?
+        if point != .pendingSave {
+            let item = try outbox.enqueue(payload, receiverIdentity: binding)
+            itemID = item.id
+            let cursorStore = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
+            _ = try OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: cursorStore)
+                .recordDirectReceiverAcceptance(itemID: item.id, receiverBindingID: binding)
+            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        }
+        pending = SleepSyncPendingTransition(payload: payload, manifest: transition.manifest,
+            receiverBindingID: binding, connectionGeneration: settings.receiverSettingsGenerationToken,
+            outboxItemID: itemID)
+        try base.saveManifest(reservation)
+        try base.savePendingTransition(pending)
+    }
+
+    func cleanUp() {
+        session?.invalidateAndCancel()
+        PayloadFenceURLProtocol.networkRecorder = nil
+        defaults.removePersistentDomain(forName: suiteName)
+        XCTAssertNoThrow(try FileManager.default.removeItem(at: root))
     }
 }
 

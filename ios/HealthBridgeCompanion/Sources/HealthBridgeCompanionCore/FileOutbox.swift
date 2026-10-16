@@ -2752,6 +2752,20 @@ public final class KeychainReceiverTokenStore: ReceiverTokenStoring {
     #endif
 }
 
+struct SleepStorageOperationFailure: Error {
+    let underlyingError: Error
+}
+
+func withSleepStorageOrigin<T>(_ operation: () throws -> T) throws -> T {
+    do {
+        return try operation()
+    } catch let cancellation as CancellationError {
+        throw cancellation
+    } catch {
+        throw SleepStorageOperationFailure(underlyingError: error)
+    }
+}
+
 public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     public let label: String
     public let receiverURLString: String
