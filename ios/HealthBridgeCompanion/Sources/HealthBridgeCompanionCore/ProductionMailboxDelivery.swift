@@ -115,8 +115,9 @@ public final class ProductionMailboxDelivery {
     private let pendingGenerationStore: BackgroundSyncSettingsStore?
     private let sleepStore: (any SleepSyncManifestStoring)?
     private let keyStore: MailboxKeyStore
+    private let componentsFactory: (() throws -> ProductionMailboxComponents)?
 
-    public init(
+    public convenience init(
         settingsStore: ReceiverSettingsStore,
         outbox: FileOutbox,
         cursorStore: any SyncCursorStoring,
@@ -127,6 +128,28 @@ public final class ProductionMailboxDelivery {
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
         )
     ) {
+        self.init(
+            settingsStore: settingsStore,
+            outbox: outbox,
+            cursorStore: cursorStore,
+            proofStore: proofStore,
+            pendingGenerationStore: pendingGenerationStore,
+            sleepStore: sleepStore,
+            keyStore: keyStore,
+            componentsFactory: nil
+        )
+    }
+
+    init(
+        settingsStore: ReceiverSettingsStore,
+        outbox: FileOutbox,
+        cursorStore: any SyncCursorStoring,
+        proofStore: CoreLaneUploadProofStore? = nil,
+        pendingGenerationStore: BackgroundSyncSettingsStore? = nil,
+        sleepStore: (any SleepSyncManifestStoring)? = nil,
+        keyStore: MailboxKeyStore,
+        componentsFactory: (() throws -> ProductionMailboxComponents)?
+    ) {
         self.settingsStore = settingsStore
         self.outbox = outbox
         self.cursorStore = cursorStore
@@ -134,6 +157,7 @@ public final class ProductionMailboxDelivery {
         self.pendingGenerationStore = pendingGenerationStore
         self.sleepStore = sleepStore
         self.keyStore = keyStore
+        self.componentsFactory = componentsFactory
     }
 
     public func validateAvailability() throws {
@@ -469,6 +493,14 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.initialAdvance
         }
+        var finalizedCount: Int
+        do {
+            finalizedCount = try finalizeVerifiedForegroundHeads(components: components)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ProductionMailboxDeliveryPhaseError.consumeAck
+        }
         let ackLane: URL
         do {
             let locator = try components.locate()
@@ -497,7 +529,6 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.scanAck
         }
-        var finalizedCount = 0
         var ackCleanupFailureCount = 0
         var mappedEvents: [(event: MailboxAckEvent, itemID: String)] = []
         for event in report.events {
@@ -541,11 +572,8 @@ public final class ProductionMailboxDelivery {
                 }
                 switch event.classification {
                 case .committed, .duplicateIdentical:
-                    let disposition = try coordinator.consume(event, itemID: itemID)
-                    if disposition == .ackVerified {
-                        _ = try coordinator.finalizeCommitted(itemID: itemID)
-                        finalizedCount += 1
-                    }
+                    _ = try coordinator.consume(event, itemID: itemID)
+                    finalizedCount += try finalizeVerifiedForegroundHeads(components: components)
                     if try coordinator.state(itemID: itemID)?.phase == .committedFinalized {
                         let deleted = Self.deleteAcknowledgmentAfterDurableCommit {
                             try coordinator.deleteAcknowledgment(for: event, itemID: itemID)
@@ -591,6 +619,24 @@ public final class ProductionMailboxDelivery {
             ignoredTemporaryCount: report.ignoredTemporaryCount,
             quarantine: report.quarantine
         )
+    }
+
+    @MainActor
+    private func finalizeVerifiedForegroundHeads(
+        components: ProductionMailboxComponents
+    ) throws -> Int {
+        var finalizedCount = 0
+        while true {
+            try Task.checkCancellation()
+            guard let item = try outbox.pendingItems().first,
+                  item.receiverIdentity == components.identity.opaqueBinding,
+                  item.deliveryState?.phase == .ackVerified else {
+                return finalizedCount
+            }
+            let coordinator = try coordinator(components: components, itemID: item.id)
+            _ = try coordinator.finalizeCommitted(itemID: item.id)
+            finalizedCount += 1
+        }
     }
 
     static func orderedAcknowledgmentIndices(
@@ -799,7 +845,10 @@ public final class ProductionMailboxDelivery {
     }
 
     private func makeComponents() throws -> ProductionMailboxComponents {
-        try ProductionMailboxComponents.make(
+        if let componentsFactory {
+            return try componentsFactory()
+        }
+        return try ProductionMailboxComponents.make(
             settingsStore: settingsStore,
             outbox: outbox,
             keyStore: keyStore
