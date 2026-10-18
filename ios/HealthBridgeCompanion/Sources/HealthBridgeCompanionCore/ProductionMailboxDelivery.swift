@@ -448,6 +448,7 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     public func deliverPending() async throws -> ProductionMailboxDeliverySummary {
+        let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         let components: ProductionMailboxComponents
         do {
             components = try makeComponents()
@@ -513,7 +514,7 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.locateAckLane
         }
-        let hydration: MailboxAckHydrationReport
+        var hydration: MailboxAckHydrationReport
         do {
             hydration = try await ProductionMailboxAckHydration.make(lane: ackLane).hydrate()
         } catch is CancellationError {
@@ -521,13 +522,82 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.hydrateAck
         }
-        let report: MailboxAckScanReport
+        var report: MailboxAckScanReport
         do {
+            try Task.checkCancellation()
+            guard settingsStore.receiverSettingsGenerationToken == receiverGeneration else {
+                throw ProductionMailboxDeliveryError.inactive
+            }
             report = try components.scanner.scan()
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             throw ProductionMailboxDeliveryPhaseError.scanAck
+        }
+        let pendingFIFOHead: FileOutboxItem?
+        let pendingFIFOHeadEnvelopeID: Data?
+        do {
+            pendingFIFOHead = try outbox.pendingItems().first
+            if let pendingFIFOHead,
+               pendingFIFOHead.receiverIdentity == components.identity.opaqueBinding,
+               pendingFIFOHead.deliveryState?.phase == .providerObserved {
+                pendingFIFOHeadEnvelopeID = try envelopeID(
+                    for: pendingFIFOHead,
+                    signingPublicKey: components.deviceSigningPublicKey
+                )
+            } else {
+                pendingFIFOHeadEnvelopeID = nil
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ProductionMailboxDeliveryPhaseError.mapAckItem
+        }
+        if let pendingFIFOHeadEnvelopeID,
+           !report.events.contains(where: { $0.envelopeID == pendingFIFOHeadEnvelopeID }) {
+            let exactHydration: MailboxAckHydrationReport
+            do {
+                exactHydration = try await ProductionMailboxAckHydration.make(
+                    lane: ackLane,
+                    candidateFileNames: [pendingFIFOHeadEnvelopeID.hexV1 + ".hba"],
+                    maximumWaits: 1
+                ).hydrate()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ProductionMailboxDeliveryPhaseError.hydrateAck
+            }
+            let exactReport: MailboxAckScanReport
+            do {
+                try Task.checkCancellation()
+                guard settingsStore.receiverSettingsGenerationToken == receiverGeneration,
+                      try outbox.pendingItems().first == pendingFIFOHead else {
+                    throw ProductionMailboxDeliveryError.itemUnavailable
+                }
+                exactReport = try components.scanner.scanExact(envelopeID: pendingFIFOHeadEnvelopeID)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ProductionMailboxDeliveryPhaseError.scanAck
+            }
+            hydration = MailboxAckHydrationReport(
+                eligibleCandidateCount: hydration.eligibleCandidateCount + exactHydration.eligibleCandidateCount,
+                requestedDownloadCount: hydration.requestedDownloadCount + exactHydration.requestedDownloadCount,
+                remainingUnavailableCount: hydration.remainingUnavailableCount + exactHydration.remainingUnavailableCount,
+                skippedUnverifiableIdentityCount: hydration.skippedUnverifiableIdentityCount
+                    + exactHydration.skippedUnverifiableIdentityCount
+            )
+            var quarantine = report.quarantine
+            for reason in exactReport.quarantine.records {
+                quarantine.append(reason)
+            }
+            report = MailboxAckScanReport(
+                events: report.events + exactReport.events,
+                quarantine: quarantine,
+                scannedFinalCount: report.scannedFinalCount + exactReport.scannedFinalCount,
+                scannedByteCount: report.scannedByteCount + exactReport.scannedByteCount,
+                ignoredTemporaryCount: report.ignoredTemporaryCount + exactReport.ignoredTemporaryCount
+            )
         }
         var ackCleanupFailureCount = 0
         var mappedEvents: [(event: MailboxAckEvent, itemID: String)] = []
