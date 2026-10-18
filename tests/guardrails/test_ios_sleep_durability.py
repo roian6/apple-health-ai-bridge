@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -631,14 +632,74 @@ def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> Non
     assert "engine.requestRun(" in handler
     assert "bootstrapBeforeRun: true" in handler
     assert handler.index("engine.requestRun(") < handler.index(
-        "BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded"
+        "platform.scheduleRefresh(viewModel)"
     )
+    assert handler.count("platform.scheduleRefresh(viewModel)") == 1
+    assert re.search(
+        str.join(
+            "",
+            (
+                r"try\? await engine\.requestRun\(\s*",
+                r"reason: \.scheduledRefresh,\s*bootstrapBeforeRun: true\s*\)\s*",
+                r"platform\.scheduleRefresh\(viewModel\)",
+            ),
+        ),
+        handler,
+    )
+    platform_start = runtime.index("struct Platform {")
+    schedule_start = runtime.index("var scheduleRefresh:", platform_start)
+    schedule_end = runtime.index("var cancelRefresh:", schedule_start)
+    schedule_default = runtime[schedule_start:schedule_end].strip()
+    assert re.fullmatch(
+        str.join(
+            "",
+            (
+                r"var scheduleRefresh: \(HealthBridgeCompanionViewModel\) -> Void ",
+                r"= \{\s*",
+                r"BackgroundRefreshScheduler\.scheduleNextRefreshIfNeeded",
+                r"\(viewModel: \$0\)\s*\}",
+            ),
+        ),
+        schedule_default,
+    )
+    init_start = runtime.index("init(viewModel:")
+    initializer = runtime[
+        init_start : runtime.index("func prepareForBackgroundLaunch()", init_start)
+    ]
+    assert "platform: Platform? = nil" in initializer
+    assert "self.platform = platform ?? Platform()" in initializer
     background_task = app[app.index(".backgroundTask(") :]
     # Executable cancellation-boundary tests cover the shared lifecycle owner.
     # SwiftUI must await that owner rather than returning before its finalizer.
     assert "await applicationRuntime.handleBackgroundRefresh()" in background_task
     assert "guard !Task.isCancelled" not in background_task
-    lifecycle = source.split("private func performBackgroundRefreshSync(", 1)[1]
+    assert re.search(
+        str.join(
+            "",
+            (
+                r"\.backgroundTask\(\.appRefresh\(HealthBridgeBackgroundSync",
+                r"\.appRefreshIdentifier\)\) \{\s*",
+                r"await applicationRuntime\.handleBackgroundRefresh\(\)\s*\}",
+            ),
+        ),
+        background_task,
+    )
+    assert re.search(
+        str.join(
+            "",
+            (
+                r"func handleBackgroundRefresh\(\) async \{\s*",
+                r"await automaticSyncRuntime\.handleBackgroundRefresh\(\)\s*\}",
+            ),
+        ),
+        app,
+    )
+    lifecycle_start = source.index("private func performBackgroundRefreshSync(")
+    lifecycle = source[
+        lifecycle_start : source.index(
+            "private func finalizeBackgroundRefresh(", lifecycle_start
+        )
+    ]
     assert "await finalization.run" in lifecycle
     assert "await self.finalizeBackgroundRefresh(" in lifecycle
 

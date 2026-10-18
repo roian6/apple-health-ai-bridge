@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 VIEW_MODEL = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift")
@@ -10,8 +11,12 @@ BACKGROUND_SYNC = Path(
 )
 
 
-def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> None:
-    app = APP.read_text(encoding="utf-8")
+def _region(source: str, start: str, end: str) -> str:
+    begin = source.index(start)
+    return source[begin : source.index(end, begin + len(start))]
+
+
+def _assert_scene_launch_forwarding(app: str) -> None:
     startup = app[app.index(".task {") : app.index(".onChange(of: scenePhase)")]
     active_start = app.index("if newPhase == .active")
     foreground = app[active_start : app.index("} else {", active_start)]
@@ -24,7 +29,193 @@ def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> No
     )
     active_guard = "guard !Task.isCancelled, scenePhase == .active else { return }"
     assert all(active_guard in block for block in (startup, foreground))
-    source = VIEW_MODEL.read_text(encoding="utf-8")
+    for block in (startup, foreground):
+        assert (
+            block.index("await applicationRuntime.bootstrap()")
+            < block.index(active_guard)
+            < block.index("applicationRuntime.runForegroundCatchUpIfNeeded()")
+        )
+    assert "await viewModel.bootstrap()" in _region(
+        app, "func bootstrap() async", "func runForegroundCatchUpIfNeeded()"
+    )
+    assert "automaticSyncRuntime.runForegroundCatchUpIfNeeded()" in _region(
+        app, "func runForegroundCatchUpIfNeeded()", "func noteSceneLeftActive()"
+    )
+    app_initializer = _region(app, "    init(", "func prepareForBackgroundLaunch()")
+    assert (
+        "viewModel.installAutomaticSyncRuntime(automaticSyncRuntime)" in app_initializer
+    )
+
+
+def _assert_foreground_runtime_admission(runtime: str) -> None:
+    generic_start = runtime.index("func runForegroundCatchUpIfNeeded()")
+    generic = runtime[
+        generic_start : runtime.index("func noteSceneLeftActive()", generic_start)
+    ]
+    assert "usesMailboxTransport" not in generic
+    assert "runForegroundMailboxReconciliationIfNeeded" not in generic
+    assert "guard !opportunityWasConsumed else { return }" in generic
+    admission = re.search(
+        str.join(
+            "",
+            (
+                r"guard viewModel\.automaticSyncShouldRunForegroundCatchUp\(\s*",
+                r"opportunityWasConsumed: opportunityWasConsumed\s*\),\s*",
+                r"foregroundCatchUpTask == nil else \{\s*return\s*\}",
+            ),
+        ),
+        generic,
+    )
+    assert admission is not None
+    assert re.fullmatch(
+        str.join(
+            "",
+            (
+                r"func runForegroundCatchUpIfNeeded\(\) \{\s*",
+                r"let opportunityWasConsumed = foregroundOpportunityConsumed\s*",
+                r"guard !opportunityWasConsumed else \{ return \}\s*",
+                r"reconcileRegistrations\(\)\s*",
+            ),
+        ),
+        generic[: admission.start()],
+    )
+    consume = generic.index("foregroundOpportunityConsumed = true")
+    owner = generic.index("foregroundCatchUpTask = Task { @MainActor [weak self] in")
+    assert admission.end() < consume < owner
+    assert not generic[admission.end() : consume].strip()
+    assert generic[consume:owner].strip() == "foregroundOpportunityConsumed = true"
+    assert generic.count("foregroundOpportunityConsumed = true") == 1
+    assert "engine.requestRun(reason: .launchCatchUp)" in generic
+    assert re.fullmatch(
+        str.join(
+            "",
+            (
+                r"foregroundCatchUpTask = Task \{ @MainActor \[weak self\] in\s*",
+                r"guard let self else \{ return \}\s*",
+                r"self\.viewModel\.publishAutomaticSyncForegroundCatchUpStarted\(",
+                r"\)\s*",
+                r"try\? await self\.engine\.requestRun\(reason: \.launchCatchUp\)",
+                r"\s*",
+                r"self\.foregroundCatchUpTask = nil\s*\}\s*\}\s*",
+            ),
+        ),
+        generic[owner:],
+    )
+
+
+def _assert_bootstrap_readiness(source: str, runtime: str) -> None:
+    prerequisites = _region(
+        source,
+        "func automaticSyncShouldRunForegroundCatchUp(",
+        "func installAutomaticSyncRuntime(",
+    )
+    assert re.fullmatch(
+        str.join(
+            "",
+            (
+                r"func automaticSyncShouldRunForegroundCatchUp\(\s*",
+                r"opportunityWasConsumed: Bool\s*\) -> Bool \{\s*",
+                r"let prerequisitesAreReady = !Task\.isCancelled\s*",
+                r"&& terminalPayloadActionAdmissionIsOpen\s*&& automaticSyncReady",
+                r"\s*",
+                r"&& backgroundSyncEnabled\s*&& canSendConnectionTest\s*",
+                r"guard prerequisitesAreReady else \{ return false \}\s*",
+                r"return AutomaticSyncTriggerPolicy\.admitsForegroundLaunchReconci",
+                r"liation\(\s*",
+                r"prerequisitesAreReady: true,\s*",
+                r"opportunityWasConsumed: opportunityWasConsumed\s*\)\s*\}\s*",
+            ),
+        ),
+        prerequisites,
+    )
+    bootstrap = _region(
+        source,
+        "private func performBootstrap()",
+        "private func recoverPendingOutboxClearIfNeeded()",
+    )
+    assert bootstrap.index("bootstrapCompleted = true") < bootstrap.index(
+        "activateAutomaticSyncIfReady()"
+    )
+    activate_forwarding = _region(
+        source, "private func activateAutomaticSyncIfReady(", "private func "
+    )
+    assert (
+        "automaticSyncRuntime?.activateIfReady(scheduleOutbox: scheduleOutbox)"
+        in activate_forwarding
+    )
+    activation = _region(runtime, "func activateIfReady(", "func stopAdmission()")
+    ready_guard = "guard viewModel.automaticSyncRuntimeIsReady else { return }"
+    assert activation.index(ready_guard) < activation.index(
+        "runForegroundCatchUpIfNeeded()"
+    )
+    assert "guard !hasActivatedReadyWork else { return }" in activation
+
+
+def _assert_shared_engine_ack_backpressure(
+    source: str, runtime: str, background_sync: str
+) -> None:
+    engine = _region(
+        runtime, "private lazy var engine = AutomaticSyncEngine(", "    init(viewModel:"
+    )
+    assert "return await viewModel.processAutomaticSyncType(" in engine
+    assert "_ = await viewModel.performAutomaticSyncOpportunity(" in engine
+    assert "self?.beginOwner(cancelOwner: cancelOwner)" in engine
+    opportunity = _region(
+        source,
+        "func performAutomaticSyncOpportunity(",
+        "private func ownBackgroundRefreshOpportunity(",
+    )
+    assert "return await ownBackgroundRefreshOpportunity(" in opportunity
+    assert "reason: opportunity.reason" in opportunity
+    work = _region(
+        source,
+        "private func performBackgroundRefreshWork(",
+        "private func noteAutomaticSyncQueryStarted(",
+    )
+    before_payload = work.index(
+        "await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)"
+    )
+    process_pending = work.index(
+        "processedAllPending = try await processPendingTypes()"
+    )
+    after_enqueue = work.index(
+        "await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)"
+    )
+    assert before_payload < process_pending < after_enqueue
+    assert (
+        "try requireCurrentConnectionGeneration(expectedGeneration)"
+        in work[before_payload:process_pending]
+    )
+    steps = _region(
+        source,
+        "private func processAutomaticStepRepresentations(",
+        "private func automaticStepReadFailureResult(",
+    )
+    raw_read = steps.index(
+        "let raw = await performRecentStepCounts(executionMode: .automatic)"
+    )
+    assert steps.index("let flushed = await flushPendingOutbox()") < raw_read
+    assert re.search(
+        str.join(
+            "",
+            (
+                r"guard flushed, !statusIsError, trustedPendingOutboxCount\(\) == ",
+                r"0 else \{\s*",
+                r"return \.blocked\s*\}",
+            ),
+        ),
+        steps[:raw_read],
+    )
+    daily_read = steps.index("let daily = await performDailyActivityAggregates(")
+    assert re.search(r"case \.queued:\s*return \.blocked", steps[raw_read:daily_read])
+    pending_result = _region(
+        background_sync, "switch result.disposition {", "if reason == .scheduledRefresh"
+    )
+    assert re.search(r"case \.payloadEnqueued:\s*break", pending_result)
+    assert re.search(r"case \.blocked:\s*return false", pending_result)
+
+
+def _assert_retained_mailbox_reconciliation(source: str) -> None:
     mailbox_entry_start = source.index(
         "func runForegroundMailboxReconciliationIfNeeded()"
     )
@@ -45,19 +236,6 @@ def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> No
     assert "runBackgroundRefreshSync" not in mailbox_entry
     assert "syncRecentStepCounts" not in mailbox_entry
     assert "requestHealthPermissions" not in mailbox_entry
-
-    runtime = AUTOMATIC_SYNC_RUNTIME.read_text(encoding="utf-8")
-    generic_start = runtime.index("func runForegroundCatchUpIfNeeded()")
-    generic = runtime[
-        generic_start : runtime.index("func noteSceneLeftActive()", generic_start)
-    ]
-    mailbox_branch = generic.index("if viewModel.usesMailboxTransport")
-    direct_guard = generic.index(
-        "guard viewModel.automaticSyncShouldRunForegroundCatchUp"
-    )
-    assert mailbox_branch < direct_guard
-    assert "viewModel.runForegroundMailboxReconciliationIfNeeded()" in generic
-    assert "engine.requestRun(reason: .launchCatchUp)" in generic
 
     bounded_phase = helper.index("reconcileMailboxDeliveryIfNeeded(")
     point = helper.index("at: .beforePayloadGeneration", bounded_phase)
@@ -93,6 +271,18 @@ def test_mailbox_startup_and_foreground_use_delivery_only_reconciliation() -> No
     assert cancellation.index("catchUpTask?.cancel()") < cancellation.index(
         "await catchUpTask?.value"
     )
+
+
+def test_mailbox_startup_and_foreground_use_shared_launch_catch_up() -> None:
+    app = APP.read_text(encoding="utf-8")
+    source = VIEW_MODEL.read_text(encoding="utf-8")
+    runtime = AUTOMATIC_SYNC_RUNTIME.read_text(encoding="utf-8")
+    background_sync = BACKGROUND_SYNC.read_text(encoding="utf-8")
+    _assert_scene_launch_forwarding(app)
+    _assert_foreground_runtime_admission(runtime)
+    _assert_bootstrap_readiness(source, runtime)
+    _assert_shared_engine_ack_backpressure(source, runtime, background_sync)
+    _assert_retained_mailbox_reconciliation(source)
 
 
 def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:

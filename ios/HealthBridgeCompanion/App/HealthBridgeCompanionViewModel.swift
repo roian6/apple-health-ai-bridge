@@ -391,6 +391,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let scheduleDirectBackgroundUploads: (@MainActor () async throws -> Int)?
     private let cancelInheritedLegacyUploads: @MainActor () async -> BackgroundUploadCancellationResult
     private let terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)?
+    private let platformBackgroundPayloadDrain: (@MainActor () async -> Bool)?
+    private let productionMailboxDelivery: (@MainActor () throws -> ProductionMailboxDelivery)?
     private let terminalRecoveryDrainTimeoutNanoseconds: UInt64
     private var sleepSourceKey: String?
     private lazy var manualSyncProcessor = ManualSyncProcessor(viewModel: self)
@@ -440,7 +442,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             await BackgroundURLSessionOutboxUploader.shared.cancelInheritedLegacyUploads()
         },
         terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
-        terminalRecoveryDrainTimeoutNanoseconds: UInt64 = 5_000_000_000
+        terminalRecoveryDrainTimeoutNanoseconds: UInt64 = 5_000_000_000,
+        platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
+        productionMailboxDelivery: (@MainActor () throws -> ProductionMailboxDelivery)? = nil
     ) {
         let pendingPairingMayExist: Bool
         do {
@@ -509,6 +513,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.scheduleDirectBackgroundUploads = scheduleDirectBackgroundUploads
         self.cancelInheritedLegacyUploads = cancelInheritedLegacyUploads
         self.terminalBackgroundPayloadDrain = terminalBackgroundPayloadDrain
+        self.platformBackgroundPayloadDrain = platformBackgroundPayloadDrain
+        self.productionMailboxDelivery = productionMailboxDelivery
         self.terminalRecoveryDrainTimeoutNanoseconds = terminalRecoveryDrainTimeoutNanoseconds
         self.sleepSourceKey = (try? pairingStateStore.loadOrCreateInstallationID()).map {
             "apple_health.phone.\($0.lowercased())"
@@ -1158,18 +1164,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         do {
             #if os(iOS)
             await cancelBackgroundOutboxSchedulingIfNeeded()
-            let cancellationResult = await BackgroundURLSessionOutboxUploader.shared
-                .cancelPendingUploads()
-            let legacyCancellationResult = await BackgroundURLSessionOutboxUploader.shared
-                .cancelInheritedLegacyUploads()
-            let hasPendingUploadTasks = await BackgroundURLSessionOutboxUploader.shared
-                .hasPendingUploadTasks()
-            guard BackgroundUploadCancellationPolicy.canBeginDirectTransfer(
-                cancellationWasFullyFinalized: cancellationResult.fullyFinalized
-                    && legacyCancellationResult.fullyFinalized,
-                hasPendingUploadTasks: hasPendingUploadTasks
-            ) else {
-                throw CancellationError()
+            if let platformBackgroundPayloadDrain {
+                guard await platformBackgroundPayloadDrain() else {
+                    throw CancellationError()
+                }
+            } else {
+                let cancellationResult = await BackgroundURLSessionOutboxUploader.shared
+                    .cancelPendingUploads()
+                let legacyCancellationResult = await BackgroundURLSessionOutboxUploader.shared
+                    .cancelInheritedLegacyUploads()
+                let hasPendingUploadTasks = await BackgroundURLSessionOutboxUploader.shared
+                    .hasPendingUploadTasks()
+                guard BackgroundUploadCancellationPolicy.canBeginDirectTransfer(
+                    cancellationWasFullyFinalized: cancellationResult.fullyFinalized
+                        && legacyCancellationResult.fullyFinalized,
+                    hasPendingUploadTasks: hasPendingUploadTasks
+                ) else {
+                    throw CancellationError()
+                }
             }
             #endif
             let result = await operation()
@@ -2250,6 +2262,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func drainBackgroundPayloadCancellation() async -> Bool {
         #if os(iOS)
         await cancelBackgroundOutboxSchedulingIfNeeded()
+        if let platformBackgroundPayloadDrain {
+            return await platformBackgroundPayloadDrain()
+        }
         let cancellationResult = await BackgroundURLSessionOutboxUploader.shared
             .cancelPendingUploads()
         let legacyCancellationResult = await BackgroundURLSessionOutboxUploader.shared
@@ -3290,6 +3305,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     func noteSceneLeftActive() {
         foregroundMailboxSceneIsActive = false
         foregroundMailboxOpportunityConsumed = false
+    }
+
+    func waitForBootstrapAndForegroundWork() async {
+        await bootstrapTask?.value
+        await backgroundOutboxSchedulingTask?.value
+        await foregroundCatchUpTask?.value
+    }
+
+    func waitForAutomaticSyncDisableCleanup() async {
+        _ = await automaticSyncDisableCleanupTask?.value
     }
 
     private func reconcileForegroundMailboxDelivery(
@@ -6087,6 +6112,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func makeProductionMailboxDelivery() throws -> ProductionMailboxDelivery {
+        if let productionMailboxDelivery {
+            return try productionMailboxDelivery()
+        }
         guard let outbox else {
             throw CompanionPrivateStorageError.outboxUnavailable
         }

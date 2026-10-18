@@ -13,10 +13,11 @@ final class HealthBridgeCompanionApplicationRuntime {
 
     init(
         viewModel: HealthBridgeCompanionViewModel = HealthBridgeCompanionViewModel(),
-        backgroundLaunchPreparation: (@MainActor () -> Void)? = nil
+        backgroundLaunchPreparation: (@MainActor () -> Void)? = nil,
+        automaticSyncPlatform: AutomaticSyncRuntime.Platform? = nil
     ) {
         self.viewModel = viewModel
-        let automaticSyncRuntime = AutomaticSyncRuntime(viewModel: viewModel)
+        let automaticSyncRuntime = AutomaticSyncRuntime(viewModel: viewModel, platform: automaticSyncPlatform)
         self.automaticSyncRuntime = automaticSyncRuntime
         viewModel.installAutomaticSyncRuntime(automaticSyncRuntime)
         self.backgroundLaunchPreparation = backgroundLaunchPreparation ?? {
@@ -45,6 +46,15 @@ final class HealthBridgeCompanionApplicationRuntime {
     }
 }
 
+#if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+@main
+@MainActor
+struct HealthBridgeIsolatedTestHost: App {
+    var body: some Scene {
+        WindowGroup { EmptyView() }
+    }
+}
+#else
 @main
 @MainActor
 struct HealthBridgeCompanionApp: App {
@@ -90,3 +100,4 @@ struct HealthBridgeCompanionApp: App {
         }
     }
 }
+#endif

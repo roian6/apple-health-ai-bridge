@@ -10,12 +10,48 @@ import UIKit
 final class AutomaticSyncRuntime {
     unowned let viewModel: HealthBridgeCompanionViewModel
 
+    @MainActor
+    struct Platform {
+        var scheduleRefresh: (HealthBridgeCompanionViewModel) -> Void = {
+            BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: $0)
+        }
+        var cancelRefresh: () -> Void = { BackgroundRefreshScheduler.cancelPendingRefresh() }
+        var consumeRefresh: () -> Void = { BackgroundRefreshScheduler.noteRequestConsumed() }
+        var setUploadAdmission: (Bool) -> Void = {
+            #if os(iOS)
+            BackgroundURLSessionOutboxUploader.shared.setAutomaticContinuationAdmissionOpen($0)
+            #endif
+        }
+        var beginBackgroundOwner: AutomaticSyncEngine.StartOwner = { cancelOwner in
+            #if os(iOS)
+            let identifier = UIApplication.shared.beginBackgroundTask(
+                withName: "HealthBridge automatic sync",
+                expirationHandler: cancelOwner
+            )
+            return {
+                guard identifier != .invalid else { return }
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+            #else
+            return {}
+            #endif
+        }
+        #if canImport(HealthKit)
+        var healthDataAvailable: () -> Bool = { HKHealthStore.isHealthDataAvailable() }
+        var backgroundDeliveryCoordinator = HealthKitBackgroundDeliveryCoordinator()
+        #endif
+    }
+
+    private let platform: Platform
+
     private var isActivated = false
     private var hasActivatedReadyWork = false
     private var foregroundOpportunityConsumed = false
     private var foregroundCatchUpTask: Task<Void, Never>?
     #if canImport(HealthKit)
-    private let backgroundDeliveryCoordinator = HealthKitBackgroundDeliveryCoordinator()
+    private var backgroundDeliveryCoordinator: HealthKitBackgroundDeliveryCoordinator {
+        platform.backgroundDeliveryCoordinator
+    }
     #endif
 
     private lazy var engine = AutomaticSyncEngine(
@@ -45,27 +81,22 @@ final class AutomaticSyncRuntime {
         }
     )
 
-    init(viewModel: HealthBridgeCompanionViewModel) {
+    init(viewModel: HealthBridgeCompanionViewModel, platform: Platform? = nil) {
         self.viewModel = viewModel
+        self.platform = platform ?? Platform()
     }
 
     func prepareForBackgroundLaunch() {
         guard viewModel.automaticSyncLaunchPreparationIsAllowed else { return }
-        #if os(iOS)
-        BackgroundURLSessionOutboxUploader.shared
-            .setAutomaticContinuationAdmissionOpen(true)
-        #endif
+        platform.setUploadAdmission(true)
         isActivated = true
         startObservers(allowBeforeBootstrap: true)
-        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+        platform.scheduleRefresh(viewModel)
     }
 
     func activateIfReady(scheduleOutbox: Bool = true) {
         guard viewModel.automaticSyncRuntimeIsReady else { return }
-        #if os(iOS)
-        BackgroundURLSessionOutboxUploader.shared
-            .setAutomaticContinuationAdmissionOpen(true)
-        #endif
+        platform.setUploadAdmission(true)
         guard !hasActivatedReadyWork else { return }
         hasActivatedReadyWork = true
         if !isActivated {
@@ -75,22 +106,19 @@ final class AutomaticSyncRuntime {
         if scheduleOutbox {
             viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
         }
-        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+        platform.scheduleRefresh(viewModel)
         runForegroundCatchUpIfNeeded()
     }
 
     func stopAdmission() {
-        #if os(iOS)
-        BackgroundURLSessionOutboxUploader.shared
-            .setAutomaticContinuationAdmissionOpen(false)
-        #endif
+        platform.setUploadAdmission(false)
         isActivated = false
         hasActivatedReadyWork = false
         foregroundOpportunityConsumed = false
         foregroundCatchUpTask?.cancel()
         foregroundCatchUpTask = nil
         engine.cancelActiveOwner()
-        BackgroundRefreshScheduler.cancelPendingRefresh()
+        platform.cancelRefresh()
         #if canImport(HealthKit)
         backgroundDeliveryCoordinator.stop(
             healthTypes: HealthBridgeBackgroundSync.allKnownBackgroundDeliveryHealthTypes
@@ -103,21 +131,26 @@ final class AutomaticSyncRuntime {
         await engine.cancelAndWait()
     }
 
+    func waitForForegroundCatchUp() async {
+        await foregroundCatchUpTask?.value
+    }
+
+    func foregroundCatchUpCompletion() -> (@MainActor () async -> Void)? {
+        guard let task = foregroundCatchUpTask else { return nil }
+        return { await task.value }
+    }
+
     func runForegroundCatchUpIfNeeded() {
         let opportunityWasConsumed = foregroundOpportunityConsumed
         guard !opportunityWasConsumed else { return }
-        foregroundOpportunityConsumed = true
         reconcileRegistrations()
-        if viewModel.usesMailboxTransport {
-            viewModel.runForegroundMailboxReconciliationIfNeeded()
-            return
-        }
         guard viewModel.automaticSyncShouldRunForegroundCatchUp(
             opportunityWasConsumed: opportunityWasConsumed
         ),
               foregroundCatchUpTask == nil else {
             return
         }
+        foregroundOpportunityConsumed = true
         foregroundCatchUpTask = Task { @MainActor [weak self] in
             guard let self else { return }
             self.viewModel.publishAutomaticSyncForegroundCatchUpStarted()
@@ -132,13 +165,13 @@ final class AutomaticSyncRuntime {
     }
 
     func handleBackgroundRefresh() async {
-        BackgroundRefreshScheduler.noteRequestConsumed()
+        platform.consumeRefresh()
         reconcileRegistrations()
         try? await engine.requestRun(
             reason: .scheduledRefresh,
             bootstrapBeforeRun: true
         )
-        BackgroundRefreshScheduler.scheduleNextRefreshIfNeeded(viewModel: viewModel)
+        platform.scheduleRefresh(viewModel)
     }
 
     func runAutomaticSync(
@@ -161,21 +194,11 @@ final class AutomaticSyncRuntime {
         cancelOwner: @escaping AutomaticSyncEngine.CancelOwner
     ) -> AutomaticSyncEngine.FinishOwner {
         viewModel.setAutomaticSyncOwnerActive(true)
-        #if os(iOS)
-        let identifier = UIApplication.shared.beginBackgroundTask(
-            withName: "HealthBridge automatic sync",
-            expirationHandler: cancelOwner
-        )
+        let finishBackgroundOwner = platform.beginBackgroundOwner(cancelOwner)
         return { @MainActor [weak self] in
             self?.viewModel.setAutomaticSyncOwnerActive(false)
-            guard identifier != .invalid else { return }
-            UIApplication.shared.endBackgroundTask(identifier)
+            finishBackgroundOwner()
         }
-        #else
-        return { @MainActor [weak self] in
-            self?.viewModel.setAutomaticSyncOwnerActive(false)
-        }
-        #endif
     }
 
     private func reconcileRegistrations() {
@@ -190,7 +213,7 @@ final class AutomaticSyncRuntime {
 
     private func startObservers(allowBeforeBootstrap: Bool) {
         #if canImport(HealthKit)
-        guard HKHealthStore.isHealthDataAvailable() else {
+        guard platform.healthDataAvailable() else {
             viewModel.publishHealthKitUnavailableForAutomaticSync()
             return
         }

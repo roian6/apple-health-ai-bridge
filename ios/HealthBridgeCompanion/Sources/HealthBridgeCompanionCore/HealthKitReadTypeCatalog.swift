@@ -101,15 +101,34 @@ public final class HealthStoreAuthorizer {
 
 @MainActor
 public final class HealthKitBackgroundDeliveryCoordinator {
-    private let healthStore: HKHealthStore
+    private let healthDataAvailable: () -> Bool
+    private let executeQuery: (HKQuery) -> Void
+    private let stopQuery: (HKQuery) -> Void
+    private let enableDelivery: (HKSampleType, @escaping @Sendable (Bool, Error?) -> Void) -> Void
+    private let disableDelivery: (HKSampleType) -> Void
     private var activeObserverQueries: [HKObserverQuery] = []
     private var callbackGeneration: UInt64 = 0
     private var registrationTypes: [String: HKSampleType] = [:]
     private var registrationHandler: @MainActor (String, Bool) -> Void = { _, _ in }
     private var isCurrent: @MainActor () -> Bool = { false }
 
-    public init(healthStore: HKHealthStore = HKHealthStore()) {
-        self.healthStore = healthStore
+    public init(
+        healthStore: HKHealthStore = HKHealthStore(),
+        healthDataAvailable: @escaping () -> Bool = { HKHealthStore.isHealthDataAvailable() },
+        executeQuery: ((HKQuery) -> Void)? = nil,
+        stopQuery: ((HKQuery) -> Void)? = nil,
+        enableDelivery: ((HKSampleType, @escaping @Sendable (Bool, Error?) -> Void) -> Void)? = nil,
+        disableDelivery: ((HKSampleType) -> Void)? = nil
+    ) {
+        self.healthDataAvailable = healthDataAvailable
+        self.executeQuery = executeQuery ?? { healthStore.execute($0) }
+        self.stopQuery = stopQuery ?? { healthStore.stop($0) }
+        self.enableDelivery = enableDelivery ?? { sampleType, completion in
+            healthStore.enableBackgroundDelivery(for: sampleType, frequency: .immediate, withCompletion: completion)
+        }
+        self.disableDelivery = disableDelivery ?? { sampleType in
+            healthStore.disableBackgroundDelivery(for: sampleType) { _, _ in }
+        }
     }
 
     public var activeObserverCount: Int {
@@ -131,7 +150,7 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         self.isCurrent = isCurrent
         registrationTypes = [:]
         stopActiveObserverQueries()
-        guard HKHealthStore.isHealthDataAvailable(), isCurrent() else { return }
+        guard healthDataAvailable(), isCurrent() else { return }
 
         for healthType in healthTypes {
             guard let sampleType = HealthKitReadTypeCatalog.sampleTypes(for: [healthType]).first else {
@@ -197,7 +216,7 @@ public final class HealthKitBackgroundDeliveryCoordinator {
                     )
                 }
             }
-            healthStore.execute(observer)
+            executeQuery(observer)
             activeObserverQueries.append(observer)
         }
         reconcileRegistrations()
@@ -207,10 +226,7 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         guard isCurrent() else { return }
         let expectedGeneration = callbackGeneration
         for (typeCode, sampleType) in registrationTypes {
-            healthStore.enableBackgroundDelivery(
-                for: sampleType,
-                frequency: .immediate
-            ) { [weak self] succeeded, error in
+            enableDelivery(sampleType) { [weak self] succeeded, error in
                 let enabled = succeeded && error == nil
                 Task { @MainActor [weak self] in
                     guard let self,
@@ -228,7 +244,7 @@ public final class HealthKitBackgroundDeliveryCoordinator {
         callbackGeneration &+= 1
         isCurrent = { false }
         registrationTypes = [:]
-        guard HKHealthStore.isHealthDataAvailable() else {
+        guard healthDataAvailable() else {
             activeObserverQueries.removeAll()
             return
         }
@@ -236,13 +252,13 @@ public final class HealthKitBackgroundDeliveryCoordinator {
 
         let sampleTypes = HealthKitReadTypeCatalog.sampleTypes(for: healthTypes)
         for sampleType in sampleTypes {
-            healthStore.disableBackgroundDelivery(for: sampleType) { _, _ in }
+            disableDelivery(sampleType)
         }
     }
 
     private func stopActiveObserverQueries() {
         for query in activeObserverQueries {
-            healthStore.stop(query)
+            stopQuery(query)
         }
         activeObserverQueries.removeAll()
     }
