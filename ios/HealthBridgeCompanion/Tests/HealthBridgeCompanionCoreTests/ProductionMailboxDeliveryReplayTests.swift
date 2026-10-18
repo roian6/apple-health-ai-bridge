@@ -379,9 +379,10 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
                 let binding = try XCTUnwrap(first.mailboxBinding)
                 XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
                 let before = try Self.localFiles(fixture)
-                let bytes = try XCTUnwrap(before[
-                    fixture.outbox.directoryURL.appendingPathComponent(binding.envelopeFilename)
-                ])
+                let envelopeURL = fixture.outbox.directoryURL.appendingPathComponent(binding.envelopeFilename)
+                let matches = before.filter { $0.key.path == envelopeURL.path }
+                XCTAssertEqual(matches.count, 1)
+                let bytes = try XCTUnwrap(matches.first?.value)
                 XCTAssertEqual(mailboxSHA256(bytes), binding.envelopeSHA256)
                 let claims = try DeliveryProtocolV1.inspectDelivery(
                     bytes, senderSigningPublicKey: fixture.ackContext.deviceSigningPublicKey
