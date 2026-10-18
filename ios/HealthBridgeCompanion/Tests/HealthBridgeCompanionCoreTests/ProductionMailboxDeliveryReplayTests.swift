@@ -373,7 +373,33 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
                     ))
                 )
             case .admission:
+                try self.assertRetained(fixture)
+                capture.pending = try fixture.outbox.pendingItems()
+                let first = try XCTUnwrap(capture.pending?.first)
+                let binding = try XCTUnwrap(first.mailboxBinding)
+                XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
+                let before = try Self.localFiles(fixture)
+                let bytes = try XCTUnwrap(before[
+                    fixture.outbox.directoryURL.appendingPathComponent(binding.envelopeFilename)
+                ])
+                XCTAssertEqual(mailboxSHA256(bytes), binding.envelopeSHA256)
+                let claims = try DeliveryProtocolV1.inspectDelivery(
+                    bytes, senderSigningPublicKey: fixture.ackContext.deviceSigningPublicKey
+                )
+                XCTAssertEqual(claims.receiverID, fixture.ackContext.receiverID)
+                XCTAssertEqual(claims.deviceID, fixture.ackContext.deviceID)
+                XCTAssertEqual(claims.connectionGeneration, fixture.ackContext.connectionGeneration)
+                XCTAssertEqual(claims.receiverAgreementKeyID, fixture.ackContext.receiverAgreementKeyID)
+                XCTAssertEqual(claims.senderSigningKeyID, fixture.ackContext.deviceSigningKeyID)
+                XCTAssertEqual(claims.payloadSHA256, binding.payloadSHA256)
+                let lane = try XCTUnwrap(fixture.locator.lanes[.deliveries])
+                let name = try MailboxLayoutV1.finalFileName(identifier: claims.envelopeID.hexV1, kind: .delivery)
+                capture.publication = (lane.appendingPathComponent(name), bytes)
                 try FileOutbox.beginDestructiveRecovery(directory: fixture.outbox.directoryURL)
+                let after = try Self.localFiles(fixture)
+                XCTAssertEqual(after.filter { $0.key.lastPathComponent != ".clear-intent" }, before)
+                capture.files = after
+                return
             }
             capture.pending = try fixture.outbox.pendingItems()
             capture.files = try Self.localFiles(fixture)
@@ -384,6 +410,23 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
         XCTAssertTrue(barrier.observation().entered)
         XCTAssertTrue(barrier.observation().actionBeforeRelease)
         XCTAssertFalse(barrier.observation().completedBeforeRelease)
+        if case .admission = mutation {
+            XCTAssertEqual(try Self.localFiles(fixture), try XCTUnwrap(capture.files))
+            XCTAssertTrue(fixture.outbox.clearIntentIsActive)
+            XCTAssertNil(try fixture.currentCursor())
+            XCTAssertTrue(fixture.cursors.writes.isEmpty)
+            for item in [fixture.first, fixture.second] {
+                XCTAssertEqual(try Data(contentsOf: item.fileURL), fixture.payload)
+            }
+            for lane in CoreLaneUploadProofStore.Lane.allCases {
+                XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: lane, receiverBindingID: fixture.binding))
+            }
+            let acks = try XCTUnwrap(fixture.locator.lanes[.acks])
+            XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: acks.path).isEmpty)
+            let publication = try XCTUnwrap(capture.publication)
+            XCTAssertEqual(try Data(contentsOf: publication.url), publication.bytes)
+            return
+        }
         XCTAssertEqual(try fixture.outbox.pendingItems(), try XCTUnwrap(capture.pending))
         XCTAssertEqual(try Self.localFiles(fixture), try XCTUnwrap(capture.files))
         try assertRetained(fixture)
@@ -448,6 +491,7 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
 private final class PublicationSafetyCapture {
     var pending: [FileOutboxItem]?
     var files: [URL: Data]?
+    var publication: (url: URL, bytes: Data)?
 }
 
 private struct PublicationSafetyPublisher: MailboxEnvelopePublishing {
