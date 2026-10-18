@@ -212,8 +212,13 @@ def test_delivery_phase_wrappers_preserve_ack_processing_order() -> None:
     delivery_end = source.index("private func coordinator(", delivery_start)
     delivery = source[delivery_start:delivery_end]
 
+    # A retained verified head can finalize before provider ACK scanning.
+    # Check fresh ACK processing separately from that replay path.
+    provider_ack_start = delivery.index("let ackLane: URL")
+    assert delivery.index(".initialAdvance") < provider_ack_start
+    provider_ack_processing = delivery[provider_ack_start:]
+
     phases = [
-        ".initialAdvance",
         ".locateAckLane",
         ".hydrateAck",
         ".scanAck",
@@ -221,7 +226,7 @@ def test_delivery_phase_wrappers_preserve_ack_processing_order() -> None:
         ".consumeAck",
         ".remainingCount",
     ]
-    offsets = [delivery.index(phase) for phase in phases]
+    offsets = [provider_ack_processing.index(phase) for phase in phases]
 
     assert offsets == sorted(offsets)
 
