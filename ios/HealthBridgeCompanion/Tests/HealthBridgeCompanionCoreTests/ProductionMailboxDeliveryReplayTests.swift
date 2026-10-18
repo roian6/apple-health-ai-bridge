@@ -239,6 +239,329 @@ final class ProductionMailboxDeliveryAckSelectionTests: XCTestCase {
 }
 
 @MainActor
+final class ProductionMailboxPublicationSafetyTests: XCTestCase {
+    func testForegroundCancellationJoinsPublicationAndRetriesWithoutRetirement() async throws {
+        try await assertPublicationInterruption(background: false)
+    }
+
+    func testBackgroundCancellationJoinsPublicationAndRetriesWithoutRetirement() async throws {
+        try await assertPublicationInterruption(background: true)
+    }
+
+    func testBackgroundCancellationJoinsThrowingPublicationBeforeReportingCancellation() async throws {
+        try await assertPublicationInterruption(background: true, genericError: true)
+    }
+
+    func testCurrentGenericPublicationErrorPreservesPhaseErrorAndRetryableArtifacts() async throws {
+        try await assertPublicationInterruption(background: true, genericError: true, cancel: false)
+    }
+
+    func testForegroundRejectsStaleGenerationAfterSuccessfulPublication() async throws {
+        try await assertStalePublication(background: false, mutation: .generation, genericError: false)
+    }
+
+    func testBackgroundRejectsStaleGenerationAfterGenericPublicationError() async throws {
+        try await assertStalePublication(background: true, mutation: .generation, genericError: true)
+    }
+
+    func testForegroundRejectsChangedOwnershipAfterSuccessfulPublication() async throws {
+        try await assertStalePublication(background: false, mutation: .ownership, genericError: false)
+    }
+
+    func testBackgroundRejectsChangedOwnershipAfterGenericPublicationError() async throws {
+        try await assertStalePublication(background: true, mutation: .ownership, genericError: true)
+    }
+
+    func testBackgroundRejectsRevokedAdmissionAfterSuccessfulPublication() async throws {
+        try await assertStalePublication(background: true, mutation: .admission, genericError: false)
+    }
+
+    private func assertPublicationInterruption(
+        background: Bool,
+        genericError: Bool = false,
+        cancel: Bool = true
+    ) async throws {
+        let barrier = PublicationSafetyBarrier(genericError: genericError)
+        let fixture = try ForegroundReplayFixture(
+            publisher: PublicationSafetyPublisher(barrier: barrier),
+            isCancelled: { withUnsafeCurrentTask { $0?.isCancelled ?? false } }
+        )
+        defer { fixture.removeTemporaryStores() }
+        let delivery = try fixture.delivery()
+        let diagnostics = try Self.diagnosticBytes(fixture)
+        let operation = Task { @MainActor in
+            defer { barrier.recordCompletion() }
+            if background {
+                _ = try await delivery.publishPendingFIFOHead()
+            } else {
+                _ = try await delivery.deliverPending()
+            }
+        }
+        barrier.startDriver(cancel: cancel ? operation : nil)
+        let result = await operation.result
+        try await barrier.joinDriver()
+        if cancel {
+            assertCancelled(result)
+        } else {
+            XCTAssertThrowsError(try result.get()) { error in
+                XCTAssertEqual(error as? ProductionMailboxDeliveryPhaseError, .initialAdvance)
+            }
+        }
+        XCTAssertTrue(barrier.observation().entered)
+        XCTAssertFalse(barrier.observation().completedBeforeRelease)
+        XCTAssertEqual(try Self.diagnosticBytes(fixture), diagnostics)
+        try assertRetained(fixture)
+        XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id)?.phase, .encrypted)
+        XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
+        let envelope = try firstPublishedEnvelope(fixture)
+
+        try fixture.reopenOutbox()
+        try assertRetained(fixture)
+        XCTAssertEqual(try firstPublishedEnvelope(fixture), envelope)
+        if background {
+            let retry = try await fixture.delivery().publishPendingFIFOHead()
+            XCTAssertEqual(retry.attemptedCount, 1)
+            XCTAssertEqual(retry.finalizedCount, 0)
+            XCTAssertEqual(retry.waitingCount, 2)
+            XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
+        } else {
+            let retry = try await fixture.delivery().deliverPending()
+            XCTAssertEqual(retry.attemptedCount, 2)
+            XCTAssertEqual(retry.finalizedCount, 0)
+            XCTAssertEqual(retry.waitingCount, 2)
+            try fixture.assertWaitingForFirst()
+        }
+        try assertRetained(fixture)
+        XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id)?.phase, .providerObserved)
+        XCTAssertEqual(try firstPublishedEnvelope(fixture), envelope)
+    }
+
+    private enum Mutation: Sendable {
+        case generation, ownership, admission
+    }
+
+    private func assertStalePublication(background: Bool, mutation: Mutation, genericError: Bool) async throws {
+        let barrier = PublicationSafetyBarrier(genericError: genericError)
+        let fixture = try ForegroundReplayFixture(publisher: PublicationSafetyPublisher(barrier: barrier))
+        defer { fixture.removeTemporaryStores() }
+        let capture = PublicationSafetyCapture()
+        let delivery = try fixture.delivery()
+        let operation = Task { @MainActor in
+            defer { barrier.recordCompletion() }
+            if background {
+                _ = try await delivery.publishPendingFIFOHead()
+            } else {
+                _ = try await delivery.deliverPending()
+            }
+        }
+        barrier.startDriver(action: {
+            let state = try XCTUnwrap(fixture.outbox.deliveryState(for: fixture.first.id))
+            XCTAssertEqual(state.phase, .encrypted)
+            switch mutation {
+            case .generation:
+                let previous = fixture.settings.receiverSettingsGenerationToken
+                try fixture.settings.invalidateReceiverSettingsGeneration()
+                XCTAssertNotEqual(fixture.settings.receiverSettingsGenerationToken, previous)
+            case .ownership:
+                _ = try fixture.outbox.compareAndSetDeliveryState(
+                    itemID: fixture.first.id,
+                    expected: state,
+                    updated: state.assigning(OutboxDeliveryOwnershipV1(
+                        receiverGeneration: "synthetic-replacement-generation",
+                        resetEpoch: nil,
+                        ackContext: fixture.ackContext
+                    ))
+                )
+            case .admission:
+                try FileOutbox.beginDestructiveRecovery(directory: fixture.outbox.directoryURL)
+            }
+            capture.pending = try fixture.outbox.pendingItems()
+            capture.files = try Self.localFiles(fixture)
+        })
+        let result = await operation.result
+        try await barrier.joinDriver()
+        assertCancelled(result)
+        XCTAssertTrue(barrier.observation().entered)
+        XCTAssertTrue(barrier.observation().actionBeforeRelease)
+        XCTAssertFalse(barrier.observation().completedBeforeRelease)
+        XCTAssertEqual(try fixture.outbox.pendingItems(), try XCTUnwrap(capture.pending))
+        XCTAssertEqual(try Self.localFiles(fixture), try XCTUnwrap(capture.files))
+        try assertRetained(fixture)
+        XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id)?.phase, .encrypted)
+        XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
+        _ = try firstPublishedEnvelope(fixture)
+    }
+
+    private func assertCancelled(_ result: Result<Void, any Error>) {
+        switch result {
+        case .success:
+            XCTFail("Cancelled or stale publication must not report progress")
+        case .failure(let error):
+            XCTAssertTrue(error is CancellationError, "Expected cancellation, received \(error)")
+        }
+    }
+
+    private func assertRetained(_ fixture: ForegroundReplayFixture) throws {
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [fixture.first.id, fixture.second.id])
+        XCTAssertEqual(try fixture.outbox.pendingCursorCheckpoint(), fixture.firstCheckpoint)
+        XCTAssertNil(try fixture.currentCursor())
+        XCTAssertTrue(fixture.cursors.writes.isEmpty)
+        for item in [fixture.first, fixture.second] {
+            XCTAssertEqual(try Data(contentsOf: item.fileURL), fixture.payload)
+        }
+        for lane in CoreLaneUploadProofStore.Lane.allCases {
+            XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: lane, receiverBindingID: fixture.binding))
+        }
+        let acks = try XCTUnwrap(fixture.locator.lanes[.acks])
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: acks.path).isEmpty)
+    }
+
+    private func firstPublishedEnvelope(_ fixture: ForegroundReplayFixture) throws -> Data {
+        let binding = try XCTUnwrap(fixture.outbox.mailboxBinding(for: fixture.first.id))
+        let bytes = try Data(contentsOf: fixture.outbox.directoryURL.appendingPathComponent(binding.envelopeFilename))
+        XCTAssertEqual(mailboxSHA256(bytes), binding.envelopeSHA256)
+        let envelopeID = try fixture.components().transport.finalizedEnvelopeID(itemID: fixture.first.id)
+        let name = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .delivery)
+        let lane = try XCTUnwrap(fixture.locator.lanes[.deliveries])
+        XCTAssertEqual(try Data(contentsOf: lane.appendingPathComponent(name)), bytes)
+        return bytes
+    }
+
+    private static func localFiles(_ fixture: ForegroundReplayFixture) throws -> [URL: Data] {
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: fixture.outbox.directoryURL, includingPropertiesForKeys: nil
+        )
+        var files = try Dictionary(uniqueKeysWithValues: urls.map { ($0, try Data(contentsOf: $0)) })
+        if let diagnostics = try diagnosticBytes(fixture) {
+            files[fixture.root.appendingPathComponent("diagnostics.json")] = diagnostics
+        }
+        return files
+    }
+
+    private static func diagnosticBytes(_ fixture: ForegroundReplayFixture) throws -> Data? {
+        let url = fixture.root.appendingPathComponent("diagnostics.json")
+        return FileManager.default.fileExists(atPath: url.path) ? try Data(contentsOf: url) : nil
+    }
+}
+
+@MainActor
+private final class PublicationSafetyCapture {
+    var pending: [FileOutboxItem]?
+    var files: [URL: Data]?
+}
+
+private struct PublicationSafetyPublisher: MailboxEnvelopePublishing {
+    let barrier: PublicationSafetyBarrier
+
+    func publish(_ envelope: Data, finalName: String, locator: MailboxResolvedLocatorV1) throws -> URL {
+        let barrier = barrier
+        barrier.beginPublication()
+        defer { barrier.endPublication() }
+        let publisher = POSIXMailboxEnvelopePublisher { boundary in
+            if boundary == .renameTemporary { barrier.blockFirstPublication() }
+        }
+        let url = try publisher.publish(envelope, finalName: finalName, locator: locator)
+        if barrier.takeGenericError() { throw Failure.afterAtomicPublication }
+        return url
+    }
+
+    private enum Failure: Error {
+        case afterAtomicPublication
+    }
+}
+
+// NSLock protects every mutable field; only synchronization and Sendable task handles
+// cross threads. The optional fixture mutation runs and is joined on MainActor.
+private final class PublicationSafetyBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private let actionDone = DispatchSemaphore(value: 0)
+    private let completed = DispatchSemaphore(value: 0)
+    private let driver = DispatchGroup()
+    private let publication = DispatchGroup()
+    private var didEnter = false
+    private var observedEntry = false
+    private var released = false
+    private var completedBeforeRelease = false
+    private var actionBeforeRelease = false
+    private var genericError: Bool
+    private var actionTask: Task<Void, any Error>?
+
+    init(genericError: Bool) { self.genericError = genericError }
+
+    func beginPublication() { publication.enter() }
+
+    func endPublication() { publication.leave() }
+
+    func blockFirstPublication() {
+        let first = lock.withLock {
+            guard !didEnter else { return false }
+            didEnter = true
+            return true
+        }
+        guard first else { return }
+        entered.signal()
+        release.wait()
+    }
+
+    func takeGenericError() -> Bool {
+        lock.withLock {
+            let result = genericError
+            genericError = false
+            return result
+        }
+    }
+
+    func recordCompletion() {
+        lock.withLock { completedBeforeRelease = !released }
+        completed.signal()
+    }
+
+    func startDriver(
+        cancel operation: Task<Void, any Error>? = nil,
+        action: (@MainActor @Sendable () throws -> Void)? = nil
+    ) {
+        driver.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { driver.leave() }
+            let observed = entered.wait(timeout: .now() + 10) == .success
+            lock.withLock { observedEntry = observed }
+            if observed {
+                operation?.cancel()
+                if let action {
+                    let task = Task { @MainActor [self] in
+                        defer { actionDone.signal() }
+                        try action()
+                        lock.withLock { actionBeforeRelease = !released }
+                    }
+                    lock.withLock { actionTask = task }
+                    _ = actionDone.wait(timeout: .now() + 5)
+                }
+                _ = completed.wait(timeout: .now() + 1)
+            }
+            lock.withLock { released = true }
+            release.signal()
+        }
+    }
+
+    func joinDriver() async throws {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            driver.notify(queue: .global()) { continuation.resume() }
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            publication.notify(queue: .global()) { continuation.resume() }
+        }
+        let task = lock.withLock { actionTask }
+        try await task?.value
+    }
+
+    func observation() -> (entered: Bool, actionBeforeRelease: Bool, completedBeforeRelease: Bool) {
+        lock.withLock { (observedEntry, actionBeforeRelease, completedBeforeRelease) }
+    }
+}
+
+@MainActor
 final class ProductionMailboxPublicationResponsivenessTests: XCTestCase {
     func testForegroundPublicationKeepsMainActorResponsiveBeforeIORelease() async throws {
         let barrier = PublicationResponsivenessBarrier()
@@ -526,12 +849,17 @@ private final class ForegroundReplayFixture {
     let second: FileOutboxItem
     private(set) var outbox: FileOutbox
     private let envelopeIDs = ReplayEnvelopeIDs()
-    private let publisher: POSIXMailboxEnvelopePublisher
+    private let publisher: any MailboxEnvelopePublishing
+    private let isCancelled: () -> Bool
 
     var binding: String { identity.opaqueBinding }
 
-    init(publisher: POSIXMailboxEnvelopePublisher = POSIXMailboxEnvelopePublisher()) throws {
+    init(
+        publisher: any MailboxEnvelopePublishing = POSIXMailboxEnvelopePublisher(),
+        isCancelled: @escaping () -> Bool = { false }
+    ) throws {
         self.publisher = publisher
+        self.isCancelled = isCancelled
         let runID = UUID().uuidString
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ProductionMailboxDeliveryReplayTests-\(runID)")
@@ -667,7 +995,7 @@ private final class ForegroundReplayFixture {
             publisher: publisher,
             envelopeID: { envelopeIDs.next() },
             nowMilliseconds: { 1_782_000_000_123 },
-            isCancelled: { false },
+            isCancelled: isCancelled,
             observe: { url, digest in
                 mailboxSHA256(try Data(contentsOf: url)) == digest
             }

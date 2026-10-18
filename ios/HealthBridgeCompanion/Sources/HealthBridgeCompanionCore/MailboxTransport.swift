@@ -74,12 +74,21 @@ public final class MailboxTransport: DeliveryTransport {
     }
 
     func publishEnvelope(itemID: String) throws -> DeliveryTransportResult {
+        guard let work = try preparePublication(itemID: itemID) else { return .retryable }
+        return try publicationResult(Result { try work.publish() })
+    }
+
+    func preparePublication(itemID: String) throws -> MailboxPublicationWork? {
         guard let item = try outbox.pendingItem(id: itemID),
               let binding = item.mailboxBinding else {
             throw MailboxTransportError.itemUnavailable
         }
         let finalized = try loadFinalizedEnvelope(itemID: item.id, binding: binding)
-        return try publish(finalized) == nil ? .retryable : .published
+        return try preparePublication(finalized)
+    }
+
+    func publicationResult(_ result: Result<URL, any Error>) throws -> DeliveryTransportResult {
+        try publishedURL(result) == nil ? .retryable : .published
     }
 
     func observeEnvelope(itemID: String) throws -> DeliveryTransportResult {
@@ -188,16 +197,27 @@ public final class MailboxTransport: DeliveryTransport {
     }
 
     private func publish(_ finalized: FinalizedEnvelope) throws -> MailboxPublishedEnvelope? {
+        guard let work = try preparePublication(finalized),
+              let url = try publishedURL(Result { try work.publish() }) else { return nil }
+        return MailboxPublishedEnvelope(finalized: finalized, url: url)
+    }
+
+    private func preparePublication(_ finalized: FinalizedEnvelope) throws -> MailboxPublicationWork? {
         try checkCancellation()
         guard let locator = try resolvedLocator() else { return nil }
         try outbox.requireUploadAdmission()
+        return MailboxPublicationWork(
+            envelope: finalized.bytes,
+            finalName: try finalName(for: finalized),
+            locator: locator,
+            publisher: publisher
+        )
+    }
+
+    private func publishedURL(_ result: Result<URL, any Error>) throws -> URL? {
         let publishedURL: URL
         do {
-            publishedURL = try publisher.publish(
-                finalized.bytes,
-                finalName: try finalName(for: finalized),
-                locator: locator
-            )
+            publishedURL = try result.get()
         } catch let error as MailboxPublicationError {
             switch error {
             case .retryable:
@@ -209,7 +229,7 @@ public final class MailboxTransport: DeliveryTransport {
             }
         }
         try checkCancellation()
-        return MailboxPublishedEnvelope(finalized: finalized, url: publishedURL)
+        return publishedURL
     }
 
     private func observePublished(

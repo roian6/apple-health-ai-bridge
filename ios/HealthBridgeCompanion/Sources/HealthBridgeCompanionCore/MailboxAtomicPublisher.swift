@@ -16,7 +16,7 @@ enum MailboxPublicationBoundary: CaseIterable, Equatable {
     case syncDirectory
 }
 
-protocol MailboxEnvelopePublishing {
+protocol MailboxEnvelopePublishing: Sendable {
     func publish(
         _ envelope: Data,
         finalName: String,
@@ -24,7 +24,18 @@ protocol MailboxEnvelopePublishing {
     ) throws -> URL
 }
 
-struct MailboxFileProviderPublicationExecutor {
+struct MailboxPublicationWork: Sendable {
+    let envelope: Data
+    let finalName: String
+    let locator: MailboxResolvedLocatorV1
+    let publisher: any MailboxEnvelopePublishing
+
+    func publish() throws -> URL {
+        try publisher.publish(envelope, finalName: finalName, locator: locator)
+    }
+}
+
+struct MailboxFileProviderPublicationExecutor: Sendable {
     private let queue = DispatchQueue(
         label: "com.example.HealthBridgeCompanion.mailbox.file-provider-publication"
     )
@@ -199,14 +210,14 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
 }
 
 struct POSIXMailboxEnvelopePublisher: MailboxEnvelopePublishing {
-    typealias Fault = (MailboxPublicationBoundary) throws -> Void
+    typealias Fault = @Sendable (MailboxPublicationBoundary) throws -> Void
 
     private let fault: Fault
-    private let temporaryIdentifier: () -> String
+    private let temporaryIdentifier: @Sendable () -> String
 
     init(
         _ fault: @escaping Fault = { _ in },
-        temporaryIdentifier: @escaping () -> String = {
+        temporaryIdentifier: @escaping @Sendable () -> String = {
             UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         }
     ) {

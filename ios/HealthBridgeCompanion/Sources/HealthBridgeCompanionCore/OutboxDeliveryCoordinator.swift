@@ -127,11 +127,36 @@ public final class OutboxDeliveryCoordinator: MailboxAckDurableFinalizationVerif
         }
     }
 
+    func preparePublication(
+        itemID: String
+    ) throws -> (state: FileOutboxDeliveryStateV1, work: MailboxPublicationWork?)? {
+        try validateCurrentOwnership()
+        guard let current = try state(itemID: itemID),
+              current.phase == .encrypted
+                || (current.phase == .retryableFailure && current.retryFrom == .encrypted) else {
+            return nil
+        }
+        let owned = try ownedState(itemID: itemID)
+        return (owned, try transport.preparePublication(itemID: itemID))
+    }
+
     private func publish(
         itemID: String,
         current: FileOutboxDeliveryStateV1
     ) throws -> FileOutboxDeliveryStateV1 {
-        switch try transport.publishEnvelope(itemID: itemID) {
+        try completePublication(
+            itemID: itemID,
+            current: current,
+            result: transport.publishEnvelope(itemID: itemID)
+        )
+    }
+
+    func completePublication(
+        itemID: String,
+        current: FileOutboxDeliveryStateV1,
+        result: DeliveryTransportResult
+    ) throws -> FileOutboxDeliveryStateV1 {
+        switch result {
         case .published:
             return try persist(
                 itemID: itemID,

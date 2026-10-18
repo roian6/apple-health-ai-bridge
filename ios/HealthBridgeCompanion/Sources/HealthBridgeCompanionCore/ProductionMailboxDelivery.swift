@@ -192,6 +192,7 @@ public final class ProductionMailboxDelivery {
         -> ProductionMailboxBackgroundDeliverySummary
     {
         try Task.checkCancellation()
+        let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         let components = try backgroundComponents()
         let items = try backgroundPendingItems(components: components)
         guard let item = items.first else {
@@ -207,7 +208,12 @@ public final class ProductionMailboxDelivery {
             var terminalCount = 0
             for _ in 0 ..< 4 {
                 try Task.checkCancellation()
-                let state = try deliveryCoordinator.advance(itemID: item.id)
+                let state = try await advanceForPublication(
+                    deliveryCoordinator,
+                    itemID: item.id,
+                    components: components,
+                    receiverGeneration: receiverGeneration
+                )
                 switch state.phase {
                 case .collected, .encrypted, .published:
                     continue
@@ -475,7 +481,12 @@ public final class ProductionMailboxDelivery {
                     itemID: item.id
                 )
                 for _ in 0 ..< 4 {
-                    let state = try coordinator.advance(itemID: item.id)
+                    let state = try await advanceForPublication(
+                        coordinator,
+                        itemID: item.id,
+                        components: components,
+                        receiverGeneration: receiverGeneration
+                    )
                     switch state.phase {
                     case .collected, .encrypted, .published:
                         continue
@@ -753,6 +764,72 @@ public final class ProductionMailboxDelivery {
         } catch {
             return false
         }
+    }
+
+    @MainActor
+    private func advanceForPublication(
+        _ coordinator: OutboxDeliveryCoordinator,
+        itemID: String,
+        components: ProductionMailboxComponents,
+        receiverGeneration: String
+    ) async throws -> FileOutboxDeliveryStateV1 {
+        try Task.checkCancellation()
+        guard let publication = try coordinator.preparePublication(itemID: itemID) else {
+            return try coordinator.advance(itemID: itemID)
+        }
+        let result: DeliveryTransportResult
+        if let work = publication.work {
+            let pending = try outbox.pendingItems()
+            let outcome = await Task.detached { try work.publish() }.result
+            try validatePublicationCompletion(
+                coordinator,
+                itemID: itemID,
+                components: components,
+                receiverGeneration: receiverGeneration,
+                pending: pending
+            )
+            result = try components.transport.publicationResult(outcome)
+        } else {
+            result = .retryable
+        }
+        return try coordinator.completePublication(
+            itemID: itemID,
+            current: publication.state,
+            result: result
+        )
+    }
+
+    @MainActor
+    private func validatePublicationCompletion(
+        _ coordinator: OutboxDeliveryCoordinator,
+        itemID: String,
+        components: ProductionMailboxComponents,
+        receiverGeneration: String,
+        pending: [FileOutboxItem]
+    ) throws {
+        do {
+            try outbox.requireUploadAdmission()
+            guard settingsStore.receiverSettingsGenerationToken == receiverGeneration,
+                  let record = try settingsStore.currentConnectionRecordV2(),
+                  record.activation == .paired(activeTransport: .mailbox),
+                  case .available(let identity) = record.mailboxIdentity,
+                  identity == components.identity,
+                  record.localScope.bindingID == components.identity.opaqueBinding,
+                  try outbox.pendingItems() == pending else {
+                throw CancellationError()
+            }
+            let transition = try sleepStore?.loadPendingTransition()
+            let resetEpoch = transition?.outboxItemID == itemID
+                ? transition?.manifest.baselineResetEpoch : nil
+            guard coordinator.ownership.receiverGeneration == receiverGeneration,
+                  coordinator.ownership.resetEpoch == resetEpoch else {
+                throw CancellationError()
+            }
+            try coordinator.validateCurrentOwnership()
+        } catch {
+            throw CancellationError()
+        }
+        try Task.checkCancellation()
     }
 
     private func coordinator(
