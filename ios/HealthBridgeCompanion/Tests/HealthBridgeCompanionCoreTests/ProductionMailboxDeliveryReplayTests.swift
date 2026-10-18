@@ -239,6 +239,273 @@ final class ProductionMailboxDeliveryAckSelectionTests: XCTestCase {
 }
 
 @MainActor
+final class ProductionMailboxPublicationResponsivenessTests: XCTestCase {
+    func testForegroundPublicationKeepsMainActorResponsiveBeforeIORelease() async throws {
+        let barrier = PublicationResponsivenessBarrier()
+        let fixture = try ForegroundReplayFixture(publisher: POSIXMailboxEnvelopePublisher { boundary in
+            if boundary == .renameTemporary { barrier.blockFirstPublication() }
+        })
+        defer { fixture.removeTemporaryStores() }
+        let delivery = try fixture.delivery()
+        barrier.startDriver()
+
+        do {
+            let summary = try await delivery.deliverPending()
+            XCTAssertEqual(summary.attemptedCount, 2)
+            XCTAssertEqual(summary.finalizedCount, 0)
+            XCTAssertEqual(summary.waitingCount, 2)
+            XCTAssertEqual(summary.terminalCount, 0)
+        } catch {
+            XCTFail("Publication must finish normally after the barrier releases: \(error)")
+        }
+
+        await barrier.joinDriver()
+        let observation = barrier.observation()
+        XCTAssertTrue(observation.entered, "The driver must observe the real atomic publisher boundary")
+        XCTAssertTrue(observation.heartbeatRan, "Join the MainActor heartbeat even when it runs after release")
+        XCTAssertTrue(observation.heartbeatBeforeRelease, "MainActor must run while publication is still blocked")
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first, fixture.second])
+    }
+
+    func testBackgroundFIFOHeadPublicationKeepsMainActorResponsiveBeforeIORelease() async throws {
+        let barrier = PublicationResponsivenessBarrier()
+        let fixture = try ForegroundReplayFixture(publisher: POSIXMailboxEnvelopePublisher { boundary in
+            if boundary == .renameTemporary { barrier.blockFirstPublication() }
+        })
+        defer { fixture.removeTemporaryStores() }
+        let delivery = try fixture.delivery()
+        barrier.startDriver()
+
+        do {
+            let summary = try await delivery.publishPendingFIFOHead()
+            XCTAssertEqual(summary.phase, .publishFIFOHead)
+            XCTAssertEqual(summary.attemptedCount, 1)
+            XCTAssertEqual(summary.finalizedCount, 0)
+            XCTAssertEqual(summary.waitingCount, 2)
+            XCTAssertEqual(summary.terminalCount, 0)
+        } catch {
+            XCTFail("Publication must finish normally after the barrier releases: \(error)")
+        }
+
+        await barrier.joinDriver()
+        let observation = barrier.observation()
+        XCTAssertTrue(observation.entered, "The driver must observe the real atomic publisher boundary")
+        XCTAssertTrue(observation.heartbeatRan, "Join the MainActor heartbeat even when it runs after release")
+        XCTAssertTrue(observation.heartbeatBeforeRelease, "MainActor must run while publication is still blocked")
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first])
+    }
+
+    func testNonblockingForegroundPublicationPreservesPendingUntilAcknowledgment() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        let summary = try await fixture.delivery().deliverPending()
+        XCTAssertEqual(summary.attemptedCount, 2)
+        XCTAssertEqual(summary.finalizedCount, 0)
+        XCTAssertEqual(summary.waitingCount, 2)
+        XCTAssertEqual(summary.terminalCount, 0)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first, fixture.second])
+        let encrypted = try fixture.encryptedLocalFiles()
+        let states = try fixture.states()
+
+        try fixture.reopenOutbox()
+        XCTAssertEqual(try fixture.states(), states)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first, fixture.second])
+        let repeated = try await fixture.delivery().deliverPending()
+        XCTAssertEqual(repeated.finalizedCount, 0)
+        XCTAssertEqual(repeated.waitingCount, 2)
+        XCTAssertEqual(try fixture.encryptedLocalFiles(), encrypted)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first, fixture.second])
+
+        _ = try fixture.publishAck(for: fixture.first)
+        _ = try fixture.publishAck(for: fixture.second)
+        let acknowledged = try await fixture.delivery().deliverPending()
+        XCTAssertEqual(acknowledged.finalizedCount, 2)
+        XCTAssertEqual(acknowledged.waitingCount, 0)
+        try fixture.assertCompleted()
+    }
+
+    func testNonblockingBackgroundPublicationPreservesFIFOHeadBoundary() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        let summary = try await fixture.delivery().publishPendingFIFOHead()
+        XCTAssertEqual(summary.phase, .publishFIFOHead)
+        XCTAssertEqual(summary.attemptedCount, 1)
+        XCTAssertEqual(summary.finalizedCount, 0)
+        XCTAssertEqual(summary.waitingCount, 2)
+        XCTAssertEqual(summary.terminalCount, 0)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first])
+        let firstState = try fixture.outbox.deliveryState(for: fixture.first.id)
+        let firstEnvelope = try publishedEnvelope(fixture, item: fixture.first)
+
+        try fixture.reopenOutbox()
+        XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id), firstState)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first])
+        let repeated = try await fixture.delivery().publishPendingFIFOHead()
+        XCTAssertEqual(repeated.finalizedCount, 0)
+        XCTAssertEqual(repeated.waitingCount, 2)
+        XCTAssertEqual(try publishedEnvelope(fixture, item: fixture.first), firstEnvelope)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first])
+        let noAck = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(
+            afterAcknowledgmentCheckpoint: nil
+        )
+        XCTAssertEqual(noAck.finalizedCount, 0)
+        try assertUnacknowledgedPublication(fixture, published: [fixture.first])
+
+        _ = try fixture.publishAck(for: fixture.first)
+        let firstAck = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(
+            afterAcknowledgmentCheckpoint: nil
+        )
+        XCTAssertEqual(firstAck.finalizedCount, 1)
+        XCTAssertEqual(firstAck.waitingCount, 1)
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [fixture.second.id])
+        XCTAssertEqual(try fixture.outbox.pendingCursorCheckpoint(), fixture.secondCheckpoint)
+        XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id)?.phase, .committedFinalized)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.first.fileURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.outbox.directoryURL.appendingPathComponent("\(fixture.first.id).hbe").path
+        ))
+        XCTAssertEqual(
+            try fixture.outbox.deliveryState(for: fixture.second.id),
+            FileOutboxDeliveryStateV1.stable(.collected, ownership: nil)
+        )
+        XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
+        XCTAssertEqual(try Data(contentsOf: fixture.second.fileURL), fixture.payload)
+        XCTAssertEqual(fixture.cursors.writes, [fixture.firstCheckpoint.cursorValue])
+        XCTAssertEqual(try fixture.currentCursor(), fixture.firstCheckpoint.cursorValue)
+
+        let second = try await fixture.delivery().publishPendingFIFOHead()
+        XCTAssertEqual(second.attemptedCount, 1)
+        XCTAssertEqual(second.finalizedCount, 0)
+        XCTAssertEqual(second.waitingCount, 1)
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [fixture.second.id])
+        XCTAssertEqual(try fixture.outbox.pendingCursorCheckpoint(), fixture.secondCheckpoint)
+        XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.second.id)?.phase, .providerObserved)
+        XCTAssertEqual(try Data(contentsOf: fixture.second.fileURL), fixture.payload)
+        _ = try publishedEnvelope(fixture, item: fixture.second)
+        XCTAssertEqual(fixture.cursors.writes, [fixture.firstCheckpoint.cursorValue])
+        XCTAssertEqual(try fixture.currentCursor(), fixture.firstCheckpoint.cursorValue)
+        XCTAssertTrue(fixture.proofs.hasUploadedRecords(lane: .steps, receiverBindingID: fixture.binding))
+        XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: .workouts, receiverBindingID: fixture.binding))
+
+        _ = try fixture.publishAck(for: fixture.second)
+        let secondAck = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(
+            afterAcknowledgmentCheckpoint: nil
+        )
+        XCTAssertEqual(secondAck.finalizedCount, 1)
+        XCTAssertEqual(secondAck.waitingCount, 0)
+        try fixture.assertCompleted()
+    }
+
+    private func assertUnacknowledgedPublication(
+        _ fixture: ForegroundReplayFixture,
+        published: [FileOutboxItem]
+    ) throws {
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [fixture.first.id, fixture.second.id])
+        XCTAssertEqual(try fixture.outbox.pendingCursorCheckpoint(), fixture.firstCheckpoint)
+        XCTAssertNil(try fixture.currentCursor())
+        XCTAssertTrue(fixture.cursors.writes.isEmpty)
+        var finalNames: [String] = []
+        for item in [fixture.first, fixture.second] {
+            XCTAssertEqual(try Data(contentsOf: item.fileURL), fixture.payload)
+            if published.contains(where: { $0.id == item.id }) {
+                XCTAssertEqual(try fixture.outbox.deliveryState(for: item.id)?.phase, .providerObserved)
+                _ = try publishedEnvelope(fixture, item: item)
+                let envelopeID = try fixture.components().transport.finalizedEnvelopeID(itemID: item.id)
+                finalNames.append(try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .delivery))
+            } else {
+                XCTAssertEqual(
+                    try fixture.outbox.deliveryState(for: item.id),
+                    FileOutboxDeliveryStateV1.stable(.collected, ownership: nil)
+                )
+                XCTAssertNil(try fixture.outbox.mailboxBinding(for: item.id))
+                XCTAssertFalse(FileManager.default.fileExists(
+                    atPath: fixture.outbox.directoryURL.appendingPathComponent("\(item.id).hbe").path
+                ))
+            }
+        }
+        let lane = try XCTUnwrap(fixture.locator.lanes[.deliveries])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: lane.path).sorted(), finalNames.sorted())
+        for lane in CoreLaneUploadProofStore.Lane.allCases {
+            XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: lane, receiverBindingID: fixture.binding))
+        }
+    }
+
+    private func publishedEnvelope(_ fixture: ForegroundReplayFixture, item: FileOutboxItem) throws -> Data {
+        let binding = try XCTUnwrap(fixture.outbox.mailboxBinding(for: item.id))
+        let bytes = try Data(contentsOf: fixture.outbox.directoryURL.appendingPathComponent(binding.envelopeFilename))
+        XCTAssertEqual(mailboxSHA256(bytes), binding.envelopeSHA256)
+        let envelopeID = try fixture.components().transport.finalizedEnvelopeID(itemID: item.id)
+        let name = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .delivery)
+        let lane = try XCTUnwrap(fixture.locator.lanes[.deliveries])
+        XCTAssertEqual(try Data(contentsOf: lane.appendingPathComponent(name)), bytes)
+        return bytes
+    }
+}
+
+// Only lock-protected observations and thread-safe synchronization objects cross threads;
+// the driver and heartbeat never capture the MainActor fixture or production dependencies.
+private final class PublicationResponsivenessBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let heartbeat = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private let driver = DispatchGroup()
+    private var didEnter = false
+    private var driverObservedEntry = false
+    private var released = false
+    private var heartbeatRan = false
+    private var heartbeatBeforeRelease = false
+    private var heartbeatTask: Task<Void, Never>?
+
+    func blockFirstPublication() {
+        let shouldBlock = lock.withLock {
+            guard !didEnter else { return false }
+            didEnter = true
+            return true
+        }
+        guard shouldBlock else { return }
+        entered.signal()
+        release.wait()
+    }
+
+    func startDriver() {
+        driver.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { driver.leave() }
+            let observedEntry = entered.wait(timeout: .now() + 10) == .success
+            lock.withLock { driverObservedEntry = observedEntry }
+            if observedEntry {
+                let task = Task { @MainActor [self] in
+                    lock.withLock {
+                        heartbeatRan = true
+                        heartbeatBeforeRelease = !released
+                    }
+                    heartbeat.signal()
+                }
+                lock.withLock { heartbeatTask = task }
+                // This deadline only bounds a blocked test; success requires the heartbeat
+                // to record execution before the driver releases the actual publisher.
+                _ = heartbeat.wait(timeout: .now() + 5)
+            }
+            lock.withLock { released = true }
+            release.signal()
+        }
+    }
+
+    func joinDriver() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            driver.notify(queue: .global()) { continuation.resume() }
+        }
+        let task = lock.withLock { heartbeatTask }
+        await task?.value
+    }
+
+    func observation() -> (entered: Bool, heartbeatRan: Bool, heartbeatBeforeRelease: Bool) {
+        lock.withLock { (driverObservedEntry, heartbeatRan, heartbeatBeforeRelease) }
+    }
+}
+
+@MainActor
 private final class ForegroundReplayFixture {
     let root: URL
     let suiteName: String
@@ -259,10 +526,12 @@ private final class ForegroundReplayFixture {
     let second: FileOutboxItem
     private(set) var outbox: FileOutbox
     private let envelopeIDs = ReplayEnvelopeIDs()
+    private let publisher: POSIXMailboxEnvelopePublisher
 
     var binding: String { identity.opaqueBinding }
 
-    init() throws {
+    init(publisher: POSIXMailboxEnvelopePublisher = POSIXMailboxEnvelopePublisher()) throws {
+        self.publisher = publisher
         let runID = UUID().uuidString
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ProductionMailboxDeliveryReplayTests-\(runID)")
@@ -395,7 +664,7 @@ private final class ForegroundReplayFixture {
             ),
             sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keyStore),
             locate: { locator },
-            publisher: POSIXMailboxEnvelopePublisher(),
+            publisher: publisher,
             envelopeID: { envelopeIDs.next() },
             nowMilliseconds: { 1_782_000_000_123 },
             isCancelled: { false },
