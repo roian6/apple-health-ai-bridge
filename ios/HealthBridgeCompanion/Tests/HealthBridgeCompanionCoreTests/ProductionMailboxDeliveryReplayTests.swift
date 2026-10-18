@@ -130,6 +130,115 @@ final class ProductionMailboxDeliveryReplayTests: XCTestCase {
 }
 
 @MainActor
+final class ProductionMailboxDeliveryAckSelectionTests: XCTestCase {
+    func testSmallCanonicalPrefixAllowsSignedAcknowledgmentsToCompleteFIFO() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        try await fixture.publishPending()
+        let noise = try fixture.publishEarlierCanonicalNoise(count: 4)
+        _ = try fixture.publishAck(for: fixture.first)
+        _ = try fixture.publishAck(for: fixture.second)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.first)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.second)
+
+        try await fixture.deliverForegroundOpportunities(count: 4)
+
+        try fixture.assertCompleted()
+        try fixture.assertNoiseRemains(noise)
+    }
+
+    func testSignedHeadBeyondCanonicalScanCapCompletesFIFOAcrossForegroundOpportunities() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        try await fixture.publishPending()
+        XCTAssertEqual(MailboxAckScanner.maximumScanFiles, 10_000)
+        let noise = try fixture.publishEarlierCanonicalNoise(count: MailboxAckScanner.maximumScanFiles)
+        _ = try fixture.publishAck(for: fixture.first)
+        _ = try fixture.publishAck(for: fixture.second)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.first)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.second)
+
+        try await fixture.deliverForegroundOpportunities(count: 4)
+
+        try fixture.assertCompleted()
+        try fixture.assertNoiseRemains(noise)
+    }
+
+    func testSignedHeadBeyondCapCompletesAfterSameLaneRetriesAndOutboxReopen() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        try await fixture.publishPending()
+        let noise = try fixture.publishEarlierCanonicalNoise(count: MailboxAckScanner.maximumScanFiles)
+        let laterAck = try fixture.publishAck(for: fixture.second)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.second)
+        let encrypted = try fixture.encryptedLocalFiles()
+
+        for _ in 0 ..< 2 {
+            _ = try await fixture.delivery().deliverPending()
+            try fixture.assertWaitingForFirst()
+            XCTAssertEqual(try fixture.encryptedLocalFiles(), encrypted)
+            XCTAssertEqual(try Data(contentsOf: laterAck.url), laterAck.bytes)
+        }
+        let waitingStates = try fixture.states()
+        try fixture.reopenOutbox()
+        XCTAssertEqual(try fixture.states(), waitingStates)
+        try fixture.assertWaitingForFirst()
+        XCTAssertEqual(try fixture.encryptedLocalFiles(), encrypted)
+
+        _ = try fixture.publishAck(for: fixture.first)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.first)
+        try await fixture.deliverForegroundOpportunities(count: 2)
+        let statesBeforeReopen = try fixture.states()
+        let pendingBeforeReopen = try fixture.outbox.pendingItems().map(\.id)
+        let checkpointBeforeReopen = try fixture.outbox.pendingCursorCheckpoint()
+        let cursorBeforeReopen = try fixture.currentCursor()
+        let writesBeforeReopen = fixture.cursors.writes
+        try fixture.reopenOutbox()
+        XCTAssertEqual(try fixture.states(), statesBeforeReopen)
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), pendingBeforeReopen)
+        XCTAssertEqual(try fixture.outbox.pendingCursorCheckpoint(), checkpointBeforeReopen)
+        XCTAssertEqual(try fixture.currentCursor(), cursorBeforeReopen)
+        XCTAssertEqual(fixture.cursors.writes, writesBeforeReopen)
+        try await fixture.deliverForegroundOpportunities(count: 2)
+
+        try fixture.assertCompleted()
+        try fixture.assertNoiseRemains(noise)
+    }
+
+    func testInvalidSignatureForExactHeadBeyondCapPreservesPendingStateAndArtifacts() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        try await fixture.publishPending()
+        let noise = try fixture.publishEarlierCanonicalNoise(count: MailboxAckScanner.maximumScanFiles)
+        let validHead = try fixture.publishAck(for: fixture.first)
+        try fixture.assertAuthenticAcknowledgment(for: fixture.first)
+        let invalidBytes = try fixture.invalidateAcknowledgmentSignature(at: validHead.url)
+        XCTAssertNotEqual(invalidBytes, validHead.bytes)
+        let components = try fixture.components()
+        let envelopeID = try components.transport.finalizedEnvelopeID(itemID: fixture.first.id)
+        let rejected = try components.scanner.scanExact(envelopeID: envelopeID)
+        XCTAssertEqual(rejected.scannedFinalCount, 1)
+        XCTAssertTrue(rejected.events.isEmpty)
+        XCTAssertEqual(rejected.quarantine.records, [.authenticationFailed])
+        let states = try fixture.states()
+        let encrypted = try fixture.encryptedLocalFiles()
+
+        for _ in 0 ..< 2 {
+            _ = try await fixture.delivery().deliverPending()
+            XCTAssertEqual(try fixture.states(), states)
+            try fixture.assertWaitingForFirst()
+            XCTAssertEqual(try fixture.encryptedLocalFiles(), encrypted)
+            XCTAssertEqual(try Data(contentsOf: validHead.url), invalidBytes)
+        }
+        try fixture.reopenOutbox()
+        XCTAssertEqual(try fixture.states(), states)
+        try fixture.assertWaitingForFirst()
+        XCTAssertEqual(try fixture.encryptedLocalFiles(), encrypted)
+        try fixture.assertNoiseRemains(noise)
+    }
+}
+
+@MainActor
 private final class ForegroundReplayFixture {
     let root: URL
     let suiteName: String
@@ -350,6 +459,100 @@ private final class ForegroundReplayFixture {
         let url = lane.appendingPathComponent(name)
         try bytes.write(to: url, options: [.withoutOverwriting])
         return (url, bytes)
+    }
+
+    func publishEarlierCanonicalNoise(count: Int) throws -> [String] {
+        let lane = try XCTUnwrap(locator.lanes[.acks])
+        let components = try components()
+        let targetIDs = try [first, second].map {
+            try components.transport.finalizedEnvelopeID(itemID: $0.id).hexV1
+        }
+        XCTAssertEqual(targetIDs, [Data(repeating: 0x01, count: 16).hexV1, Data(repeating: 0x02, count: 16).hexV1])
+        let targetNames = try targetIDs.map {
+            try MailboxLayoutV1.finalFileName(identifier: $0, kind: .acknowledgment)
+        }
+        var names: [String] = []
+        for index in 0 ..< count {
+            let suffix = String(index, radix: 16)
+            let identifier = String(repeating: "0", count: 32 - suffix.count) + suffix
+            let name = try MailboxLayoutV1.finalFileName(identifier: identifier, kind: .acknowledgment)
+            XCTAssertFalse(targetIDs.contains(identifier))
+            for target in targetNames {
+                XCTAssertLessThan(name, target)
+            }
+            XCTAssertEqual(
+                try MailboxLayoutV1.classify(fileName: name, in: .acks, byteCount: 0),
+                .final(kind: .acknowledgment, identifier: identifier)
+            )
+            let url = lane.appendingPathComponent(name)
+            try Data().write(to: url, options: [.withoutOverwriting])
+            XCTAssertEqual(try Data(contentsOf: url).count, 0)
+            names.append(name)
+        }
+        XCTAssertEqual(names, names.sorted())
+        XCTAssertEqual(Set(names).count, count)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: lane.path).sorted(), names)
+        return names
+    }
+
+    func assertNoiseRemains(_ names: [String]) throws {
+        let lane = try XCTUnwrap(locator.lanes[.acks])
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: lane.path)
+        XCTAssertTrue(Set(names).isSubset(of: Set(remaining)))
+    }
+
+    func assertAuthenticAcknowledgment(for item: FileOutboxItem) throws {
+        let components = try components()
+        let envelopeID = try components.transport.finalizedEnvelopeID(itemID: item.id)
+        let before = try states()
+        let report = try components.scanner.scanExact(envelopeID: envelopeID)
+        XCTAssertEqual(report.scannedFinalCount, 1)
+        XCTAssertEqual(report.events.map(\.envelopeID), [envelopeID])
+        XCTAssertEqual(report.events.map(\.classification), [.committed])
+        XCTAssertTrue(report.quarantine.records.isEmpty)
+        XCTAssertEqual(try states(), before)
+    }
+
+    func invalidateAcknowledgmentSignature(at url: URL) throws -> Data {
+        let validBytes = try Data(contentsOf: url)
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: validBytes) as? [String: Any])
+        let signature = try XCTUnwrap(fields["signature"] as? String)
+        XCTAssertEqual(signature.count, 86)
+        let replacement = (signature.first == "A" ? "B" : "A") + String(signature.dropFirst())
+        let invalidBytes = Data(String(decoding: validBytes, as: UTF8.self).replacingOccurrences(
+            of: "\"signature\":\"\(signature)\"",
+            with: "\"signature\":\"\(replacement)\""
+        ).utf8)
+        XCTAssertNotEqual(invalidBytes, validBytes)
+        try invalidBytes.write(to: url)
+        return invalidBytes
+    }
+
+    func encryptedLocalFiles() throws -> [URL: Data] {
+        var files: [URL: Data] = [:]
+        for item in [first, second] {
+            let envelope = try XCTUnwrap(outbox.mailboxBinding(for: item.id))
+            let url = outbox.directoryURL.appendingPathComponent(envelope.envelopeFilename)
+            files[url] = try Data(contentsOf: url)
+        }
+        return files
+    }
+
+    func deliverForegroundOpportunities(count: Int) async throws {
+        let generation = settings.receiverSettingsGenerationToken
+        let ownership = try states().map(\.ownership)
+        let expectedCursors = [firstCheckpoint.cursorValue, secondCheckpoint.cursorValue]
+        for _ in 0 ..< count {
+            if try outbox.pendingItems().isEmpty { break }
+            _ = try await delivery().deliverPending()
+            XCTAssertEqual(cursors.writes, Array(expectedCursors.prefix(cursors.writes.count)))
+            XCTAssertEqual(settings.receiverSettingsGenerationToken, generation)
+            XCTAssertEqual(try states().map(\.ownership), ownership)
+            XCTAssertNil(try currentCursor(receiverBindingID: "synthetic-other-binding"))
+            for lane in CoreLaneUploadProofStore.Lane.allCases {
+                XCTAssertFalse(proofs.hasUploadedRecords(lane: lane, receiverBindingID: "synthetic-other-binding"))
+            }
+        }
     }
 
     func currentCursor(receiverBindingID: String? = nil) throws -> String? {
