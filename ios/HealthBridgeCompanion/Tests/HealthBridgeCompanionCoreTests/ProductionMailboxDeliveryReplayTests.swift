@@ -380,7 +380,7 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
                 XCTAssertNil(try fixture.outbox.mailboxBinding(for: fixture.second.id))
                 let before = try Self.localFiles(fixture)
                 let envelopeURL = fixture.outbox.directoryURL.appendingPathComponent(binding.envelopeFilename)
-                let matches = before.filter { $0.key.path == envelopeURL.path }
+                let matches = before.filter { $0.key.standardizedFileURL.path == envelopeURL.standardizedFileURL.path }
                 XCTAssertEqual(matches.count, 1)
                 let bytes = try XCTUnwrap(matches.first?.value)
                 XCTAssertEqual(mailboxSHA256(bytes), binding.envelopeSHA256)
