@@ -1,183 +1,98 @@
 <div align="center">
   <img src="assets/brand/health-bridge-mark-512.png" alt="" width="80">
   <h1>Apple Health AI Bridge</h1>
+  <p>Put your Apple Health history to work in your own AI assistant.</p>
   <p>
+    <a href="#get-started">Get started</a> ·
     <a href="https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806">Download on the App Store</a> ·
-    <a href="docs/setup.md">Set up your bridge</a> ·
-    <a href="docs/supported-health-data.md">Supported health data</a> ·
+    <a href="docs/supported-health-data.md">Supported data</a> ·
     <a href="https://healthbridge.chanhyo.dev/">Website</a>
   </p>
 </div>
 
 ---
 
-Apple Health AI Bridge connects your Apple Health history to the AI you already use. Ask how your sleep has changed over the past month or compare this week's workouts with last week's. Automatic sync brings in new records, so you can keep asking without exporting another file each time.
+Your iPhone already has a record of how you've been sleeping, moving, and training. Bring that history into the AI conversations where you review your week and plan what comes next.
 
-The iPhone app syncs the records you allow to a macOS or Linux computer you control. From there, a read-only MCP server gives your chosen AI access to your history.
+Apple Health AI Bridge is an open-source connector for MCP-enabled assistants. The iPhone app sends the records you allow to a macOS or Linux computer you control. Automatic sync brings in new records, so you can keep the conversation going without preparing another export.
 
-## Set up the bridge
+## Review your week with the records in view
 
-You need:
+Pull sleep, activity, and workouts into the same conversation. Compare weeks, look at a change, and ask follow-up questions instead of piecing together separate charts and screenshots.
 
-- an iPhone running iOS 18 or later;
-- a macOS or Linux computer that will run the receiver and store the private database; native Windows is not currently supported;
-- for continuous sync, a stable private HTTPS route that the physical iPhone can reach away from the local network; for an explicit local-only evaluation, a same-LAN route with the limitation below;
-- an MCP client on the receiver machine, or a terminal for direct CLI access;
-- [`uv`](https://docs.astral.sh/uv/) for the receiver package.
+> I'm planning next week's routine. How did my sleep and workouts change over the last two weeks?
 
-Enable Automatic Sync once you have paired the app. iOS controls background scheduling, so delivery timing is best-effort rather than real-time or guaranteed at a specific moment.
+| Recorded history | June 1–7 | June 8–14 |
+| --- | --- | --- |
+| Average sleep per night | 7h 24m | 6h 42m |
+| Workouts | 4 · 160 minutes | 2 · 80 minutes |
+
+The second week's workouts both fell on the weekend, while average sleep was 42 minutes shorter. Bring that pattern into the next question: which weekdays have room for the routine you want to keep?
+
+*Example using [synthetic records and reproducible queries](docs/examples/weekly-review.md).*
+
+## Start your next goals with what you actually did
+
+When you discuss a new routine with your assistant, give it your recent history to work with. Use the records alongside the goals and constraints you bring to the conversation.
+
+> Before we discuss next week's training goals, look at what I actually did over the last four weeks.
+
+## Why run your own bridge?
+
+Use your health history in the personal AI workflows you're already building. Connect an assistant that also helps with your routines and plans, and keep a store of the records on your own computer.
+
+- Choose which MCP clients can read your history, rather than committing the bridge to one AI provider.
+- Store the data on your Mac or Linux computer, with read-only tools for sleep, workouts, daily summaries, and individual measurements.
+- Build your own reviews and agent workflows on the same history as new records arrive.
+
+## Get started
+
+You need an iPhone running iOS 18 or later, a macOS or Linux computer that can stay awake and connected, and an MCP client on that computer. The computer runs the receiver and stores your health history.
 
 ### 1. Install the iPhone app
 
-Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) on your iPhone. TestFlight remains available for beta builds and prerelease testing through the [official install page](https://healthbridge.chanhyo.dev/install/).
+Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806).
 
-### 2. Prepare the receiver route
+### 2. Set up your receiver
 
-The project does not give you a receiver URL. The URL is the private address by which the iPhone reaches your receiver computer, and it must exist before core setup can create pairing material.
-
-- **Already use Tailscale:** use the private Tailscale Serve HTTPS path documented in the [setup guide](docs/setup.md#route-a-already-use-tailscale). Tailscale is an option for existing users, not a product requirement.
-- **Agent-assisted private HTTPS ingress:** use the setup guide's agent-assisted path. The setup agent must inspect first, show every proposed DNS, tunnel, proxy, firewall, and service change, and wait for approval before applying it.
-- **Local network only:** supported as a deliberate local-only fallback, but automatic sync stops when the iPhone leaves that network.
-
-Do not copy a sample hostname, expose receiver port `8765` directly to the public internet, or publish the pairing page. Follow the complete [receiver setup guide](docs/setup.md) to produce and verify the real route.
-
-### 3. Install and run setup
-
-Install the current signed receiver release:
+Install the Receiver/CLI with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
 uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.2"
 ```
 
-The route-specific guide sets `HEALTH_BRIDGE_RECEIVER_URL` to the exact configured `/v1/batches` URL. Only then run:
+Follow the [setup guide](docs/setup.md) to prepare a private HTTPS route, start the receiver, and verify the connection from your iPhone. This keeps the receiver reachable when you're away from home. The guide also covers a deliberate same-LAN installation and the separate [macOS iCloud delivery Beta](docs/icloud-mailbox-service.md).
 
-```bash
-health-bridge setup --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL"
-```
+### 3. Pair and sync
 
-For the deliberate Route C local-network-only fallback, use the same real LAN URL and the required non-loopback bind:
+[Pair the iPhone](docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
 
-```bash
-health-bridge setup \
-  --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
-  --receiver-host 0.0.0.0 \
-  --receiver-port 8765
-```
+### 4. Connect your AI and ask
 
-`health-bridge setup` creates the private SQLite database and single-use pairing page, prepares the receiver command, emits a canonical same-host stdio MCP descriptor, verifies the local MCP server, and detects client adapters without modifying them.
+[Add the bridge to your MCP client](docs/setup.md#connect-an-mcp-client-intentionally), then [check your records and ask your first question](docs/setup.md#ask-your-first-question). If your phone is already paired, you can add the client using your existing database.
 
-A successful local MCP check does not prove receiver readiness or phone reachability. Put the printed receiver command under the host's approved service manager, start it, require `{"status":"ok"}` from the printed local `/health` URL, and then require the same response from the exact phone-facing `/health` URL on the physical iPhone. Routes A and B use HTTPS; Route C uses HTTP only on the same trusted LAN.
+## Supported data
 
-Adding a client creates another process that can read the private health database, so setup never does that automatically. Use an explicit `--configure-client <name>` only after choosing the client.
+The catalog includes sleep, workouts, activity such as steps and energy, heart-rate measurements, weight, and body composition. See the [complete supported data list](docs/supported-health-data.md) for the types available to the app and the permissions you control in Apple Health.
 
-### Delivery transports
+The MCP tools let your assistant retrieve time-series observations, workouts, sleep and daily summaries, and the sources behind those records. See the [architecture reference](docs/architecture.md#agent-boundary) for the tool surface.
 
-Direct is the default transport, including direct private HTTPS and trusted-LAN setups. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta; a Direct failure never switches transports automatically.
+## Privacy
 
-The Beta applies application-layer encryption and signatures before an envelope reaches the user's iCloud container. The user's Mac receiver decrypts and commits accepted batches, then returns an encrypted, signed ACK; the app advances committed local progress only after validating a committed ACK. The iCloud container and receiver remain user-owned. Mailbox ACK publication also requires the exact signed, notarized macOS helper published with Receiver/CLI `1.1.2`; users verify and explicitly install it before the optional per-user LaunchAgent. Follow the [mailbox service guide](docs/icloud-mailbox-service.md).
+Apple Health access and the MCP query tools are read-only. You run the receiver and choose which AI clients can read the stored history. When a client uses a cloud model, its provider receives the query results it sends; that client's settings and policies apply.
 
-### 4. Pair and sync
-
-1. Continue only after the supervised receiver, local health check, and physical-iPhone health check all pass.
-2. On the receiver computer, open the generated pairing HTML on a trusted screen. For a headless receiver, securely copy that one file to a trusted local screen; never publish it or place it on a web server.
-3. Scan the QR with iPhone Camera, open the setup link, and connect the companion app.
-4. Tap **Allow Health Access** and review Apple’s native authorization sheet.
-5. Enable **Automatic Sync**.
-6. Wait for the first successful receiver upload, then ask your agent about your data.
-
-## What is supported
-
-The companion requests every HealthKit type that is both implemented by the app and available on the current iOS runtime. Unsupported or unavailable types remain absent rather than being fabricated.
-
-See the versioned [supported health data reference](docs/supported-health-data.md).
-
-## Agent surface
-
-The MCP server is read-only and exposes bounded, source-grounded tools:
-
-- bridge and sync status;
-- supported and currently synced metric catalogs;
-- time-series observations;
-- workouts;
-- sleep summaries;
-- daily summaries;
-- source provenance.
-
-It does not expose raw SQL, token material, cursor values, or clinical recommendations.
-
-## Privacy and security
-
-- HealthKit access is read-only.
-- The receiver and SQLite database are user-owned.
-- The project has no hosted health-data backend.
-- Pairing invitations are temporary and single-use.
-- Device credentials are stored in the iOS Keychain and hashed at rest by the receiver.
-- Logs and agent status omit health values and credentials by default.
-- The receiver is designed for one trusted user, not mutually untrusted tenants.
-- The developer does not operate or have access to the user's receiver or iCloud container. A “Data Not Collected” App Privacy answer remains valid only while that developer-no-access boundary remains true.
-
-Do not expose the receiver's loopback port or pairing page to the public internet. For continuous sync away from home, use an existing private-network HTTPS route such as Tailscale Serve or an agent-assisted private HTTPS ingress reviewed for the receiver paths. LAN-only access is a limited fallback.
-
-Report vulnerabilities through GitHub’s private vulnerability reporting flow described in [SECURITY.md](SECURITY.md).
-
-Public policies and help: [Privacy](https://healthbridge.chanhyo.dev/privacy) · [Support](https://healthbridge.chanhyo.dev/support)
-
-### Remove local bridge data
-
-Stop the receiver, then inspect the exact deletion scope with the default dry-run:
-
-```bash
-health-bridge receiver purge --db ~/.local/share/health-bridge/health.sqlite
-```
-
-Run the same command with `--confirm` only after reviewing the listed database and SQLite sidecars. Confirmation is refused while the receiver is still using the database. This removes the local bridge copy and does not delete Apple Health data. Empty private `.lifecycle.lock` and `.access.lock` coordination files and a private `.purge-*` directory containing zero-byte tomb files may remain; they contain no health records.
-
-If the command returns `recovery-required`, do not restart the receiver. Review the structured source, quarantine, and truncated path lists; the command deliberately keeps the private quarantine instead of claiming a rollback after an irreversible partial purge.
-
-## Component versions and releases
-
-The repository contains independently released components. Always include the component label rather than referring to an unlabeled “repo version.”
-
-| Surface | Current version | Identifier |
-| --- | --- | --- |
-| Receiver/CLI | `1.1.2` | signed tag `receiver-v1.1.2` |
-| iOS Companion | `1.1.1` | App Store build `50` |
-| Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
-
-These numbers do not need to match. Receiver-only fixes must not force an unchanged iOS Companion update, and compatible product patches must not bump the Batch Protocol. The canonical machine-readable mapping is [`component-versions.json`](component-versions.json); see the complete [versioning and compatibility policy](docs/versioning.md).
-
-User installs are pinned to a signed Receiver/CLI release tag instead of the moving `main` branch. Each GitHub Release publishes the exact-tag wheel and source archive together with the signed mailbox helper and its public manifest, SHA-256 checksums, build provenance, and metadata that ties the Receiver/CLI, compatible iOS Companion, helper source tree, Git tree, and Batch Protocol together. Existing `v1.0.0`, `v1.0.1`, and `receiver-v1.1.0` releases remain immutable; current and future receiver releases use component-scoped tags such as `receiver-v1.1.2`.
-
-## Build from source
-
-The App Store is the normal iPhone installation path. TestFlight is reserved for beta builds. Contributors and advanced users can build with Xcode 16 or later by following [docs/self-build.md](docs/self-build.md).
+Read the [privacy policy](https://healthbridge.chanhyo.dev/privacy) and [security model](SECURITY.md) for the full data-handling boundaries. For help removing your local copy, see [Remove local bridge data](docs/setup.md#remove-local-bridge-data).
 
 ## Documentation
 
-- [Setup](docs/setup.md)
-- [Supported health data](docs/supported-health-data.md)
-- [Architecture and trust boundaries](docs/architecture.md)
-- [Brand guide](docs/brand.md)
-- [Batch contract](docs/reference/batch-v1.md)
-- [SQLite schema](docs/reference/sqlite-v1.md)
-- [Build the iOS app](docs/self-build.md)
-- [Contribution ideas](docs/contribution-ideas.md)
-- [Support routes](SUPPORT.md)
-- [Maintainer workflow](docs/maintainer-guide.md)
+- **Install and use:** [Setup and troubleshooting](docs/setup.md) · [Supported data](docs/supported-health-data.md) · [Support](https://healthbridge.chanhyo.dev/support)
+- **Understand and build:** [Architecture](docs/architecture.md) · [Batch protocol](docs/reference/batch-v1.md) · [SQLite schema](docs/reference/sqlite-v1.md) · [Brand guide](docs/brand.md)
+- **Contribute:** [Development setup](CONTRIBUTING.md) · [Contribution ideas](docs/contribution-ideas.md) · [Build the iPhone app with Xcode 16 or later](docs/self-build.md)
 
-## Development
-
-```bash
-uv sync --all-extras --dev --locked
-uv run pytest -q
-uv run ruff check .
-uv run basedpyright
-```
-
-Synthetic fixtures and smoke commands are contributor tools, not part of user onboarding. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Apple Health AI Bridge is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Apple Inc.
+Current components: **Receiver/CLI** `1.1.2` · **iOS Companion** `1.1.1` (build `50`) · **Batch Protocol** `1.0.0`. See [release downloads](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.2), [`component-versions.json`](component-versions.json), and the [compatibility policy](docs/versioning.md).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE).
+
+Apple Health AI Bridge is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Apple Inc.

@@ -46,6 +46,14 @@ Version 1.0.0 and later receive security fixes on the main branch.
 
 ## Security Model Boundaries
 
+### Storage and AI clients
+
+The receiver stores the health history on the user's own computer. SQLite uses owner-only filesystem permissions, rather than application-level database encryption. The receiver is designed for one trusted user, not mutually untrusted tenants. Device credentials are stored in the iOS Keychain and hashed at rest by the receiver; logs and agent status omit health values and credentials by default.
+
+Connecting an MCP client grants that client read access to the stored history. If the client uses a cloud model, it can send query results to that model provider under the client's settings and policies. The bridge's user-owned storage and read-only tools are separate from the selected client's AI processing.
+
+### App and delivery boundaries
+
 - HealthKit access is read-only by default.
 - The receiver is intended for user-owned local/private-network deployment.
 - MCP and CLI tools are read-only query surfaces over the local store.

@@ -1,6 +1,6 @@
 # Set up Health Bridge for AI
 
-The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, and leave Automatic Sync enabled.
+The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 
 Run the installation and setup commands in this guide only after the immutable `receiver-v1.1.2` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older mailbox helper.
 
@@ -9,7 +9,7 @@ Run the installation and setup commands in this guide only after the immutable `
 You need:
 
 - an iPhone running iOS 18 or later;
-- an approved build shown on the [Health Bridge install status page](https://healthbridge.chanhyo.dev/install/), or a self-build;
+- the [iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806); TestFlight builds and self-build options are listed on the [install status page](https://healthbridge.chanhyo.dev/install/);
 - a macOS or Linux computer for the receiver and private database; native Windows is not currently supported;
 - [`uv`](https://docs.astral.sh/uv/);
 - for continuous sync away from home, either an existing Tailscale connection or an agent-assisted private HTTPS ingress; for an explicit local-only evaluation, a same-LAN route with the limitations below;
@@ -124,7 +124,7 @@ export HEALTH_BRIDGE_LAN_HOST="$(scutil --get LocalHostName).local"
 On Linux, have the installer select and verify the actual LAN address that belongs to the receiver's intended interface; do not blindly choose the first address when VPN, container, or multiple network interfaces exist. Numeric LAN IPs are supported, but DHCP may change them, so reserve the address or update and re-pair after a change. Then set the exact URL locally:
 
 ```bash
-: "${HEALTH_BRIDGE_LAN_HOST:?Set this to the receiver's verified LAN hostname or private address}"
+: "${HEALTH_BRIDGE_LAN_HOST:?Set this to the verified receiver LAN hostname or private address}"
 export HEALTH_BRIDGE_RECEIVER_URL="http://${HEALTH_BRIDGE_LAN_HOST}:8765/v1/batches"
 ```
 
@@ -226,23 +226,56 @@ The app asks for all runtime-supported read types in one authorization flow. App
 
 ## Verify the first sync
 
-Receiver/CLI `1.1.2` supports native CLI and MCP reads while the receiver keeps running. In another terminal, use the same database path for `health-bridge status` and `health-bridge mcp smoke`. No iOS update is required for this receiver fix.
+Keep the receiver running. In another terminal on the same computer, check the status and the metric catalog using the database path from setup:
 
 ```bash
 health-bridge status \
   --db ~/.local/share/health-bridge/health.sqlite \
   --json
+health-bridge query synced-metrics \
+  --db ~/.local/share/health-bridge/health.sqlite
 ```
 
-Then call `get_bridge_status` or `list_synced_metrics`, or use the direct read-only query CLI. Missing data must be reported as unknown; it may mean no record, denied permission, source gaps, or sync gaps.
+Confirm that an upload has been accepted and that the catalog contains the type you want to ask about. Then connect your client below. If expected records are absent, use [the missing-data checks](#health-types-are-missing).
 
 ## Connect an MCP client intentionally
 
-Configure only a client you intend to grant health-data access. Append `--configure-client hermes` (or another documented client name) to the same Route A/B or Route C setup command used above; Route C must repeat its explicit `--receiver-host` and `--receiver-port` flags.
+Choose a client you intend to grant access to your stored health history. The MCP server runs as a local **stdio** process on the receiver computer, using the same database as the receiver. You can add a client after your phone is already paired, keeping your current connection and database.
 
-`--configure-client` is repeatable, but configuring more than one client grants each one access. Non-interactive and `--json` runs still make no client changes unless this option is present.
+Find the installed executable:
 
-For another same-host stdio MCP client, render `access_descriptors` into that client's documented configuration schema. Do not copy a root key from an unrelated product.
+```bash
+command -v health-bridge
+```
+
+In your client's stdio MCP settings, add a server named `health-bridge` with the following executable and arguments. Replace both absolute paths with the executable found above and the database path from setup. The default database is `~/.local/share/health-bridge/health.sqlite`; expand `~` to an absolute path in the configuration.
+
+```json
+{
+  "command": "/absolute/path/to/health-bridge",
+  "args": ["mcp", "start", "--db", "/absolute/path/to/health.sqlite"]
+}
+```
+
+This is the server entry; place it under the root key documented by your client, or enter the same command and argument list in its configuration UI. The phone's HTTP receiver URL belongs to the iPhone connection, not to this stdio entry.
+
+Use the client's connection test and start a session that loads the new tools. For a running agent service, follow that client's documented configuration-reload procedure.
+
+For a **new installation**, the built-in adapters can configure Hermes or OpenClaw during the initial setup: append `--configure-client hermes` or `--configure-client openclaw` to the Route A/B or Route C setup command. Route C keeps its explicit `--receiver-host` and `--receiver-port` flags. The option is repeatable; each selected client gains read access. Setup's `access_descriptors` also provide the executable, arguments, working directory, and environment references for a client-neutral handoff.
+
+## Ask your first question
+
+In the connected assistant, ask it to call `get_bridge_status` and `list_synced_metrics`. Check that the records match what you saw in the terminal and that the metric and period you want to discuss are available.
+
+Then start with a question grounded in your own history:
+
+> Summarize my recorded activity over the last seven completed days. Which days stand out?
+
+Follow up with the context that matters to you, such as the routine you're trying to maintain or the week you're planning. The bridge provides the records for that conversation.
+
+### How fresh are the records?
+
+iOS controls background scheduling. Leave **Automatic Sync** enabled and the receiver reachable for new records to arrive. Check the target metric's dates as well as the sync status when you need to know whether a particular record has arrived. Force-quitting the app may suspend background delivery until you open it again.
 
 ## Deployment boundaries
 
@@ -284,6 +317,8 @@ This is the safe default. Use `--configure-client hermes` or `--configure-client
 ### Health types are missing
 
 Open iOS Settings and review Health permissions for Health Bridge. The app requests every implemented type available on the current runtime, but Apple may withhold types that are unavailable, restricted, or denied.
+
+Compare the synced catalog with the metric and dates you expect. An empty result can mean no source record, denied permission, device availability, or incomplete sync; treat it as unknown rather than zero activity. A successful client connection or local MCP self-test checks the tool connection; use the stored records to check arrival and freshness.
 
 ### Pairing material was exposed
 

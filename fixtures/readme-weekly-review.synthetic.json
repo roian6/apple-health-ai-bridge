@@ -1,0 +1,419 @@
+{
+  "schema_id": "health_bridge.batch.v1",
+  "schema_version": "1.0.0",
+  "generated_at": "2026-06-15T09:00:00Z",
+  "export_window": {
+    "start_time": "2026-06-01T00:00:00Z",
+    "end_time": "2026-06-15T00:00:00Z"
+  },
+  "sources": [
+    {
+      "source_key": "synthetic.watch.bravo",
+      "name": "Synthetic Watch Bravo",
+      "kind": "watch",
+      "bundle_id": "com.example.synthetic.watch",
+      "device_model": "SyntheticWatch1,1"
+    }
+  ],
+  "health_types": [
+    {
+      "type_code": "sleep_analysis",
+      "display_name": "Sleep Analysis",
+      "category": "sleep",
+      "default_unit": "stage",
+      "sensitivity": "moderate",
+      "aliases": [
+        "HKCategoryTypeIdentifierSleepAnalysis"
+      ]
+    }
+  ],
+  "samples": [],
+  "workouts": [
+    {
+      "client_record_id": "synthetic-readme-workout-01",
+      "source_key": "synthetic.watch.bravo",
+      "workout_type": "walking",
+      "start_time": "2026-06-01T18:00:00Z",
+      "end_time": "2026-06-01T18:40:00Z",
+      "duration_seconds": 2400,
+      "distance_meters": 3000
+    },
+    {
+      "client_record_id": "synthetic-readme-workout-03",
+      "source_key": "synthetic.watch.bravo",
+      "workout_type": "walking",
+      "start_time": "2026-06-03T18:00:00Z",
+      "end_time": "2026-06-03T18:40:00Z",
+      "duration_seconds": 2400,
+      "distance_meters": 3000
+    },
+    {
+      "client_record_id": "synthetic-readme-workout-05",
+      "source_key": "synthetic.watch.bravo",
+      "workout_type": "walking",
+      "start_time": "2026-06-05T18:00:00Z",
+      "end_time": "2026-06-05T18:40:00Z",
+      "duration_seconds": 2400,
+      "distance_meters": 3000
+    },
+    {
+      "client_record_id": "synthetic-readme-workout-07",
+      "source_key": "synthetic.watch.bravo",
+      "workout_type": "walking",
+      "start_time": "2026-06-07T18:00:00Z",
+      "end_time": "2026-06-07T18:40:00Z",
+      "duration_seconds": 2400,
+      "distance_meters": 3000
+    },
+    {
+      "client_record_id": "synthetic-readme-workout-13",
+      "source_key": "synthetic.watch.bravo",
+      "workout_type": "walking",
+      "start_time": "2026-06-13T18:00:00Z",
+      "end_time": "2026-06-13T18:40:00Z",
+      "duration_seconds": 2400,
+      "distance_meters": 3000
+    },
+    {
+      "client_record_id": "synthetic-readme-workout-14",
+      "source_key": "synthetic.watch.bravo",
+      "workout_type": "walking",
+      "start_time": "2026-06-14T18:00:00Z",
+      "end_time": "2026-06-14T18:40:00Z",
+      "duration_seconds": 2400,
+      "distance_meters": 3000
+    }
+  ],
+  "sleep_sessions": [
+    {
+      "client_record_id": "synthetic-readme-sleep-20260601",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-01T00:00:00Z",
+      "end_time": "2026-06-01T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-01T00:00:00Z",
+          "end_time": "2026-06-01T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-01T01:00:00Z",
+          "end_time": "2026-06-01T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-01T05:54:00Z",
+          "end_time": "2026-06-01T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260602",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-02T00:00:00Z",
+      "end_time": "2026-06-02T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-02T00:00:00Z",
+          "end_time": "2026-06-02T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-02T01:00:00Z",
+          "end_time": "2026-06-02T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-02T05:54:00Z",
+          "end_time": "2026-06-02T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260603",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-03T00:00:00Z",
+      "end_time": "2026-06-03T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-03T00:00:00Z",
+          "end_time": "2026-06-03T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-03T01:00:00Z",
+          "end_time": "2026-06-03T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-03T05:54:00Z",
+          "end_time": "2026-06-03T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260604",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-04T00:00:00Z",
+      "end_time": "2026-06-04T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-04T00:00:00Z",
+          "end_time": "2026-06-04T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-04T01:00:00Z",
+          "end_time": "2026-06-04T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-04T05:54:00Z",
+          "end_time": "2026-06-04T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260605",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-05T00:00:00Z",
+      "end_time": "2026-06-05T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-05T00:00:00Z",
+          "end_time": "2026-06-05T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-05T01:00:00Z",
+          "end_time": "2026-06-05T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-05T05:54:00Z",
+          "end_time": "2026-06-05T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260606",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-06T00:00:00Z",
+      "end_time": "2026-06-06T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-06T00:00:00Z",
+          "end_time": "2026-06-06T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-06T01:00:00Z",
+          "end_time": "2026-06-06T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-06T05:54:00Z",
+          "end_time": "2026-06-06T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260607",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-07T00:00:00Z",
+      "end_time": "2026-06-07T07:24:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-07T00:00:00Z",
+          "end_time": "2026-06-07T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-07T01:00:00Z",
+          "end_time": "2026-06-07T05:54:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-07T05:54:00Z",
+          "end_time": "2026-06-07T07:24:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260608",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-08T00:00:00Z",
+      "end_time": "2026-06-08T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-08T00:00:00Z",
+          "end_time": "2026-06-08T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-08T01:00:00Z",
+          "end_time": "2026-06-08T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-08T05:12:00Z",
+          "end_time": "2026-06-08T06:42:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260609",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-09T00:00:00Z",
+      "end_time": "2026-06-09T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-09T00:00:00Z",
+          "end_time": "2026-06-09T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-09T01:00:00Z",
+          "end_time": "2026-06-09T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-09T05:12:00Z",
+          "end_time": "2026-06-09T06:42:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260610",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-10T00:00:00Z",
+      "end_time": "2026-06-10T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-10T00:00:00Z",
+          "end_time": "2026-06-10T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-10T01:00:00Z",
+          "end_time": "2026-06-10T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-10T05:12:00Z",
+          "end_time": "2026-06-10T06:42:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260611",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-11T00:00:00Z",
+      "end_time": "2026-06-11T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-11T00:00:00Z",
+          "end_time": "2026-06-11T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-11T01:00:00Z",
+          "end_time": "2026-06-11T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-11T05:12:00Z",
+          "end_time": "2026-06-11T06:42:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260612",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-12T00:00:00Z",
+      "end_time": "2026-06-12T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-12T00:00:00Z",
+          "end_time": "2026-06-12T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-12T01:00:00Z",
+          "end_time": "2026-06-12T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-12T05:12:00Z",
+          "end_time": "2026-06-12T06:42:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260613",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-13T00:00:00Z",
+      "end_time": "2026-06-13T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-13T00:00:00Z",
+          "end_time": "2026-06-13T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-13T01:00:00Z",
+          "end_time": "2026-06-13T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-13T05:12:00Z",
+          "end_time": "2026-06-13T06:42:00Z"
+        }
+      ]
+    },
+    {
+      "client_record_id": "synthetic-readme-sleep-20260614",
+      "source_key": "synthetic.watch.bravo",
+      "start_time": "2026-06-14T00:00:00Z",
+      "end_time": "2026-06-14T06:42:00Z",
+      "stage_intervals": [
+        {
+          "stage": "deep",
+          "start_time": "2026-06-14T00:00:00Z",
+          "end_time": "2026-06-14T01:00:00Z"
+        },
+        {
+          "stage": "core",
+          "start_time": "2026-06-14T01:00:00Z",
+          "end_time": "2026-06-14T05:12:00Z"
+        },
+        {
+          "stage": "rem",
+          "start_time": "2026-06-14T05:12:00Z",
+          "end_time": "2026-06-14T06:42:00Z"
+        }
+      ]
+    }
+  ],
+  "deleted_records": [],
+  "sync": {
+    "sync_window": {
+      "start_time": "2026-06-01T00:00:00Z",
+      "end_time": "2026-06-15T00:00:00Z"
+    },
+    "cursors": []
+  }
+}
