@@ -43,6 +43,51 @@ xcodebuild -project HealthBridgeCompanion.xcodeproj \
 
 Real-device HealthKit validation is useful, but any reported evidence must be redacted and aggregate-only.
 
+## Automated tests
+
+Add automated tests for major functionality and behavior-changing bug fixes.
+For fixes, first reproduce the defect with a failing regression test, then verify
+the corrected behavior. Cover the relevant success, invalid-input, empty-data,
+date-boundary, or failure-recovery cases through the public boundary involved.
+Use synthetic fixtures; a source-string assertion alone does not demonstrate
+runtime behavior. Documentation examples should also run through the CLI or MCP.
+
+Representative patterns already in the suite include
+[`tests/queries/test_date_boundaries.py`](tests/queries/test_date_boundaries.py),
+[`tests/receiver/test_delivery_acceptance_failures.py`](tests/receiver/test_delivery_acceptance_failures.py),
+and [`DeliveryProtocolV1TamperTests.swift`](ios/HealthBridgeCompanion/Tests/HealthBridgeCompanionCoreTests/DeliveryProtocolV1TamperTests.swift).
+Keep deterministic fuzz contracts in the normal suite; run the native campaign
+on its supported platform. Explain in the PR when a change has no testable
+behavior, such as a prose-only correction.
+
+## Swift static analysis
+
+From the repository root, run `bash scripts/swift-analysis.sh` on macOS with
+Xcode selected. The wrapper downloads [SwiftLint 0.65.1](https://github.com/realm/SwiftLint/releases/tag/0.65.1)
+(MIT licensed), verifies its pinned archive SHA-256, and uses only temporary
+tooling. Linux ARM64 is supported when its required runtime, including SourceKit,
+is available; a missing runtime is a failure, not a successful analysis.
+
+The policy in [`.swiftlint.yml`](.swiftlint.yml) checks every Swift file in the
+iOS App, CompanionCore, and macOS ACK helper. Tests, separate QA app harnesses,
+package manifests, and generated builds are outside these production roots;
+QA support authored inside CompanionCore remains included.
+
+The bounded [rule set](https://realm.github.io/SwiftLint/rule-directory.html)
+detects forced casts/tries that can trap, duplicate conditions/enum cases and
+identical operands that can conceal logic errors, discarded notification
+observers and unsafe observer detachment, strong delegate references, and invalid
+IBInspectable declarations. It deliberately does not enforce formatting or file
+length. Review policy changes on their merits; do not remove rules or add
+baselines/source suppressions to hide findings.
+
+The wrapper prints the version and file coverage, accepts a clean synthetic
+control, and requires a known-bad forced cast to fail with the expected rule.
+Download, checksum, runtime, empty-scope, control, and production violations fail
+the command. The existing **Swift tests and unsigned app builds** job in
+[iOS CI](.github/workflows/ios.yml) runs it before the unchanged tests and builds.
+Static analysis complements those gates and does not replace them.
+
 ## Input Fuzzing
 
 The optional `fuzz` dependency group pins Atheris 3.1.0 for Linux x86_64

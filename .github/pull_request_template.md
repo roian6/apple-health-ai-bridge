@@ -18,6 +18,8 @@
 
 ## Tests
 
+- [ ] Added automated regression tests for major functionality or behavior-changing bug fixes; reproduced fixes with a failing test, or explained why no testable behavior changed.
+- [ ] `bash scripts/swift-analysis.sh` and existing Swift/Xcode gates run for Swift changes.
 - [ ] `uv run ruff format --check .`
 - [ ] `uv run ruff check .`
 - [ ] `uv run basedpyright`

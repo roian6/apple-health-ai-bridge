@@ -16,6 +16,15 @@ Mailbox publication is release-blocking for Receiver/CLI `1.1.1`: the release mu
 
 ## Required checks
 
+For future releases, confirm automated regression tests accompany major
+functionality and behavior-changing bug fixes. Require the exact source commit
+to pass `bash scripts/swift-analysis.sh` in `.github/workflows/ios.yml`, including
+the clean and known-bad controls and all production Swift scopes, in addition to
+the existing Swift tests and unsigned builds. Retain the tool version, archive
+digest, file coverage, and findings with the release validation evidence. A Linux
+runtime blocker does not satisfy the native macOS gate. This prospective check
+does not change the validation claims of historical immutable releases.
+
 ```bash
 test -z "$(git status --porcelain=v1)"
 uv sync --all-extras --dev --locked

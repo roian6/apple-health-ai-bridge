@@ -34,6 +34,11 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      - name: Analyze production Swift with pinned SwiftLint
+        working-directory: ${{ github.workspace }}
+        timeout-minutes: 10
+        run: bash scripts/swift-analysis.sh
+
       - name: Run Swift package tests
         run: swift test
 

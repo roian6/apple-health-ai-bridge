@@ -75,6 +75,14 @@ Set `release_scope` explicitly in `component-versions.json`. Use `receiver` only
 
 Before release:
 
+For future releases, verify test additions for major functionality and
+behavior-changing fixes against the contributor policy. Require
+`bash scripts/swift-analysis.sh`, including both controls and complete production
+file coverage, in `.github/workflows/ios.yml` on the exact source commit, alongside
+the existing Python, Swift test, and unsigned build gates. Resolve findings before
+publication. This obligation applies prospectively; it does not assert that these
+analyses ran for historical immutable releases.
+
 1. collect merged work labeled `release-note` or `breaking-change`;
 2. update each changed authoritative version source, `component-versions.json`, and release notes in one reviewed pull request;
 3. state the exact compatible iOS Companion version/build and exact compatible Batch Protocol schema identifier/version in the release notes;
