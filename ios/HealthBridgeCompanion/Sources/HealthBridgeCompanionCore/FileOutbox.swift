@@ -845,9 +845,12 @@ public final class FileOutbox {
 
     public func projectionRepairStart(receiverBindingID: String, sourceKey: String, typeCodes: [String]) throws -> Date? {
         let manifest = try reconciledManifest()
-        return typeCodes.flatMap { type in
-            manifest.projectionRepairs?[receiverBindingID + "\n" + sourceKey + "\n" + type] ?? []
-        }.map(\.start).min()
+        let repairs: [ProjectionRepair] = typeCodes.flatMap { (type: String) -> [ProjectionRepair] in
+            let key: String = receiverBindingID + "\n" + sourceKey + "\n" + type
+            return manifest.projectionRepairs?[key] ?? []
+        }
+        let starts: [Date] = repairs.map { $0.start }
+        return starts.min()
     }
 
     private func subtractProjectionCoverage(
