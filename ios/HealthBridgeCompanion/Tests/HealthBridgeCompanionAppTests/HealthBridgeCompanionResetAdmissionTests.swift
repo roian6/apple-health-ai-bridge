@@ -8,6 +8,145 @@ import XCTest
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testIssue83AutomaticSingleRetryableReadMustNotReportSuccess() async throws {
+        try await exerciseIssue83AutomaticReadOutcome(eligibleTypeCodes: ["steps"], failRawRead: true)
+    }
+
+    func testIssue83AutomaticRetryableStepsThenSuccessfulBasalMustNotReportSuccess() async throws {
+        try await exerciseIssue83AutomaticReadOutcome(
+            eligibleTypeCodes: ["basal_energy", "steps"], failRawRead: true
+        )
+    }
+
+    func testIssue83AutomaticAllSelectedReadsSucceedAndRetirePending() async throws {
+        try await exerciseIssue83AutomaticReadOutcome(
+            eligibleTypeCodes: ["basal_energy", "steps"], failRawRead: false
+        )
+    }
+
+    private func exerciseIssue83AutomaticReadOutcome(
+        eligibleTypeCodes: [String], failRawRead: Bool
+    ) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Build the App host and test target with HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST.")
+        #else
+        let fixture = try AutomaticStepsFaultFixture(sampleStart: Date(timeIntervalSince1970: 1_700_000_000))
+        let previousRecorder = PayloadFenceURLProtocol.networkRecorder
+        addTeardownBlock { @MainActor in
+            fixture.cleanUp()
+            PayloadFenceURLProtocol.networkRecorder = previousRecorder
+        }
+        fixture.failRawRead = failRawRead
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(
+            healthDataAvailable: { true },
+            executeQuery: { _ in }, stopQuery: { _ in },
+            enableDelivery: { _, _ in }, disableDelivery: { _ in }
+        )
+        let platform = AutomaticSyncRuntime.Platform(
+            scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in },
+            beginBackgroundOwner: { _ in
+                fixture.ownersStarted += 1
+                return { fixture.ownersFinished += 1 }
+            },
+            healthDataAvailable: { true }, backgroundDeliveryCoordinator: coordinator
+        )
+        let runtime = try await makeStepsFaultRuntime(
+            fixture, eligibleTypeCodes: eligibleTypeCodes,
+            automaticSyncPlatform: platform,
+            platformBackgroundPayloadDrain: { fixture.platformDrains += 1; return true }
+        )
+        // XCTest runs teardown blocks in reverse order, keeping both owners alive until joined.
+        addTeardownBlock { @MainActor in
+            let foregroundCompletion = runtime.automaticSyncRuntime.foregroundCatchUpCompletion()
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await foregroundCompletion?()
+            await runtime.viewModel.waitForBootstrapAndForegroundWork()
+            XCTAssertFalse(runtime.viewModel.automaticSyncOwnerIsActive)
+            XCTAssertEqual(coordinator.activeObserverCount, 0)
+            XCTAssertEqual(fixture.ownersStarted, fixture.ownersFinished)
+        }
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+        let settings = BackgroundSyncSettingsStore(
+            userDefaults: try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
+        )
+        XCTAssertTrue(runtime.viewModel.automaticSyncRuntimeIsReady)
+        XCTAssertEqual(runtime.viewModel.automaticSyncSelectedEligibleTypeCodes(), eligibleTypeCodes)
+        XCTAssertGreaterThan(fixture.platformDrains, 0, "Bootstrap must use the injected platform drain.")
+        XCTAssertTrue(fixture.readEvents.isEmpty)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertNil(settings.lastRun)
+        XCTAssertTrue(try fixture.pending().isEmpty)
+        let original = try fixture.admit(eligibleTypeCodes)
+        // Resume at Steps using the production fairness API, before the later daily lane.
+        try settings.advanceAutomaticSyncContinuation(after: eligibleTypeCodes[0], in: eligibleTypeCodes)
+        let expectedOrder = ["steps"] + eligibleTypeCodes.filter { $0 != "steps" }
+        XCTAssertEqual(settings.automaticSyncTypeCodesInContinuationOrder(eligibleTypeCodes), expectedOrder)
+        fixture.inspectBeforeACK(eligible: eligibleTypeCodes, admitted: original, acceptedBefore: 0, opportunity: 1)
+        let runID = UUID()
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh, diagnosticRunID: runID)
+        await runtime.automaticSyncRuntime.waitForForegroundCatchUp()
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(fixture.ownersStarted, 1)
+        XCTAssertEqual(fixture.ownersFinished, 1)
+        XCTAssertFalse(runtime.viewModel.automaticSyncOwnerIsActive)
+        XCTAssertEqual(fixture.rawAnchors, [fixture.previousAnchor])
+        let successfulDailyTypes = failRawRead ? expectedOrder.filter { $0 != "steps" } : expectedOrder
+        XCTAssertEqual(fixture.dailyRequests, successfulDailyTypes.map { [$0] })
+        XCTAssertEqual(fixture.readEvents,
+            ["steps.raw", failRawRead ? "steps.raw.failed" : "steps.raw.succeeded"]
+                + successfulDailyTypes.flatMap { ["\($0).daily", "\($0).daily.succeeded"] })
+        let raw = try fixture.acceptedSamples(kind: "raw_quantity")
+        XCTAssertEqual(raw.map(\.typeCode), failRawRead ? [] : ["steps"])
+        XCTAssertEqual(raw.map(\.value), failRawRead ? [] : [17])
+        let daily = try fixture.acceptedSamples(kind: "daily_aggregate")
+        XCTAssertEqual(daily.map(\.typeCode), successfulDailyTypes)
+        XCTAssertEqual(daily.map(\.value), successfulDailyTypes.map { $0 == "steps" ? 4_321.0 : 345.0 })
+        let expectedUploads = successfulDailyTypes.count + (failRawRead ? 0 : 1)
+        XCTAssertEqual(fixture.recorder.invocationCount, expectedUploads)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads.count, expectedUploads)
+        XCTAssertEqual(fixture.recorder.responseInspectionCount, expectedUploads)
+        XCTAssertEqual(fixture.recorder.payloads, fixture.recorder.acceptedPayloads)
+        XCTAssertEqual(try fixture.stepCursor(), failRawRead ? fixture.previousAnchor : fixture.currentAnchor)
+        let remaining = failRawRead ? original.filter { $0.key == "steps" } : [:]
+        XCTAssertEqual(try fixture.pending(), remaining)
+        XCTAssertTrue(try FileOutbox(directory: fixture.root.appendingPathComponent("outbox")).pendingItems().isEmpty)
+
+        let diagnostic = try XCTUnwrap(AutomaticSyncDiagnosticStore(
+            fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+        ).latestRecord)
+        XCTAssertEqual(diagnostic.runID, runID)
+        XCTAssertEqual(diagnostic.triggerReason, .scheduledRefresh)
+        XCTAssertEqual(diagnostic.admissionResult, .accepted)
+        XCTAssertEqual(diagnostic.remainingPendingLaneCount, remaining.count)
+        let chain = try XCTUnwrap(diagnostic.causalChain)
+        XCTAssertEqual(chain.lanes.compactMap(\.typeCode).sorted(), eligibleTypeCodes)
+        XCTAssertTrue(chain.lanes.allSatisfy(\.attempted))
+        let steps = try XCTUnwrap(chain.lanes.first { $0.typeCode == "steps" })
+        XCTAssertEqual(steps.query, failRawRead ? .failed : .records)
+        XCTAssertEqual(steps.delivery, failRawRead ? .notRun : .accepted)
+        for type in successfulDailyTypes {
+            let lane = try XCTUnwrap(chain.lanes.first { $0.typeCode == type })
+            XCTAssertEqual(lane.query, .records)
+            XCTAssertEqual(lane.delivery, .accepted)
+            XCTAssertTrue(lane.pendingItems.isEmpty)
+        }
+        let lastRun = try XCTUnwrap(settings.lastRun)
+        XCTAssertNotNil(lastRun.finishedAt)
+        if failRawRead {
+            XCTAssertFalse(lastRun.succeeded, "An attempted read failed and its original generation still needs retry.")
+            XCTAssertNotEqual(diagnostic.runOutcome, .completed, "A later successful lane cannot make collection all-success.")
+        } else {
+            XCTAssertTrue(lastRun.succeeded)
+            XCTAssertEqual(lastRun.outcome, .completed)
+            XCTAssertEqual(diagnostic.runOutcome, .completed)
+        }
+        #endif
+    }
+
     func testAutomaticSyncDefaultEligibleTypesMatchRuntimeCatalog() async throws {
         let fixture = try AutomaticStepsFaultFixture()
         defer { fixture.cleanUp() }
@@ -342,7 +481,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
 
     private func makeStepsFaultRuntime(
         _ fixture: AutomaticStepsFaultFixture,
-        eligibleTypeCodes: [String]? = nil
+        eligibleTypeCodes: [String]? = nil,
+        automaticSyncPlatform: AutomaticSyncRuntime.Platform? = nil,
+        platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil
     ) async throws -> HealthBridgeCompanionApplicationRuntime {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
         let configuration = URLSessionConfiguration.ephemeral
@@ -374,10 +515,13 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             },
             scheduleDirectBackgroundUploads: {
                 fixture.declineBackgroundScheduling()
-            }
+            },
+            platformBackgroundPayloadDrain: platformBackgroundPayloadDrain
         )
         await viewModel.bootstrap()
-        return HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
+        return HealthBridgeCompanionApplicationRuntime(
+            viewModel: viewModel, automaticSyncPlatform: automaticSyncPlatform
+        )
     }
 
     private func assertStepsFaultCompletion(_ fixture: AutomaticStepsFaultFixture) throws {
@@ -2233,7 +2377,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
         },
         terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
-        terminalRecoveryDrainTimeoutNanoseconds: UInt64 = 5_000_000_000
+        terminalRecoveryDrainTimeoutNanoseconds: UInt64 = 5_000_000_000,
+        platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil
     ) throws -> HealthBridgeCompanionViewModel {
         HealthBridgeCompanionViewModel(
             receiverClient: receiverClient,
@@ -2275,7 +2420,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             scheduleDirectBackgroundUploads: scheduleDirectBackgroundUploads,
             cancelInheritedLegacyUploads: cancelInheritedLegacyUploads,
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
-            terminalRecoveryDrainTimeoutNanoseconds: terminalRecoveryDrainTimeoutNanoseconds
+            terminalRecoveryDrainTimeoutNanoseconds: terminalRecoveryDrainTimeoutNanoseconds,
+            platformBackgroundPayloadDrain: platformBackgroundPayloadDrain
         )
     }
 }
@@ -2430,10 +2576,15 @@ private final class AutomaticStepsFaultFixture {
     private(set) var declinedBackgroundSchedules = 0
     private(set) var rawAnchors: [String] = []
     private(set) var dailyRequests: [[String]] = []
+    private(set) var readEvents: [String] = []
     private(set) var completedStepsDay: HealthKitDailyActivityAggregate?
-    private let sampleStart = Date().addingTimeInterval(-120)
+    var ownersStarted = 0
+    var ownersFinished = 0
+    var platformDrains = 0
+    private let sampleStart: Date
 
-    init() throws {
+    init(sampleStart: Date = Date().addingTimeInterval(-120)) throws {
+        self.sampleStart = sampleStart
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AutomaticStepsFaultTests", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2536,11 +2687,16 @@ private final class AutomaticStepsFaultFixture {
     }
 
     func readRaw(anchor: String?, start: Date?, receivedAt: Date) throws -> HealthKitAnchoredStepChanges {
+        readEvents.append("steps.raw")
         let anchor = try XCTUnwrap(anchor)
         rawAnchors.append(anchor)
         XCTAssertTrue([previousAnchor, currentAnchor].contains(anchor))
         XCTAssertNil(start)
-        if failRawRead { throw ReadFailure.injected }
+        if failRawRead {
+            readEvents.append("steps.raw.failed")
+            throw ReadFailure.injected
+        }
+        readEvents.append("steps.raw.succeeded")
         return HealthKitAnchoredStepChanges(
             stepSamples: anchor == currentAnchor ? [] : [HealthKitStepSampleSummary(
                 uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000058")),
@@ -2552,11 +2708,13 @@ private final class AutomaticStepsFaultFixture {
     }
 
     func readDaily(types: [String], start: Date, end: Date, calendar: Calendar) throws -> [HealthKitDailyActivityAggregate] {
+        readEvents.append("\(types.joined(separator: ",")).daily")
         dailyRequests.append(types)
         XCTAssertFalse(types.isEmpty)
         XCTAssertTrue(Set(types).isSubset(of: ["steps", "basal_energy"]))
         XCTAssertEqual(calendar.timeZone, Calendar.current.timeZone)
         if failStepsDailyRead, types.contains("steps") { throw ReadFailure.injected }
+        readEvents.append("\(types.joined(separator: ",")).daily.succeeded")
         let today = calendar.startOfDay(for: end)
         let yesterday = try XCTUnwrap(calendar.date(byAdding: .day, value: -1, to: today))
         let tomorrow = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: today))

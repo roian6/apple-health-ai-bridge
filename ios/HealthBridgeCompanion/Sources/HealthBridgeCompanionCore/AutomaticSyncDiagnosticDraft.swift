@@ -2,6 +2,7 @@ import Foundation
 
 public final class AutomaticSyncDiagnosticDraft {
     public let runID: UUID
+    public private(set) var firstReadFailure: AutomaticSyncDiagnosticFailure?
     private var causalChain = AutomaticSyncCausalChain(lanes: [])
     private var activeLaneIndex: Int?
     private var queryStarted = false
@@ -195,8 +196,11 @@ public final class AutomaticSyncDiagnosticDraft {
     }
 
     public func noteLaneFailure(_ failure: AutomaticSyncDiagnosticFailure) {
-        guard let activeLaneIndex else { return }
         let cancelled = failure.category == .cancellation
+        if queryStarted, failure.stage == .read, !cancelled, firstReadFailure == nil {
+            firstReadFailure = failure
+        }
+        guard let activeLaneIndex else { return }
         if queryStarted {
             noteQuery(cancelled ? .cancelled : .failed, newestSampleAge: nil)
         }
