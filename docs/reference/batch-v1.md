@@ -64,6 +64,30 @@ Negative, nonfinite, incomplete, and unselected aggregates are not published.
 A missing sum or an empty, permission-ambiguous query emits neither a zero nor
 a derived-record tombstone. A raw-sample tombstone removes only its raw identity.
 
+Daily projection observations use the reserved cursor kind
+`daily_projection_observation:<canonical-type>`. Its JSON value contains an opaque
+`namespace`, a positive UInt64 `sequence`, `type_code`, `raw_intervals` with
+`client_record_id`/`start_time`/`end_time`, and an optional `statistics_window`.
+The producer reserves the order durably before the query. Each raw chunk carries
+its own interval evidence with the same captured order; ordinary HealthKit
+checkpoint cursors remain on the final chunk. Retries reuse the exact payload.
+
+The receiver pins the initial namespace for each source/type. It rejects older
+per-record mutations before changing values or validity, while retaining previously
+unseen historical raw records. Raw changes invalidate overlapping daily projections;
+unmapped deletions produce an explicit unknown scope. Actual newer completed values,
+including zero, can revalidate their days. Empty statistics report an unknown query
+window and never establish a readable baseline, zero or completed obligation.
+Incomparable namespaces cannot win by arrival. No namespace reset is implicit.
+
+Read-only daily results include only current projections in `daily_activity_totals`.
+Retained statistics and timeseries expose receiver-owned `projection_status` as
+`current`, `last_known` or `unknown`; raw-only points use `null`. Client metadata
+cannot set this field. `sample_totals` remain observed sums and can overlap daily
+projections; they are not replacement merged HealthKit totals. Calendar coverage
+and projection currentness are separate requirements. Legacy values remain useful
+as observations without creating causal recovery proof.
+
 ## Workouts
 
 Workouts use `client_record_id`, `source_key`, `workout_type`, `start_time`,

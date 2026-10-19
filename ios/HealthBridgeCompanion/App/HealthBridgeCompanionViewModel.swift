@@ -388,6 +388,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let readDailyActivityAggregates: (@MainActor (
         [String], Date, Date, Calendar
     ) async throws -> [HealthKitDailyActivityAggregate])?
+    private let readAnchoredQuantityChanges: (@MainActor (
+        String, String?, Date?, Date
+    ) async throws -> HealthKitAnchoredQuantityChanges)?
+    private let requestProjectionReadAuthorization: (@MainActor ([String]) async throws -> Void)?
     private let scheduleDirectBackgroundUploads: (@MainActor () async throws -> Int)?
     private let cancelInheritedLegacyUploads: @MainActor () async -> BackgroundUploadCancellationResult
     private let terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)?
@@ -399,6 +403,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private weak var automaticSyncRuntime: AutomaticSyncRuntime?
     private var backgroundAutomaticSyncFailure: AutomaticSyncDiagnosticFailure?
     private var backgroundAutomaticSyncQuerySucceeded = false
+    private var backgroundAutomaticSyncUnknownStatistics = false
     private var lastOutboxNotice = ""
     #if canImport(HealthKit)
     private var automaticSyncActiveObserverCount = 0
@@ -444,7 +449,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
         terminalRecoveryDrainTimeoutNanoseconds: UInt64 = 5_000_000_000,
         platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
-        productionMailboxDelivery: (@MainActor () throws -> ProductionMailboxDelivery)? = nil
+        productionMailboxDelivery: (@MainActor () throws -> ProductionMailboxDelivery)? = nil,
+        readAnchoredQuantityChanges: (@MainActor (
+            String, String?, Date?, Date
+        ) async throws -> HealthKitAnchoredQuantityChanges)? = nil,
+        requestProjectionReadAuthorization: (@MainActor ([String]) async throws -> Void)? = nil
     ) {
         let pendingPairingMayExist: Bool
         do {
@@ -510,6 +519,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.readAnchoredStepChanges = readAnchoredStepChanges
         self.automaticSyncEligibleTypeCodesForTesting = automaticSyncEligibleTypeCodesForTesting
         self.readDailyActivityAggregates = readDailyActivityAggregates
+        self.readAnchoredQuantityChanges = readAnchoredQuantityChanges
+        self.requestProjectionReadAuthorization = requestProjectionReadAuthorization
         self.scheduleDirectBackgroundUploads = scheduleDirectBackgroundUploads
         self.cancelInheritedLegacyUploads = cancelInheritedLegacyUploads
         self.terminalBackgroundPayloadDrain = terminalBackgroundPayloadDrain
@@ -3626,6 +3637,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         statusIsError = false
         backgroundAutomaticSyncFailure = nil
         backgroundAutomaticSyncQuerySucceeded = false
+        backgroundAutomaticSyncUnknownStatistics = false
         let pendingBefore = trustedPendingOutboxCount()
         switch typeCode {
         case HealthBridgeHealthType.steps.typeCode:
@@ -3643,9 +3655,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 pendingGenerationRetirements: retirementGenerations
             )
         case let code where HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(code):
-            _ = await syncDailyActivityAggregates(
+            await syncBackgroundAutomaticQuantityMetrics(
                 typeCodes: retirementGenerations.keys.sorted(),
-                executionMode: .automatic,
+                historyDepth: healthHistoryDepthStore.historyDepth,
                 pendingGenerationRetirements: retirementGenerations
             )
         default:
@@ -3681,6 +3693,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard let pendingAfter else { return .blocked }
         if pendingAfter > (pendingBefore ?? pendingAfter) {
             return .payloadEnqueued
+        }
+        if backgroundAutomaticSyncUnknownStatistics {
+            return .unknownAvailabilityCovering(retirementGenerations)
         }
         guard backgroundAutomaticSyncQuerySucceeded else { return .blocked }
         return .noPayloadCovering(retirementGenerations)
@@ -3764,7 +3779,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try requireCurrentConnectionGeneration(expectedGeneration)
             switch daily {
             case .noPayload:
-                return .noPayloadCovering(pendingGenerationRetirements)
+                return .unknownAvailabilityCovering(pendingGenerationRetirements)
             case .accepted, .queued:
                 return .payloadEnqueued
             case .failed:
@@ -4035,7 +4050,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             diagnostic.noteFailure(readFailure)
         }
         let failed = statusIsError || diagnostic.record.failure != nil
-        let incomplete = processedAllPending == false
+        let incomplete = processedAllPending == false || !pendingTypeCodes.isEmpty
         let diagnosticOutcome: AutomaticSyncDiagnosticRunOutcome = failed
             ? .failed
             : incomplete ? .deferred : .completed
@@ -4246,7 +4261,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusIsError = false
             statusMessage = "Reading anchored Step Count changes from HealthKit..."
             if executionMode.shouldRequestReadAuthorization {
-                try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.steps])
+                if let requestProjectionReadAuthorization {
+                    try await requestProjectionReadAuthorization(["steps"])
+                } else {
+                    try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.steps])
+                }
             }
             let now = Date()
             let calendar = utcCalendar()
@@ -4294,6 +4313,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     cursorKind: AnchoredStepSyncPolicy.bootstrapStartCursorKind
                 )
             }
+            guard let outbox else { throw CompanionPrivateStorageError.outboxUnavailable }
+            let observationOrder = try outbox.reserveDailyProjectionObservation()
             failureStage = .read
             noteAutomaticSyncQueryStarted(executionMode: executionMode)
             let changes: HealthKitAnchoredStepChanges
@@ -4324,10 +4345,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 statusMessage = "HealthKit step anchor is unchanged. Nothing sent."
                 return .noPayload
             }
-            let batch = StepCountSyncBatchFactory.makeAnchoredStepBatch(
+            let rawBatch = StepCountSyncBatchFactory.makeAnchoredStepBatch(
                 changes: changes,
                 generatedAt: now
             )
+            let batch = try outbox.prepareProjectionRawBatches(
+                [rawBatch], order: observationOrder, receiverBindingID: receiverBindingID,
+                typeCode: "steps",
+                fallbackStart: healthHistoryDepthStore.historyDepth.lowerBoundDate(now: now)
+                    ?? queryPlan.queryStart ?? changes.windowStart,
+                end: now, calendar: .current
+            )[0]
             let uploadedRecords = !batch.samples.isEmpty
 
             guard ForegroundSyncUploadPolicy.shouldUpload(batch) else {
@@ -4445,7 +4473,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusIsError = false
             statusMessage = "Reading HealthKit daily activity totals..."
             if executionMode.shouldRequestReadAuthorization {
-                try await HealthStoreAuthorizer().requestReadAuthorization(typeCodes: typeCodes)
+                if let requestProjectionReadAuthorization {
+                    try await requestProjectionReadAuthorization(typeCodes)
+                } else {
+                    try await HealthStoreAuthorizer().requestReadAuthorization(typeCodes: typeCodes)
+                }
             }
             let now = Date()
             let calendar = Calendar.current
@@ -4469,7 +4501,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     before: end
                 )
             )
-            let start = ForegroundSyncWindowPolicy.windowStart(
+            let replayStart = ForegroundSyncWindowPolicy.windowStart(
                 fallbackStart: fallbackStart,
                 end: end,
                 cursorValue: cursorValue,
@@ -4477,6 +4509,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 alignToStartOfDay: true,
                 calendar: calendar
             )
+            guard let outbox else { throw CompanionPrivateStorageError.outboxUnavailable }
+            let repairStart = try outbox.projectionRepairStart(
+                receiverBindingID: receiverBindingID, sourceKey: sourceKey, typeCodes: typeCodes
+            )
+            let start = min(replayStart, repairStart ?? replayStart)
+            let observationOrder = try outbox.reserveDailyProjectionObservation()
             failureStage = .read
             noteAutomaticSyncQueryStarted(executionMode: executionMode)
             let aggregates: [HealthKitDailyActivityAggregate]
@@ -4496,7 +4534,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: executionMode
             )
             try requireCurrentReceiverSyncProgressScope(progressScope)
-            guard let batch = DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            guard let aggregateBatch = DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
                 aggregates: aggregates,
                 typeCodes: typeCodes,
                 windowStart: start,
@@ -4507,16 +4545,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 statusMessage = "No readable daily activity aggregate types are available. Nothing sent."
                 return .failed
             }
-            guard !batch.samples.isEmpty else {
-                statusIsError = false
-                statusMessage = "HealthKit returned no daily activity totals for the selected sync window. Nothing sent."
-                return .noPayload
+            let hasValues = !aggregateBatch.samples.isEmpty
+            if !hasValues, executionMode == .automatic { backgroundAutomaticSyncUnknownStatistics = true }
+            try outbox.noteProjectionStatisticsWindow(
+                batch: aggregateBatch, order: observationOrder, receiverBindingID: receiverBindingID,
+                typeCodes: typeCodes, start: start, end: end, calendar: calendar
+            )
+            var batch = aggregateBatch
+            for typeCode in typeCodes {
+                batch = try DailyProjectionObservation(
+                    order: observationOrder, typeCode: typeCode,
+                    statisticsWindow: HealthBridgeTimeWindow(
+                        startTime: HealthBridgeUTCFormatter.string(from: start),
+                        endTime: HealthBridgeUTCFormatter.string(from: end)
+                    )
+                ).appending(to: batch)
+            }
+            let coveredRetirements = try outbox.projectionRetirementsCovered(
+                pendingGenerationRetirements, batch: batch, order: observationOrder,
+                receiverBindingID: receiverBindingID
+            )
+            if executionMode == .automatic, coveredRetirements.count < pendingGenerationRetirements.count {
+                backgroundAutomaticSyncUnknownStatistics = true
             }
 
             statusMessage = "Uploading \(batch.samples.count) daily activity total(s) to \(url.host() ?? url.absoluteString)..."
             failureStage = .encoding
             let data = try encoder.encode(batch)
-            let cursor = shouldPersistSharedProgress
+            let cursor = shouldPersistSharedProgress && hasValues
                 ? batch.sync.cursors.first(where: {
                     $0.sourceKey == sourceKey
                         && $0.cursorKind == DailyActivityAggregateSyncPolicy.cursorKind
@@ -4537,7 +4593,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 to: url,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
-                pendingGenerationRetirements: pendingGenerationRetirements,
+                pendingGenerationRetirements: coveredRetirements,
                 stepsRawAndDailyCoverage: stepsRawAndDailyCoverage
             )
             try requireCurrentReceiverSyncProgressScope(
@@ -4552,6 +4608,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 queuedDescription: "Queued \(batch.samples.count) daily activity total(s) behind earlier pending upload(s)",
                 outboxNotice: outboxNotice
             )
+            if !hasValues { return .noPayload }
             return deliveryResult.directUpload == nil
                 ? .queued(hasRecords: true)
                 : .accepted(hasRecords: true)
@@ -5207,6 +5264,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         )
     }
 
+    private func reaggregateActivityIfNeeded(
+        typeCode: String, executionMode: HealthBridgeSyncExecutionMode,
+        retirements: [String: Int]
+    ) async {
+        guard let entry = HealthKitTypeCatalog.entry(for: typeCode),
+              entry.aggregation == .sum,
+              HealthKitTypeCatalog.healthType(from: entry).category == .activity else { return }
+        _ = await performDailyActivityAggregates(
+            typeCodes: [typeCode], executionMode: executionMode,
+            pendingGenerationRetirements: retirements.filter { $0.key == typeCode }
+        )
+    }
+
     private var supportedForegroundQuantityTypeCodes: [String] {
         enabledBroadQuantityTypeCodes
     }
@@ -5420,14 +5490,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     let canPersistSelectedProgress = shouldPersistSharedProgress
                         || cursorOwnership.isIndependentAutomaticFallback
 
+                    guard let outbox else { throw CompanionPrivateStorageError.outboxUnavailable }
+                    let observationOrder = try outbox.reserveDailyProjectionObservation()
                     failureStage = .read
                     noteAutomaticSyncQueryStarted(executionMode: mode.executionMode)
-                    let changes = try await reader.readAnchoredQuantityChanges(
-                        typeCode: queryPlan.canonicalTypeCode,
-                        anchorCursorValue: cursorOwnership.cursorValue,
-                        predicateStart: queryPlan.predicateStart,
-                        receivedAt: now
-                    )
+                    let changes: HealthKitAnchoredQuantityChanges
+                    if let readAnchoredQuantityChanges {
+                        changes = try await readAnchoredQuantityChanges(
+                            queryPlan.canonicalTypeCode, cursorOwnership.cursorValue,
+                            queryPlan.predicateStart, now
+                        )
+                    } else {
+                        changes = try await reader.readAnchoredQuantityChanges(
+                            typeCode: queryPlan.canonicalTypeCode,
+                            anchorCursorValue: cursorOwnership.cursorValue,
+                            predicateStart: queryPlan.predicateStart,
+                            receivedAt: now
+                        )
+                    }
                     noteAutomaticSyncQueryResult(
                         hasRecords: !changes.samples.isEmpty || !changes.deletedSamples.isEmpty,
                         newestSampleEnd: changes.samples.map(\.end).max(),
@@ -5446,13 +5526,25 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             activeSampleCount: changes.samples.count,
                             deletedSampleCount: changes.deletedSamples.count
                         )
-                    let batches = GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(
+                    let rawBatches = GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(
                         changes: changes,
                         generatedAt: now,
                         includeAnchorCursor: shouldIncludeAnchor,
                         cursorKind: cursorOwnership.cursorKind
                     ).filter(ForegroundSyncUploadPolicy.shouldUpload)
+                    let batches = try outbox.prepareProjectionRawBatches(
+                        rawBatches, order: observationOrder, receiverBindingID: receiverBindingID,
+                        typeCode: typeCode,
+                        fallbackStart: selectedHistoryDepth.lowerBoundDate(now: now)
+                            ?? queryPlan.predicateStart ?? changes.windowStart,
+                        end: now, calendar: .current
+                    )
                     guard !batches.isEmpty else {
+                        await reaggregateActivityIfNeeded(
+                            typeCode: typeCode, executionMode: mode.executionMode,
+                            retirements: pendingGenerationRetirements
+                        )
+                        try requireCurrentReceiverSyncProgressScope(progressScope)
                         continue
                     }
 
@@ -5473,12 +5565,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         to: url,
                         cursorCheckpoint: cursorCheckpoint,
                         executionMode: mode.executionMode,
-                        pendingGenerationRetirements: pendingGenerationRetirements
+                        pendingGenerationRetirements: selectedEntries.first(where: { $0.typeCode == typeCode })?.aggregation == .sum
+                            ? [:] : pendingGenerationRetirements
                     )
                     try requireCurrentReceiverSyncProgressScope(
                         progressScope,
                         deliveryGeneration: deliveryResult.connectionGeneration
                     )
+                    await reaggregateActivityIfNeeded(
+                        typeCode: typeCode, executionMode: mode.executionMode,
+                        retirements: pendingGenerationRetirements
+                    )
+                    try requireCurrentReceiverSyncProgressScope(progressScope)
                     if deliveryResult.directUpload == nil {
                         queuedAnyPayload = true
                     }

@@ -222,7 +222,10 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
             "provenance. Selects start_time >= the inclusive UTC lower bound and "
             "start_time < the exclusive upper bound, not interval overlap; "
             "sample end times are not clipped. Returns at most 500 points in "
-            "start-time order; check truncated and missing_data_notes."
+            "start-time order; check truncated and missing_data_notes. "
+            "Receiver-owned projection_status distinguishes current, last_known "
+            "and unknown daily projections; raw points have no projection status. "
+            "No clinical interpretation."
         ),
         input_schema=TIMESERIES_INPUT_SCHEMA,
     ),
@@ -259,7 +262,10 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
             "not overlap or wake date. Returns sum-safe sample_totals and "
             "type-aware sample_statistics; inspect sample_total_semantics before "
             "treating sums as daily activity. daily_activity_totals requires "
-            "completed calendar-day coverage. Empty days do not prove zero "
+            "completed calendar-day coverage and includes only current projections. "
+            "Retained statistics carry receiver-owned projection_status "
+            "(current, last_known or unknown) separately from calendar coverage; "
+            "raw sums may overlap projections. Empty days do not prove zero "
             "activity; consult source provenance and missing_data_notes. "
             "No clinical interpretation."
         ),

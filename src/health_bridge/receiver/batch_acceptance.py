@@ -14,6 +14,10 @@ from health_bridge.receiver.source_binding import (
     SourcePrincipalMismatchError,
     bind_batch_to_principal,
 )
+from health_bridge.storage.daily_projections import (
+    ProjectionObservationInvalidError,
+    parse_observations,
+)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -63,6 +67,10 @@ class BatchAcceptanceCore:
             bound = bind_batch_to_principal(batch, value.principal)
         except SourcePrincipalMismatchError:
             return BatchPrincipalMismatch()
+        try:
+            _ = parse_observations(bound)
+        except (ValidationError, ProjectionObservationInvalidError):
+            return BatchPayloadInvalid()
         return PreparedBatch(exact_bytes=value.exact_bytes, batch=bound)
 
     @staticmethod

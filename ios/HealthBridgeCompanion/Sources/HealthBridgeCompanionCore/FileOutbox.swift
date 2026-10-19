@@ -390,6 +390,11 @@ public struct FileOutboxFinalizationRecord: Equatable, Sendable {
     }
 }
 
+public struct DailyProjectionObservationOrder: Codable, Equatable, Sendable {
+    public let namespace: String
+    public let sequence: UInt64
+}
+
 public enum FileOutboxCursorCheckpointError: Error, Equatable {
     case pendingCommit
     case checkpointMismatch
@@ -499,10 +504,26 @@ public final class FileOutbox {
         var version: Int
         var nextSequence: UInt64
         var entries: [SequenceEntry]
+        var observationNamespace: String? = nil
+        var projectionIntervals: [String: ProjectionInterval]? = nil
+        var projectionRepairs: [String: [ProjectionRepair]]? = nil
+        var projectionHistory: [String: Date]? = nil
+        var projectionCompleted: [String: [ProjectionRepair]]? = nil
 
         static var empty: SequenceManifest {
             SequenceManifest(version: directOnlyVersion, nextSequence: 1, entries: [])
         }
+    }
+
+    private struct ProjectionInterval: Codable, Equatable {
+        let start: Date
+        let end: Date
+    }
+
+    private struct ProjectionRepair: Codable, Equatable {
+        let start: Date
+        let end: Date
+        let sequence: UInt64
     }
 
     private struct MailboxEnvelopeFinalizationIntent: Codable, Equatable {
@@ -739,6 +760,256 @@ public final class FileOutbox {
         try recoverMailboxEnvelopeFinalizationIfNeeded()
         _ = try reconciledManifest()
     }
+
+    public func reserveDailyProjectionObservation() throws -> DailyProjectionObservationOrder {
+        try requireUploadAdmission()
+        var manifest = try reconciledManifest()
+        guard manifest.nextSequence < UInt64.max else { throw SequenceError.exhausted }
+        let namespace = manifest.observationNamespace ?? UUID().uuidString.lowercased()
+        let order = DailyProjectionObservationOrder(namespace: namespace, sequence: manifest.nextSequence)
+        manifest.observationNamespace = namespace
+        manifest.nextSequence += 1
+        try persistManifest(manifest)
+        return order
+    }
+
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    public func prepareProjectionRawBatches(
+        _ batches: [HealthBridgeBatchV1], order: DailyProjectionObservationOrder,
+        receiverBindingID: String, typeCode: String, fallbackStart: Date, end: Date,
+        calendar: Calendar
+    ) throws -> [HealthBridgeBatchV1] {
+        var manifest = try reconciledManifest()
+        guard order.sequence > 0, manifest.observationNamespace == order.namespace,
+              order.sequence < manifest.nextSequence else { throw SequenceError.invalidManifest }
+        let source = batches.first?.sources.first?.sourceKey ?? HealthBridgeAppleHealthSource.phone.sourceKey
+        let key = receiverBindingID + "\n" + source + "\n" + typeCode
+        let entry = HealthKitTypeCatalog.entry(for: typeCode)
+        let tracksDaily = typeCode == "steps" || (entry?.aggregation == .sum
+            && entry.map { HealthKitTypeCatalog.healthType(from: $0).category == .activity } == true)
+        var index = manifest.projectionIntervals ?? [:]
+        var repairs = manifest.projectionRepairs ?? [:]
+        var evidence: [String: DailyProjectionObservation.RawInterval] = [:]
+        let today = calendar.startOfDay(for: end)
+        func note(_ interval: ProjectionInterval) {
+            guard tracksDaily else { return }
+            let start = calendar.startOfDay(for: interval.start)
+            let lastDay = calendar.startOfDay(for: interval.end)
+            let exclusiveEnd = interval.end == lastDay && interval.end > interval.start
+                ? lastDay : (calendar.date(byAdding: .day, value: 1, to: lastDay) ?? today)
+            let last = min(today, exclusiveEnd)
+            if start < last {
+                let repair = ProjectionRepair(start: start, end: last, sequence: order.sequence)
+                if let index = repairs[key]?.firstIndex(where: { $0.start == start && $0.end == last }) {
+                    repairs[key]?[index] = repair
+                } else {
+                    repairs[key, default: []].append(repair)
+                }
+            }
+        }
+        for batch in batches {
+            for sample in batch.samples {
+                guard let start = HealthBridgeUTCFormatter.date(from: sample.startTime),
+                      let end = HealthBridgeUTCFormatter.date(from: sample.endTime) else {
+                    throw SequenceError.invalidManifest
+                }
+                let identity = key + "\n" + sample.clientRecordID
+                if let previous = index[identity] { note(previous) }
+                let interval = ProjectionInterval(start: start, end: end)
+                note(interval)
+                if tracksDaily { index[identity] = interval }
+                evidence[sample.clientRecordID] = .init(clientRecordID: sample.clientRecordID, start: start, end: end)
+            }
+            for deletion in batch.deletedRecords where deletion.recordFamily == "sample" {
+                let identity = key + "\n" + deletion.clientRecordID
+                if let previous = index[identity] {
+                    note(previous)
+                    evidence[deletion.clientRecordID] = .init(clientRecordID: deletion.clientRecordID, start: previous.start, end: previous.end)
+                } else {
+                    let start = manifest.projectionHistory?[key] ?? fallbackStart
+                    note(ProjectionInterval(start: start, end: today))
+                }
+            }
+        }
+        manifest.projectionIntervals = index
+        manifest.projectionRepairs = repairs
+        try persistManifest(manifest)
+        return try batches.map { batch in
+            let ids = Set(batch.samples.map(\.clientRecordID) + batch.deletedRecords.map(\.clientRecordID))
+            return try DailyProjectionObservation(
+                order: order, typeCode: typeCode,
+                rawIntervals: evidence.values.filter { ids.contains($0.clientRecordID) }.sorted { $0.clientRecordID < $1.clientRecordID }
+            ).appending(to: batch)
+        }
+    }
+
+    public func projectionRepairStart(receiverBindingID: String, sourceKey: String, typeCodes: [String]) throws -> Date? {
+        let manifest = try reconciledManifest()
+        return typeCodes.flatMap { type in
+            manifest.projectionRepairs?[receiverBindingID + "\n" + sourceKey + "\n" + type] ?? []
+        }.map(\.start).min()
+    }
+
+    private func subtractProjectionCoverage(
+        _ repairs: [ProjectionRepair], samples: [HealthBridgeSample], sequence: UInt64
+    ) -> [ProjectionRepair] {
+        var remaining = repairs
+        for sample in samples where sample.metadata["aggregation_completeness"] == "complete" {
+            guard let start = HealthBridgeUTCFormatter.date(from: sample.startTime),
+                  let end = HealthBridgeUTCFormatter.date(from: sample.endTime) else { continue }
+            remaining = remaining.flatMap { repair -> [ProjectionRepair] in
+                guard sequence > repair.sequence, start < repair.end, end > repair.start else { return [repair] }
+                return projectionRemainder(repair, excluding: ProjectionInterval(start: start, end: end))
+            }
+        }
+        return remaining
+    }
+
+    private func projectionRemainder(_ repair: ProjectionRepair, excluding interval: ProjectionInterval) -> [ProjectionRepair] {
+        guard interval.start < repair.end, interval.end > repair.start else { return [repair] }
+        var pieces: [ProjectionRepair] = []
+        if repair.start < interval.start {
+            pieces.append(.init(start: repair.start, end: interval.start, sequence: repair.sequence))
+        }
+        if interval.end < repair.end {
+            pieces.append(.init(start: interval.end, end: repair.end, sequence: repair.sequence))
+        }
+        return pieces
+    }
+
+    private func completedProjectionSamples(
+        _ batch: HealthBridgeBatchV1, sourceKey: String, typeCode: String,
+        start: Date, end: Date, calendar: Calendar
+    ) -> [HealthBridgeSample] {
+        batch.samples.filter { sample in
+            guard sample.sourceKey == sourceKey, sample.typeCode == typeCode,
+                  sample.metadata["sample_kind"] == "daily_aggregate",
+                  sample.metadata["aggregation_completeness"] == "complete",
+                  sample.value.isFinite, sample.value >= 0,
+                  let dayStart = HealthBridgeUTCFormatter.date(from: sample.startTime),
+                  let dayEnd = HealthBridgeUTCFormatter.date(from: sample.endTime) else { return false }
+            var sampleCalendar = calendar
+            if let identifier = sample.metadata["time_zone_identifier"] {
+                guard let timeZone = TimeZone(identifier: identifier) else { return false }
+                sampleCalendar.timeZone = timeZone
+            }
+            return dayStart >= start && dayStart == sampleCalendar.startOfDay(for: dayStart)
+                && sampleCalendar.date(byAdding: .day, value: 1, to: dayStart) == dayEnd
+                && dayEnd <= sampleCalendar.startOfDay(for: end)
+        }
+    }
+
+    public func projectionRetirementsCovered(
+        _ retirements: [String: Int], batch: HealthBridgeBatchV1,
+        order: DailyProjectionObservationOrder, receiverBindingID: String
+    ) throws -> [String: Int] {
+        let manifest = try reconciledManifest()
+        let source = batch.sources.first?.sourceKey ?? HealthBridgeAppleHealthSource.phone.sourceKey
+        return retirements.filter { type, _ in
+            guard let start = HealthBridgeUTCFormatter.date(from: batch.exportWindow.startTime),
+                  let end = HealthBridgeUTCFormatter.date(from: batch.exportWindow.endTime) else { return false }
+            let samples = completedProjectionSamples(
+                batch, sourceKey: source, typeCode: type, start: start, end: end, calendar: .current
+            )
+            let key = receiverBindingID + "\n" + source + "\n" + type
+            return !samples.isEmpty && subtractProjectionCoverage(
+                manifest.projectionRepairs?[key] ?? [], samples: samples, sequence: order.sequence
+            ).isEmpty
+        }
+    }
+
+    public func noteProjectionStatisticsWindow(
+        batch: HealthBridgeBatchV1, order: DailyProjectionObservationOrder,
+        receiverBindingID: String, typeCodes: [String], start: Date, end: Date, calendar: Calendar
+    ) throws {
+        let last = calendar.startOfDay(for: end)
+        guard start < last else { return }
+        var manifest = try reconciledManifest()
+        guard order.sequence > 0, manifest.observationNamespace == order.namespace,
+              order.sequence < manifest.nextSequence else { throw SequenceError.invalidManifest }
+        var repairs = manifest.projectionRepairs ?? [:]
+        let source = batch.sources.first?.sourceKey ?? HealthBridgeAppleHealthSource.phone.sourceKey
+        for type in typeCodes {
+            let key = receiverBindingID + "\n" + source + "\n" + type
+            let completed = completedProjectionSamples(
+                batch, sourceKey: source, typeCode: type, start: start, end: end, calendar: calendar
+            )
+            var missing: [ProjectionRepair]
+            if completed.isEmpty {
+                let unknownStart = max(calendar.startOfDay(for: start), manifest.projectionHistory?[key] ?? start)
+                missing = unknownStart < last
+                    ? [ProjectionRepair(start: unknownStart, end: last, sequence: order.sequence)] : []
+                for known in manifest.projectionCompleted?[key] ?? [] where known.sequence >= order.sequence {
+                    missing = missing.flatMap {
+                        projectionRemainder($0, excluding: ProjectionInterval(start: known.start, end: known.end))
+                    }
+                }
+            } else {
+                let known = (manifest.projectionCompleted?[key] ?? []).filter {
+                    $0.start >= start && $0.end <= last && $0.sequence < order.sequence
+                }
+                missing = subtractProjectionCoverage(known, samples: completed, sequence: order.sequence)
+            }
+            for interval in missing {
+                let repair = ProjectionRepair(start: interval.start, end: interval.end, sequence: order.sequence)
+                if let index = repairs[key]?.firstIndex(where: { $0.start == repair.start && $0.end == repair.end }) {
+                    if let existing = repairs[key]?[index], existing.sequence < repair.sequence {
+                        repairs[key]?[index] = repair
+                    }
+                } else {
+                    repairs[key, default: []].append(repair)
+                }
+            }
+        }
+        manifest.projectionRepairs = repairs
+        try persistManifest(manifest)
+    }
+
+    private func acknowledgeProjectionPayload(itemID: String, receiverBindingID: String) throws {
+        let url = finalPayloadURL(for: itemID)
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        let bytes = try Data(contentsOf: url)
+        guard let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes),
+              batch.sync.cursors.contains(where: { $0.cursorKind.hasPrefix(DailyProjectionObservation.cursorPrefix) }) else { return }
+        var manifest = try loadManifest() ?? .empty
+        var repairs = manifest.projectionRepairs ?? [:]
+        var history = manifest.projectionHistory ?? [:]
+        var completed = manifest.projectionCompleted ?? [:]
+        for cursor in batch.sync.cursors where cursor.cursorKind.hasPrefix(DailyProjectionObservation.cursorPrefix) {
+            let observation = try JSONDecoder().decode(DailyProjectionObservation.self, from: Data(cursor.cursorValue.utf8))
+            guard observation.namespace == manifest.observationNamespace,
+                  observation.sequence > 0, observation.sequence < manifest.nextSequence,
+                  let window = observation.statisticsWindow,
+                  let start = HealthBridgeUTCFormatter.date(from: window.startTime),
+                  let end = HealthBridgeUTCFormatter.date(from: window.endTime) else { continue }
+            let samples = completedProjectionSamples(
+                batch, sourceKey: cursor.sourceKey, typeCode: observation.typeCode,
+                start: start, end: end, calendar: .current
+            )
+            let key = receiverBindingID + "\n" + cursor.sourceKey + "\n" + observation.typeCode
+            repairs[key] = subtractProjectionCoverage(repairs[key] ?? [], samples: samples, sequence: observation.sequence)
+            for sample in samples {
+                guard let dayStart = HealthBridgeUTCFormatter.date(from: sample.startTime),
+                      let dayEnd = HealthBridgeUTCFormatter.date(from: sample.endTime) else { continue }
+                let interval = ProjectionRepair(start: dayStart, end: dayEnd, sequence: observation.sequence)
+                if let index = completed[key]?.firstIndex(where: { $0.start == dayStart && $0.end == dayEnd }) {
+                    if let previous = completed[key]?[index], previous.sequence < interval.sequence {
+                        completed[key]?[index] = interval
+                    }
+                } else {
+                    completed[key, default: []].append(interval)
+                }
+            }
+            if let first = samples.compactMap({ HealthBridgeUTCFormatter.date(from: $0.startTime) }).min() {
+                history[key] = min(history[key] ?? first, first)
+            }
+        }
+        manifest.projectionRepairs = repairs
+        manifest.projectionHistory = history
+        manifest.projectionCompleted = completed
+        try persistManifest(manifest)
+    }
+    #endif
 
     public func enqueue(
         _ payload: Data,
@@ -1008,6 +1279,9 @@ public final class FileOutbox {
             if !transaction.directAcknowledgedIDs.contains(itemID) {
                 try requireDirectRetirementAllowed(itemID: itemID)
             }
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            try acknowledgeProjectionPayload(itemID: itemID, receiverBindingID: receiverIdentity)
+            #endif
             let updated = transaction.recordingDirectAcknowledgment(for: itemID)
             if updated != transaction {
                 transactions[transactionIndex] = updated
@@ -1078,6 +1352,11 @@ public final class FileOutbox {
 
     public func markUploaded(_ item: FileOutboxItem) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        if let identity = item.receiverIdentity {
+            try acknowledgeProjectionPayload(itemID: item.id, receiverBindingID: identity)
+        }
+        #endif
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
         }
@@ -1677,6 +1956,11 @@ public final class FileOutbox {
               binding.envelopeFilename == "\(entry.id).hbe" else {
             throw FileOutboxMailboxError.invalidDeliveryState
         }
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        if let identity = entry.receiverIdentity {
+            try acknowledgeProjectionPayload(itemID: entry.id, receiverBindingID: identity)
+        }
+        #endif
         try removeIfExists(finalPayloadURL(for: entry.id))
         try fault(.payloadRetired)
         try removeIfExists(directory.appendingPathComponent(binding.envelopeFilename))
@@ -2023,6 +2307,11 @@ public final class FileOutbox {
         for entry in manifest.entries
             where entry.deliveryState?.phase == .committedFinalized {
             try retireCommittedArtifacts(for: entry, fault: { _ in })
+        }
+        if let acknowledged = try loadManifest() {
+            manifest.projectionRepairs = acknowledged.projectionRepairs
+            manifest.projectionHistory = acknowledged.projectionHistory
+            manifest.projectionCompleted = acknowledged.projectionCompleted
         }
         let payloadURLs = try payloadFileURLs()
         let payloadIDs = Set(payloadURLs.map(payloadID))

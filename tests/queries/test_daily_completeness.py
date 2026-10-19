@@ -11,7 +11,7 @@ from health_bridge.contract.batch_v1 import Sample
 from health_bridge.ingest import ingest_fixture
 from health_bridge.queries import get_daily_summary
 from health_bridge.queries.models import DailyObservation
-from tests.fixture_helpers import FIXTURE_PATH
+from tests.fixture_helpers import FIXTURE_PATH, with_projection_observations
 
 SampleInput: TypeAlias = tuple[str, str, float, dict[str, str]]
 DAY = "2026-06-09"
@@ -47,7 +47,7 @@ def _ingest_samples(tmp_path: Path, rows: list[SampleInput]) -> Path:
         },
     )
     input_path = tmp_path / "daily.synthetic.json"
-    _ = input_path.write_text(batch.model_dump_json())
+    _ = input_path.write_text(with_projection_observations(batch).model_dump_json())
     db_path = tmp_path / "daily.sqlite"
     assert ingest_fixture(db_path, input_path).sample_count == len(rows)
     return db_path

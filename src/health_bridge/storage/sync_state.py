@@ -78,6 +78,8 @@ def upsert_sync_state(
             deleted_at=deleted_record.deleted_at,
         )
     for cursor in batch.sync.cursors:
+        if cursor.cursor_kind.startswith("daily_projection_observation:"):
+            continue
         if (
             cursor.source_key in stale_sleep_reset_source_keys
             and cursor.cursor_kind in SLEEP_CURSOR_KINDS

@@ -18,6 +18,13 @@ Tables:
 - `sleep_stage_intervals`: intervals attached to sleep sessions.
 - `deleted_records`: tombstones by record family and client identity.
 - `sync_cursors`: latest cursor state per source.
+- `daily_projection_owners`: pinned causal namespace per source/type.
+- `daily_projection_records`: per-record order, interval, replay identity and
+  receiver-owned daily validity; UInt64 sequence values use fixed-width decimal
+  text to avoid narrowing to SQLite's signed integer range.
+- `daily_projection_fences`: affected intervals and unknown-scope observation fences.
+- `daily_projection_replays`: semantic replay fingerprints preserving ordering
+  evidence when an identical unordered payload is retried.
 - `sleep_baseline_namespaces`: every anchored sleep reset namespace seen per source and whether a non-empty authoritative baseline was applied. Replayed older namespaces are ignored; an empty reset remains non-destructive and pending until the same namespace supplies readable sleep sessions.
 - `receiver_tokens`: receiver bearer-token hashes, lookup prefixes, usage timestamps,
   and revocation state. Legacy v1 rows may retain a short raw token prefix for

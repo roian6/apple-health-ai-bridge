@@ -13,6 +13,7 @@ from health_bridge.queries._common import (
 )
 from health_bridge.queries.calendar_coverage import completed_day_interval
 from health_bridge.queries.models import (
+    PROJECTION_NOTE,
     DailyObservation,
     DailySampleStatistic,
     DailySummaryResult,
@@ -21,7 +22,7 @@ from health_bridge.queries.models import (
 )
 from health_bridge.timeseries_catalog import timeseries_aggregation_for
 
-SampleDailyRow: TypeAlias = tuple[str, str, str, float, str, str, str]
+SampleDailyRow: TypeAlias = tuple[str, str, str, float, str, str, str, str]
 WorkoutDailyRow: TypeAlias = tuple[str, int]
 SleepDailyRow: TypeAlias = tuple[str, int]
 DailySourceRow: TypeAlias = tuple[str, str, str]
@@ -41,12 +42,16 @@ METADATA_ADAPTER: Final[TypeAdapter[dict[str, object]]] = TypeAdapter(
 
 SAMPLE_DAILY_SQL: Final = (
     "select coalesce(cast(json_extract(metadata_json, '$.calendar_day') as text), "
-    "substr(start_time, 1, 10)) as day, type_code, start_time, value, "
-    "unit, metadata_json, end_time from samples where "
-    "(start_time >= ? and start_time < ?) "
+    "substr(samples.start_time, 1, 10)) as day, samples.type_code, "
+    "samples.start_time, value, "
+    "unit, metadata_json, samples.end_time, coalesce(projection.status, 'unknown') "
+    "from samples left join daily_projection_records projection on "
+    "projection.source_id=samples.source_id and projection.type_code=samples.type_code "
+    "and projection.client_record_id=samples.client_record_id where "
+    "(samples.start_time >= ? and samples.start_time < ?) "
     "or (json_extract(metadata_json, '$.calendar_day') >= ? "
     "and json_extract(metadata_json, '$.calendar_day') < ?) "
-    "order by day, type_code, start_time"
+    "order by day, samples.type_code, samples.start_time"
 )
 WORKOUT_DAILY_SQL: Final = (
     "select substr(start_time, 1, 10) as day, count(*) "
@@ -123,7 +128,16 @@ def get_daily_summary(
         period=Period(start=start_date, end=end_date),
         days=days,
         sources_used=sources if observed_count > 0 else (),
-        missing_data_notes=notes_for_count(observed_count),
+        missing_data_notes=notes_for_count(observed_count)
+        + (
+            (PROJECTION_NOTE,)
+            if any(
+                stat.projection_status is not None
+                for day in days
+                for stat in day.sample_statistics.values()
+            )
+            else ()
+        ),
         truncated=False,
     )
 
@@ -198,6 +212,18 @@ def _sample_statistic(
     values = [row[3] for row in sorted_rows]
     aggregation = _aggregation_for(type_code, sorted_rows)
     units = {row[4] for row in sorted_rows}
+    states = {
+        row[7] for row in rows if _metadata_indicates_daily_aggregate(_metadata(row[5]))
+    }
+    projection_status = (
+        "unknown"
+        if "unknown" in states
+        else "last_known"
+        if "last_known" in states
+        else "current"
+        if states
+        else None
+    )
     latest_row = None
     if aggregation == "latest":
         latest_row = max(sorted_rows, key=lambda row: row[2])
@@ -213,6 +239,7 @@ def _sample_statistic(
             maximum=None,
             latest=None,
             latest_time=None,
+            projection_status=projection_status,
         )
     total = sum(values) if aggregation == "sum" else None
     average = (sum(values) / len(values)) if aggregation == "min_max_average" else None
@@ -228,6 +255,7 @@ def _sample_statistic(
         maximum=maximum,
         latest=latest_row[3] if latest_row is not None else None,
         latest_time=latest_row[2] if latest_row is not None else None,
+        projection_status=projection_status,
     )
 
 
@@ -258,7 +286,11 @@ def _sum_semantics_for(rows: list[SampleDailyRow]) -> str:
 
 
 def _daily_aggregate_total(rows: list[SampleDailyRow]) -> float | None:
-    daily_rows = [row for row in rows if _is_completed_daily_aggregate(row)]
+    daily_rows = [
+        row
+        for row in rows
+        if row[7] == "current" and _is_completed_daily_aggregate(row)
+    ]
     if not daily_rows:
         return None
     units = {row[4] for row in daily_rows}
@@ -301,7 +333,9 @@ def _metadata_indicates_daily_aggregate(metadata: dict[str, object]) -> bool:
     aggregation = metadata.get("aggregation")
     healthkit_query = metadata.get("healthkit_query")
     return (
-        aggregation == "daily_sum" or healthkit_query == "HKStatisticsCollectionQuery"
+        aggregation == "daily_sum"
+        or healthkit_query == "HKStatisticsCollectionQuery"
+        or metadata.get("sample_kind") == "daily_aggregate"
     )
 
 

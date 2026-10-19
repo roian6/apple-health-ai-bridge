@@ -8,6 +8,187 @@ import XCTest
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testIssue63PopulatedDailyControlsDeliverSixAndZero() async throws {
+        for value in [6.0, 0.0] {
+            let fixture = try AutomaticStepsFaultFixture()
+            defer { fixture.cleanUp() }
+            fixture.completedStepsValue = value
+            let runtime = try await makeIssue63Runtime(fixture)
+            _ = try fixture.admit(["steps"])
+
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+
+            XCTAssertEqual(try fixture.acceptedSamples(kind: "raw_quantity").map(\.value), [17])
+            XCTAssertEqual(try fixture.acceptedSamples(kind: "daily_aggregate").map(\.value), [value])
+            XCTAssertEqual(fixture.dailyRequests, [["steps"]])
+            XCTAssertTrue(try fixture.pending().isEmpty)
+            XCTAssertTrue(try FileOutbox(directory: fixture.root.appendingPathComponent("outbox")).pendingItems().isEmpty)
+            await runtime.automaticSyncRuntime.cancelAndWait()
+        }
+    }
+
+    func testIssue63EmptyStatisticsKeepsDailyObligationAcrossRelaunch() async throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        fixture.emptyStepsDailyRead = true
+        var runtime: HealthBridgeCompanionApplicationRuntime? = try await makeIssue63Runtime(fixture)
+        let original = try fixture.admit(["steps"])
+
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+
+        XCTAssertEqual(try fixture.acceptedSamples(kind: "raw_quantity").map(\.value), [17])
+        XCTAssertEqual(try fixture.stepCursor(), fixture.currentAnchor)
+        XCTAssertEqual(fixture.dailyRequests, [["steps"]])
+        XCTAssertTrue(try fixture.acceptedSamples(kind: "daily_aggregate").isEmpty)
+        XCTAssertEqual(try fixture.pending(), original, "Empty statistics are unknown, not completed daily coverage.")
+        await runtime?.automaticSyncRuntime.cancelAndWait()
+        runtime = nil
+
+        runtime = try await makeIssue63Runtime(fixture)
+        XCTAssertEqual(try fixture.pending(), original, "The unfulfilled daily obligation must survive reopening private stores.")
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+
+        XCTAssertEqual(fixture.dailyRequests, [["steps"], ["steps"]])
+        XCTAssertEqual(try fixture.pending(), original)
+        XCTAssertTrue(try fixture.acceptedSamples(kind: "daily_aggregate").isEmpty, "Never synthesize zero from an empty read.")
+        await runtime?.automaticSyncRuntime.cancelAndWait()
+    }
+
+    func testIssue63ObservationReservedBeforeReadAndStableAcrossRetryAndRestart() async throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        fixture.completedStepsValue = 6
+        fixture.captureObservationOrder = true
+        fixture.recorder.setFailedStepsSampleKinds(["daily_aggregate"])
+        var runtime: HealthBridgeCompanionApplicationRuntime? = try await makeIssue63Runtime(fixture)
+        _ = try fixture.admit(["steps"])
+
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+
+        XCTAssertEqual(try fixture.acceptedSamples(kind: "raw_quantity").map(\.value), [17])
+        XCTAssertEqual(fixture.dailyRequests, [["steps"]])
+        let pending = try FileOutbox(directory: fixture.root.appendingPathComponent("outbox")).pendingItems()
+        let queued = try XCTUnwrap(pending.first, "Populated daily payload must reach the durable outbox before the injected HTTP failure.")
+        let queuedBytes = try Data(contentsOf: queued.fileURL)
+        let queuedBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: queuedBytes)
+        XCTAssertEqual(queuedBatch.samples.map(\.value), [6])
+        await runtime?.automaticSyncRuntime.cancelAndWait()
+        runtime = nil
+
+        fixture.recorder.setFailedStepsSampleKinds([])
+        runtime = try await makeIssue63Runtime(fixture)
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+
+        XCTAssertGreaterThanOrEqual(fixture.recorder.payloads.filter { $0 == queuedBytes }.count, 2, "Retry sends the identical persisted bytes.")
+        XCTAssertTrue(fixture.recorder.acceptedPayloads.contains(queuedBytes))
+        XCTAssertTrue(try fixture.pending().isEmpty)
+        XCTAssertEqual(fixture.ordersBeforeRead.count, 2, "ACK retry must reuse the queued observation without another HealthKit read.")
+        _ = try fixture.admit(["steps"])
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+        XCTAssertEqual(fixture.ordersBeforeRead.count, 4, "Both raw and statistics readers must be reached on both owners.")
+        await runtime?.automaticSyncRuntime.cancelAndWait()
+
+        let firstRawBytes = try XCTUnwrap(fixture.recorder.acceptedPayloads.first)
+        let firstRaw = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: firstRawBytes)
+        let rawOrder = try issue63Observation(in: firstRaw)
+        let dailyOrder = try issue63Observation(in: queuedBatch)
+        let latestBytes = try XCTUnwrap(fixture.recorder.acceptedPayloads.last)
+        let latest = try issue63Observation(in: JSONDecoder().decode(HealthBridgeBatchV1.self, from: latestBytes))
+        XCTAssertEqual(rawOrder.namespace, dailyOrder.namespace)
+        XCTAssertEqual(latest.namespace, dailyOrder.namespace, "Restart retains the durable owner namespace.")
+        XCTAssertLessThan(rawOrder.sequence, dailyOrder.sequence)
+        XCTAssertGreaterThan(latest.sequence, dailyOrder.sequence)
+        for (index, order) in [(0, rawOrder), (1, dailyOrder), (3, latest)] {
+            let beforeRead = try XCTUnwrap(fixture.ordersBeforeRead[index])
+            XCTAssertEqual(beforeRead.observationNamespace, order.namespace)
+            XCTAssertGreaterThan(beforeRead.nextSequence, order.sequence, "Order must already be reserved on disk before the injected reader is entered.")
+        }
+        XCTAssertFalse(rawOrder.rawIntervals.isEmpty)
+        XCTAssertNotNil(dailyOrder.statisticsWindow)
+    }
+
+    func testIssue63HistoricalRawChangeExpandsStatisticsBeyondRollingOverlap() async throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        fixture.sampleStart = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -30, to: Date()))
+        fixture.completedStepsValue = 6
+        let runtime = try await makeIssue63Runtime(fixture)
+        let cursors = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json"))
+        try cursors.saveCursorValue(
+            HealthBridgeUTCFormatter.string(from: Date().addingTimeInterval(-60)),
+            receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: DailyActivityAggregateSyncPolicy.cursorKind
+        )
+        _ = try fixture.admit(["steps"])
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+
+        let acceptedRaw = try XCTUnwrap(fixture.acceptedSamples(kind: "raw_quantity").first)
+        XCTAssertEqual(acceptedRaw.value, 17)
+        XCTAssertEqual(try fixture.acceptedSamples(kind: "daily_aggregate").map(\.value), [6])
+        let reachedStart = try XCTUnwrap(fixture.dailyWindowStarts.first)
+        let affectedDay = Calendar.current.startOfDay(for: fixture.sampleStart)
+        XCTAssertLessThanOrEqual(reachedStart, affectedDay, "An accepted historical raw change must not be stranded outside the three-day statistics overlap.")
+        await runtime.automaticSyncRuntime.cancelAndWait()
+    }
+
+    private func issue63Observation(in batch: HealthBridgeBatchV1) throws -> Issue63ObservationWire {
+        let cursor = try XCTUnwrap(batch.sync.cursors.first {
+            $0.cursorKind == "daily_projection_observation:steps"
+        }, "Successful raw/daily delivery lacks causal observation order and scope.")
+        return try JSONDecoder().decode(Issue63ObservationWire.self, from: Data(cursor.cursorValue.utf8))
+    }
+
+    private func makeIssue63Runtime(
+        _ fixture: AutomaticStepsFaultFixture
+    ) async throws -> HealthBridgeCompanionApplicationRuntime {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw Issue63FixtureError.isolatedHostRequired
+        #else
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PayloadFenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        fixture.sessions.append(session)
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let viewModel = try makeViewModel(
+            root: fixture.root, defaults: defaults,
+            settingsStore: fixture.makeSettingsStore(defaults: defaults),
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: fixture.pairingPendingStore,
+                installationIDStore: fixture.installationStore,
+                cancellationStore: fixture.pairingCancellationStore,
+                installationIDGenerator: { "synthetic-issue63-installation" }
+            ),
+            outbox: try FileOutbox(directory: fixture.root.appendingPathComponent("outbox")),
+            receiverClient: ReceiverClient(session: session),
+            automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: fixture.root.appendingPathComponent("diagnostics.json")),
+            readAnchoredStepChanges: { try fixture.readRaw(anchor: $0, start: $1, receivedAt: $2) },
+            automaticSyncEligibleTypeCodesForTesting: ["steps"],
+            readDailyActivityAggregates: { try fixture.readDaily(types: $0, start: $1, end: $2, calendar: $3) },
+            scheduleDirectBackgroundUploads: { fixture.declineBackgroundScheduling() },
+            terminalBackgroundPayloadDrain: { true },
+            platformBackgroundPayloadDrain: { true }
+        )
+        await viewModel.bootstrap()
+        XCTAssertFalse(viewModel.statusIsError, viewModel.statusMessage)
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(
+            healthDataAvailable: { false },
+            executeQuery: { _ in XCTFail("Issue63 tests must use the injected raw/daily readers.") },
+            stopQuery: { _ in }, enableDelivery: { _, completion in completion(false, nil) },
+            disableDelivery: { _ in }
+        )
+        let platform = AutomaticSyncRuntime.Platform(
+            scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in }, beginBackgroundOwner: { _ in {} },
+            healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+        )
+        return HealthBridgeCompanionApplicationRuntime(viewModel: viewModel, automaticSyncPlatform: platform)
+        #endif
+    }
+
     func testIssue83AutomaticSingleRetryableReadMustNotReportSuccess() async throws {
         try await exerciseIssue83AutomaticReadOutcome(eligibleTypeCodes: ["steps"], failRawRead: true)
     }
@@ -485,6 +666,12 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         automaticSyncPlatform: AutomaticSyncRuntime.Platform? = nil,
         platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil
     ) async throws -> HealthBridgeCompanionApplicationRuntime {
+        if automaticSyncPlatform != nil {
+            let calendar = Calendar.current
+            let yesterday = try XCTUnwrap(calendar.date(byAdding: .day, value: -1,
+                to: calendar.startOfDay(for: Date())))
+            fixture.sampleStart = yesterday.addingTimeInterval(3_600)
+        }
         let defaults = try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PayloadFenceURLProtocol.self]
@@ -516,7 +703,14 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             scheduleDirectBackgroundUploads: {
                 fixture.declineBackgroundScheduling()
             },
-            platformBackgroundPayloadDrain: platformBackgroundPayloadDrain
+            platformBackgroundPayloadDrain: platformBackgroundPayloadDrain,
+            readAnchoredQuantityChanges: { typeCode, _, start, now in
+                HealthKitAnchoredQuantityChanges(
+                    typeCode: typeCode, samples: [], deletedSamples: [],
+                    anchorCursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 0)),
+                    windowStart: start ?? now, windowEnd: now
+                )
+            }
         )
         await viewModel.bootstrap()
         return HealthBridgeCompanionApplicationRuntime(
@@ -2378,7 +2572,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         },
         terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
         terminalRecoveryDrainTimeoutNanoseconds: UInt64 = 5_000_000_000,
-        platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil
+        platformBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
+        readAnchoredQuantityChanges: (@MainActor (String, String?, Date?, Date) async throws -> HealthKitAnchoredQuantityChanges)? = nil
     ) throws -> HealthBridgeCompanionViewModel {
         HealthBridgeCompanionViewModel(
             receiverClient: receiverClient,
@@ -2421,7 +2616,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             cancelInheritedLegacyUploads: cancelInheritedLegacyUploads,
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             terminalRecoveryDrainTimeoutNanoseconds: terminalRecoveryDrainTimeoutNanoseconds,
-            platformBackgroundPayloadDrain: platformBackgroundPayloadDrain
+            platformBackgroundPayloadDrain: platformBackgroundPayloadDrain,
+            readAnchoredQuantityChanges: readAnchoredQuantityChanges
         )
     }
 }
@@ -2571,6 +2767,8 @@ private final class AutomaticStepsFaultFixture {
     var sessions: [URLSession] = []
     var failRawRead = false
     var failStepsDailyRead = false
+    var emptyStepsDailyRead = false
+    var captureObservationOrder = false
     var completedStepsValue: Double = 4_321
     var completedBasalEnergyValue: Double = 345
     private(set) var declinedBackgroundSchedules = 0
@@ -2578,10 +2776,12 @@ private final class AutomaticStepsFaultFixture {
     private(set) var dailyRequests: [[String]] = []
     private(set) var readEvents: [String] = []
     private(set) var completedStepsDay: HealthKitDailyActivityAggregate?
+    private(set) var dailyWindowStarts: [Date] = []
+    private(set) var ordersBeforeRead: [Issue63OutboxOrderSnapshot?] = []
     var ownersStarted = 0
     var ownersFinished = 0
     var platformDrains = 0
-    private let sampleStart: Date
+    var sampleStart: Date
 
     init(sampleStart: Date = Date().addingTimeInterval(-120)) throws {
         self.sampleStart = sampleStart
@@ -2687,6 +2887,7 @@ private final class AutomaticStepsFaultFixture {
     }
 
     func readRaw(anchor: String?, start: Date?, receivedAt: Date) throws -> HealthKitAnchoredStepChanges {
+        try captureOrderBeforeRead()
         readEvents.append("steps.raw")
         let anchor = try XCTUnwrap(anchor)
         rawAnchors.append(anchor)
@@ -2708,12 +2909,15 @@ private final class AutomaticStepsFaultFixture {
     }
 
     func readDaily(types: [String], start: Date, end: Date, calendar: Calendar) throws -> [HealthKitDailyActivityAggregate] {
+        try captureOrderBeforeRead()
         readEvents.append("\(types.joined(separator: ",")).daily")
         dailyRequests.append(types)
+        dailyWindowStarts.append(start)
         XCTAssertFalse(types.isEmpty)
         XCTAssertTrue(Set(types).isSubset(of: ["steps", "basal_energy"]))
         XCTAssertEqual(calendar.timeZone, Calendar.current.timeZone)
         if failStepsDailyRead, types.contains("steps") { throw ReadFailure.injected }
+        if emptyStepsDailyRead, types.contains("steps") { return [] }
         readEvents.append("\(types.joined(separator: ",")).daily.succeeded")
         let today = calendar.startOfDay(for: end)
         let yesterday = try XCTUnwrap(calendar.date(byAdding: .day, value: -1, to: today))
@@ -2745,11 +2949,57 @@ private final class AutomaticStepsFaultFixture {
         return 0
     }
 
+    private func captureOrderBeforeRead() throws {
+        guard captureObservationOrder else { return }
+        let manifest = root.appendingPathComponent("outbox/.fifo-sequence")
+        let snapshot: Issue63OutboxOrderSnapshot?
+        if FileManager.default.fileExists(atPath: manifest.path) {
+            snapshot = try JSONDecoder().decode(Issue63OutboxOrderSnapshot.self, from: Data(contentsOf: manifest))
+        } else {
+            snapshot = nil
+        }
+        ordersBeforeRead.append(snapshot)
+    }
+
     func cleanUp() {
         sessions.forEach { $0.invalidateAndCancel() }
         PayloadFenceURLProtocol.networkRecorder = nil
         UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
         try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private struct Issue63OutboxOrderSnapshot: Decodable {
+    let nextSequence: UInt64
+    let observationNamespace: String?
+}
+
+private enum Issue63FixtureError: Error { case isolatedHostRequired }
+
+private struct Issue63ObservationWire: Decodable {
+    let namespace: String
+    let sequence: UInt64
+    let typeCode: String
+    let rawIntervals: [Issue63RawIntervalWire]
+    let statisticsWindow: HealthBridgeTimeWindow?
+
+    enum CodingKeys: String, CodingKey {
+        case namespace, sequence
+        case typeCode = "type_code"
+        case rawIntervals = "raw_intervals"
+        case statisticsWindow = "statistics_window"
+    }
+}
+
+private struct Issue63RawIntervalWire: Decodable {
+    let clientRecordID: String
+    let startTime: String
+    let endTime: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientRecordID = "client_record_id"
+        case startTime = "start_time"
+        case endTime = "end_time"
     }
 }
 
@@ -3740,5 +3990,803 @@ private final class MemoryMailboxKeychain: MailboxKeychainClient {
 
     func removeTrust(service: String, record: MailboxTrustRecord) throws {
         trustItems.removeValue(forKey: "\(service)\u{0}\(record.rawValue)")
+    }
+}
+
+private struct Issue63ProducerStream: Codable {
+    let version: Int
+    let payloads: [String]
+    let stageEnds: [Int]
+    let replayedPayloadIndex: Int
+}
+
+@MainActor
+private final class Issue63StreamFixture {
+    let base: AutomaticStepsFaultFixture
+    var deleted = false
+    var quantityReads = 0
+
+    init() throws {
+        base = try AutomaticStepsFaultFixture()
+        let today = Calendar.current.startOfDay(for: Date())
+        base.sampleStart = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: today)).addingTimeInterval(3_600)
+        base.completedStepsValue = 6
+    }
+
+    func raw(anchor: String?, start: Date?, now: Date) throws -> HealthKitAnchoredStepChanges {
+        if !deleted { return try base.readRaw(anchor: anchor, start: start, receivedAt: now) }
+        let next = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 43))
+        return HealthKitAnchoredStepChanges(
+            stepSamples: [],
+            deletedStepSamples: anchor == next ? [] : [HealthKitDeletedStepSample(
+                uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000058")), deletedAt: now
+            )],
+            anchorCursorValue: next, windowStart: base.sampleStart, windowEnd: now
+        )
+    }
+
+    func quantity(type: String, anchor: String?, start: Date?, now: Date) throws -> HealthKitAnchoredQuantityChanges {
+        quantityReads += 1
+        let next = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 99))
+        return HealthKitAnchoredQuantityChanges(
+            typeCode: type,
+            samples: anchor == next ? [] : [HealthKitQuantitySampleSummary(
+                uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000063")),
+                typeCode: type, start: base.sampleStart, end: base.sampleStart, value: 70
+            )], deletedSamples: [], anchorCursorValue: next,
+            windowStart: start ?? base.sampleStart, windowEnd: now
+        )
+    }
+}
+
+extension HealthBridgeCompanionResetAdmissionTests {
+    func testIssue63ExportProducerCorrectionStream() async throws {
+        let fixture = try Issue63StreamFixture()
+        defer { fixture.base.cleanUp() }
+        var runtime: HealthBridgeCompanionApplicationRuntime? = try await makeIssue63StreamRuntime(fixture)
+        _ = try fixture.base.admit(["steps"])
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+        XCTAssertEqual(try fixture.base.acceptedSamples(kind: "daily_aggregate").map(\.value), [6])
+        let firstEnd = fixture.base.recorder.acceptedPayloads.count
+        let originalDailyIndex = try XCTUnwrap(fixture.base.recorder.acceptedPayloads.firstIndex { data in
+            (try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: data))?.samples.contains {
+                $0.metadata["sample_kind"] == "daily_aggregate"
+            } == true
+        })
+
+        fixture.deleted = true
+        fixture.base.emptyStepsDailyRead = true
+        let pending = try fixture.base.admit(["steps"])
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+        XCTAssertEqual(try fixture.base.pending(), pending)
+        let deletedEnd = fixture.base.recorder.acceptedPayloads.count
+        XCTAssertGreaterThan(deletedEnd, firstEnd)
+        await runtime?.automaticSyncRuntime.cancelAndWait()
+        runtime = nil
+
+        fixture.base.emptyStepsDailyRead = false
+        fixture.base.completedStepsValue = 0
+        runtime = try await makeIssue63StreamRuntime(fixture)
+        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps"]))
+        XCTAssertEqual(try fixture.base.acceptedSamples(kind: "daily_aggregate").map(\.value), [6, 0])
+        XCTAssertTrue(try fixture.base.pending().isEmpty)
+        await runtime?.automaticSyncRuntime.cancelAndWait()
+
+        var payloads = fixture.base.recorder.acceptedPayloads.map { String(decoding: $0, as: UTF8.self) }
+        let recollectedEnd = payloads.count
+        payloads.append(payloads[originalDailyIndex])
+        let export = Issue63ProducerStream(version: 1, payloads: payloads,
+            stageEnds: [firstEnd, deletedEnd, recollectedEnd, payloads.count], replayedPayloadIndex: originalDailyIndex)
+        let attachment = XCTAttachment(data: try JSONEncoder().encode(export), uniformTypeIdentifier: "public.json")
+        attachment.name = "issue63-producer-stream-v1.json"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testIssue63UnknownStatisticsDoesNotStarveAnotherSelectedType() async throws {
+        let fixture = try Issue63StreamFixture()
+        defer { fixture.base.cleanUp() }
+        fixture.base.emptyStepsDailyRead = true
+        let runtime = try await makeIssue63StreamRuntime(fixture, eligible: ["steps", "weight"])
+        let pending = try fixture.base.admit(["steps", "weight"])
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["steps", "weight"]))
+        XCTAssertEqual(fixture.base.dailyRequests, [["steps"]])
+        XCTAssertEqual(fixture.quantityReads, 1)
+        XCTAssertEqual(try fixture.base.acceptedSamples(kind: "raw_quantity").filter { $0.typeCode == "weight" }.map(\.value), [70])
+        XCTAssertEqual(try fixture.base.pending(), pending.filter { $0.key == "steps" })
+        await runtime.automaticSyncRuntime.cancelAndWait()
+    }
+
+    func testIssue63RawChunksKeepEvidenceAndACKProgressAcrossReopen() throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        let anchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 63))
+        let start = Date().addingTimeInterval(-30 * 86_400)
+        let count = GenericQuantitySyncBatchFactory.defaultMaxSamplesPerBatch + 1
+        let samples = try (1...count).map { index in
+            HealthKitQuantitySampleSummary(
+                uuid: try XCTUnwrap(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012x", index))),
+                typeCode: "basal_energy", start: start, end: start.addingTimeInterval(60), value: 1
+            )
+        }
+        let changes = HealthKitAnchoredQuantityChanges(typeCode: "basal_energy", samples: samples,
+            deletedSamples: [], anchorCursorValue: anchor, windowStart: start, windowEnd: Date())
+        let directory = fixture.root.appendingPathComponent("chunks")
+        var outbox = try FileOutbox(directory: directory)
+        let order = try outbox.reserveDailyProjectionObservation()
+        let batches = try outbox.prepareProjectionRawBatches(
+            GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(changes: changes),
+            order: order, receiverBindingID: fixture.receiverBindingID, typeCode: "basal_energy",
+            fallbackStart: start, end: Date(), calendar: .current
+        )
+        XCTAssertGreaterThan(batches.count, 1)
+        for (index, batch) in batches.enumerated() {
+            let evidence = try XCTUnwrap(batch.sync.cursors.first { $0.cursorKind == "daily_projection_observation:basal_energy" })
+            let observation = try JSONDecoder().decode(Issue63ObservationWire.self, from: Data(evidence.cursorValue.utf8))
+            XCTAssertEqual(observation.sequence, order.sequence)
+            XCTAssertEqual(Set(observation.rawIntervals.map(\.clientRecordID)), Set(batch.samples.map(\.clientRecordID)))
+            XCTAssertEqual(batch.sync.cursors.filter { !$0.cursorKind.hasPrefix("daily_projection_observation:") }.count, index == batches.count - 1 ? 1 : 0)
+        }
+        let cursorKind = GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "basal_energy")
+        let cursorStore = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("chunk-cursors.json"))
+        let payloads = try batches.map { try HealthBridgeBatchEncoder().encode($0) }
+        let items = try outbox.enqueueSequence(payloads, receiverIdentity: fixture.receiverBindingID,
+            cursorCheckpoint: FileOutboxCursorCheckpoint(receiverIdentity: fixture.receiverBindingID,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: cursorKind, cursorValue: anchor))
+        let first = try XCTUnwrap(items.first)
+        let finalizer = OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: cursorStore)
+        XCTAssertFalse(try finalizer.recordDirectReceiverAcceptance(itemID: first.id, receiverBindingID: fixture.receiverBindingID))
+        XCTAssertNil(try cursorStore.cursorValue(receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: cursorKind))
+        outbox = try FileOutbox(directory: directory)
+        let remaining = try outbox.pendingItems()
+        XCTAssertEqual(remaining.count, items.count - 1)
+        let reopenedFinalizer = OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: cursorStore)
+        for item in remaining {
+            XCTAssertTrue(payloads.contains(try Data(contentsOf: item.fileURL)))
+            _ = try reopenedFinalizer.recordDirectReceiverAcceptance(itemID: item.id, receiverBindingID: fixture.receiverBindingID)
+        }
+        XCTAssertEqual(try cursorStore.cursorValue(receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: cursorKind), anchor)
+        let next = try outbox.reserveDailyProjectionObservation()
+        XCTAssertEqual(next.namespace, order.namespace)
+        XCTAssertGreaterThan(next.sequence, order.sequence)
+        XCTAssertNotNil(try outbox.projectionRepairStart(receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, typeCodes: ["basal_energy"]))
+    }
+
+    func testIssue63PartialStatisticsACKKeepsRemainingHistoricalRepair() throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        let calendar = Calendar.current
+        let end = calendar.startOfDay(for: Date())
+        let first = try XCTUnwrap(calendar.date(byAdding: .day, value: -30, to: end))
+        let second = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: first))
+        let third = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: second))
+        let directory = fixture.root.appendingPathComponent("partial-repair")
+        var outbox = try FileOutbox(directory: directory)
+        let rawOrder = try outbox.reserveDailyProjectionObservation()
+        let changes = HealthKitAnchoredQuantityChanges(typeCode: "basal_energy", samples: [
+            HealthKitQuantitySampleSummary(uuid: UUID(), typeCode: "basal_energy", start: first,
+                end: second, value: 1),
+            HealthKitQuantitySampleSummary(uuid: UUID(), typeCode: "basal_energy", start: second,
+                end: third, value: 2)
+        ], deletedSamples: [], anchorCursorValue: "synthetic-partial-anchor", windowStart: first, windowEnd: end)
+        _ = try outbox.prepareProjectionRawBatches(
+            GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(changes: changes),
+            order: rawOrder, receiverBindingID: fixture.receiverBindingID, typeCode: "basal_energy",
+            fallbackStart: first, end: end, calendar: calendar)
+        let statisticsOrder = try outbox.reserveDailyProjectionObservation()
+        let firstDay = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            aggregates: [HealthKitDailyActivityAggregate(typeCode: "basal_energy", dayStart: first,
+                dayEnd: second, value: 6)], typeCodes: ["basal_energy"], windowStart: first, windowEnd: third))
+        let batch = try DailyProjectionObservation(order: statisticsOrder, typeCode: "basal_energy",
+            statisticsWindow: HealthBridgeTimeWindow(startTime: HealthBridgeUTCFormatter.string(from: first),
+                endTime: HealthBridgeUTCFormatter.string(from: third))).appending(to: firstDay)
+        let bytes = try HealthBridgeBatchEncoder().encode(batch)
+        let item = try outbox.enqueue(bytes, receiverIdentity: fixture.receiverBindingID)
+        XCTAssertEqual(try outbox.projectionRepairStart(receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, typeCodes: ["basal_energy"]), first)
+        outbox = try FileOutbox(directory: directory)
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), bytes)
+        try outbox.markUploaded(item)
+        outbox = try FileOutbox(directory: directory)
+        XCTAssertEqual(try outbox.projectionRepairStart(receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, typeCodes: ["basal_energy"]), second)
+        let newer = try outbox.reserveDailyProjectionObservation()
+        XCTAssertEqual(newer.namespace, statisticsOrder.namespace)
+        XCTAssertGreaterThan(newer.sequence, statisticsOrder.sequence)
+        let secondDay = try XCTUnwrap(DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
+            aggregates: [HealthKitDailyActivityAggregate(typeCode: "basal_energy", dayStart: second,
+                dayEnd: third, value: 0)], typeCodes: ["basal_energy"], windowStart: second, windowEnd: third))
+        let recollection = try DailyProjectionObservation(order: newer, typeCode: "basal_energy",
+            statisticsWindow: HealthBridgeTimeWindow(startTime: HealthBridgeUTCFormatter.string(from: second),
+                endTime: HealthBridgeUTCFormatter.string(from: third))).appending(to: secondDay)
+        try outbox.markUploaded(outbox.enqueue(HealthBridgeBatchEncoder().encode(recollection),
+            receiverIdentity: fixture.receiverBindingID))
+        XCTAssertNil(try outbox.projectionRepairStart(receiverBindingID: fixture.receiverBindingID,
+            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, typeCodes: ["basal_energy"]))
+    }
+
+    func testIssue63ObservationCounterExhaustionNeverWrapsOrResets() throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        let directory = fixture.root.appendingPathComponent("exhausted-order")
+        _ = try FileOutbox(directory: directory)
+        let manifest = directory.appendingPathComponent(".fifo-sequence")
+        let bytes = Data(#"{"version":3,"nextSequence":18446744073709551615,"entries":[]}"#.utf8)
+        try bytes.write(to: manifest, options: [.atomic])
+        let outbox = try FileOutbox(directory: directory)
+        XCTAssertThrowsError(try outbox.reserveDailyProjectionObservation())
+        XCTAssertEqual(try Data(contentsOf: manifest), bytes)
+    }
+
+    private func makeIssue63StreamRuntime(_ fixture: Issue63StreamFixture,
+        eligible: [String] = ["steps"]) async throws -> HealthBridgeCompanionApplicationRuntime {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw Issue63FixtureError.isolatedHostRequired
+        #else
+        let base = fixture.base
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: base.suiteName))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PayloadFenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        base.sessions.append(session)
+        PayloadFenceURLProtocol.networkRecorder = base.recorder
+        let viewModel = HealthBridgeCompanionViewModel(
+            receiverClient: ReceiverClient(session: session), settingsStore: base.makeSettingsStore(defaults: defaults),
+            pairingStateStore: ReceiverPairingStateStore(pendingStore: base.pairingPendingStore,
+                installationIDStore: base.installationStore, cancellationStore: base.pairingCancellationStore,
+                installationIDGenerator: { "synthetic-issue63-stream" }),
+            backgroundSyncStore: BackgroundSyncSettingsStore(userDefaults: defaults),
+            automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: base.root.appendingPathComponent("diagnostics.json")),
+            healthPermissionRequestStore: CompanionHealthPermissionRequestStore(userDefaults: defaults),
+            healthHistoryDepthStore: HealthHistoryDepthSelectionStore(userDefaults: defaults),
+            historicalBackfillStateStore: HealthHistoricalBackfillStateStore(userDefaults: defaults),
+            quantityObservationStore: QuantityObservationStore(userDefaults: defaults),
+            coreLaneUploadProofStore: CoreLaneUploadProofStore(userDefaults: defaults),
+            outbox: try FileOutbox(directory: base.root.appendingPathComponent("outbox")),
+            outboxDirectoryURL: base.root.appendingPathComponent("outbox"),
+            cursorStore: try FileSyncCursorStore(fileURL: base.root.appendingPathComponent("cursors.json")),
+            cursorStoreFileURL: base.root.appendingPathComponent("cursors.json"),
+            sleepManifestStore: try FileSleepSyncManifestStore(fileURL: base.root.appendingPathComponent("sleep.json")),
+            sleepManifestFileURL: base.root.appendingPathComponent("sleep.json"),
+            sleepResetEpochStore: SleepResetEpochStore(tokenStore: MemoryReceiverTokenStore(), epochFloorProvider: { 1 }),
+            mailboxKeyStore: MailboxKeyStore(service: "synthetic.issue63-stream", keychain: MemoryMailboxKeychain()),
+            readAnchoredStepChanges: { try fixture.raw(anchor: $0, start: $1, now: $2) },
+            automaticSyncEligibleTypeCodesForTesting: eligible,
+            readDailyActivityAggregates: { try base.readDaily(types: $0, start: $1, end: $2, calendar: $3) },
+            scheduleDirectBackgroundUploads: { base.declineBackgroundScheduling() },
+            cancelInheritedLegacyUploads: { BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true) },
+            terminalBackgroundPayloadDrain: { true }, platformBackgroundPayloadDrain: { true },
+            readAnchoredQuantityChanges: { try fixture.quantity(type: $0, anchor: $1, start: $2, now: $3) }
+        )
+        await viewModel.bootstrap()
+        XCTAssertFalse(viewModel.statusIsError, viewModel.statusMessage)
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(healthDataAvailable: { false },
+            executeQuery: { _ in XCTFail("Unexpected native HealthKit query") }, stopQuery: { _ in },
+            enableDelivery: { _, completion in completion(false, nil) }, disableDelivery: { _ in })
+        let platform = AutomaticSyncRuntime.Platform(scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in }, beginBackgroundOwner: { _ in {} },
+            healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator)
+        return HealthBridgeCompanionApplicationRuntime(viewModel: viewModel, automaticSyncPlatform: platform)
+        #endif
+    }
+}
+
+private enum Issue63KnownWindowMode: Equatable, Sendable {
+    case missingKnownDay, fullObservedWindow, neverObservedBlank
+}
+
+private enum Issue63KnownWindowPhase: String, Sendable {
+    case seed, foreground, partial, restore
+}
+
+private func issue63KnownWindowRequire(
+    _ condition: Bool, _ message: String, file: StaticString = #filePath, line: UInt = #line
+) throws {
+    _ = try XCTUnwrap(condition ? true : nil, message, file: file, line: line)
+}
+
+private struct Issue63KnownWindowManifest: Decodable {
+    struct Repair: Decodable {
+        let start: Date
+        let end: Date
+        let sequence: UInt64
+    }
+    let nextSequence: UInt64
+    let projectionRepairs: [String: [Repair]]?
+}
+
+private final class Issue63KnownWindowTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func record(_ event: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        events.append(event)
+    }
+
+    var snapshot: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
+@MainActor
+private final class Issue63KnownWindowFixture {
+    static let typeCode = "basal_energy"
+    let root: URL
+    let suiteName = "Issue63KnownWindow.\(UUID().uuidString)"
+    let token = MemoryReceiverTokenStore()
+    let backup = MemoryReceiverTokenStore()
+    let pendingPairing = MemoryReceiverTokenStore()
+    let installation = MemoryReceiverTokenStore()
+    let cancellation = MemoryReceiverTokenStore()
+    let recorder = PayloadFenceNetworkRecorder()
+    let trace = Issue63KnownWindowTrace()
+    let mode: Issue63KnownWindowMode
+    let a: Date
+    let b: Date
+    let today: Date
+    let seedAnchor: String
+    let partialAnchor: String
+    private(set) var binding = ""
+    var phase = Issue63KnownWindowPhase.seed
+    var sessions: [URLSession] = []
+    var runtimes: [HealthBridgeCompanionApplicationRuntime] = []
+    var authorizationRequests: [[String]] = []
+    var ownersStarted = 0
+    var ownersFinished = 0
+
+    var rawKind: String {
+        GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: Self.typeCode)
+    }
+
+    init(mode: Issue63KnownWindowMode) throws {
+        self.mode = mode
+        let calendar = Calendar.current
+        today = calendar.startOfDay(for: Date())
+        a = try XCTUnwrap(calendar.date(byAdding: .day, value: -6, to: today))
+        b = try XCTUnwrap(calendar.date(byAdding: .day, value: -4, to: today))
+        seedAnchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 101))
+        partialAnchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 102))
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("Issue63KnownWindow-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let savedSettings = settings(defaults)
+        try savedSettings.save(receiverURLString: "https://synthetic.example.test/v1/batches",
+            bearerToken: "synthetic-known-window-credential", rotateBindingID: true)
+        binding = try XCTUnwrap(savedSettings.receiverBindingID)
+        try BackgroundSyncSettingsStore(userDefaults: defaults).setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes))
+        let entry = try XCTUnwrap(HealthKitTypeCatalog.entry(for: Self.typeCode))
+        try issue63KnownWindowRequire(entry.aggregation == .sum
+            && HealthKitTypeCatalog.healthType(from: entry).category == .activity
+            && HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(Self.typeCode),
+            "SETUP: supported generic cumulative activity dispatch is required.")
+    }
+
+    func settings(_ defaults: UserDefaults) -> ReceiverSettingsStore {
+        ReceiverSettingsStore(userDefaults: defaults, tokenStore: token,
+            preCutoverBackupStore: backup, synchronize: { true })
+    }
+
+    func pending() throws -> [String: Int] {
+        try BackgroundSyncSettingsStore(userDefaults: XCTUnwrap(UserDefaults(suiteName: suiteName)))
+            .loadPendingObserverTypeCodeGenerations()
+    }
+
+    func cursor(_ kind: String) throws -> String? {
+        try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
+            .cursorValue(receiverBindingID: binding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: kind)
+    }
+
+    func repairs() throws -> [Issue63KnownWindowManifest.Repair] {
+        let path = root.appendingPathComponent("outbox/.fifo-sequence")
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let state = try JSONDecoder().decode(Issue63KnownWindowManifest.self, from: Data(contentsOf: path))
+        return state.projectionRepairs?[binding + "\n" + HealthBridgeAppleHealthSource.phone.sourceKey + "\n" + Self.typeCode] ?? []
+    }
+
+    func reservedSequence() throws -> UInt64 {
+        let state = try JSONDecoder().decode(Issue63KnownWindowManifest.self,
+            from: Data(contentsOf: root.appendingPathComponent("outbox/.fifo-sequence")))
+        try issue63KnownWindowRequire(state.nextSequence > 1, "SETUP: observation must be durably reserved before reading.")
+        return state.nextSequence - 1
+    }
+
+    func dailySamples(since index: Int = 0) throws -> [HealthBridgeSample] {
+        try recorder.acceptedPayloads.dropFirst(index).flatMap {
+            try JSONDecoder().decode(HealthBridgeBatchV1.self, from: $0).samples
+        }.filter { $0.typeCode == Self.typeCode && $0.metadata["sample_kind"] == "daily_aggregate" }
+    }
+
+    func recordState(_ label: String) throws {
+        let intervals = try repairs().map {
+            "(\($0.start.timeIntervalSince(a)),\($0.end.timeIntervalSince(a)),\($0.sequence))"
+        }.joined(separator: ",")
+        trace.record("\(label): repairs=[\(intervals)] pending=\(try pending().values.sorted()) accepted=\(recorder.acceptedPayloads.count)")
+    }
+
+    func assertFresh() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        try issue63KnownWindowRequire(try cursor(rawKind) == nil
+            && cursor(GenericQuantitySyncBatchFactory.anchoredCursorKind(for: Self.typeCode)) == nil
+            && cursor(DailyActivityAggregateSyncPolicy.cursorKind) == nil
+            && repairs().isEmpty && pending().isEmpty
+            && QuantityObservationStore(userDefaults: defaults).observedTypeCodes.isEmpty
+            && !CoreLaneUploadProofStore(userDefaults: defaults).hasUploadedRecords(lane: .steps, receiverBindingID: binding)
+            && !CoreLaneUploadProofStore(userDefaults: defaults).hasUploadedRecords(lane: .workouts, receiverBindingID: binding),
+            "SETUP: fresh stores must contain no manufactured progress, proof, history or repair.")
+        trace.record("fresh.no-progress.ok")
+    }
+
+    func readRaw(type: String, anchor: String?, start: Date?, now: Date) throws -> HealthKitAnchoredQuantityChanges {
+        try issue63KnownWindowRequire(type == Self.typeCode, "SETUP: unexpected selected raw type.")
+        try issue63KnownWindowRequire(try cursor(rawKind) == anchor, "SETUP: reader must use the actual ACK-owned automatic cursor.")
+        let days: [Date]
+        let next: String
+        switch phase {
+        case .seed, .foreground:
+            if anchor == nil {
+                try issue63KnownWindowRequire(phase == .seed, "SETUP: foreground entry cannot manufacture a raw baseline.")
+                days = mode == .neverObservedBlank ? [a] : [a, b]
+                next = seedAnchor
+                if let start {
+                    try issue63KnownWindowRequire(start <= a.addingTimeInterval(3_600), "SETUP: raw seed must lie within the requested history.")
+                }
+            } else {
+                try issue63KnownWindowRequire(anchor == seedAnchor, "SETUP: seed re-entry must use its earned anchor.")
+                days = []
+                next = seedAnchor
+            }
+        case .partial:
+            try issue63KnownWindowRequire(anchor == seedAnchor || anchor == partialAnchor,
+                "SETUP: partial collection requires previously ACKed generic raw progress.")
+            days = anchor == seedAnchor ? [a] : []
+            next = partialAnchor
+        case .restore:
+            try issue63KnownWindowRequire(anchor == partialAnchor, "SETUP: cold launch must retain the earned partial raw anchor.")
+            days = []
+            next = partialAnchor
+        }
+        let order = try reservedSequence()
+        trace.record("\(phase.rawValue).raw.read: records=\(days.count) order=\(order) anchorKnown=\(anchor != nil)")
+        if !days.isEmpty {
+            try armACK(daily: false, order: order)
+        }
+        let samples = try days.map { day in
+            HealthKitQuantitySampleSummary(
+                uuid: try XCTUnwrap(UUID(uuidString: day == a
+                    ? "00000000-0000-0000-0000-000000006301" : "00000000-0000-0000-0000-000000006302")),
+                typeCode: type, start: day.addingTimeInterval(3_600), end: day.addingTimeInterval(3_660),
+                value: phase == .partial ? 7 : 6)
+        }
+        return HealthKitAnchoredQuantityChanges(typeCode: type, samples: samples, deletedSamples: [],
+            anchorCursorValue: next, windowStart: start ?? a, windowEnd: now)
+    }
+
+    func readDaily(types: [String], start: Date, end: Date, calendar: Calendar) throws -> [HealthKitDailyActivityAggregate] {
+        try issue63KnownWindowRequire(types == [Self.typeCode], "SETUP: unexpected merged statistics type.")
+        let before = try repairs()
+        if phase == .partial {
+            let old = try dailySamples().filter { $0.startTime == HealthBridgeUTCFormatter.string(from: b) }
+            try issue63KnownWindowRequire(before.count == 1 && before[0].start == a
+                && before[0].end == calendar.date(byAdding: .day, value: 1, to: a),
+                "SETUP: only A has a pending raw repair; B must not be pre-seeded.")
+            try issue63KnownWindowRequire(mode == .neverObservedBlank ? old.isEmpty : old.last?.value == 6,
+                "SETUP: B must have the intended genuinely observed or never-observed history.")
+            try issue63KnownWindowRequire(start <= a
+                && calendar.date(byAdding: .day, value: 1, to: b).map { $0 <= end } == true,
+                "SETUP: the actual partial statistics interval must contain complete A and B.")
+            trace.record("partial.A-only.no-B-repair.window-AB.ok")
+        }
+        if phase == .restore {
+            try issue63KnownWindowRequire(before.count == 1 && before[0].start == b && start <= b,
+                "F3: recent cursor advancement must not strand the omitted known day.")
+            trace.record("restore.query-reaches-B.ok")
+        }
+        var days: [Date]
+        if mode == .fullObservedWindow {
+            days = []
+            var day = calendar.startOfDay(for: start)
+            while day < calendar.startOfDay(for: end) {
+                days.append(day)
+                day = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: day))
+            }
+        } else if mode == .neverObservedBlank {
+            days = [a]
+        } else {
+            switch phase {
+            case .seed, .foreground: days = [a, b]
+            case .partial: days = [a]
+            case .restore: days = [b]
+            }
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        let values = try days.map { day in
+            let next = try XCTUnwrap(calendar.date(byAdding: .day, value: 1, to: day))
+            try issue63KnownWindowRequire(day >= start && next <= end, "SETUP: completed values must lie within the real requested window.")
+            return HealthKitDailyActivityAggregate(typeCode: Self.typeCode, dayStart: day, dayEnd: next,
+                value: phase == .partial ? 7 : (phase == .restore ? 9 : 6), isComplete: true,
+                calendarDay: formatter.string(from: day), timeZoneIdentifier: calendar.timeZone.identifier)
+        }
+        trace.record("\(phase.rawValue).daily.read: startFromA=\(start.timeIntervalSince(a)) endFromA=\(end.timeIntervalSince(a)) records=\(values.count)")
+        try armACK(daily: true, order: reservedSequence())
+        return values
+    }
+
+    func armACK(daily: Bool, order: UInt64) throws {
+        let root = self.root, binding = self.binding, suiteName = self.suiteName
+        let type = Self.typeCode, phase = self.phase, mode = self.mode
+        let a = self.a, b = self.b, trace = self.trace, rawKind = self.rawKind
+        let oldRaw = try cursor(rawKind), oldDaily = try cursor(DailyActivityAggregateSyncPolicy.cursorKind)
+        let admitted = try pending()
+        let source = HealthBridgeAppleHealthSource.phone.sourceKey
+        recorder.setBeforeResponse { bytes, _ in
+            do {
+                let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes)
+                let slot = try XCTUnwrap(batch.sync.cursors.first { $0.cursorKind == DailyProjectionObservation.cursorPrefix + type })
+                let observation = try JSONDecoder().decode(Issue63ObservationWire.self, from: Data(slot.cursorValue.utf8))
+                try issue63KnownWindowRequire(observation.sequence == order
+                    && (observation.statisticsWindow != nil) == daily
+                    && batch.deletedRecords.isEmpty
+                    && batch.samples.allSatisfy {
+                        $0.typeCode == type && $0.metadata["sample_kind"] == (daily ? "daily_aggregate" : "raw_quantity")
+                    },
+                    "SETUP: real encoded generic payload must match its reserved read, without Steps cleanup tombstones.")
+                let head = try XCTUnwrap(FileOutbox(directory: root.appendingPathComponent("outbox")).pendingItems().first)
+                try issue63KnownWindowRequire(try Data(contentsOf: head.fileURL) == bytes,
+                    "SETUP: inspected bytes must be the actual durable FIFO head.")
+                let cursors = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
+                try issue63KnownWindowRequire(try cursors.cursorValue(receiverBindingID: binding, sourceKey: source, cursorKind: rawKind) == oldRaw
+                    && cursors.cursorValue(receiverBindingID: binding, sourceKey: source, cursorKind: DailyActivityAggregateSyncPolicy.cursorKind) == oldDaily,
+                    "SETUP: a payload cannot advance its checkpoint before actual ACK.")
+                let pending = try BackgroundSyncSettingsStore(userDefaults: XCTUnwrap(UserDefaults(suiteName: suiteName)))
+                    .loadPendingObserverTypeCodeGenerations()
+                try issue63KnownWindowRequire(pending == admitted && (phase == .foreground || pending[type] != nil),
+                    "SETUP: matching observer generation must remain pending before actual ACK.")
+                let state = try JSONDecoder().decode(Issue63KnownWindowManifest.self,
+                    from: Data(contentsOf: root.appendingPathComponent("outbox/.fifo-sequence")))
+                let repairs = state.projectionRepairs?[binding + "\n" + source + "\n" + type] ?? []
+                if phase == .partial {
+                    try issue63KnownWindowRequire(repairs.contains { $0.start == a }
+                        && repairs.allSatisfy { $0.start == a || (daily && mode == .missingKnownDay && $0.start == b) },
+                        "SETUP: A stays pending before ACK; a new B obligation may only follow the partial result.")
+                }
+                if phase == .restore {
+                    try issue63KnownWindowRequire(repairs.count == 1 && repairs[0].start == b,
+                        "F3: B must remain pending before the real recollection ACK.")
+                }
+                if daily {
+                    try issue63KnownWindowRequire(batch.samples.allSatisfy {
+                        $0.metadata["aggregation_completeness"] == "complete" && $0.value.isFinite
+                    }, "SETUP: only actual finite completed merged values may cover repair work.")
+                }
+                trace.record("\(phase.rawValue).\(daily ? "daily" : "raw").before-ACK.ok: order=\(order) repairs=\(repairs.count) pending=\(pending.values.sorted())")
+            } catch {
+                trace.record("SETUP.transport-inspection.failed")
+                throw error
+            }
+        }
+    }
+
+    func makeRuntime() throws -> HealthBridgeCompanionApplicationRuntime {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw Issue63FixtureError.isolatedHostRequired
+        #else
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PayloadFenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        sessions.append(session)
+        PayloadFenceURLProtocol.networkRecorder = recorder
+        let viewModel = HealthBridgeCompanionViewModel(
+            receiverClient: ReceiverClient(session: session), settingsStore: settings(defaults),
+            pairingStateStore: ReceiverPairingStateStore(pendingStore: pendingPairing,
+                installationIDStore: installation, cancellationStore: cancellation,
+                installationIDGenerator: { "synthetic-known-window-installation" }),
+            backgroundSyncStore: BackgroundSyncSettingsStore(userDefaults: defaults),
+            automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json")),
+            healthPermissionRequestStore: CompanionHealthPermissionRequestStore(userDefaults: defaults),
+            healthHistoryDepthStore: HealthHistoryDepthSelectionStore(userDefaults: defaults),
+            historicalBackfillStateStore: HealthHistoricalBackfillStateStore(userDefaults: defaults),
+            quantityObservationStore: QuantityObservationStore(userDefaults: defaults),
+            coreLaneUploadProofStore: CoreLaneUploadProofStore(userDefaults: defaults),
+            outbox: try FileOutbox(directory: root.appendingPathComponent("outbox")),
+            outboxDirectoryURL: root.appendingPathComponent("outbox"),
+            cursorStore: try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            cursorStoreFileURL: root.appendingPathComponent("cursors.json"),
+            sleepManifestStore: try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json")),
+            sleepManifestFileURL: root.appendingPathComponent("sleep.json"),
+            sleepResetEpochStore: SleepResetEpochStore(tokenStore: MemoryReceiverTokenStore(), epochFloorProvider: { 1 }),
+            mailboxKeyStore: MailboxKeyStore(service: "synthetic.known-window", keychain: MemoryMailboxKeychain()),
+            readAnchoredStepChanges: { _, _, _ in
+                XCTFail("SETUP: unexpected Steps reader.")
+                throw Issue63FixtureError.isolatedHostRequired
+            },
+            automaticSyncEligibleTypeCodesForTesting: [Self.typeCode],
+            readDailyActivityAggregates: { try self.readDaily(types: $0, start: $1, end: $2, calendar: $3) },
+            scheduleDirectBackgroundUploads: { 0 },
+            cancelInheritedLegacyUploads: { BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true) },
+            terminalBackgroundPayloadDrain: { true }, platformBackgroundPayloadDrain: { true },
+            readAnchoredQuantityChanges: { try self.readRaw(type: $0, anchor: $1, start: $2, now: $3) },
+            requestProjectionReadAuthorization: { types in
+                try issue63KnownWindowRequire(self.phase == .foreground && types == [Self.typeCode],
+                    "SETUP: only the explicit foreground daily seed requests authorization.")
+                self.authorizationRequests.append(types)
+                self.trace.record("foreground.authorization-request.injected")
+            })
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(healthDataAvailable: { false },
+            executeQuery: { _ in XCTFail("SETUP: unexpected real HealthKit query.") }, stopQuery: { _ in },
+            enableDelivery: { _, completion in completion(false, nil) }, disableDelivery: { _ in })
+        let platform = AutomaticSyncRuntime.Platform(scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in }, beginBackgroundOwner: { _ in
+                self.ownersStarted += 1
+                let label = self.phase.rawValue
+                self.trace.record("\(label).owner.started")
+                return {
+                    self.ownersFinished += 1
+                    self.trace.record("\(label).owner.finished")
+                }
+            }, healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator)
+        let runtime = HealthBridgeCompanionApplicationRuntime(viewModel: viewModel, automaticSyncPlatform: platform)
+        runtimes.append(runtime)
+        return runtime
+        #endif
+    }
+
+    func join(_ runtime: HealthBridgeCompanionApplicationRuntime) async throws {
+        await runtime.automaticSyncRuntime.waitForForegroundCatchUp()
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+        try issue63KnownWindowRequire(!runtime.viewModel.automaticSyncOwnerIsActive
+            && ownersStarted == ownersFinished, "SETUP: every started owner must be joined before changing phase.")
+        try issue63KnownWindowRequire(!trace.snapshot.contains("SETUP.transport-inspection.failed"),
+            "SETUP: transport preconditions failed; later product markers are not qualified.")
+    }
+
+    func stopAndJoin(_ runtime: HealthBridgeCompanionApplicationRuntime) async {
+        let completion = runtime.automaticSyncRuntime.foregroundCatchUpCompletion()
+        runtime.automaticSyncRuntime.stopAdmission()
+        await completion?()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        await runtime.viewModel.waitForAutomaticSyncDisableCleanup()
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+    }
+
+    func tearDown() async {
+        for runtime in runtimes { await stopAndJoin(runtime) }
+        runtimes.removeAll()
+        XCTAssertEqual(ownersStarted, ownersFinished)
+        XCTContext.runActivity(named: "Issue63 synthetic causal state transitions") { activity in
+            let attachment = XCTAttachment(string: trace.snapshot.joined(separator: "\n"))
+            attachment.lifetime = .keepAlways
+            activity.add(attachment)
+        }
+        sessions.forEach { $0.invalidateAndCancel() }
+        sessions.removeAll()
+        UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+extension HealthBridgeCompanionResetAdmissionTests {
+    func testIssue63FollowupPartialWindowRetainsMissingKnownDayAcrossACKAndRestart() async throws {
+        try await exerciseIssue63KnownWindow(.missingKnownDay)
+    }
+
+    func testIssue63FollowupFullyObservedWindowRetiresOnlyAfterACK() async throws {
+        try await exerciseIssue63KnownWindow(.fullObservedWindow)
+    }
+
+    func testIssue63FollowupNeverObservedBlankDayDoesNotCreateRepair() async throws {
+        try await exerciseIssue63KnownWindow(.neverObservedBlank)
+    }
+
+    private func exerciseIssue63KnownWindow(_ mode: Issue63KnownWindowMode) async throws {
+        let fixture = try Issue63KnownWindowFixture(mode: mode)
+        let previousRecorder = PayloadFenceURLProtocol.networkRecorder
+        addTeardownBlock { @MainActor in
+            await fixture.tearDown()
+            PayloadFenceURLProtocol.networkRecorder = previousRecorder
+        }
+        var runtime: HealthBridgeCompanionApplicationRuntime? = try fixture.makeRuntime()
+        try fixture.assertFresh()
+        await runtime?.bootstrap()
+        try await fixture.join(XCTUnwrap(runtime))
+        try fixture.recordState("seed.accepted-and-owner-joined")
+        try issue63KnownWindowRequire(try fixture.cursor(fixture.rawKind) == fixture.seedAnchor
+            && fixture.repairs().isEmpty && fixture.pending().isEmpty
+            && fixture.trace.snapshot.contains(where: { $0.hasPrefix("seed.daily.before-ACK.ok") }),
+            "SETUP: natural launch must earn actual raw progress and retire all seeded repairs through ACK.")
+        let initialB = try fixture.dailySamples().filter { $0.startTime == HealthBridgeUTCFormatter.string(from: fixture.b) }
+        try issue63KnownWindowRequire(mode == .neverObservedBlank ? initialB.isEmpty : initialB.last?.value == 6,
+            "SETUP: accepted seed must establish the intended known-B or never-observed-B control.")
+
+        fixture.phase = .foreground
+        let seededDaily = await runtime?.viewModel.syncDailyActivityAggregates(typeCodes: [Issue63KnownWindowFixture.typeCode])
+        try await fixture.join(XCTUnwrap(runtime))
+        try issue63KnownWindowRequire(seededDaily == true && fixture.authorizationRequests == [[Issue63KnownWindowFixture.typeCode]]
+            && (try fixture.repairs()).isEmpty && (try fixture.pending()).isEmpty,
+            "SETUP: explicit foreground daily ACK must finish the real seed without injected progress.")
+        let seedDailyCursor = try XCTUnwrap(fixture.cursor(DailyActivityAggregateSyncPolicy.cursorKind))
+        let seedDate = try XCTUnwrap(HealthBridgeUTCFormatter.date(from: seedDailyCursor))
+        try issue63KnownWindowRequire(seedDate >= fixture.today, "SETUP: daily progress must already be recent while B is outside the rolling overlap.")
+        try fixture.recordState("foreground.seed-checkpoint.accepted")
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+
+        fixture.phase = .partial
+        let active = try XCTUnwrap(runtime)
+        let partialAcceptedStart = fixture.recorder.acceptedPayloads.count
+        guard case .continueProcessing = active.viewModel.admitAutomaticSyncObserver(
+            typeCode: Issue63KnownWindowFixture.typeCode, diagnosticRunID: UUID()) else {
+            XCTFail("SETUP: supported durable observer admission failed.")
+            return
+        }
+        let admitted = try fixture.pending()
+        try issue63KnownWindowRequire(admitted.keys.sorted() == [Issue63KnownWindowFixture.typeCode],
+            "SETUP: exactly the selected generic observer generation must be admitted.")
+        await active.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: [Issue63KnownWindowFixture.typeCode]))
+        try await fixture.join(active)
+        try fixture.recordState("partial.accepted-and-owner-joined")
+        try issue63KnownWindowRequire(fixture.trace.snapshot.contains("partial.A-only.no-B-repair.window-AB.ok")
+            && fixture.trace.snapshot.contains(where: { $0.hasPrefix("partial.daily.before-ACK.ok") }),
+            "SETUP: partial read and actual ACK prerequisites were not reached; no F3 product RED is qualified.")
+        let partialValues = try fixture.dailySamples(since: partialAcceptedStart)
+        try issue63KnownWindowRequire(partialValues.contains {
+            $0.startTime == HealthBridgeUTCFormatter.string(from: fixture.a) && $0.value == 7
+        } && (mode == .fullObservedWindow || !partialValues.contains {
+            $0.startTime == HealthBridgeUTCFormatter.string(from: fixture.b)
+        }), "SETUP: actual accepted partial statistics must contain A=7 and the intended B omission.")
+        let recent = try XCTUnwrap(HealthBridgeUTCFormatter.date(from: XCTUnwrap(fixture.cursor(DailyActivityAggregateSyncPolicy.cursorKind))))
+        try issue63KnownWindowRequire(try fixture.cursor(fixture.rawKind) == fixture.partialAnchor
+            && recent > seedDate
+            && FileOutbox(directory: fixture.root.appendingPathComponent("outbox")).pendingItems().isEmpty,
+            "SETUP: observer ACK must earn partial raw progress and advance normal recent daily progress.")
+        let expected = mode == .missingKnownDay ? [fixture.b] : []
+        try issue63KnownWindowRequire(try fixture.repairs().map(\.start) == expected,
+            "F3: A was ACKed; omitted known B needs a NEW obligation, but never-observed blank days do not.")
+        try issue63KnownWindowRequire(try fixture.pending() == (mode == .missingKnownDay ? admitted : [:]),
+            "F3: matching pending generation must survive exactly the missing-known-B obligation.")
+        if mode == .missingKnownDay {
+            await fixture.stopAndJoin(active)
+            runtime = nil
+            fixture.phase = .restore
+            runtime = try fixture.makeRuntime()
+            try fixture.recordState("cold.owner-created-before-bootstrap")
+            try issue63KnownWindowRequire(try fixture.repairs().map(\.start) == expected
+                && fixture.pending() == admitted,
+                "F3: actual cold owner recreation must preserve known missing B and its pending generation.")
+            let beforeRestore = fixture.recorder.acceptedPayloads.count
+            await runtime?.bootstrap()
+            try await fixture.join(XCTUnwrap(runtime))
+            try fixture.recordState("restore.accepted-and-owner-joined")
+            let restoredB = try fixture.dailySamples(since: beforeRestore).filter {
+                $0.startTime == HealthBridgeUTCFormatter.string(from: fixture.b)
+            }
+            try issue63KnownWindowRequire(fixture.trace.snapshot.contains("restore.query-reaches-B.ok")
+                && fixture.trace.snapshot.contains(where: { $0.hasPrefix("restore.daily.before-ACK.ok") })
+                && restoredB.map(\.value) == [9],
+                "F3: only actual newer completed B=9 may discharge B, never nil-to-zero.")
+        }
+        try issue63KnownWindowRequire(try fixture.pending().isEmpty && fixture.repairs().isEmpty,
+            "F3: every legitimate obligation must retire after actual completed ACK.")
+        if mode == .neverObservedBlank {
+            try issue63KnownWindowRequire(try !fixture.dailySamples().contains {
+                $0.startTime == HealthBridgeUTCFormatter.string(from: fixture.b)
+            }, "F3: never-observed B must remain blank, not an invented total or repair.")
+        }
+        try issue63KnownWindowRequire(fixture.authorizationRequests == [[Issue63KnownWindowFixture.typeCode]],
+            "SETUP: automatic observer/launch opportunities must not request authorization.")
     }
 }

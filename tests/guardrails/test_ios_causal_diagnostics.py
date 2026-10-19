@@ -14,7 +14,7 @@ def test_each_automatic_healthkit_query_has_typed_start_and_result_seams() -> No
         "let aggregates: [HealthKitDailyActivityAggregate]",
         "let changes = try await HealthKitWorkoutReader",
         "let changes: HealthKitAnchoredSleepChanges",
-        "let changes = try await reader.readAnchoredQuantityChanges",
+        "let changes: HealthKitAnchoredQuantityChanges",
     ):
         start = source.index(query)
         assert "noteAutomaticSyncQueryStarted(" in source[start - 180 : start]

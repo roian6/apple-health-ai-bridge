@@ -54,6 +54,8 @@ MIGRATION_IDS: Final = (
     "007_sleep_baseline_namespaces",
     DELIVERY_RECEIPT_MIGRATION_ID,
     "009_pairing_transport",
+    "010_daily_projection_state",
+    "011_daily_projection_fence_order",
 )
 
 
@@ -64,14 +66,16 @@ def _protect_database_files(db_path: Path) -> tuple[int, int]:
         if not sidecar.exists() and not sidecar.is_symlink():
             continue
         try:
-            _ = _protect_database_file(sidecar, create=False)
+            _ = _protect_database_file(sidecar, create=False, optional_sidecar=True)
         except FileNotFoundError:
             continue
     return identity
 
 
-def _protect_database_file(path: Path, *, create: bool) -> tuple[int, int]:
-    fd = open_database_lock_fd(path, create=create)
+def _protect_database_file(
+    path: Path, *, create: bool, optional_sidecar: bool = False
+) -> tuple[int, int]:
+    fd = open_database_lock_fd(path, create=create, optional_sidecar=optional_sidecar)
     try:
         entry = os.fstat(fd)
         require_path_identity(path, entry)

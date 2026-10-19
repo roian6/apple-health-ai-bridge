@@ -89,7 +89,9 @@ def open_lock_file_fd(lock_path: Path, plan: DatabaseLockPlan) -> int | None:
     return fd
 
 
-def open_database_lock_fd(db_path: Path, *, create: bool) -> int:
+def open_database_lock_fd(
+    db_path: Path, *, create: bool, optional_sidecar: bool = False
+) -> int:
     if create:
         ensure_private_directory(db_path.parent)
     require_private_parent(db_path.parent)
@@ -114,7 +116,15 @@ def open_database_lock_fd(db_path: Path, *, create: bool) -> int:
     else:
         fd = os.open(db_path, flags)
     try:
-        validate_database_lock_stat(db_path, os.fstat(fd))
+        entry = os.fstat(fd)
+        if (
+            optional_sidecar
+            and entry.st_nlink == 0
+            and stat.S_ISREG(entry.st_mode)
+            and (not hasattr(os, "getuid") or entry.st_uid == os.getuid())
+        ):
+            _ = db_path.stat(follow_symlinks=False)
+        validate_database_lock_stat(db_path, entry)
         register_database_descriptor(fd)
     except OSError:
         retire_database_descriptor(fd)

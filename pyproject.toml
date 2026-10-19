@@ -55,6 +55,8 @@ exclude = [
 "src/health_bridge/storage/migrations/003_receiver_tokens.sql" = "health_bridge/storage/migrations/003_receiver_tokens.sql"
 "src/health_bridge/storage/migrations/004_pairing_invitations.sql" = "health_bridge/storage/migrations/004_pairing_invitations.sql"
 "src/health_bridge/storage/migrations/009_pairing_transport.sql" = "health_bridge/storage/migrations/009_pairing_transport.sql"
+"src/health_bridge/storage/migrations/010_daily_projection_state.sql" = "health_bridge/storage/migrations/010_daily_projection_state.sql"
+"src/health_bridge/storage/migrations/011_daily_projection_fence_order.sql" = "health_bridge/storage/migrations/011_daily_projection_fence_order.sql"
 
 [tool.hatch.build.targets.sdist]
 exclude = [

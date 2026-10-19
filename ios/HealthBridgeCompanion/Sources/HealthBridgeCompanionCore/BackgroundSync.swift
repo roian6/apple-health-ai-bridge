@@ -90,6 +90,7 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
     fileprivate enum Disposition: Equatable, Sendable {
         case noPayload
         case retryableReadFailure
+        case unknownAvailability
         case payloadEnqueued
         case blocked
     }
@@ -118,6 +119,10 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
         _ generations: [String: Int]
     ) -> Self {
         Self(disposition: .retryableReadFailure, coveredGenerations: generations)
+    }
+
+    public static func unknownAvailabilityCovering(_ generations: [String: Int]) -> Self {
+        Self(disposition: .unknownAvailability, coveredGenerations: generations)
     }
 }
 
@@ -392,6 +397,7 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             typeCodes = snapshot.keys.sorted()
         }
         var handled: Set<String> = []
+        var allAvailable = true
         for typeCode in typeCodes where !handled.contains(typeCode) {
             try Task.checkCancellation()
             guard let generation = snapshot[typeCode] else { continue }
@@ -407,6 +413,8 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
                 )
             case .retryableReadFailure:
                 break
+            case .unknownAvailability:
+                allAvailable = false
             case .payloadEnqueued:
                 break
             case .blocked:
@@ -420,7 +428,7 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             }
             try Task.checkCancellation()
         }
-        return true
+        return allAvailable
     }
 }
 

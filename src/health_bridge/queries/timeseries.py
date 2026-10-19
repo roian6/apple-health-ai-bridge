@@ -10,10 +10,18 @@ from health_bridge.queries._common import (
     source_from_row,
     unique_sources,
 )
-from health_bridge.queries.models import Period, TimeseriesPoint, TimeseriesResult
+from health_bridge.queries.models import (
+    PROJECTION_NOTE,
+    Period,
+    ProjectionStatus,
+    TimeseriesPoint,
+    TimeseriesResult,
+)
 from health_bridge.timeseries_catalog import canonical_sample_type_code
 
-TimeseriesRow: TypeAlias = tuple[str, str, str, float, str, str, str, str, str]
+TimeseriesRow: TypeAlias = tuple[
+    str, str, str, float, str, str, str, str, str, ProjectionStatus
+]
 TIMESERIES_ROWS_ADAPTER: Final[TypeAdapter[list[TimeseriesRow]]] = TypeAdapter(
     list[TimeseriesRow],
 )
@@ -28,8 +36,12 @@ LEGACY_QUERY_TYPE_CODES: Final[dict[str, tuple[str, ...]]] = {
 TIMESERIES_SQL: Final = (
     "select samples.type_code, samples.start_time, samples.end_time, samples.value, "
     "samples.unit, sources.source_key, sources.name, sources.kind, "
-    "samples.metadata_json "
+    "samples.metadata_json, coalesce(projection.status, 'unknown') "
     "from samples join sources on sources.source_id = samples.source_id "
+    "left join daily_projection_records projection "
+    "on projection.source_id=samples.source_id "
+    "and projection.type_code=samples.type_code "
+    "and projection.client_record_id=samples.client_record_id "
     "where samples.type_code in ({placeholders}) "
     "and samples.start_time >= ? and samples.start_time < ? "
     "order by samples.start_time, samples.type_code "
@@ -71,7 +83,12 @@ def get_timeseries(
         requested_types=type_codes,
         points=points,
         sources_used=unique_sources(point.source for point in points),
-        missing_data_notes=notes_for_count(len(points)),
+        missing_data_notes=notes_for_count(len(points))
+        + (
+            (PROJECTION_NOTE,)
+            if any(point.projection_status is not None for point in points)
+            else ()
+        ),
         truncated=truncated,
     )
 
@@ -96,7 +113,14 @@ def _point_from_row(row: TimeseriesRow) -> TimeseriesPoint:
         name,
         kind,
         metadata_json,
+        status,
     ) = row
+    metadata = _metadata(metadata_json)
+    daily = (
+        metadata.get("aggregation") == "daily_sum"
+        or metadata.get("healthkit_query") == "HKStatisticsCollectionQuery"
+        or metadata.get("sample_kind") == "daily_aggregate"
+    )
     return TimeseriesPoint(
         type_code=type_code,
         start_time=start_time,
@@ -104,7 +128,8 @@ def _point_from_row(row: TimeseriesRow) -> TimeseriesPoint:
         value=float(value),
         unit=unit,
         source=source_from_row((source_key, name, kind)),
-        metadata=_metadata(metadata_json),
+        metadata=metadata,
+        projection_status=status if daily else None,
     )
 
 

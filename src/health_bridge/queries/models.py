@@ -1,6 +1,13 @@
-from typing import ClassVar
+from typing import ClassVar, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+ProjectionStatus = Literal["current", "last_known", "unknown"]
+PROJECTION_NOTE: Final = (
+    "Daily projections marked last_known or unknown are retained observations, "
+    "not current HealthKit totals. Calendar coverage alone does not establish "
+    "currentness; raw sums may overlap daily projections."
+)
 
 
 class QueryModel(BaseModel):
@@ -43,6 +50,7 @@ class TimeseriesPoint(QueryModel):
     unit: str
     source: SourceUsed
     metadata: dict[str, object] = Field(default_factory=dict)
+    projection_status: ProjectionStatus | None = None
 
 
 class TimeseriesResult(QueryModel):
@@ -91,6 +99,7 @@ class DailySampleStatistic(QueryModel):
     maximum: float | None
     latest: float | None
     latest_time: str | None
+    projection_status: ProjectionStatus | None = None
 
 
 class DailyObservation(QueryModel):

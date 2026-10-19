@@ -12,7 +12,10 @@ from health_bridge.queries import (
     list_synced_metrics,
 )
 from health_bridge.storage import initialize_database
-from tests.fixture_helpers import initialized_fixture_db
+from tests.fixture_helpers import (
+    initialized_fixture_db,
+    qualify_stored_daily_projections,
+)
 
 SOURCE_ID_ROW_ADAPTER: TypeAdapter[tuple[int] | None] = TypeAdapter(tuple[int] | None)
 
@@ -507,6 +510,7 @@ def test_get_daily_summary_distinguishes_raw_sample_sums_from_daily_aggregates(
     _insert_activity_semantics_samples(db_path)
 
     # When
+    qualify_stored_daily_projections(db_path)
     result = get_daily_summary(
         db_path,
         start_date="2026-06-09",
@@ -558,6 +562,7 @@ def test_get_daily_summary_uses_calendar_day_metadata_for_daily_aggregates(
         )
 
     # When
+    qualify_stored_daily_projections(db_path)
     result = get_daily_summary(
         db_path,
         start_date="2026-06-25",
@@ -682,7 +687,7 @@ def _insert_activity_semantics_samples(db_path: Path) -> None:
                 (
                     source_id,
                     "steps",
-                    "activity-raw-steps-1",
+                    "synthetic-activity-raw-steps-1",
                     "2026-06-09T09:00:00Z",
                     "2026-06-09T09:10:00Z",
                     400.0,
@@ -692,7 +697,7 @@ def _insert_activity_semantics_samples(db_path: Path) -> None:
                 (
                     source_id,
                     "steps",
-                    "activity-raw-steps-2",
+                    "synthetic-activity-raw-steps-2",
                     "2026-06-09T10:00:00Z",
                     "2026-06-09T10:15:00Z",
                     600.0,
@@ -702,7 +707,7 @@ def _insert_activity_semantics_samples(db_path: Path) -> None:
                 (
                     source_id,
                     "steps",
-                    "activity-daily-steps",
+                    "synthetic-activity-daily-steps",
                     "2026-06-09T00:00:00Z",
                     "2026-06-10T00:00:00Z",
                     11824.0,
@@ -712,7 +717,7 @@ def _insert_activity_semantics_samples(db_path: Path) -> None:
                 (
                     source_id,
                     "distance_walking_running",
-                    "activity-daily-distance",
+                    "synthetic-activity-daily-distance",
                     "2026-06-09T00:00:00Z",
                     "2026-06-10T00:00:00Z",
                     9000.0,

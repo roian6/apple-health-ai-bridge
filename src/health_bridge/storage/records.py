@@ -6,6 +6,7 @@ from pydantic import TypeAdapter
 
 from health_bridge.contract import HealthBridgeBatchV1
 from health_bridge.storage.catalog import source_id, upsert_catalog
+from health_bridge.storage.daily_projections import prepare_batch
 from health_bridge.storage.sleep import (
     plan_sleep_baseline_resets,
     upsert_sleep_sessions,
@@ -63,6 +64,7 @@ def upsert_batch_records(
     batch: HealthBridgeBatchV1,
 ) -> None:
     upsert_catalog(connection, batch)
+    batch = prepare_batch(connection, batch)
     sleep_reset_plan = plan_sleep_baseline_resets(connection, batch)
     _upsert_samples(connection, batch)
     _upsert_workouts(connection, batch)

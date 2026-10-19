@@ -1,5 +1,68 @@
 import Foundation
 
+public struct DailyProjectionObservation: Codable, Equatable, Sendable {
+    public struct RawInterval: Codable, Equatable, Sendable {
+        public let clientRecordID: String
+        public let startTime: String
+        public let endTime: String
+
+        public init(clientRecordID: String, start: Date, end: Date) {
+            self.clientRecordID = clientRecordID
+            startTime = HealthBridgeUTCFormatter.string(from: start)
+            endTime = HealthBridgeUTCFormatter.string(from: end)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case clientRecordID = "client_record_id"
+            case startTime = "start_time"
+            case endTime = "end_time"
+        }
+    }
+
+    public static let cursorPrefix = "daily_projection_observation:"
+    public let namespace: String
+    public let sequence: UInt64
+    public let typeCode: String
+    public let rawIntervals: [RawInterval]
+    public let statisticsWindow: HealthBridgeTimeWindow?
+
+    public init(order: DailyProjectionObservationOrder, typeCode: String,
+                rawIntervals: [RawInterval] = [], statisticsWindow: HealthBridgeTimeWindow? = nil) {
+        namespace = order.namespace
+        sequence = order.sequence
+        self.typeCode = GenericQuantityCoveragePolicy.canonicalTypeCode(for: typeCode)
+        self.rawIntervals = rawIntervals
+        self.statisticsWindow = statisticsWindow
+    }
+
+    public func appending(to batch: HealthBridgeBatchV1) throws -> HealthBridgeBatchV1 {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let cursor = HealthBridgeSyncCursor(
+            sourceKey: batch.sources.first?.sourceKey ?? HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: Self.cursorPrefix + typeCode,
+            cursorValue: String(decoding: try encoder.encode(self), as: UTF8.self)
+        )
+        return HealthBridgeBatchV1(
+            schemaID: batch.schemaID, schemaVersion: batch.schemaVersion,
+            generatedAt: batch.generatedAt, exportWindow: batch.exportWindow,
+            sources: batch.sources, healthTypes: batch.healthTypes, samples: batch.samples,
+            workouts: batch.workouts, sleepSessions: batch.sleepSessions, deletedRecords: batch.deletedRecords,
+            sync: HealthBridgeSyncContext(syncWindow: batch.sync.syncWindow,
+                cursors: batch.sync.cursors.filter {
+                    statisticsWindow == nil || !batch.samples.isEmpty || $0.cursorKind.hasPrefix(Self.cursorPrefix)
+                } + [cursor])
+        )
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case namespace, sequence
+        case typeCode = "type_code"
+        case rawIntervals = "raw_intervals"
+        case statisticsWindow = "statistics_window"
+    }
+}
+
 public struct HealthKitSampleProvenance: Equatable, Sendable {
     public let sourceName: String?
     public let sourceBundleIdentifier: String?
