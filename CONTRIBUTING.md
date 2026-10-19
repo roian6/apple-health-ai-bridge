@@ -43,6 +43,48 @@ xcodebuild -project HealthBridgeCompanion.xcodeproj \
 
 Real-device HealthKit validation is useful, but any reported evidence must be redacted and aggregate-only.
 
+## Input Fuzzing
+
+The optional `fuzz` dependency group pins Atheris 3.1.0 for Linux x86_64
+CPython 3.12-3.14. It is separate from runtime dependencies and normal development
+setup. From the repository root in that environment:
+
+```bash
+uv sync --locked --dev --group fuzz --python 3.12
+scratch="$(mktemp -d)"
+uv run --no-sync python -m fuzz.campaign "$scratch"
+```
+
+The campaign copies the committed synthetic seeds into the temporary directory,
+replays them, then mutates each target for 45 seconds. Inputs are capped at 4096
+bytes, five seconds per input, and 512 MiB RSS per engine process; each process
+also has a 90-second wall-clock deadline. The targets call the receiver's batch
+model and MCP's date-range argument model without opening a database or listener.
+Only Pydantic validation rejections are expected. Unexpected exceptions, crashes,
+timeouts, missing engine support, or failure to demonstrate new coverage features
+produce a nonzero exit status. Logs, copied corpora, and crash artifacts remain
+under `$scratch`; inspect them locally and remove that directory when finished.
+
+Replay a minimized synthetic crash with the same target and resource bounds:
+
+```bash
+uv run --no-sync python -m fuzz.engine batch \
+  "$scratch/batch/artifacts/crash-REPLACE_WITH_HASH" \
+  -runs=1 -max_len=4096 -timeout=5 -rss_limit_mb=512 \
+  "-artifact_prefix=$scratch/batch/artifacts/"
+```
+
+Use `mcp_dates` for MCP date-range reproducers. Report a minimal synthetic
+reproducer and traceback for unexpected failures; do not broaden exception
+handling to hide them. On ARM64, macOS, Windows, or other unsupported engine
+environments, run the deterministic validator and harness contracts:
+
+```bash
+uv sync --all-extras --dev --locked
+uv run pytest -q tests/fuzzing tests/guardrails/test_fuzzing_workflow.py
+uv run basedpyright fuzz
+```
+
 ## Branches and Design Decisions
 
 Use a short branch name with one of these prefixes:
