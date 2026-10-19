@@ -26,8 +26,14 @@ def test_glama_score_is_a_linked_accessible_badge_in_existing_row() -> None:
     badge_row = header.rsplit("<p>", 1)[1].split("</p>", 1)[0]
     parser = BadgeParser()
     parser.feed(badge_row)
-    # Then: a small linked score badge joins the four existing badges.
-    assert len(parser.badges) == 5
+    # Then: the existing badges remain as other verified quality badges join.
+    repository = "https://github.com/roian6/apple-health-ai-bridge"
+    assert {
+        f"{repository}/releases",
+        f"{repository}/actions/workflows/python.yml",
+        f"{repository}/actions/workflows/ios.yml",
+        "LICENSE",
+    } <= parser.badges.keys()
     assert parser.badges[
         "https://glama.ai/mcp/servers/roian6/apple-health-ai-bridge"
     ] == {
