@@ -1,6 +1,7 @@
 import json
 import re
 import tomllib
+from html import unescape
 from pathlib import Path
 from typing import cast
 
@@ -209,6 +210,57 @@ def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None
     assert "Health Bridge for AI" not in readme
     assert "open-source project behind" not in readme
     assert "https://github.com/roian6/apple-health-ai-bridge.git@" in readme
+
+
+def test_readme_uses_official_app_store_install_artwork() -> None:
+    header = (
+        Path("README.md").read_text(encoding="utf-8").split("</div>", maxsplit=1)[0]
+    )
+    target = "https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806"
+    match = re.search(
+        rf'<a href="{re.escape(target)}">\s*(<img\b[^>]*>)\s*</a>',
+        header,
+    )
+
+    assert match is not None
+    image = match.group(1)
+    official_artwork = "https://developer.apple.com/assets/elements/badges/"
+    official_artwork += "download-on-the-app-store.svg"
+    assert f'src="{official_artwork}"' in image
+    assert 'alt="Download on the App Store"' in image
+    assert 'height="40"' in image
+
+
+def test_readme_links_status_badges_to_their_public_sources() -> None:
+    header = (
+        Path("README.md").read_text(encoding="utf-8").split("</div>", maxsplit=1)[0]
+    )
+    repository = "roian6/apple-health-ai-bridge"
+    expected_links = (
+        (
+            f"https://github.com/{repository}/releases",
+            f"https://img.shields.io/github/v/release/{repository}?filter=receiver-v%2A",
+        ),
+        (
+            f"https://github.com/{repository}/actions/workflows/python.yml",
+            f"https://img.shields.io/github/actions/workflow/status/{repository}/python.yml?branch=main",
+        ),
+        (
+            f"https://github.com/{repository}/actions/workflows/ios.yml",
+            f"https://img.shields.io/github/actions/workflow/status/{repository}/ios.yml?branch=main",
+        ),
+        ("LICENSE", f"https://img.shields.io/github/license/{repository}?"),
+    )
+    for target, endpoint in expected_links:
+        match = re.search(
+            rf'<a href="{re.escape(target)}">\s*(<img\b[^>]*>)\s*</a>',
+            header,
+        )
+        assert match is not None, target
+        image = unescape(match.group(1))
+        assert endpoint in image
+        assert "style=flat-square" in image
+        assert 'height="20"' in image
 
 
 def test_readme_introduces_user_workflows_before_installation_details() -> None:

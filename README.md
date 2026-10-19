@@ -3,10 +3,18 @@
   <h1>Apple Health AI Bridge</h1>
   <p>Put your Apple Health history to work in your own AI assistant.</p>
   <p>
+    <a href="https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on the App Store" height="40"></a>
+  </p>
+  <p>
     <a href="#get-started">Get started</a> ·
-    <a href="https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806">Download on the App Store</a> ·
     <a href="docs/supported-health-data.md">Supported data</a> ·
     <a href="https://healthbridge.chanhyo.dev/">Website</a>
+  </p>
+  <p>
+    <a href="https://github.com/roian6/apple-health-ai-bridge/releases"><img src="https://img.shields.io/github/v/release/roian6/apple-health-ai-bridge?filter=receiver-v%2A&amp;label=release&amp;style=flat-square" alt="Receiver release" height="20"></a>
+    <a href="https://github.com/roian6/apple-health-ai-bridge/actions/workflows/python.yml"><img src="https://img.shields.io/github/actions/workflow/status/roian6/apple-health-ai-bridge/python.yml?branch=main&amp;label=Python%20CI&amp;style=flat-square" alt="Python CI" height="20"></a>
+    <a href="https://github.com/roian6/apple-health-ai-bridge/actions/workflows/ios.yml"><img src="https://img.shields.io/github/actions/workflow/status/roian6/apple-health-ai-bridge/ios.yml?branch=main&amp;label=iOS%20CI&amp;style=flat-square" alt="iOS CI" height="20"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/roian6/apple-health-ai-bridge?style=flat-square" alt="License: Apache-2.0" height="20"></a>
   </p>
 </div>
 
