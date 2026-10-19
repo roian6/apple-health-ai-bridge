@@ -8,7 +8,7 @@ from typing import Final, TypeAlias
 from pydantic import TypeAdapter
 
 from health_bridge.queries.models import Period, SourceUsed
-from health_bridge.storage.database import connect_readonly_database
+from health_bridge.storage._query_database import connect_query_database
 
 DEFAULT_LIMIT: Final = 500
 EMPTY_RESULT_NOTE: Final = (
@@ -46,7 +46,7 @@ order by sync_run_id desc limit 1
 
 @contextmanager
 def connect_readonly(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
-    with connect_readonly_database(db_path) as connection:
+    with connect_query_database(db_path) as connection:
         yield connection
 
 

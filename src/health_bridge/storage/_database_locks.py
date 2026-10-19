@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Final
 
 import health_bridge.storage._database_lock_files as database_lock_files
+from health_bridge.storage._database_descriptors import (
+    database_descriptor_lifetime,
+    retire_database_descriptor,
+)
 from health_bridge.storage._database_lock_files import (
     DatabaseLockPlan,
     open_database_lock_fd,
@@ -49,15 +53,18 @@ def database_access_lock(
     create: bool,
     nonblocking: bool = False,
 ) -> Generator[None, None, None]:
-    with _database_file_lock(
-        db_path,
-        DatabaseLockPlan(
-            suffix=DATABASE_ACCESS_LOCK_SUFFIX,
-            exclusive=exclusive,
-            create=create,
-            nonblocking=nonblocking,
-            lock_database=True,
-            optional_lock_file=not create,
+    with (
+        database_descriptor_lifetime(db_path),
+        _database_file_lock(
+            db_path,
+            DatabaseLockPlan(
+                suffix=DATABASE_ACCESS_LOCK_SUFFIX,
+                exclusive=exclusive,
+                create=create,
+                nonblocking=nonblocking,
+                lock_database=True,
+                optional_lock_file=not create,
+            ),
         ),
     ):
         yield
@@ -110,13 +117,13 @@ def _database_file_lock(
                             yield
                     finally:
                         if database_fd is not None:
-                            os.close(database_fd)
+                            retire_database_descriptor(database_fd)
             finally:
                 if lock_fd is not None:
-                    os.close(lock_fd)
+                    retire_database_descriptor(lock_fd, database_file=False)
     finally:
         if stable_lock is not None:
-            os.close(stable_lock.fd)
+            retire_database_descriptor(stable_lock.fd, database_file=False)
 
 
 @contextmanager

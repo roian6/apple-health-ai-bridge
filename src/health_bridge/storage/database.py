@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -5,11 +6,15 @@ from pathlib import Path
 from typing import Final
 
 from health_bridge.private_files import (
-    ensure_private_file,
-    repair_private_file_mode,
+    apply_private_file_mode,
+)
+from health_bridge.storage._database_descriptors import (
+    retire_database_descriptor,
 )
 from health_bridge.storage._database_lock_files import (
     SQLITE_PRIVATE_SIDECAR_SUFFIXES,
+    open_database_lock_fd,
+    require_path_identity,
     require_quiescent_database,
 )
 from health_bridge.storage._database_locks import (
@@ -53,16 +58,27 @@ MIGRATION_IDS: Final = (
 
 
 def _protect_database_files(db_path: Path) -> tuple[int, int]:
-    identity = ensure_private_file(db_path)
+    identity = _protect_database_file(db_path, create=True)
     for suffix in SQLITE_PRIVATE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{db_path}{suffix}")
         if not sidecar.exists() and not sidecar.is_symlink():
             continue
         try:
-            repair_private_file_mode(sidecar)
+            _ = _protect_database_file(sidecar, create=False)
         except FileNotFoundError:
             continue
     return identity
+
+
+def _protect_database_file(path: Path, *, create: bool) -> tuple[int, int]:
+    fd = open_database_lock_fd(path, create=create)
+    try:
+        entry = os.fstat(fd)
+        require_path_identity(path, entry)
+        apply_private_file_mode(fd, path)
+        return entry.st_dev, entry.st_ino
+    finally:
+        retire_database_descriptor(fd)
 
 
 @contextmanager

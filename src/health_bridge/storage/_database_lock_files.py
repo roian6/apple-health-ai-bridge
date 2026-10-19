@@ -10,6 +10,10 @@ from health_bridge.private_files import (
     ensure_private_directory,
     require_private_parent,
 )
+from health_bridge.storage._database_descriptors import (
+    register_database_descriptor,
+    retire_database_descriptor,
+)
 
 SQLITE_PRIVATE_SIDECAR_SUFFIXES: Final = ("-journal", "-wal", "-shm")
 
@@ -80,7 +84,7 @@ def open_lock_file_fd(lock_path: Path, plan: DatabaseLockPlan) -> int | None:
     try:
         validate_lock_stat(lock_path, os.fstat(fd))
     except OSError:
-        os.close(fd)
+        retire_database_descriptor(fd, database_file=False)
         raise
     return fd
 
@@ -90,7 +94,12 @@ def open_database_lock_fd(db_path: Path, *, create: bool) -> int:
         ensure_private_directory(db_path.parent)
     require_private_parent(db_path.parent)
     access_mode = os.O_RDWR if create else os.O_RDONLY
-    flags = access_mode | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    flags = (
+        access_mode
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     if create:
         try:
             fd = os.open(db_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
@@ -106,8 +115,9 @@ def open_database_lock_fd(db_path: Path, *, create: bool) -> int:
         fd = os.open(db_path, flags)
     try:
         validate_database_lock_stat(db_path, os.fstat(fd))
+        register_database_descriptor(fd)
     except OSError:
-        os.close(fd)
+        retire_database_descriptor(fd)
         raise
     return fd
 
@@ -156,7 +166,7 @@ def _open_stable_database_lock_fd(db_path: Path) -> tuple[Path, int]:
     try:
         validate_lock_stat(lock_path, os.fstat(fd))
     except OSError:
-        os.close(fd)
+        retire_database_descriptor(fd, database_file=False)
         raise
     return lock_path, fd
 
@@ -196,7 +206,7 @@ def create_private_lock(lock_path: Path) -> None:
     try:
         validate_lock_stat(lock_path, os.fstat(fd))
     finally:
-        os.close(fd)
+        retire_database_descriptor(fd, database_file=False)
 
 
 def require_quiescent_database(db_path: Path) -> None:

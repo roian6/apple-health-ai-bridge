@@ -18,7 +18,7 @@ from health_bridge.mcp.tools import (
 )
 from health_bridge.mcp.types import required_object
 from health_bridge.storage import initialize_database
-from health_bridge.storage.database import connect_database
+from health_bridge.storage.database import connect_database, connect_readonly_database
 from tests.fixture_helpers import initialized_fixture_db
 
 if TYPE_CHECKING:
@@ -491,26 +491,13 @@ def test_mcp_read_only_refuses_wal_without_creating_shm(tmp_path: Path) -> None:
     assert not shm_path.exists()
 
 
-def test_mcp_read_only_refuses_active_writer_snapshot(tmp_path: Path) -> None:
+def test_strict_read_only_refuses_active_writer_snapshot(tmp_path: Path) -> None:
     db_path = initialized_fixture_db(tmp_path)
     with connect_database(db_path) as connection:
         _ = connection.execute("begin immediate")
-        response = dispatch_request(
-            db_path,
-            {
-                "jsonrpc": "2.0",
-                "id": 20,
-                "method": "tools/call",
-                "params": {"name": "get_bridge_status", "arguments": {}},
-            },
-        )
+        with pytest.raises(BlockingIOError), connect_readonly_database(db_path):
+            pass
         connection.rollback()
-
-    assert response == {
-        "jsonrpc": "2.0",
-        "id": 20,
-        "error": {"code": -32000, "message": "Health Bridge database is unavailable."},
-    }
 
 
 def test_mcp_rejects_noncanonical_date_forms(tmp_path: Path) -> None:

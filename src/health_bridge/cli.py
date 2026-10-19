@@ -39,6 +39,7 @@ from health_bridge.ingest import MALFORMED_JSON_SUMMARY
 from health_bridge.ingest import ingest_fixture as ingest_fixture_batch
 from health_bridge.status import read_status, read_status_markdown, read_status_snapshot
 from health_bridge.storage import initialize_database
+from health_bridge.storage._query_database import DatabaseReadError
 
 app = typer.Typer(
     add_completion=False,
@@ -535,4 +536,8 @@ def _summary_for_validation_error(exc: ValidationError) -> str:
 
 
 def run() -> None:
-    app()
+    try:
+        app()
+    except DatabaseReadError:
+        typer.echo("Health Bridge database is unavailable.", err=True)
+        raise SystemExit(1) from None

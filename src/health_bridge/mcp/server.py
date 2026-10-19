@@ -23,6 +23,7 @@ from health_bridge.mcp.types import (
     required_object,
     required_string,
 )
+from health_bridge.storage._query_database import connect_query_database
 
 Handler: TypeAlias = Callable[[Path, "JsonRpcRequest"], JsonObject]
 
@@ -71,6 +72,11 @@ def _request_id_or_none(value: JsonValue) -> int | str | None:
 
 
 def mcp_smoke_result(db_path: Path) -> JsonObject:
+    with connect_query_database(db_path):
+        return _mcp_smoke_result(db_path)
+
+
+def _mcp_smoke_result(db_path: Path) -> JsonObject:
     list_response = dispatch_request(
         db_path,
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},

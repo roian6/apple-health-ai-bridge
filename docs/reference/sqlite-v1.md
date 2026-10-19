@@ -84,3 +84,40 @@ Pairing and authentication storage rules:
 All future query surfaces should read from SQLite without mutation by default.
 Authentication, pairing redemption, and explicit revocation commands are the
 reviewed mutation exceptions.
+
+## Committed query snapshots
+
+Ordinary CLI queries, status, and MCP tools use a `mode=ro` connection with
+`query_only` enabled and an explicit read transaction. All component SELECTs in
+one response share the committed snapshot established at entry. MCP smoke also
+holds one transaction across its component tool calls. A receiver's uncommitted
+changes are invisible; a later response can observe them after commit.
+
+This path supports rollback-journal databases. A writer holding a RESERVED lock
+can continue while readers see the previous committed state. Committing may wait
+until a response releases its read transaction. Read lock waits are limited to
+250 milliseconds; maintenance and bridge access-lock contention fail immediately.
+Unavailable storage produces an explicit redacted error, never a fabricated empty
+result. WAL databases, WAL/SHM sidecars, unsafe paths, malformed journal headers, corrupt
+databases, and uninitialized stores are refused. Journal mode is never changed.
+
+`connect_readonly_database` remains the strict quiescent, immutable connection
+for callers requiring that policy. It still refuses an active bridge writer or
+any SQLite sidecar. Neither query path creates an absent database or repairs its
+permissions. Ordinary queries require the initialized store's lifecycle lock.
+
+Read-only SQL does not promise zero filesystem I/O: rollback journals are inspected,
+SQLite may need local journal recovery (which this read-only connection refuses),
+and the existing Darwin stable-lock machinery may create or secure its private
+lock directory/files. No WAL/SHM creation or journal migration is enabled here.
+
+All in-process database users must use the bridge's connection and access-lock
+owners. Non-SQLite database and sidecar descriptors are retained until every
+overlapping access scope has closed its SQLite connection, because closing any
+descriptor for an inode can release that process's SQLite record locks. A short
+mutex protects descriptor bookkeeping, not query/write transactions. To bound
+retention during long-lived transactions, new access scopes are refused when the
+sum of retained descriptors and active scopes reaches 256; access resumes after
+those scopes drain. Connections must not be inherited across `fork`, and raw
+external opens/closes in the same process are outside this ownership contract.
+Independent processes continue to coordinate through SQLite and bridge file locks.
