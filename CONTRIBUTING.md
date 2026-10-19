@@ -43,6 +43,12 @@ xcodebuild -project HealthBridgeCompanion.xcodeproj \
 
 Real-device HealthKit validation is useful, but any reported evidence must be redacted and aggregate-only.
 
+## Interface references
+
+See the [CLI reference](docs/reference/cli.md) for command options and output
+formats, and the [MCP reference](docs/reference/mcp.md) for all nine tools,
+parameters, results, date boundaries, and errors.
+
 ## Automated tests
 
 Add automated tests for major functionality and behavior-changing bug fixes.

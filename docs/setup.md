@@ -6,9 +6,6 @@ Run the installation and setup commands in this guide only after the immutable `
 
 ## Before you start
 
-For command options and output formats, see the [CLI reference](reference/cli.md).
-For local AI integrations, see the [nine-tool MCP reference](reference/mcp.md).
-
 You need:
 
 - an iPhone running iOS 18 or later;
