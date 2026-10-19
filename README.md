@@ -15,6 +15,7 @@
     <a href="https://github.com/roian6/apple-health-ai-bridge/actions/workflows/python.yml"><img src="https://img.shields.io/github/actions/workflow/status/roian6/apple-health-ai-bridge/python.yml?branch=main&amp;label=Python%20CI&amp;style=flat-square" alt="Python CI" height="20"></a>
     <a href="https://github.com/roian6/apple-health-ai-bridge/actions/workflows/ios.yml"><img src="https://img.shields.io/github/actions/workflow/status/roian6/apple-health-ai-bridge/ios.yml?branch=main&amp;label=iOS%20CI&amp;style=flat-square" alt="iOS CI" height="20"></a>
     <a href="LICENSE"><img src="https://img.shields.io/github/license/roian6/apple-health-ai-bridge?style=flat-square" alt="License: Apache-2.0" height="20"></a>
+    <a href="https://glama.ai/mcp/servers/roian6/apple-health-ai-bridge"><img src="https://glama.ai/mcp/servers/roian6/apple-health-ai-bridge/badges/score.svg" alt="Glama tool quality and maintenance" width="110" height="20"></a>
   </p>
 </div>
 

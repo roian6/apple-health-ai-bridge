@@ -186,6 +186,12 @@ def _list_tools(_db_path: Path, request: JsonRpcRequest) -> JsonObject:
                     "name": tool.name,
                     "description": tool.description,
                     "inputSchema": dict(tool.input_schema),
+                    "annotations": {
+                        "readOnlyHint": True,
+                        "destructiveHint": False,
+                        "idempotentHint": True,
+                        "openWorldHint": False,
+                    },
                 }
                 for tool in MCP_TOOL_DEFINITIONS
             ],

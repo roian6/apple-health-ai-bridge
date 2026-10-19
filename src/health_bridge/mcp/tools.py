@@ -97,11 +97,21 @@ DATE_RANGE_INPUT_SCHEMA: Final[JsonObject] = {
             "type": "string",
             "format": "date",
             "pattern": r"^\d{4}-\d{2}-\d{2}$",
+            "description": (
+                "Inclusive start date (YYYY-MM-DD), at 00:00:00 UTC for "
+                "start-time filtering. Daily samples use calendar_day metadata "
+                "when present, otherwise their UTC start date."
+            ),
         },
         "end_date": {
             "type": "string",
             "format": "date",
             "pattern": r"^\d{4}-\d{2}-\d{2}$",
+            "description": (
+                "Exclusive end date (YYYY-MM-DD), at 00:00:00 UTC for "
+                "start-time filtering; this calendar day is not included. "
+                "Must be on or after start_date; equal dates give an empty range."
+            ),
         },
     },
     "required": ["start_date", "end_date"],
@@ -110,13 +120,26 @@ DATE_RANGE_INPUT_SCHEMA: Final[JsonObject] = {
 TIMESERIES_INPUT_SCHEMA: Final[JsonObject] = {
     "type": "object",
     "properties": {
-        "type_codes": {"type": "array", "items": {"type": "string"}},
+        "type_codes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Sample type codes, e.g. steps, heart_rate, weight, energy. "
+                "Discover vocabulary with list_supported_timeseries_types and "
+                "local record counts with list_synced_metrics. Legacy body_mass "
+                "and active_energy aliases are accepted. Unmatched codes yield "
+                "no points; an empty list returns none. Use dedicated tools for "
+                "workout and sleep_analysis sessions."
+            ),
+        },
         "start_time": {
             "type": "string",
             "format": "date-time",
             "pattern": UTC_TIMESTAMP_PATTERN,
             "description": (
-                "Fixed-UTC RFC 3339 lexical form; runtime validation also rejects "
+                "Inclusive sample start-time lower bound in UTC, "
+                "YYYY-MM-DDTHH:MM:SSZ (no offsets or fractional seconds); "
+                "runtime validation also rejects "
                 "nonexistent calendar dates."
             ),
         },
@@ -125,8 +148,10 @@ TIMESERIES_INPUT_SCHEMA: Final[JsonObject] = {
             "format": "date-time",
             "pattern": UTC_TIMESTAMP_PATTERN,
             "description": (
-                "Fixed-UTC RFC 3339 lexical form; runtime validation also rejects "
-                "nonexistent calendar dates."
+                "Exclusive sample start-time upper bound in UTC, "
+                "YYYY-MM-DDTHH:MM:SSZ (no offsets or fractional seconds); "
+                "must be on or after start_time. Equal timestamps give an empty "
+                "range; runtime validation also rejects nonexistent calendar dates."
             ),
         },
     },
@@ -135,84 +160,119 @@ TIMESERIES_INPUT_SCHEMA: Final[JsonObject] = {
 }
 SUPPORTED_TIMESERIES_INPUT_SCHEMA: Final[JsonObject] = {
     "type": "object",
-    "properties": {"category": {"type": "string"}},
+    "properties": {
+        "category": {
+            "type": "string",
+            "description": (
+                "Optional exact, case-sensitive category filter, e.g. heart, "
+                "activity, body. Omit to discover all categories in types[].category; "
+                "an unknown category returns an empty types list."
+            ),
+        },
+    },
     "additionalProperties": False,
 }
 MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
     ToolDefinition(
         name="get_bridge_status",
         description=(
-            "Read-only redacted bridge and receiver sync status for local agents; "
-            "omits sample values, cursor values, and token material; no clinical "
-            "interpretation."
+            "Read-only operational snapshot as JSON text: store counts, latest "
+            "sync, receiver token presence, and per-metric freshness. Use to "
+            "check sync health or data coverage before querying observations. "
+            "Omits sample values, cursor values, and token material."
         ),
         input_schema=EMPTY_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="get_bridge_context_markdown",
         description=(
-            "Read-only redacted Markdown bridge context for local agents/wiki; "
-            "omits sample values, cursor values, token material, and clinical "
-            "interpretation."
+            "Read-only Markdown rendering of get_bridge_status for assistant "
+            "context or a wiki. Choose get_bridge_status for machine-readable "
+            "fields. Includes counts and sync freshness, not sample values, "
+            "cursor values, or token material."
         ),
         input_schema=EMPTY_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="list_supported_timeseries_types",
         description=(
-            "Read-only supported timeseries type metadata; metadata "
-            "only, no local health values, no cursor values, and no clinical "
-            "interpretation."
+            "Read-only static catalog of timeseries type codes, categories, units, "
+            "aggregation rules, and iOS support status. Use to choose type_codes "
+            "for get_timeseries; omit category to discover filters. Catalog "
+            "support does not imply permission or local records: check "
+            "list_synced_metrics for availability. Does not read health values."
         ),
         input_schema=SUPPORTED_TIMESERIES_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="list_synced_metrics",
         description=(
-            "Read-only catalog observation listing synced metric types, provenance, "
-            "and missing-data caveats; no clinical interpretation."
+            "Read-only local metric catalog with record counts, units, sensitivity, "
+            "and source provenance. Use to discover stored types before querying; "
+            "catalog entries can have zero records. Use get_workouts and "
+            "get_sleep_summary for workout and sleep_analysis sessions. Missing "
+            "records mean unknown availability, not zero activity."
         ),
         input_schema=EMPTY_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="get_timeseries",
         description=(
-            "Read-only time-series observations for selected metric types with "
-            "source provenance and missing-data caveats; no clinical interpretation."
+            "Read-only stored sample observations with units, metadata, and source "
+            "provenance. Selects start_time >= the inclusive UTC lower bound and "
+            "start_time < the exclusive upper bound, not interval overlap; "
+            "sample end times are not clipped. Returns at most 500 points in "
+            "start-time order; check truncated and missing_data_notes."
         ),
         input_schema=TIMESERIES_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="get_workouts",
         description=(
-            "Read-only workout observations for a date range with source provenance "
-            "and missing-data caveats; no clinical interpretation."
+            "Read-only workout sessions with source provenance for "
+            "[start_date, end_date) at UTC midnight. Selects by workout start: "
+            "earlier overlapping workouts are excluded; selected workouts keep "
+            "their full duration even beyond end_date. Returns at most 500 "
+            "workouts in start-time order; check truncated and missing_data_notes."
         ),
         input_schema=DATE_RANGE_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="get_sleep_summary",
         description=(
-            "Read-only sleep-stage summary observations for a date range with "
-            "source provenance and missing-data caveats; no clinical interpretation."
+            "Read-only session count and summed seconds per sleep stage with "
+            "source provenance for [start_date, end_date) at UTC midnight. "
+            "Selects by session start, not wake date or overlap: earlier "
+            "overlapping sessions are excluded. Selected sessions contribute "
+            "all stage intervals without clipping or overlap deduplication. "
+            "Check missing_data_notes; stage totals have no clinical interpretation."
         ),
         input_schema=DATE_RANGE_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="get_daily_summary",
         description=(
-            "Read-only daily observation summaries for a date range with source "
-            "provenance, missing-data caveats, sum-safe sample_totals, and "
-            "type-aware sample_statistics for non-summable metrics; no clinical "
-            "interpretation."
+            "Read-only daily observations for [start_date, end_date). Samples "
+            "group by calendar_day metadata when present, otherwise UTC start "
+            "date; calendar_day can include samples starting outside the UTC "
+            "range. Workouts and sleep sessions count on their UTC start date, "
+            "not overlap or wake date. Returns sum-safe sample_totals and "
+            "type-aware sample_statistics; inspect sample_total_semantics before "
+            "treating sums as daily activity. daily_activity_totals requires "
+            "completed calendar-day coverage. Empty days do not prove zero "
+            "activity; consult source provenance and missing_data_notes. "
+            "No clinical interpretation."
         ),
         input_schema=DATE_RANGE_INPUT_SCHEMA,
     ),
     ToolDefinition(
         name="explain_sources",
         description=(
-            "Read-only provenance summary for local sources and sync cursors with "
-            "missing-data caveats; no clinical interpretation."
+            "Read-only source provenance: source names, kinds, bundle IDs, device "
+            "models, and sync cursor kinds/update times, without cursor values. "
+            "Use to identify which app/device supplied records or investigate "
+            "source gaps; use get_bridge_status for receiver and sync health. "
+            "Includes missing-data caveats, not sample values."
         ),
         input_schema=EMPTY_INPUT_SCHEMA,
     ),
