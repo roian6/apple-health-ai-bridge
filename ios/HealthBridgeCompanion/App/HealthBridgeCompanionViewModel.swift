@@ -4029,6 +4029,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         let pendingTypeCodes = (try? backgroundSyncStore
             .loadPendingObserverTypeCodeGenerations().keys.sorted()) ?? []
+        if processedAllPending == true, !statusIsError,
+           diagnostic.record.failure == nil,
+           let readFailure = diagnostic.firstReadFailure {
+            diagnostic.noteFailure(readFailure)
+        }
         let failed = statusIsError || diagnostic.record.failure != nil
         let incomplete = processedAllPending == false
         let diagnosticOutcome: AutomaticSyncDiagnosticRunOutcome = failed

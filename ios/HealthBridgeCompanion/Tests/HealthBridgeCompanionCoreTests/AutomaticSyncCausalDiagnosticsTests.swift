@@ -351,6 +351,77 @@ final class AutomaticSyncCausalDiagnosticsTests: XCTestCase {
         }
     }
 
+    func testFirstReadFailureSurvivesLaterSuccessTruncationAndReplanning() throws {
+        let draft = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
+        let readFailure = AutomaticSyncDiagnosticFailure.classified(stage: .read, isCancellation: false)
+        draft.notePlan(typeCodes: ["steps", "basal_energy"])
+        draft.noteAttempt(typeCode: "steps")
+        draft.noteQueryStarted()
+        draft.noteLaneFailure(readFailure)
+        XCTAssertEqual(draft.firstReadFailure, readFailure)
+        XCTAssertNil(draft.record.failure)
+
+        draft.noteAttempt(typeCode: "basal_energy")
+        draft.noteQueryStarted()
+        draft.noteQuery(.records, newestSampleAge: nil, now: now)
+        draft.noteQueued(itemIDs: (1...100).map(item), complete: true, now: now)
+        draft.noteDelivery(.accepted, now: now)
+        XCTAssertTrue(try XCTUnwrap(draft.record.causalChain).truncated)
+        XCTAssertEqual(draft.firstReadFailure, readFailure)
+
+        draft.notePlan(typeCodes: ["basal_energy"])
+        draft.noteAttempt(typeCode: "basal_energy")
+        draft.noteQueryStarted()
+        draft.noteQuery(.noRecords, newestSampleAge: nil, now: now)
+        XCTAssertTrue(try XCTUnwrap(draft.record.causalChain).lanes.allSatisfy { $0.query == .noRecords })
+        XCTAssertEqual(draft.firstReadFailure, readFailure)
+        XCTAssertNil(draft.record.failure)
+
+        let next = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
+        next.notePlan(typeCodes: ["steps"])
+        next.noteAttempt(typeCode: "steps")
+        next.noteQueryStarted()
+        next.noteQuery(.records, newestSampleAge: 60, now: now)
+        next.noteDelivery(.accepted, now: now)
+        next.noteCompletion(.completed)
+        XCTAssertNil(next.firstReadFailure)
+        XCTAssertNil(next.record.failure)
+        XCTAssertEqual(next.record.runOutcome, .completed)
+    }
+
+    func testFirstReadFailureRequiresAttemptedNonCancellationReadIndependentOfLaneEvidence() {
+        let readFailure = AutomaticSyncDiagnosticFailure.classified(stage: .read, isCancellation: false)
+        let draft = AutomaticSyncDiagnosticDraft(reason: .scheduledRefresh)
+        draft.notePlan(typeCodes: ["steps"])
+        draft.noteAttempt(typeCode: "steps")
+        draft.noteLaneFailure(readFailure)
+        XCTAssertNil(draft.firstReadFailure)
+
+        for stage in [AutomaticSyncDiagnosticFailureStage.read, .store, .transport] {
+            draft.noteQueryStarted()
+            draft.noteLaneFailure(.classified(stage: stage, isCancellation: true))
+            XCTAssertNil(draft.firstReadFailure)
+        }
+        for stage in [AutomaticSyncDiagnosticFailureStage.store, .encoding, .transport] {
+            draft.noteQueryStarted()
+            draft.noteLaneFailure(.classified(stage: stage, isCancellation: false))
+            XCTAssertNil(draft.firstReadFailure)
+        }
+
+        draft.notePlan(typeCodes: [])
+        draft.noteQueryStarted()
+        draft.noteLaneFailure(readFailure)
+        XCTAssertEqual(draft.firstReadFailure, readFailure)
+        XCTAssertTrue(draft.record.causalChain?.lanes.isEmpty == true)
+        XCTAssertNil(draft.record.failure)
+        let cancellation = AutomaticSyncDiagnosticFailure.classified(stage: .unknown, isCancellation: true)
+        draft.noteFailure(cancellation)
+        draft.noteCompletion(.interrupted)
+        XCTAssertEqual(draft.record.failure, cancellation)
+        XCTAssertEqual(draft.record.runOutcome, .interrupted)
+        XCTAssertEqual(draft.firstReadFailure, readFailure)
+    }
+
     func testUnknownVersionAndMalformedOrTruncatedEvidenceHolds() throws {
         var valid = record(core.map(evidence))
         valid.causalChain?.version = 999
