@@ -155,6 +155,8 @@ jobs:
     name: Coverage-guided input fuzzing
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      UV_PYTHON: "3.12"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -174,7 +176,11 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install locked fuzz dependencies
-        run: uv sync --locked --dev --group fuzz
+        run: uv sync --locked --dev --group fuzz --python 3.12
+
+      - name: Verify native engine environment
+        run: |
+          uv run --no-sync python -c 'import atheris, platform, sys; from importlib.metadata import version; assert sys.version_info[:2] == (3, 12); assert platform.machine() == "x86_64"; print("Native Atheris", version("atheris"), "on", platform.python_version(), platform.machine())'
 
       - name: Audit installed fuzz dependencies
         run: uv run --no-sync pip-audit --local --skip-editable
@@ -186,4 +192,8 @@ jobs:
         run: |
           set -euo pipefail
           scratch="$(mktemp -d "$RUNNER_TEMP/health-bridge-fuzz.XXXXXX")"
-          uv run --no-sync python -m fuzz.campaign "$scratch"
+          uv run --no-sync python -m fuzz.campaign "$scratch" || {
+            status=$?
+            find "$scratch" -type f -name '*.log' -print -exec cat {} \;
+            exit "$status"
+          }

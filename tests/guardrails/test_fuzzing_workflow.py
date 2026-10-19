@@ -84,6 +84,13 @@ def test_native_ci_requires_campaign_and_dependency_audit() -> None:
     # Then
     assert "runs-on: ubuntu-24.04" in job
     assert 'python-version: "3.12"' in job
+    assert '    env:\n      UV_PYTHON: "3.12"\n' in job
+    assert "uv sync --locked --dev --group fuzz --python 3.12" in job
+    assert "Verify native engine environment" in job
+    assert "import atheris, platform, sys" in job
+    assert "assert sys.version_info[:2] == (3, 12)" in job
+    assert 'find "$scratch" -type f -name' in job
+    assert 'exit "$status"' in job
     assert "timeout-minutes: 10" in job
     assert "persist-credentials: false" in job
     assert "uv sync --locked --dev --group fuzz" in job
