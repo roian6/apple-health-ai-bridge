@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from threading import BrokenBarrierError
@@ -147,7 +148,7 @@ def opened_receipt(
 
 
 def counts(db_path: Path) -> tuple[int, int, int]:
-    with sqlite3.connect(db_path) as database:
+    with closing(sqlite3.connect(db_path)) as database, database:
         return (
             fetch_one_int(database, "select count(*) from samples"),
             fetch_one_int(database, "select count(*) from sync_runs"),

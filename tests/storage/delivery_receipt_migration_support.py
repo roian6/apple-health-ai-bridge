@@ -1,5 +1,6 @@
 import multiprocessing
 import sqlite3
+from contextlib import closing
 from multiprocessing.synchronize import Barrier as ProcessBarrier
 from pathlib import Path
 from threading import BrokenBarrierError
@@ -55,7 +56,7 @@ PROHIBITED_RECEIPT_COLUMN_PARTS = {
 
 def create_legacy_database(db_path: Path) -> None:
     migration_dir = Path("src/health_bridge/storage/migrations")
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("pragma foreign_keys = on")
         for migration_id in LEGACY_MIGRATION_IDS:
             _ = connection.executescript(

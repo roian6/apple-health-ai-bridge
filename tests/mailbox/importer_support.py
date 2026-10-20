@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -149,7 +150,7 @@ def import_once(
 
 
 def database_counts(value: ImportEnvironment) -> tuple[int, int, int]:
-    with sqlite3.connect(value.db_path) as database:
+    with closing(sqlite3.connect(value.db_path)) as database, database:
         return (
             fetch_one_int(database, "select count(*) from samples"),
             fetch_one_int(database, "select count(*) from sync_runs"),

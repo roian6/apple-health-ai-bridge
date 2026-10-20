@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 from http.client import RemoteDisconnected
 from pathlib import Path
 from typing import Literal
@@ -84,7 +85,7 @@ def test_invalid_reserved_observation_is_structured_http_refusal_and_rolls_back(
             )
         except RemoteDisconnected:
             disconnected = True
-        with sqlite3.connect(db) as connection:
+        with closing(sqlite3.connect(db)) as connection, connection:
             counts = COUNTS.validate_python(
                 connection.execute(
                     """select (select count(*) from samples),

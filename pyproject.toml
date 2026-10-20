@@ -31,8 +31,10 @@ dev = [
     "bandit>=1.9",
     "basedpyright>=1.29",
     "check-jsonschema>=0.33",
+    "coverage[toml]>=7.16.2",
     "pip-audit>=2.10",
     "pytest>=8.4",
+    "pytest-cov>=7.1",
     "ruff>=0.12",
 ]
 
@@ -150,3 +152,14 @@ minversion = "8.0"
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-config", "--strict-markers"]
 filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+concurrency = ["thread", "multiprocessing"]
+source = ["src/health_bridge"]
+relative_files = true
+patch = ["subprocess"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true

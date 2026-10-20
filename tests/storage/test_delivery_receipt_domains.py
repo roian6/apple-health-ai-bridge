@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Final, cast
 
@@ -158,7 +159,8 @@ def test_sql_rejects_noninteger_storage_classes_and_coercible_text(
     values[field] = invalid
 
     with (
-        sqlite3.connect(db_path) as connection,
+        closing(sqlite3.connect(db_path)) as connection,
+        connection,
         pytest.raises(sqlite3.IntegrityError),
     ):
         _ = connection.execute(RAW_RECEIPT_INSERT_SQL, values)
@@ -178,7 +180,8 @@ def test_sql_rejects_text_in_every_blob_metadata_column(
     values[field] = "x" * length
 
     with (
-        sqlite3.connect(db_path) as connection,
+        closing(sqlite3.connect(db_path)) as connection,
+        connection,
         pytest.raises(sqlite3.IntegrityError),
     ):
         _ = connection.execute(RAW_RECEIPT_INSERT_SQL, values)

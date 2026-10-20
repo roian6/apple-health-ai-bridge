@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -75,7 +76,7 @@ def with_projection_observations(
 def qualify_stored_daily_projections(db: Path) -> None:
     row_adapter = TypeAdapter(list[tuple[str, str, str, str, str, float, str, str]])
     source_adapter = TypeAdapter(list[tuple[str, str, str]])
-    with sqlite3.connect(db) as connection:
+    with closing(sqlite3.connect(db)) as connection, connection:
         rows = row_adapter.validate_python(
             connection.execute(
                 """select sources.source_key, type_code, client_record_id, start_time,

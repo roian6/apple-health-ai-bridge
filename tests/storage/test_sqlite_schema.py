@@ -5,6 +5,7 @@ import stat
 import sys
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from threading import Barrier
 from typing import TYPE_CHECKING, cast
@@ -464,7 +465,7 @@ def test_initialize_database_creates_core_tables_when_database_is_empty(
     initialize_database(db_path)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         table_rows = fetch_text_rows(
             connection,
             "select name from sqlite_master where type = 'table'",
@@ -499,7 +500,7 @@ def test_initialize_database_is_idempotent_when_called_twice(tmp_path: Path) -> 
     initialize_database(db_path)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         migration_count = fetch_one_int(
             connection,
             "select count(*) from schema_migrations",
@@ -517,7 +518,7 @@ def _create_legacy_sleep_revision_database(db_path: Path) -> None:
         "004_pairing_invitations",
         "005_pairing_devices",
     )
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("pragma foreign_keys = on")
         for migration_id in legacy_migration_ids:
             _ = connection.executescript(
@@ -574,7 +575,7 @@ def test_sleep_baseline_namespace_migration_backfills_current_reset(
     db_path = tmp_path / "legacy-sleep-baseline.sqlite"
     _create_legacy_sleep_revision_database(db_path)
     migration_dir = Path("src/health_bridge/storage/migrations")
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.executescript(
             (migration_dir / "006_sleep_session_revisions.sql").read_text(
                 encoding="utf-8"
@@ -594,7 +595,7 @@ def test_sleep_baseline_namespace_migration_backfills_current_reset(
 
     initialize_database(db_path)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         namespaces = fetch_text_rows(
             connection,
             "select namespace from sleep_baseline_namespaces",
@@ -619,7 +620,7 @@ def test_sleep_revision_migration_keeps_longest_same_start_session(
     initialize_database(db_path)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id, end_time from sleep_sessions"
         ).fetchall()
@@ -673,7 +674,7 @@ def test_sleep_revision_migration_rolls_back_dedupe_when_index_creation_fails(
     with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
         initialize_database(db_path)
 
-    with real_connect(db_path) as connection:
+    with closing(real_connect(db_path)) as connection, connection:
         session_count = fetch_one_int(connection, "select count(*) from sleep_sessions")
         migration_count = fetch_one_int(
             connection,
@@ -726,7 +727,7 @@ def test_pending_migration_is_serialized_and_rechecked_under_write_lock(
             _ = future.result()
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         migration_count = fetch_one_int(
             connection,
             "select count(*) from schema_migrations where migration_id = ?",
@@ -762,7 +763,7 @@ def test_initialize_database_repairs_existing_database_permissions(
 ) -> None:
     # Given
     db_path = tmp_path / "test.sqlite"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("create table existing_data (value text)")
     db_path.chmod(0o644)
 
@@ -801,9 +802,9 @@ def test_connect_database_rejects_path_swap_before_sqlite_open(
     db_path = tmp_path / "test.sqlite"
     replacement_path = tmp_path / "replacement.sqlite"
     backup_path = tmp_path / "original.sqlite"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("create table original_data (value text)")
-    with sqlite3.connect(replacement_path) as connection:
+    with closing(sqlite3.connect(replacement_path)) as connection, connection:
         _ = connection.execute("create table replacement_data (value text)")
     real_connect = sqlite3.connect
     swapped = False
@@ -830,7 +831,7 @@ def test_connect_database_rejects_path_swap_before_sqlite_open(
 def test_connect_database_rejects_symlink_database_path(tmp_path: Path) -> None:
     # Given
     target = tmp_path / "target.sqlite"
-    with sqlite3.connect(target):
+    with closing(sqlite3.connect(target)) as connection, connection:
         pass
     symlink = tmp_path / "linked.sqlite"
     symlink.symlink_to(target)
@@ -954,7 +955,7 @@ def test_connect_database_repairs_existing_wal_sidecar_permissions(
     previous_umask = os.umask(0o022)
 
     try:
-        with sqlite3.connect(db_path) as writer:
+        with closing(sqlite3.connect(db_path)) as writer, writer:
             journal_mode = cast(
                 "tuple[str]",
                 writer.execute("pragma journal_mode = wal").fetchone(),

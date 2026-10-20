@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tarfile
 import zipfile
+from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Final, TypeAlias
 
@@ -69,11 +70,11 @@ def test_fresh_database_adds_receipt_schema_and_pre_migration_backup(
     initialize_database(db_path)
 
     backup_path = delivery_receipt_backup_path(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         migrations = connection.execute(
             "select migration_id from schema_migrations order by migration_id"
         ).fetchall()
-    with sqlite3.connect(backup_path) as backup:
+    with closing(sqlite3.connect(backup_path)) as backup, backup:
         backup_tables = backup.execute(
             "select name from sqlite_master where type = 'table'"
         ).fetchall()
@@ -92,7 +93,7 @@ def test_upgrade_preserves_legacy_rows_and_exact_backup_checksum(
 
     backup_path = delivery_receipt_backup_path(db_path)
     assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == original_sha256
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute("select count(*) from sources").fetchone() == (1,)
         assert connection.execute("select count(*) from sync_runs").fetchone() == (1,)
 
@@ -103,7 +104,7 @@ def test_concurrent_process_upgrade_applies_once(tmp_path: Path) -> None:
 
     run_concurrent_process_upgrades(db_path)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         count = TypeAdapter(tuple[int]).validate_python(
             connection.execute(
                 "select count(*) from schema_migrations where migration_id = ?",
@@ -147,7 +148,7 @@ def test_failed_migration_keeps_original_and_backup_without_partial_table(
     backup_path = delivery_receipt_backup_path(db_path)
     assert hashlib.sha256(db_path.read_bytes()).hexdigest() == original_sha256
     assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == original_sha256
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         partial = connection.execute(
             "select name from sqlite_master where name like '%receipt%'"
         ).fetchall()
@@ -179,13 +180,13 @@ def test_old_binary_restore_holds_after_post_migration_commit(tmp_path: Path) ->
     db_path = tmp_path / "hold.sqlite"
     create_legacy_database(db_path)
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = insert_delivery_receipt(connection, _committed_receipt())
 
     decision = restore_delivery_receipt_backup(db_path)
 
     assert decision.value == "hold_post_migration_commit"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute(
             "select count(*) from delivery_receipts"
         ).fetchone() == (1,)
@@ -208,7 +209,7 @@ def test_typed_api_round_trips_committed_ack_regeneration_metadata(
     db_path = tmp_path / "api.sqlite"
     initialize_database(db_path)
     expected = _committed_receipt()
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         row_id = insert_delivery_receipt(connection, expected)
         actual = fetch_delivery_receipt(connection, row_id)
 
@@ -220,7 +221,7 @@ def test_authenticated_scope_and_ack_id_collisions_are_rejected(
 ) -> None:
     db_path = tmp_path / "collision.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = insert_delivery_receipt(connection, _committed_receipt())
         with pytest.raises(DeliveryReceiptConflictError):
             _ = insert_delivery_receipt(
@@ -240,7 +241,7 @@ def test_receipt_id_collision_is_rejected_across_distinct_scope(
         envelope_id=bytes([10]) * 16,
         ack_id=bytes([11]) * 16,
     )
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = insert_delivery_receipt(connection, original)
         with pytest.raises(DeliveryReceiptConflictError):
             _ = insert_delivery_receipt(connection, duplicate_receipt_id)
@@ -252,7 +253,7 @@ def test_schema_has_only_reviewed_metadata_columns_and_constraints(
     db_path = tmp_path / "privacy.sqlite"
     initialize_database(db_path)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         column_rows = TypeAdapter(
             list[tuple[int, str, str, int, None, int]]
         ).validate_python(
@@ -282,7 +283,7 @@ def test_direct_only_open_leaves_receipt_ledger_dormant(tmp_path: Path) -> None:
     initialize_database(db_path)
     initialize_database(db_path)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute("select count(*) from sources").fetchone() == (1,)
         assert connection.execute("select count(*) from sync_runs").fetchone() == (1,)
         assert connection.execute(

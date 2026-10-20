@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+from coverage import Coverage
+
 PYTHON_WORKFLOW = Path(".github/workflows/python.yml")
 IOS_WORKFLOW = Path(".github/workflows/ios.yml")
 DEPENDABOT_CONFIG = Path(".github/dependabot.yml")
@@ -36,11 +38,26 @@ def test_python_ci_runs_all_release_facing_python_gates() -> None:
         "uv run bandit -r src -q",
         "uv run pip-audit --local --skip-editable",
         "uv run pytest -q",
+        "--cov --cov-config=pyproject.toml",
+        "--cov-report=xml:coverage/coverage.xml",
+        "--cov-report=json:coverage/coverage.json",
         "rm -rf dist",
         build_command,
         "uv run python scripts/package-smoke.py --dist-dir dist",
     ):
         assert command in text
+
+
+def test_python_coverage_measures_all_source_and_child_process_branches() -> None:
+    coverage = Coverage(config_file="pyproject.toml")
+
+    assert coverage.get_option("run:branch") is True
+    assert coverage.get_option("run:source") == ["src/health_bridge"]
+    assert coverage.get_option("run:relative_files") is True
+    assert coverage.get_option("run:concurrency") == ["thread", "multiprocessing"]
+    assert coverage.get_option("run:patch") == ["subprocess"]
+    assert not coverage.get_option("run:omit")
+    assert not coverage.get_option("report:omit")
 
 
 def test_ios_ci_runs_swift_tests_and_unsigned_simulator_build() -> None:

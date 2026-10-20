@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Final
 
@@ -75,7 +76,7 @@ def test_ingest_fixture_stores_batch_records_when_fixture_is_valid(
     result = ingest_fixture(db_path, FIXTURE_PATH)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         counts = {
             table_name: fetch_count(connection, table_name)
             for table_name in (
@@ -131,7 +132,7 @@ def test_ingest_fixture_does_not_duplicate_logical_records_when_repeated(
     second_result = ingest_fixture(db_path, FIXTURE_PATH)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         samples_count = fetch_count(connection, "samples")
         sync_runs_count = fetch_count(connection, "sync_runs")
 
@@ -158,7 +159,7 @@ def test_ingest_fixture_records_failed_sync_run_when_schema_version_is_invalid(
     with pytest.raises(ValidationError):
         _ = ingest_fixture(db_path, invalid_path)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         row = FAILED_SYNC_ROW_ADAPTER.validate_python(
             connection.execute(
                 FAILED_SYNC_RUN_SQL,
@@ -197,7 +198,7 @@ def test_ingest_fixture_records_failed_sync_run_when_storage_write_fails(
     with pytest.raises(sqlite3.Error):
         _ = ingest_fixture(db_path, invalid_storage_path)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sync_runs_count = fetch_count(connection, "sync_runs")
         samples_count = fetch_count(connection, "samples")
         row = FAILED_SYNC_ROW_ADAPTER.validate_python(
@@ -233,7 +234,7 @@ def test_ingest_fixture_counts_unique_logical_records_when_batch_has_duplicates(
     result = ingest_fixture(db_path, duplicate_path)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         samples_count = fetch_count(connection, "samples")
         row = FAILED_SYNC_ROW_ADAPTER.validate_python(
             connection.execute(
@@ -277,7 +278,7 @@ def test_ingest_fixture_ignores_duplicate_sleep_intervals_in_same_batch(
     result = ingest_fixture(db_path, duplicate_path)
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sleep_stage_count = fetch_count(connection, "sleep_stage_intervals")
         sync_runs_count = fetch_count(connection, "sync_runs")
 
@@ -317,7 +318,7 @@ def test_ingest_batch_supersedes_partial_sleep_revision_with_complete_session(
     result = ingest_batch(db_path, complete_batch, "sleep-complete")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id, start_time, end_time from sleep_sessions"
         ).fetchall()
@@ -361,7 +362,7 @@ def test_ingest_batch_does_not_regress_complete_sleep_with_late_partial_replay(
     result = ingest_batch(db_path, partial_batch, "sleep-partial-replay")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id, start_time, end_time from sleep_sessions"
         ).fetchall()
@@ -420,7 +421,7 @@ def test_superseded_sleep_revision_cannot_resurrect_after_winner_is_deleted(
     result = ingest_batch(db_path, partial_batch, "sleep-replay-superseded")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_count = fetch_count(connection, "sleep_sessions")
         tombstone_rows = CLIENT_RECORD_ID_ROWS_ADAPTER.validate_python(
             connection.execute(
@@ -479,7 +480,7 @@ def test_ingest_batch_accepts_authoritative_shortened_sleep_revision(
     result = ingest_batch(db_path, correction_batch, "sleep-shortened")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id, start_time, end_time from sleep_sessions"
         ).fetchall()
@@ -549,7 +550,7 @@ def test_first_anchored_sleep_baseline_replaces_shifted_legacy_revision(
     result = ingest_batch(db_path, anchored_batch, "sleep-first-anchored-baseline")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id, start_time, end_time from sleep_sessions"
         ).fetchall()
@@ -594,7 +595,7 @@ def _assert_equal_pending_empty_sleep_epoch_is_ignored(
         }
     )
     result = ingest_batch(db_path, replay, "sleep-equal-empty-epoch-replay")
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         anchor = CURSOR_VALUE_ADAPTER.validate_python(
             connection.execute(
                 "select cursor_value from sync_cursors where cursor_kind = ?",
@@ -636,7 +637,7 @@ def _assert_equal_authoritative_sleep_epoch_is_ignored(
         equal_epoch_replay,
         "sleep-equal-authoritative-epoch-replay",
     )
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         equal_session_ids = {
             row[0]
             for row in CLIENT_RECORD_ID_ROWS_ADAPTER.validate_python(
@@ -722,7 +723,7 @@ def test_sleep_baseline_reset_rebinds_identity_when_receiver_already_has_anchor(
         "sleep-empty-new-namespace",
     )
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sessions_after_empty = [
             row[0]
             for row in CLIENT_RECORD_ID_ROWS_ADAPTER.validate_python(
@@ -748,7 +749,7 @@ def test_sleep_baseline_reset_rebinds_identity_when_receiver_already_has_anchor(
 
     result = ingest_batch(db_path, reset_batch, "sleep-rebound-namespace")
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_ids = [
             row[0]
             for row in CLIENT_RECORD_ID_ROWS_ADAPTER.validate_python(
@@ -794,7 +795,7 @@ def test_sleep_baseline_reset_rebinds_identity_when_receiver_already_has_anchor(
             "sleep-stale-old-namespace-replay",
         )
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         replayed_session_ids = [
             row[0]
             for row in CLIENT_RECORD_ID_ROWS_ADAPTER.validate_python(
@@ -859,7 +860,7 @@ def test_sleep_baseline_reset_rebinds_identity_when_receiver_already_has_anchor(
     )
     with pytest.raises(sqlite3.Error):
         _ = ingest_batch(db_path, delayed, "sleep-unseen-delayed-epoch")
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sessions_after_delayed = {
             row[0]
             for row in CLIENT_RECORD_ID_ROWS_ADAPTER.validate_python(
@@ -907,7 +908,7 @@ def test_sleep_baseline_reset_without_anchored_cursor_is_rejected(
     with pytest.raises(sqlite3.Error):
         _ = ingest_batch(db_path, incomplete, "sleep-incomplete-reset")
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert fetch_count(connection, "sleep_sessions") == 0
         assert connection.execute(
             "select count(*) from sleep_baseline_namespaces"
@@ -985,7 +986,7 @@ def test_installation_scoped_sleep_baselines_do_not_delete_other_devices(
         "sleep-delayed-legacy-phone-replay",
     )
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         installation_rows = TypeAdapter(list[tuple[str, str]]).validate_python(
             connection.execute(
                 """
@@ -1071,7 +1072,7 @@ def test_ingest_batch_accepts_authoritative_stage_only_sleep_revision(
     result = ingest_batch(db_path, corrected_batch, "sleep-stage-corrected")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id from sleep_sessions"
         ).fetchall()
@@ -1118,7 +1119,7 @@ def test_ingest_batch_replaces_stages_for_same_sleep_record_revision(
     result = ingest_batch(db_path, corrected_batch, "sleep-corrected")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         interval_count = fetch_count(connection, "sleep_stage_intervals")
         session_count = fetch_count(connection, "sleep_sessions")
 
@@ -1153,7 +1154,7 @@ def test_ingest_batch_accepts_equal_end_correction_for_existing_duplicate_id(
         update={"sleep_sessions": (correction,)}
     )
     _ = ingest_batch(db_path, original_batch, "sleep-original")
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("drop index sleep_sessions_source_start_unique")
         source_id = fetch_one_int(
             connection,
@@ -1187,7 +1188,7 @@ def test_ingest_batch_accepts_equal_end_correction_for_existing_duplicate_id(
     result = ingest_batch(db_path, correction_batch, "sleep-correction")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         session_rows = connection.execute(
             "select client_record_id from sleep_sessions"
         ).fetchall()
@@ -1239,7 +1240,7 @@ def test_ingest_batch_reconciles_deleted_records_by_removing_active_rows(
     result = ingest_batch(db_path, delete_batch, "delete-batch")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         counts = {
             table_name: fetch_count(connection, table_name)
             for table_name in (
@@ -1306,7 +1307,7 @@ def test_ingest_batch_does_not_resurrect_tombstoned_records_from_late_replay(
     result = ingest_batch(db_path, replay_batch, "late-active-replay")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         counts = {
             table_name: fetch_count(connection, table_name)
             for table_name in (
@@ -1366,7 +1367,7 @@ def test_ingest_batch_does_not_regress_timestamp_sync_cursor_from_late_replay(
     result = ingest_batch(db_path, older_batch, "late-older-cursor-replay")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         row = CURSOR_VALUE_ADAPTER.validate_python(
             connection.execute(
                 """
@@ -1513,7 +1514,7 @@ def test_ingest_batch_canonicalizes_legacy_active_energy_samples_and_cursors(
     result = ingest_batch(db_path, batch, "legacy-active-energy")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sample_rows = connection.execute(
             """
             select type_code, client_record_id, value
@@ -1562,7 +1563,7 @@ def test_ingest_batch_promotes_existing_legacy_active_energy_sample_without_dupl
     # Given
     db_path = tmp_path / "active-energy-sample-migration.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -1653,7 +1654,7 @@ def test_ingest_batch_promotes_existing_legacy_active_energy_sample_without_dupl
     result = ingest_batch(db_path, batch, "legacy-active-energy-sample")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sample_rows = connection.execute(
             """
             select type_code, client_record_id, value
@@ -1671,7 +1672,7 @@ def test_ingest_batch_skips_active_energy_replay_after_legacy_tombstone(
     # Given
     db_path = tmp_path / "active-energy-legacy-tombstone-replay.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -1748,7 +1749,7 @@ def test_ingest_batch_skips_active_energy_replay_after_legacy_tombstone(
     result = ingest_batch(db_path, batch, "legacy-active-energy-late-replay")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sample_count = fetch_count(connection, "samples")
     assert result.status == "succeeded"
     assert sample_count == 0
@@ -1760,7 +1761,7 @@ def test_ingest_batch_removes_existing_legacy_sample_after_canonical_tombstone(
     # Given
     db_path = tmp_path / "active-energy-canonical-tombstone-legacy-row.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -1866,7 +1867,7 @@ def test_ingest_batch_removes_existing_legacy_sample_after_canonical_tombstone(
     result = ingest_batch(db_path, batch, "legacy-active-energy-after-delete")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sample_count = fetch_count(connection, "samples")
     assert result.status == "succeeded"
     assert sample_count == 0
@@ -1878,7 +1879,7 @@ def test_ingest_batch_deletes_legacy_active_energy_sample_from_canonical_tombsto
     # Given
     db_path = tmp_path / "active-energy-legacy-delete.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -1966,7 +1967,7 @@ def test_ingest_batch_deletes_legacy_active_energy_sample_from_canonical_tombsto
     result = ingest_batch(db_path, batch, "legacy-active-energy-delete")
 
     # Then
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sample_count = fetch_count(connection, "samples")
         tombstone_ids = connection.execute(
             "select client_record_id from deleted_records order by client_record_id",
@@ -1982,7 +1983,7 @@ def test_ingest_batch_promotes_newer_legacy_active_energy_cursor_to_canonical(
     # Given
     db_path = tmp_path / "active-energy-cursor-migration.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -2088,7 +2089,7 @@ def _stored_cursor_value(
     source_key: str,
     cursor_kind: str,
 ) -> tuple[str] | None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         return CURSOR_VALUE_ADAPTER.validate_python(
             connection.execute(
                 """

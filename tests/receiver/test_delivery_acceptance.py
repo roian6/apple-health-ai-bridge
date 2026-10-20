@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing
 import sqlite3
+from contextlib import closing
 from typing import TYPE_CHECKING
 
 import pytest
@@ -96,7 +97,7 @@ def test_alternate_exact_bytes_under_new_id_follow_inner_idempotence(
     # Then
     assert first.ack_bytes != alternate.ack_bytes
     assert counts(db_path) == (1, 2, 2)
-    with sqlite3.connect(db_path) as database:
+    with closing(sqlite3.connect(db_path)) as database, database:
         digests = database.execute(
             "select payload_sha256 from delivery_receipts order by receipt_id"
         ).fetchall()

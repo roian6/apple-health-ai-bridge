@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from http.client import HTTPResponse, RemoteDisconnected
 from pathlib import Path
 from threading import Thread
@@ -494,7 +494,7 @@ def test_receiver_redeem_retry_is_idempotent_after_response_loss(
                 assert response.status == 200
                 _ = PairingCompletionResponse.model_validate_json(response.read())
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         active_mapped_tokens = TypeAdapter(tuple[int]).validate_python(
             connection.execute(
                 """

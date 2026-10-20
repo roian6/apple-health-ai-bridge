@@ -161,7 +161,7 @@ def test_legacy_identical_raw_body_is_accepted_twice_without_logical_duplicates(
     assert observations == (expected, expected)
     assert b"delivery" not in SUCCESS_BODY
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         logical_counts = LOGICAL_COUNTS_ADAPTER.validate_python(
             connection.execute(
                 """

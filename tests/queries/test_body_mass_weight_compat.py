@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ def test_get_timeseries_resolves_body_mass_and_weight_in_both_directions(
 ) -> None:
     db_path = tmp_path / "body-mass-weight-query.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)

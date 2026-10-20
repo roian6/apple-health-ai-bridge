@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import ClassVar, Final
 
@@ -57,12 +58,12 @@ def test_python_raw_http_row_matches_runtime_bytes_and_ingest(tmp_path: Path) ->
     with running_receiver(db_path) as port:
         unauthorized_body = b"{}"
         unauthorized = post_raw_batch(port, "synthetic-wrong-token", unauthorized_body)
-        with sqlite3.connect(db_path) as connection:
+        with closing(sqlite3.connect(db_path)) as connection, connection:
             unauthorized_ingest_count = COUNT_ADAPTER.validate_python(
                 connection.execute("select count(*) from sync_runs").fetchone()[0]
             )
         response = post_raw_batch(port, LEGACY_TOKEN, request_body)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         ingest_count = COUNT_ADAPTER.validate_python(
             connection.execute("select count(*) from sync_runs").fetchone()[0]
         )

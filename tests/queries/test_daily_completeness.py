@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypeAlias
@@ -73,7 +74,7 @@ def test_completed_total_excludes_partial_but_preserves_observations(
     assert day.sample_counts == {"steps": 2}
     assert day.sample_total_semantics == {"steps": "daily_aggregate"}
     assert day.daily_activity_totals == {"steps": 6.0}
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute("select count(*) from samples").fetchone() == (2,)
 
 
@@ -129,7 +130,7 @@ def test_malformed_stored_marker_is_not_missing(
     marker: object,
 ) -> None:
     db_path = _ingest_samples(tmp_path, [(START, END, 20.0, DAILY)])
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute(
             "update samples set metadata_json = ?",
             (json.dumps({**DAILY, "aggregation_completeness": marker}),),
@@ -262,14 +263,14 @@ def test_invalid_calendar_metadata_cannot_certify_a_total(
     metadata = {**DAILY, **calendar_metadata}
     if marker is not None:
         metadata["aggregation_completeness"] = marker
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute(
             "update samples set metadata_json = ?",
             (json.dumps(metadata),),
         )
     result = get_daily_summary(db_path, start_date="2026-06-09", end_date="2026-06-11")
     assert all(day.daily_activity_totals == {} for day in result.days)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute("select count(*) from samples").fetchone() == (1,)
 
 
@@ -291,7 +292,7 @@ def test_malformed_or_empty_stored_boundary_cannot_certify_a_total(
     boundary: str,
 ) -> None:
     db_path = _ingest_samples(tmp_path, [(START, END, 6.0, COMPLETE)])
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         if field == "start_time":
             _ = connection.execute("update samples set start_time = ?", (boundary,))
         else:

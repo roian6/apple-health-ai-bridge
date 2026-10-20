@@ -5,6 +5,7 @@ import re
 import sqlite3
 import stat
 import sys
+from contextlib import closing
 from pathlib import Path
 from subprocess import run
 from typing import Final, Literal, TypeAlias
@@ -304,7 +305,7 @@ def test_receiver_purge_refuses_active_database_lock(tmp_path: Path) -> None:
     assert result.stdout == ""
     assert "unavailable or still in use" in result.stderr
     assert db_path.exists()
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute("pragma integrity_check").fetchone() == ("ok",)
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Self, cast, final
 from urllib.error import HTTPError
@@ -725,5 +726,8 @@ def test_direct_serve_receiver_never_starts_mailbox_worker(
 
     server_module.serve_receiver(tmp_path / "receiver.sqlite", "127.0.0.1", 0)
 
-    with sqlite3.connect(tmp_path / "receiver.sqlite") as connection:
+    with (
+        closing(sqlite3.connect(tmp_path / "receiver.sqlite")) as connection,
+        connection,
+    ):
         assert connection.execute("SELECT 1").fetchone() == (1,)

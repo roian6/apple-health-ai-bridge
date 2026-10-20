@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -102,7 +103,7 @@ def test_body_mass_upgrade_delete_and_replay_share_one_weight_namespace(
 ) -> None:
     db_path = tmp_path / "body-mass-weight-upgrade.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -166,7 +167,7 @@ def test_body_mass_upgrade_delete_and_replay_share_one_weight_namespace(
         "body-mass-upgrade",
     )
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         upgraded_samples = connection.execute(
             """
             select type_code, client_record_id, value
@@ -205,7 +206,7 @@ def test_body_mass_upgrade_delete_and_replay_share_one_weight_namespace(
         "body-mass-legacy-replay",
     )
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         remaining_samples = connection.execute(
             "select type_code, client_record_id from samples",
         ).fetchall()

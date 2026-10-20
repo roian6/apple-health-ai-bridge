@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -84,7 +85,7 @@ def test_get_timeseries_resolves_legacy_active_energy_requests(
     # Given
     db_path = tmp_path / "legacy-active-energy-query.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -139,7 +140,7 @@ def test_get_timeseries_includes_pre_migration_active_energy_rows(
     # Given
     db_path = tmp_path / "pre-migration-active-energy-query.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -193,7 +194,7 @@ def test_get_timeseries_exposes_sample_metadata_for_agent_source_decisions(
     # Given
     db_path = tmp_path / "timeseries-metadata-query.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_cursor = connection.execute(
             """
             insert into sources (source_key, name, kind, bundle_id, device_model)
@@ -532,7 +533,7 @@ def test_get_daily_summary_uses_calendar_day_metadata_for_daily_aggregates(
 ) -> None:
     # Given
     db_path = initialized_fixture_db(tmp_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_id = _sample_source_id(connection)
         _ = connection.execute(
             """
@@ -578,7 +579,7 @@ def test_get_daily_summary_uses_calendar_day_metadata_for_daily_aggregates(
 
 
 def _insert_metric_samples(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_id = _sample_source_id(connection)
         _upsert_sample_health_types(connection)
         upsert_sample_sql = """
@@ -655,7 +656,7 @@ def _insert_metric_samples(db_path: Path) -> None:
 
 
 def _insert_activity_semantics_samples(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_id = _sample_source_id(connection)
         upsert_health_type_sql = """
             insert or replace into health_types
@@ -729,7 +730,7 @@ def _insert_activity_semantics_samples(db_path: Path) -> None:
 
 
 def _insert_mixed_unit_samples(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_id = _sample_source_id(connection)
         _upsert_sample_health_types(connection)
         upsert_sample_sql = """
@@ -786,7 +787,7 @@ def _insert_mixed_unit_samples(db_path: Path) -> None:
 
 
 def _insert_timeseries_catalog_metric_samples(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_id = _sample_source_id(connection)
         upsert_health_type_sql = """
             insert or replace into health_types

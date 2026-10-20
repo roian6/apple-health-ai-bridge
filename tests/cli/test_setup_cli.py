@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import stat
 import sys
+from contextlib import closing
 from pathlib import Path
 from subprocess import CompletedProcess, run
 from typing import ClassVar, Literal, cast
@@ -280,7 +281,7 @@ def test_setup_provisions_explicit_mailbox_only_on_supported_mac_topology(
     assert "best-effort/eventual" in manifest.warning
     assert "mailbox deliveries are imported" in manifest.next_steps[4]
     assert "ACK after its database commit" in manifest.next_steps[4]
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         invitation = cast(
             "tuple[str] | None",
             connection.execute("SELECT transport FROM pairing_invitations").fetchone(),

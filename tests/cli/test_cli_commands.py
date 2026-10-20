@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from subprocess import run
 from typing import ClassVar, Final
@@ -156,7 +157,7 @@ def test_cli_init_ingest_and_status_report_counts_when_fixture_is_valid(
     assert "sync_runs: 2" in status_result.stdout
     assert "last_sync_status: succeeded" in status_result.stdout
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         sample_count = fetch_one_int(connection, "select count(*) from samples")
         sync_run_count = fetch_one_int(connection, "select count(*) from sync_runs")
 
@@ -229,7 +230,7 @@ def test_cli_status_json_reports_structured_redacted_agent_snapshot(
         check=True,
     )
     issued_token = IssuedTokenOutput.model_validate_json(token_result.stdout)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_row = SOURCE_ID_ROW_ADAPTER.validate_python(
             connection.execute(
                 "select source_id from sources where source_key = ?",
@@ -315,7 +316,7 @@ def test_cli_status_json_notes_optional_only_sync_without_core_daily_lanes(
          sync_cursor_count)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_row = SOURCE_ID_ROW_ADAPTER.validate_python(
             connection.execute(
                 insert_source_sql,
@@ -686,7 +687,7 @@ def test_cli_ingest_fixture_fails_cleanly_when_fixture_is_malformed(
     assert "Fixture ingest failed: malformed JSON fixture." in result.stderr
     assert "do-not-print" not in result.stderr
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         row = ERROR_ROW_ADAPTER.validate_python(
             connection.execute(
                 "select status, error_summary from sync_runs",
@@ -735,7 +736,7 @@ def test_cli_ingest_fixture_fails_cleanly_when_storage_write_fails(
     assert "Fixture ingest failed: records could not be stored." in result.stderr
     assert "synthetic.missing.source" not in result.stderr
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         row = ERROR_ROW_ADAPTER.validate_python(
             connection.execute(
                 "select status, error_summary from sync_runs",

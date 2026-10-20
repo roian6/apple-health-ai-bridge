@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -165,7 +165,7 @@ def test_wrong_receipt_schema_cannot_return_under_shared_lock(
     # Given
     db_path = tmp_path / "wrong-receipt-schema.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("drop table delivery_receipts")
         _ = connection.execute("create table delivery_receipts(dummy text)")
     lock_modes = _trace_lifecycle_locks(monkeypatch)
@@ -183,7 +183,7 @@ def test_missing_receipt_table_fails_closed_after_exclusive_recovery(
     # Given
     db_path = tmp_path / "missing-receipt-table.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("drop table delivery_receipts")
     lock_modes = _trace_lifecycle_locks(monkeypatch)
 
@@ -191,7 +191,7 @@ def test_missing_receipt_table_fails_closed_after_exclusive_recovery(
     with pytest.raises(OSError, match="invalid delivery receipt schema"):
         initialize_database(db_path)
     assert lock_modes == [False, True]
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert (
             connection.execute(
                 "select 1 from sqlite_master where type = 'table' and name = ?",
@@ -208,7 +208,7 @@ def test_malformed_migration_table_reaches_exclusive_recheck_before_failure(
     # Given
     db_path = tmp_path / "malformed-schema-migrations.sqlite"
     initialize_database(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = connection.execute("drop table schema_migrations")
         _ = connection.execute("create table schema_migrations(dummy text)")
     lock_modes = _trace_lifecycle_locks(monkeypatch)
@@ -257,7 +257,7 @@ def test_post_migration_receipt_commit_cannot_be_reclassified_as_safe(
     db_path = tmp_path / "receipt-after-boundary.sqlite"
     create_legacy_database(db_path)
     _interrupt_guard_once(db_path, monkeypatch)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         _ = insert_delivery_receipt(connection, committed_receipt())
 
     with pytest.raises(OSError, match="delivery receipt migration recovery mismatch"):
@@ -283,7 +283,7 @@ def test_concurrent_restarts_recover_one_guard(
     assert (
         restore_delivery_receipt_backup(db_path).value == "hold_post_migration_commit"
     )
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute(
             "select 1 from schema_migrations where migration_id = ?",
             ("009_pairing_transport",),

@@ -2,7 +2,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from threading import Thread
 from typing import TYPE_CHECKING, cast
@@ -165,7 +165,7 @@ def test_v2_tokens_bind_all_claimed_sources_to_the_paired_installation(
         )
         assert post_batch(url, TOKEN_B, b_delete) == 202
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         source_keys = connection.execute(
             "select source_key from sources order by source_key"
         ).fetchall()
