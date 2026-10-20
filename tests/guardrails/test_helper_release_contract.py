@@ -36,6 +36,7 @@ def _helper_verification_args(
     *,
     helper_sha256: str,
     manifest_sha256: str,
+    version: str = "1.1.1",
 ) -> tuple[str, ...]:
     return (
         "--repo",
@@ -43,7 +44,7 @@ def _helper_verification_args(
         "--dist-dir",
         str(dist),
         "--tag",
-        "receiver-v1.1.1",
+        f"receiver-v{version}",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -152,14 +153,16 @@ def test_release_metadata_binds_expected_exact_source_helper(
     assert len(source["git_tree"]) == 40
 
 
-def test_final_checksums_bind_helper_digest_and_exact_asset_set(
+def build_helper_packet(
     tmp_path: Path,
     receiver_release_repo: Path,
-) -> None:
+    version: str = "1.1.1",
+) -> tuple[str, ...]:
+    """Create synthetic helper inputs; these are not native signing evidence."""
     dist = tmp_path / "dist"
     dist.mkdir()
-    wheel = dist / "apple_health_ai_bridge-1.1.1-py3-none-any.whl"
-    sdist = dist / "apple_health_ai_bridge-1.1.1.tar.gz"
+    wheel = dist / f"apple_health_ai_bridge-{version}-py3-none-any.whl"
+    sdist = dist / f"apple_health_ai_bridge-{version}.tar.gz"
     _ = wheel.write_bytes(b"wheel fixture")
     _ = sdist.write_bytes(b"sdist fixture")
     metadata = dist / "release-metadata.json"
@@ -170,7 +173,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
         "--dist-dir",
         str(dist),
         "--tag",
-        "receiver-v1.1.1",
+        f"receiver-v{version}",
         "--tag-object",
         "3" * 40,
         "--commit",
@@ -186,7 +189,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
         "dict[str, object]", release_metadata["macos_mailbox_ack_helper"]
     )
     source = cast("dict[str, str]", helper_contract["source"])
-    archive = dist / "HealthBridgeMailboxAckPublisher-1.1.1.zip"
+    archive = dist / f"HealthBridgeMailboxAckPublisher-{version}.zip"
     bundle_identifier = _identity_value(
         "dev.", "chanhyo.", "healthbridge", ".mailbox.ackpublisher"
     )
@@ -198,7 +201,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
             "CFBundleExecutable": "HealthBridgeMailboxAckPublisher",
             "CFBundleIdentifier": bundle_identifier,
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "1.1.1",
+            "CFBundleShortVersionString": version,
             "CFBundleVersion": "1",
             "HealthBridgeExpectedBundleIdentifier": bundle_identifier,
             "HealthBridgeICloudContainerIdentifier": container_identifier,
@@ -220,7 +223,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
             b"synthetic signature",
         )
     helper_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    helper_manifest = dist / ("HealthBridgeMailboxAckPublisher-1.1.1.manifest.json")
+    helper_manifest = dist / f"HealthBridgeMailboxAckPublisher-{version}.manifest.json"
     approved_signer = _identity_value("Y3BJ", "C2J65L")
     _ = helper_manifest.write_text(
         json.dumps(
@@ -234,12 +237,12 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
                     "build": "1",
                     "identifier": bundle_identifier,
                     "icloud_container_identifier": container_identifier,
-                    "version": "1.1.1",
+                    "version": version,
                 },
                 "component": "HealthBridgeMailboxAckPublisher",
                 "release": {
                     "commit": "1" * 40,
-                    "tag": "receiver-v1.1.1",
+                    "tag": f"receiver-v{version}",
                     "tag_object": "3" * 40,
                     "tree": "2" * 40,
                 },
@@ -278,12 +281,22 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
         ),
         encoding="utf-8",
     )
-    common = _helper_verification_args(
+    return _helper_verification_args(
         receiver_release_repo,
         dist,
         helper_sha256=helper_digest,
         manifest_sha256=hashlib.sha256(helper_manifest.read_bytes()).hexdigest(),
+        version=version,
     )
+
+
+def test_final_checksums_bind_helper_digest_and_exact_asset_set(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+) -> None:
+    common = build_helper_packet(tmp_path, receiver_release_repo)
+    dist = tmp_path / "dist"
+    expected_names = sorted(path.name for path in dist.iterdir())
 
     verified = _run_release_tool("verify-helper", *common)
     finalized = _run_release_tool(
@@ -299,15 +312,7 @@ def test_final_checksums_bind_helper_digest_and_exact_asset_set(
         line.split("  ", 1)[1]
         for line in (dist / "SHA256SUMS").read_text().splitlines()
     ]
-    assert names == sorted(
-        [
-            archive.name,
-            helper_manifest.name,
-            wheel.name,
-            sdist.name,
-            metadata.name,
-        ]
-    )
+    assert names == expected_names
 
 
 def test_owner_staging_script_is_exact_source_and_public_safe() -> None:

@@ -77,7 +77,21 @@ Before pushing a release tag, configure and read back these repository-side gate
 3. Create a separate active tag ruleset targeting `refs/tags/receiver-v*`. Enable **Restrict creations**, **Restrict deletions**, and **Restrict updates**. Limit bypass to the release maintainer role needed to create a new signed tag; the workflow token does not need tag mutation permission. Never bypass the ruleset to move or recreate an existing version.
 4. Open GitHub repository **Settings → General → Releases** and select **Enable release immutability**. Read back all four controls immediately before the next tag: the environment name/reviewer and `receiver-v*` deployment rule, the no-bypass legacy `v*` ruleset, the protected `receiver-v*` creation ruleset, and release immutability enabled.
 
-The tagged workflow creates one helper-pending draft and attests the core packet; it cannot publish. If that phase fails, inspect and remove only that unpublished draft before retrying. Never move or reuse a published version tag.
+The downloadable proof policy starts prospectively at Receiver/CLI `1.1.3`
+(including prereleases with that version core). Earlier immutable releases retain
+their original asset contracts; do not retrofit bundles or checksums onto
+`receiver-v1.1.2` or any older release. Adding this policy does not change the
+current source version or publish a new release.
+
+For releases under this policy, the tagged workflow explicitly attests the wheel,
+sdist, and `release-metadata.json`, exports the action's original signed Sigstore
+bundle as `receiver-build-provenance.intoto.jsonl`, and verifies each subject with
+native `gh attestation verify` before creating the four-asset helper-pending
+draft. JSON compaction preserves the signed DSSE payload and verification material;
+the JSONL file is not an unsigned metadata substitute. The workflow downloads the
+draft again and checks exact bytes, names, digests, sizes, and native proof.
+It cannot publish. If that phase fails, inspect and remove only that unpublished
+draft before retrying. Never move or reuse a published version tag.
 
 On the canonical owner Mac, create a private xcconfig outside the repository with the Apple Developer Team, production helper bundle identifier, matching expected bundle identifier, and iCloud container overrides. Do not commit that overlay or signing material. From a clean checkout at the exact signed tag, stage a new helper:
 
@@ -91,7 +105,32 @@ scripts/stage-mailbox-helper-release.sh \
 
 The staging command verifies the signed annotated tag and clean canonical helper source; checks the non-secret publisher, Team ID, bundle, and iCloud container against source-controlled release-policy digests; builds with a Developer ID Application identity, secure timestamp, hardened runtime, and a non-device-limited provisioning profile; validates the exact bundle, application, Team ID, sandbox, and iCloud entitlements; submits a private temporary zip with the named Keychain profile and waits for an accepted notarization; staples and validates the ticket; requires Gatekeeper acceptance; then creates and revalidates the deterministic final assets. It prints only public filenames and the helper SHA-256. It emits no credential, Keychain profile name, private path, raw entitlement/profile data, or notary/signing log.
 
-Attach the two newly staged helper files to the existing helper-pending draft without replacing any asset. Then manually run **Continue helper-bound release** with the exact draft database ID, tag, and printed helper SHA-256. A clean GitHub-hosted macOS runner first downloads the exact bound draft assets and independently verifies source/archive/manifest binding, Developer ID publisher and Team ID, profile and entitlements, timestamp and hardened runtime, stapled notarization, and Gatekeeper acceptance. The publish job requires that gate, reverifies the live signed tag/commit identities, current default-main equality, Git tree, existing unpublished draft ID, exact helper source binding and digest, and exact five-asset pre-checksum set. It creates and uploads a new `SHA256SUMS` without clobbering, attests the helper/manifest/checksum, reverifies the exact six-asset draft, and only then changes that same draft to published. It refuses an already published release and cannot create or replace a release.
+Attach the two newly staged helper files to the existing helper-pending draft
+without replacing any asset. Then manually run **Continue helper-bound release**
+with the exact draft database ID, tag, and printed helper archive and manifest
+SHA-256 values. Select the same receiver tag as the workflow's execution ref
+(`gh workflow run publish-release.yml --ref "$tag"` when using the CLI); the
+requested tag input alone does not select the executing workflow. Both workflow
+source and checked-out source must resolve to the exact signed tag commit and
+tree. A dispatch from `main` with a tag input is rejected.
+
+A clean GitHub-hosted macOS runner downloads exactly six helper-bound inputs:
+the four initial assets plus the same-version helper zip and manifest. It
+verifies the original build proof and remote names/digests/sizes, then checks
+source/archive/manifest binding, Developer ID publisher and Team ID, profile and
+entitlements, timestamp and hardened runtime, stapled notarization, and Gatekeeper
+acceptance. The protected Ubuntu job requires that gate, repeats the six-input
+validation, and reverifies signed tag/commit identities, default-main equality,
+Git tree, and unpublished draft ID.
+
+`SHA256SUMS` covers those six inputs, excluding itself. The continuation explicitly
+attests the helper zip, helper manifest, and `SHA256SUMS`, then exports
+`receiver-final-provenance.intoto.jsonl`. Native verification of that final bundle
+is independent; the bundle is not an input to its own upstream checksums. The
+final packet contains exactly eight assets. Only after local proof, exact remote
+draft bytes, and both bundles pass verification may that same draft become
+published. The published assets are downloaded and verified again. Every proof
+failure blocks publication; no release or asset replacement is permitted.
 
 GitHub defines the push payload's `after` field as the most recent **commit** on the pushed ref. For an annotated tag, the release workflow therefore binds the peeled target commit to `github.event.after`; it separately binds the live tag ref to the locally fetched annotated tag object, verifies the signed tag's internal name, and relies on the active tag ruleset to prevent creation/update/deletion races.
 

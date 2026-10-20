@@ -314,7 +314,7 @@ def test_publish_requires_clean_macos_distribution_gate() -> None:
         workflow.count('[[ "$EXPECTED_HELPER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]')
         == 2
     )
-    assert workflow.count("--helper-manifest-sha256") == 5
+    assert workflow.count("--helper-manifest-sha256") == 6
     assert workflow.count('test "$actual_manifest_sha256" =') == 2
     assert "ditto -x -k" in workflow
     extracted_executable = (

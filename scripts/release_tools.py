@@ -15,6 +15,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, assert_never, cast
 
+from release_provenance import (
+    BUILD_PROVENANCE,
+    FINAL_PROVENANCE,
+    ProvenanceError,
+    ProvenanceRequest,
+    Workflow,
+    verify_execution,
+    verify_provenance,
+)
 from release_versions import (
     ReleaseError,
     canonical_receiver_tag,
@@ -193,6 +202,10 @@ def _release_scope(versions: ReleaseVersions) -> str:
 
 def _expected_receiver_tag(version: str) -> str:
     return canonical_receiver_tag(version)
+
+
+def requires_provenance(tag: str) -> bool:
+    return parse_receiver_release_tag(tag).version.as_tuple() >= (1, 1, 3)
 
 
 def _validate_release_notes(
@@ -990,6 +1003,8 @@ def verify_packet(request: PacketVerificationRequest) -> None:
 
 def _validate_helper_packet(
     request: HelperVerificationRequest,
+    *,
+    final: bool = False,
 ) -> tuple[set[str], dict[str, tuple[str, int]]]:
     if SHA256_PATTERN.fullmatch(request.helper_sha256) is None:
         message = "expected helper digest must be lowercase SHA-256"
@@ -1044,9 +1059,14 @@ def _validate_helper_packet(
         manifest_name,
         metadata_path.name,
     }
+    proof_required = requires_provenance(request.tag)
+    names.update({BUILD_PROVENANCE} if proof_required else set())
+    final_outputs = (
+        {"SHA256SUMS", FINAL_PROVENANCE} if proof_required else {"SHA256SUMS"}
+    )
     present = _exact_regular_file_names(
         request.dist,
-        excluded_names={request.output.name} if request.output is not None else None,
+        excluded_names=final_outputs if final else set(),
     )
     if present != names:
         message = "helper continuation packet file set is not exact"
@@ -1056,6 +1076,17 @@ def _validate_helper_packet(
         if path.stat().st_size != size or _sha256(path) != digest:
             message = f"release metadata artifact mismatch: {name}"
             raise ReleaseError(message)
+    if proof_required:
+        verify_provenance(
+            ProvenanceRequest(
+                request.dist,
+                request.tag,
+                request.commit,
+                "release.yml",
+                BUILD_PROVENANCE,
+                frozenset(records) | {"release-metadata.json"},
+            )
+        )
     return names, records
 
 
@@ -1067,8 +1098,13 @@ def create_final_checksums(request: HelperVerificationRequest) -> None:
     if request.output is None:
         message = "final checksum output is required"
         raise ReleaseError(message)
-    if request.output.parent.resolve() != request.dist.resolve():
-        message = "final checksum output must be inside dist directory"
+    if (
+        request.output.parent.resolve() != request.dist.resolve()
+        or request.output.name != "SHA256SUMS"
+        or request.output.exists()
+        or request.output.is_symlink()
+    ):
+        message = "final checksum output must be a new SHA256SUMS inside dist directory"
         raise ReleaseError(message)
     names, _records = _validate_helper_packet(request)
     lines = "".join(
@@ -1145,13 +1181,8 @@ def _verify_remote_assets(
             raise ReleaseError(message)
 
 
-def verify_core_draft(request: DraftVerificationRequest) -> None:
+def verify_core_packet(request: PacketVerificationRequest) -> set[str]:
     versions = validate_tag(request.repo, request.tag)
-    payload = json.loads(request.release_json.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        message = "GitHub release response must be an object"
-        raise ReleaseError(message)
-    _verify_release_identity(payload, request, expected_draft=True)
     metadata_payload = json.loads(
         (request.dist / "release-metadata.json").read_text(encoding="utf-8")
     )
@@ -1167,6 +1198,8 @@ def verify_core_draft(request: DraftVerificationRequest) -> None:
         ),
     )
     expected_names = set(records) | {"release-metadata.json"}
+    if requires_provenance(request.tag):
+        expected_names.add(BUILD_PROVENANCE)
     if _exact_regular_file_names(request.dist) != expected_names:
         message = "helper-pending draft packet file set is not exact"
         raise ReleaseError(message)
@@ -1175,13 +1208,84 @@ def verify_core_draft(request: DraftVerificationRequest) -> None:
         if local.stat().st_size != size or _sha256(local) != digest:
             message = f"release metadata artifact mismatch: {name}"
             raise ReleaseError(message)
+    if requires_provenance(request.tag):
+        verify_provenance(
+            ProvenanceRequest(
+                request.dist,
+                request.tag,
+                request.commit,
+                "release.yml",
+                BUILD_PROVENANCE,
+                frozenset(records) | {"release-metadata.json"},
+            )
+        )
+    return expected_names
+
+
+def verify_core_draft(request: DraftVerificationRequest) -> None:
+    payload = json.loads(request.release_json.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        message = "GitHub release response must be an object"
+        raise ReleaseError(message)
+    _verify_release_identity(payload, request, expected_draft=True)
+    expected_names = verify_core_packet(
+        PacketVerificationRequest(
+            request.repo,
+            request.dist,
+            request.tag,
+            request.tag_object,
+            request.commit,
+            request.tree,
+        )
+    )
     _verify_remote_assets(payload, request.dist, expected_names)
+
+
+def verify_final_packet(
+    request: HelperVerificationRequest,
+    *,
+    final: bool = True,
+) -> set[str]:
+    checksum_path = request.dist / "SHA256SUMS"
+    names, _records = _validate_helper_packet(request, final=final)
+    expected_names = names | {checksum_path.name} if final else names
+    proof_required = requires_provenance(request.tag)
+    if final and proof_required:
+        expected_names.add(FINAL_PROVENANCE)
+    if _exact_regular_file_names(request.dist) != expected_names:
+        message = "final release packet file set is not exact"
+        raise ReleaseError(message)
+    if final:
+        _verify_packet_checksums(
+            request.dist,
+            expected_names - {FINAL_PROVENANCE} if proof_required else expected_names,
+        )
+        if proof_required:
+            version = str(parse_receiver_release_tag(request.tag).version)
+            verify_provenance(
+                ProvenanceRequest(
+                    request.dist,
+                    request.tag,
+                    request.commit,
+                    "publish-release.yml",
+                    FINAL_PROVENANCE,
+                    frozenset(
+                        {
+                            f"{HELPER_COMPONENT}-{version}.zip",
+                            f"{HELPER_COMPONENT}-{version}.manifest.json",
+                            "SHA256SUMS",
+                        }
+                    ),
+                )
+            )
+    return expected_names
 
 
 def verify_final_release_state(
     request: FinalReleaseVerificationRequest,
     *,
     expected_draft: bool,
+    final: bool = True,
 ) -> None:
     release = request.release
     payload = json.loads(release.release_json.read_text(encoding="utf-8"))
@@ -1189,24 +1293,19 @@ def verify_final_release_state(
         message = "GitHub release response must be an object"
         raise ReleaseError(message)
     _verify_release_identity(payload, release, expected_draft=expected_draft)
-    checksum_path = release.dist / "SHA256SUMS"
-    helper_request = HelperVerificationRequest(
-        repo=release.repo,
-        dist=release.dist,
-        tag=release.tag,
-        tag_object=release.tag_object,
-        commit=release.commit,
-        tree=release.tree,
-        helper_sha256=request.helper_sha256,
-        helper_manifest_sha256=request.helper_manifest_sha256,
-        output=checksum_path,
+    expected_names = verify_final_packet(
+        HelperVerificationRequest(
+            repo=release.repo,
+            dist=release.dist,
+            tag=release.tag,
+            tag_object=release.tag_object,
+            commit=release.commit,
+            tree=release.tree,
+            helper_sha256=request.helper_sha256,
+            helper_manifest_sha256=request.helper_manifest_sha256,
+        ),
+        final=final,
     )
-    names, _records = _validate_helper_packet(helper_request)
-    expected_names = names | {checksum_path.name}
-    if _exact_regular_file_names(release.dist) != expected_names:
-        message = "final release packet file set is not exact"
-        raise ReleaseError(message)
-    _verify_packet_checksums(release.dist, expected_names)
     _verify_remote_assets(payload, release.dist, expected_names)
 
 
@@ -1262,12 +1361,34 @@ def verify_release_state(
             raise ReleaseError(message)
 
 
+def verify_checkout_execution(
+    repo: Path, tag: str, commit: str, tree: str, workflow: Workflow
+) -> None:
+    _ = validate_tag(repo, tag)
+    if (
+        _git_output(repo, "rev-parse", "HEAD") != commit
+        or _git_output(repo, "rev-parse", "HEAD^{tree}") != tree
+    ):
+        message = "workflow checkout commit or tree is not exact"
+        raise ReleaseError(message)
+    verify_execution(tag, commit, workflow)
+
+
 def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser = argparse.ArgumentParser(description="Build exact-tag release metadata.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     tag_info = subparsers.add_parser("tag-info")
     tag_info.add_argument("--tag", required=True)
+
+    execution = subparsers.add_parser("verify-execution")
+    execution.add_argument("--repo", type=Path, required=True)
+    execution.add_argument("--tag", required=True)
+    execution.add_argument("--commit", required=True)
+    execution.add_argument("--tree", required=True)
+    execution.add_argument(
+        "--workflow", choices=("release.yml", "publish-release.yml"), required=True
+    )
 
     validate = subparsers.add_parser("validate")
     validate.add_argument("--repo", type=Path, required=True)
@@ -1294,7 +1415,7 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     checksums.add_argument("--tree", required=True)
     checksums.add_argument("--output", type=Path, required=True)
 
-    for command in ("verify-helper", "final-checksums"):
+    for command in ("verify-helper", "final-checksums", "verify-final"):
         helper_parser = subparsers.add_parser(command)
         helper_parser.add_argument("--repo", type=Path, required=True)
         helper_parser.add_argument("--dist-dir", type=Path, required=True)
@@ -1307,13 +1428,14 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         if command == "final-checksums":
             helper_parser.add_argument("--output", type=Path, required=True)
 
-    verify_packet_parser = subparsers.add_parser("verify-packet")
-    verify_packet_parser.add_argument("--repo", type=Path, required=True)
-    verify_packet_parser.add_argument("--dist-dir", type=Path, required=True)
-    verify_packet_parser.add_argument("--tag", required=True)
-    verify_packet_parser.add_argument("--tag-object", required=True)
-    verify_packet_parser.add_argument("--commit", required=True)
-    verify_packet_parser.add_argument("--tree", required=True)
+    for command in ("verify-packet", "verify-core"):
+        verify_packet_parser = subparsers.add_parser(command)
+        verify_packet_parser.add_argument("--repo", type=Path, required=True)
+        verify_packet_parser.add_argument("--dist-dir", type=Path, required=True)
+        verify_packet_parser.add_argument("--tag", required=True)
+        verify_packet_parser.add_argument("--tag-object", required=True)
+        verify_packet_parser.add_argument("--commit", required=True)
+        verify_packet_parser.add_argument("--tree", required=True)
     for command in ("verify-draft", "verify-published"):
         verify_release_parser = subparsers.add_parser(command)
         verify_release_parser.add_argument("--repo", type=Path, required=True)
@@ -1333,7 +1455,11 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     core_draft.add_argument("--tag-object", required=True)
     core_draft.add_argument("--commit", required=True)
     core_draft.add_argument("--tree", required=True)
-    for command in ("verify-final-draft", "verify-final-published"):
+    for command in (
+        "verify-helper-draft",
+        "verify-final-draft",
+        "verify-final-published",
+    ):
         final_parser = subparsers.add_parser(command)
         final_parser.add_argument("--repo", type=Path, required=True)
         final_parser.add_argument("--dist-dir", type=Path, required=True)
@@ -1383,6 +1509,10 @@ def main() -> int:  # noqa: C901, PLR0912
                 )
                 + "\n"
             )
+        elif args.command == "verify-execution":
+            verify_checkout_execution(
+                args.repo, args.tag, args.commit, args.tree, args.workflow
+            )
         elif args.command == "validate":
             versions = validate_source_checkpoint(args.repo, args.tag)
             transition_commits = (
@@ -1430,8 +1560,11 @@ def main() -> int:  # noqa: C901, PLR0912
                     output=args.output,
                 )
             )
-        elif args.command == "verify-packet":
-            verify_packet(
+        elif args.command in {"verify-packet", "verify-core"}:
+            packet_verifier = (
+                verify_packet if args.command == "verify-packet" else verify_core_packet
+            )
+            _ = packet_verifier(
                 PacketVerificationRequest(
                     repo=args.repo,
                     dist=args.dist_dir,
@@ -1441,7 +1574,7 @@ def main() -> int:  # noqa: C901, PLR0912
                     tree=args.tree,
                 )
             )
-        elif args.command in {"verify-helper", "final-checksums"}:
+        elif args.command in {"verify-helper", "final-checksums", "verify-final"}:
             helper_request = HelperVerificationRequest(
                 repo=args.repo,
                 dist=args.dist_dir,
@@ -1455,6 +1588,8 @@ def main() -> int:  # noqa: C901, PLR0912
             )
             if args.command == "verify-helper":
                 verify_helper_packet(helper_request)
+            elif args.command == "verify-final":
+                _ = verify_final_packet(helper_request)
             else:
                 create_final_checksums(helper_request)
         elif args.command in {"verify-draft", "verify-published"}:
@@ -1484,7 +1619,11 @@ def main() -> int:  # noqa: C901, PLR0912
                     tree=args.tree,
                 )
             )
-        elif args.command in {"verify-final-draft", "verify-final-published"}:
+        elif args.command in {
+            "verify-helper-draft",
+            "verify-final-draft",
+            "verify-final-published",
+        }:
             verify_final_release_state(
                 FinalReleaseVerificationRequest(
                     release=DraftVerificationRequest(
@@ -1500,13 +1639,16 @@ def main() -> int:  # noqa: C901, PLR0912
                     helper_sha256=args.helper_sha256,
                     helper_manifest_sha256=args.helper_manifest_sha256,
                 ),
-                expected_draft=args.command == "verify-final-draft",
+                expected_draft=args.command != "verify-final-published",
+                final=args.command != "verify-helper-draft",
             )
     except (
         OSError,
         ReleaseError,
+        ProvenanceError,
         json.JSONDecodeError,
         tomllib.TOMLDecodeError,
+        subprocess.TimeoutExpired,
     ) as exc:
         sys.stderr.write(f"{exc}\n")
         return 1

@@ -951,9 +951,11 @@ def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  #
     assert "--draft=false" not in workflow
     assert 'test "$asset_names" = "$expected_assets"' in workflow
     assert workflow.count("git/ref/tags/${GITHUB_REF_NAME}") >= 2
-    assert workflow.index(
-        "Create and verify helper-pending draft release"
-    ) < workflow.index("Attest release artifacts")
+    assert (
+        workflow.index("Attest release artifacts")
+        < workflow.index("Export and verify original build attestation")
+        < workflow.index("Create and verify helper-pending draft release")
+    )
     assert "verify-core-draft" in workflow
     assert "helper-pending" in workflow
     assert "published_at == null" in workflow
@@ -962,7 +964,7 @@ def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  #
     assert "release body does not match exact notes" in release_tool
     assert "(cd dist && sha256sum --check --strict SHA256SUMS)" in workflow
     assert "--verify-tag" in workflow
-    assert workflow.count("release_tools.py tag-info") == 1
+    assert workflow.count("release_tools.py tag-info") == 2
     assert 'prerelease="$(jq -r \'.prerelease\' <<< "$tag_info")"' in workflow
     assert 'version="$(jq -r \'.version\' <<< "$tag_info")"' in workflow
     assert 'if [[ "$prerelease" = "true" ]]' in workflow
@@ -970,13 +972,15 @@ def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  #
     assert "release_flags+=(--prerelease)" in workflow
     assert '--notes-file ".github/release/notes-${GITHUB_REF_NAME}.md"' in workflow
     assert "--generate-notes" not in workflow
-    assert "dist/*.whl" in workflow
-    assert "dist/*.tar.gz" in workflow
+    assert '"dist/apple_health_ai_bridge-${version}-py3-none-any.whl"' in workflow
+    assert '"dist/apple_health_ai_bridge-${version}.tar.gz"' in workflow
+    assert "subject-path: dist/*" not in workflow
     create_block = workflow.split("gh release create", 1)[1].split(
         "release_flags[@]",
         1,
     )[0]
     assert "dist/SHA256SUMS" not in create_block
+    assert "dist/receiver-build-provenance.intoto.jsonl" in create_block
     assert "dist/release-metadata.json" in workflow
     assert "(cd dist && sha256sum --check --strict SHA256SUMS)" in workflow
     assert "pypi" not in workflow.lower()

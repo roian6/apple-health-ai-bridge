@@ -80,6 +80,62 @@ Helper status uses fixed, path-free codes:
 | `helper_drift` | Owned metadata, app bytes, identity, permissions, or signature changed. |
 | `unsupported_host` | Installed-helper inspection is unavailable on this host. |
 
+## Downloadable proof for future releases
+
+Receiver/CLI `1.1.3` and later require two additional assets:
+`receiver-build-provenance.intoto.jsonl` and
+`receiver-final-provenance.intoto.jsonl`. This is a prospective release policy;
+the `1.1.2` install commands and its six immutable assets above remain unchanged.
+The new files contain the original GitHub Actions Sigstore bundles, including
+signed in-toto/SLSA statements. No separate signature format is needed.
+
+For a release covered by this policy, download all eight assets into a new
+directory. Obtain the expected commit by independently verifying the signed
+annotated tag, and check its tree against the source-bound release metadata and
+helper manifest. Do not choose the expected commit solely from the downloaded
+metadata. From the asset directory, set `tag` to that exact receiver tag and
+`commit` to its verified 40-character target SHA, then run:
+
+```bash
+set -euo pipefail
+: "${tag:?Set the verified receiver tag}"
+: "${commit:?Set the independently verified tag target commit}"
+version="${tag#receiver-v}"
+repository="roian6/apple-health-ai-bridge"
+verify_subject() {
+  gh attestation verify "$1" --repo "$repository" \
+    --bundle "$2" \
+    --signer-workflow "$repository/.github/workflows/$3" \
+    --source-ref "refs/tags/$tag" --source-digest "$commit" \
+    --signer-digest "$commit" --deny-self-hosted-runners \
+    --predicate-type https://slsa.dev/provenance/v1
+}
+for subject in \
+  "apple_health_ai_bridge-${version}-py3-none-any.whl" \
+  "apple_health_ai_bridge-${version}.tar.gz" \
+  release-metadata.json; do
+  verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml
+done
+for subject in \
+  "HealthBridgeMailboxAckPublisher-${version}.zip" \
+  "HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
+  SHA256SUMS; do
+  verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml
+done
+shasum -a 256 -c SHA256SUMS
+```
+
+`SHA256SUMS` covers the wheel, sdist, metadata, build-provenance bundle, helper
+zip, and helper manifest. It must contain exactly those six unique names, with
+neither itself nor the final bundle included. The final bundle independently
+authenticates the helper and checksum subjects, avoiding a checksum cycle.
+The release workflow additionally enforces exact filenames, sizes, signed
+subject sets, and remote bytes; see the [release criteria](../.github/release/criteria.md).
+Use a current [GitHub CLI](https://cli.github.com/manual/gh_attestation_verify)
+supporting these verification flags. Native proof failure is a release blocker.
+These attestations identify the workflow and source; they do not replace the
+helper's macOS signing, notarization, and Gatekeeper checks.
+
 ## Create mailbox pairing material
 
 Set the exact values for the user-selected iCloud container and the already

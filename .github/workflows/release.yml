@@ -313,12 +313,16 @@ jobs:
           path: dist
 
       - name: Verify downloaded release packet
+        id: packet
         run: |
           set -euo pipefail
           test ! -e dist/.git
           commit_sha="$(git rev-parse HEAD)"
           tree_sha="$(git rev-parse "${commit_sha}^{tree}")"
           test "$commit_sha" = "$PINNED_TARGET_COMMIT_SHA"
+          uv run python scripts/release_tools.py verify-execution \
+            --repo . --tag "$GITHUB_REF_NAME" \
+            --commit "$commit_sha" --tree "$tree_sha" --workflow release.yml
           (cd dist && sha256sum --check --strict SHA256SUMS)
           uv run python scripts/release_tools.py verify-packet \
             --repo . \
@@ -327,6 +331,33 @@ jobs:
             --tag-object "$PINNED_TAG_OBJECT_SHA" \
             --commit "$commit_sha" \
             --tree "$tree_sha"
+          version="$(uv run python scripts/release_tools.py tag-info \
+            --tag "$GITHUB_REF_NAME" | jq -r '.version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          rm dist/SHA256SUMS dist/release-notes.md
+
+      - name: Attest release artifacts
+        id: build_attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/apple_health_ai_bridge-${{ steps.packet.outputs.version }}-py3-none-any.whl
+            dist/apple_health_ai_bridge-${{ steps.packet.outputs.version }}.tar.gz
+            dist/release-metadata.json
+
+      - name: Export and verify original build attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.build_attestation.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          jq -ce 'select(type == "object")' "$ATTESTATION_BUNDLE" \
+            > dist/receiver-build-provenance.intoto.jsonl
+          uv run python scripts/release_tools.py verify-core \
+            --repo . --dist-dir dist --tag "$GITHUB_REF_NAME" \
+            --tag-object "$PINNED_TAG_OBJECT_SHA" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" \
+            --tree "$(git rev-parse "${PINNED_TARGET_COMMIT_SHA}^{tree}")"
 
       - name: Create and verify helper-pending draft release
         env:
@@ -352,7 +383,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
             --verify-tag
             --title "$GITHUB_REF_NAME"
-            --notes-file dist/release-notes.md
+            --notes-file ".github/release/notes-${GITHUB_REF_NAME}.md"
             --draft
           )
           tag_info="$(uv run python scripts/release_tools.py tag-info \
@@ -363,9 +394,10 @@ jobs:
             release_flags+=(--prerelease)
           fi
           gh release create "$GITHUB_REF_NAME" \
-            dist/*.whl \
-            dist/*.tar.gz \
+            "dist/apple_health_ai_bridge-${version}-py3-none-any.whl" \
+            "dist/apple_health_ai_bridge-${version}.tar.gz" \
             dist/release-metadata.json \
+            dist/receiver-build-provenance.intoto.jsonl \
             "${release_flags[@]}"
           draft_release_id=""
           for _ in {1..10}; do
@@ -381,10 +413,13 @@ jobs:
           echo "DRAFT_RELEASE_ID=$draft_release_id" >> "$GITHUB_ENV"
           release_api="/repos/${GITHUB_REPOSITORY}/releases/${draft_release_id}"
           gh api "$release_api" > "$RUNNER_TEMP/release-draft.json"
-          rm dist/SHA256SUMS dist/release-notes.md
+          remote_dir="$(mktemp -d "$RUNNER_TEMP/core-proof.XXXXXX")"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --dir "$remote_dir"
+          diff --recursive dist "$remote_dir"
           uv run python scripts/release_tools.py verify-core-draft \
             --repo . \
-            --dist-dir dist \
+            --dist-dir "$remote_dir" \
             --release-json "$RUNNER_TEMP/release-draft.json" \
             --notes-file ".github/release/notes-${GITHUB_REF_NAME}.md" \
             --tag "$GITHUB_REF_NAME" \
@@ -392,7 +427,7 @@ jobs:
             --commit "$PINNED_TARGET_COMMIT_SHA" \
             --tree "$(git rev-parse "${PINNED_TARGET_COMMIT_SHA}^{tree}")"
           asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
-          expected_assets="apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,release-metadata.json"
+          expected_assets="apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,receiver-build-provenance.intoto.jsonl,release-metadata.json"
           test "$asset_names" = "$expected_assets"
 
       - name: Confirm helper-pending draft remains unpublished
@@ -406,8 +441,3 @@ jobs:
           test "$helper_pending" = "true"
           echo "Existing published release replacement remains forbidden."
           echo "Awaiting exact HealthBridgeMailboxAckPublisher release assets."
-
-      - name: Attest release artifacts
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/*

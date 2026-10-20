@@ -6,7 +6,9 @@ This guide records the public triage, merge, and release process for Apple Healt
 
 While the repository has one direct maintainer, the main ruleset keeps pull requests, required checks, linear history, resolved review threads, squash-only merging, deletion protection, and non-fast-forward protection. The required approval count is `0`, and last-push approval is disabled because an author cannot approve their own pull request.
 
-When a second trusted maintainer is added, restore one required approval and last-push approval. Do not enable required code-owner review before that reviewer exists.
+One required approval and last-push approval may be enabled when a second trusted maintainer can provide human review, or when an independently eligible native automated reviewer has been demonstrated on a real pull request. For an automated reviewer, read back the App's identity, review state, reviewed commit, and GitHub's actual approval and last-push eligibility before changing the rules. A summary comment or successful check alone is not an eligible review. Do not enable required code-owner review before an eligible code owner exists.
+
+The repository's `.coderabbit.yaml` configures English reviews, walkthrough summaries, incremental review, and the request-changes workflow, with author approval overrides disabled and drafts excluded. Installing the hosted CodeRabbit App and confirming its effective configuration are separate maintainer actions. This configuration does not establish that the App is installed, that its reviews satisfy a rule, or that an approval requirement has been activated.
 
 Do not routinely disable the main ruleset or push directly to `main`. Emergency changes still use a narrowly scoped pull request and the same required checks.
 
@@ -58,6 +60,7 @@ Require an accepted issue and maintainer decision before implementation when a c
 - Require these exact status checks on `main`:
   - `Python quality and package checks`
   - `Swift tests and unsigned app builds`
+  - `Analyze Python`
 - Use squash merge only. The pull-request title becomes the durable change summary.
 
 Fork pull requests must run with read-only workflow permissions, no repository secrets, no persisted checkout credentials, and no `pull_request_target` execution of untrusted code.
