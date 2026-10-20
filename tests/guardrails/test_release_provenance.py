@@ -28,6 +28,149 @@ REPOSITORY = "roian6/apple-health-ai-bridge"
 TAG = "receiver-v1.1.3"
 
 
+def run_documented_proof(
+    tmp_path: Path,
+    *,
+    failed_gh: int = 0,
+    failed_checksum: bool = False,
+    missing: Literal["tag", "commit"] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Exercise the actual docs in Bash; stubs test control flow, not signatures."""
+    document = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
+    section = document.split("## Downloadable proof for future releases\n", 1)[1]
+    snippet = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    controls = tmp_path / "shell-controls"
+    controls.mkdir()
+    calls = tmp_path / "shell-calls.txt"
+    stub = f"""#!{sys.executable}
+import os
+import pathlib
+import sys
+
+command = pathlib.Path(sys.argv[0]).name
+calls = pathlib.Path(os.environ['DOC_PROOF_CALLS'])
+previous = calls.read_text().splitlines() if calls.exists() else []
+with calls.open('a') as stream:
+    stream.write(command + '\\n')
+if command == 'gh' and previous.count('gh') + 1 == int(os.environ['DOC_PROOF_FAIL_GH']):
+    sys.exit(17)
+if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
+    sys.exit(23)
+"""
+    for name in ("gh", "shasum"):
+        tool = controls / name
+        _ = tool.write_text(stub, encoding="utf-8")
+        tool.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        PATH=f"{controls}{os.pathsep}{os.environ['PATH']}",
+        DOC_PROOF_CALLS=str(calls),
+        DOC_PROOF_FAIL_GH=str(failed_gh),
+        DOC_PROOF_FAIL_CHECKSUM="1" if failed_checksum else "0",
+    )
+    script = "\n".join(
+        [
+            "set +e +u",
+            "set +o pipefail",
+            f"tag={TAG}",
+            "commit=" + "1" * 40,
+            f"unset {missing}" if missing else ":",
+            'verification_flags_before="$-"',
+            'verification_options_before="$(set +o)"',
+            snippet,
+            "verification_block_status=$?",
+            'verification_options_after="$(set +o)"',
+            str.join(
+                "",
+                (
+                    'if [[ "$verification_flags_before" = "$-" && ',
+                    '"$verification_options_before" = ',
+                    '"$verification_options_after" ]]; then',
+                ),
+            ),
+            "  verification_options_preserved=yes",
+            "else",
+            "  verification_options_preserved=no",
+            "fi",
+            str.join(
+                "",
+                (
+                    "printf '\\nVERIFICATION_PARENT %s %s\\n' ",
+                    '"$verification_block_status" "$verification_options_preserved"',
+                ),
+            ),
+        ]
+    )
+    completed = subprocess.run(
+        ["bash", "--noprofile", "--norc"],
+        input=script,
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    recorded_calls = calls.read_text().splitlines() if calls.exists() else []
+    return completed, recorded_calls
+
+
+@pytest.mark.parametrize("failed_gh", [0, 1])
+def test_documented_proof_preserves_parent_shell(
+    tmp_path: Path, failed_gh: int
+) -> None:
+    completed, _ = run_documented_proof(tmp_path, failed_gh=failed_gh)
+    assert completed.returncode == 0, completed.stderr
+    marker = next(
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("VERIFICATION_PARENT ")
+    )
+    assert marker.endswith(" yes"), marker
+
+
+def test_documented_proof_reports_success(tmp_path: Path) -> None:
+    completed, calls = run_documented_proof(tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFICATION_PARENT 0 yes" in completed.stdout
+    assert "Release proof verified." in completed.stdout
+    assert "Release proof FAILED." not in completed.stdout + completed.stderr
+    assert calls == ["gh"] * 6 + ["shasum"]
+
+
+@pytest.mark.parametrize("failed_gh", [1, 3, 4, 6])
+def test_documented_proof_stops_after_rejected_subject(
+    tmp_path: Path, failed_gh: int
+) -> None:
+    completed, calls = run_documented_proof(tmp_path, failed_gh=failed_gh)
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFICATION_PARENT 17 yes" in completed.stdout
+    assert "Release proof FAILED." in completed.stderr
+    assert "Release proof verified." not in completed.stdout
+    assert calls == ["gh"] * failed_gh
+
+
+def test_documented_proof_reports_checksum_failure(tmp_path: Path) -> None:
+    completed, calls = run_documented_proof(tmp_path, failed_checksum=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFICATION_PARENT 23 yes" in completed.stdout
+    assert "Release proof FAILED." in completed.stderr
+    assert "Release proof verified." not in completed.stdout
+    assert calls == ["gh"] * 6 + ["shasum"]
+
+
+@pytest.mark.parametrize("missing", ["tag", "commit"])
+def test_documented_proof_reports_missing_input(
+    tmp_path: Path, missing: Literal["tag", "commit"]
+) -> None:
+    completed, calls = run_documented_proof(tmp_path, missing=missing)
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFICATION_PARENT 1 yes" in completed.stdout
+    assert "Release proof FAILED." in completed.stderr
+    assert "Release proof verified." not in completed.stdout
+    assert calls == []
+
+
 class SubjectRecord(TypedDict):
     name: str
     digest: dict[str, str]

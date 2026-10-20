@@ -97,32 +97,41 @@ metadata. From the asset directory, set `tag` to that exact receiver tag and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
-set -euo pipefail
-: "${tag:?Set the verified receiver tag}"
-: "${commit:?Set the independently verified tag target commit}"
-version="${tag#receiver-v}"
-repository="roian6/apple-health-ai-bridge"
-verify_subject() {
-  gh attestation verify "$1" --repo "$repository" \
-    --bundle "$2" \
-    --signer-workflow "$repository/.github/workflows/$3" \
-    --source-ref "refs/tags/$tag" --source-digest "$commit" \
-    --signer-digest "$commit" --deny-self-hosted-runners \
-    --predicate-type https://slsa.dev/provenance/v1
-}
-for subject in \
-  "apple_health_ai_bridge-${version}-py3-none-any.whl" \
-  "apple_health_ai_bridge-${version}.tar.gz" \
-  release-metadata.json; do
-  verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml
-done
-for subject in \
-  "HealthBridgeMailboxAckPublisher-${version}.zip" \
-  "HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
-  SHA256SUMS; do
-  verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml
-done
-shasum -a 256 -c SHA256SUMS
+(
+  set -euo pipefail
+  trap 'verification_status=$?
+    if [ "$verification_status" -eq 0 ]; then
+      printf "%s\n" "Release proof verified."
+    else
+      printf "%s\n" "Release proof FAILED." >&2
+    fi
+    exit "$verification_status"' EXIT
+  : "${tag:?Set the verified receiver tag}"
+  : "${commit:?Set the independently verified tag target commit}"
+  version="${tag#receiver-v}"
+  repository="roian6/apple-health-ai-bridge"
+  verify_subject() {
+    gh attestation verify "$1" --repo "$repository" \
+      --bundle "$2" \
+      --signer-workflow "$repository/.github/workflows/$3" \
+      --source-ref "refs/tags/$tag" --source-digest "$commit" \
+      --signer-digest "$commit" --deny-self-hosted-runners \
+      --predicate-type https://slsa.dev/provenance/v1
+  }
+  for subject in \
+    "apple_health_ai_bridge-${version}-py3-none-any.whl" \
+    "apple_health_ai_bridge-${version}.tar.gz" \
+    release-metadata.json; do
+    verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml
+  done
+  for subject in \
+    "HealthBridgeMailboxAckPublisher-${version}.zip" \
+    "HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
+    SHA256SUMS; do
+    verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml
+  done
+  shasum -a 256 -c SHA256SUMS
+)
 ```
 
 `SHA256SUMS` covers the wheel, sdist, metadata, build-provenance bundle, helper
