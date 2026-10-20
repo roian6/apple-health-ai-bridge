@@ -132,7 +132,7 @@ draft bytes, and both bundles pass verification may that same draft become
 published. The published assets are downloaded and verified again. Every proof
 failure blocks publication; no release or asset replacement is permitted.
 
-GitHub defines the push payload's `after` field as the most recent **commit** on the pushed ref. For an annotated tag, the release workflow therefore binds the peeled target commit to `github.event.after`; it separately binds the live tag ref to the locally fetched annotated tag object, verifies the signed tag's internal name, and relies on the active tag ruleset to prevent creation/update/deletion races.
+For an annotated-tag push, `github.event.after` identifies the pushed tag object, not its peeled commit. The workflow binds that event object to both the live tag ref and the locally fetched signed annotated tag, then verifies its internal name and checks the peeled target independently against the checkout and default main. GitHub's [push payload schema](https://github.com/octokit/webhooks/blob/main/payload-schemas/api.github.com/push/event.schema.json) explicitly distinguishes an annotated `after` object from the expanded target in `head_commit`; the protected tag ruleset prevents creation, update, and deletion races.
 
 Create a new Receiver/CLI version only from the clean, reviewed, GitHub-verified release commit. Sign the annotated tag with the repository's configured SSH signing key:
 
