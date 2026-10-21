@@ -2,11 +2,11 @@
 
 Apple Health AI Bridge contains independently released components. Always include the component name when presenting a version; the phrase “repository version” is intentionally avoided because a Git checkout is identified by a commit or tag, not by a single product version.
 
-## Current compatibility
+## Source compatibility
 
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.2` | Release tag `receiver-v1.1.2` |
+| Receiver/CLI | `1.1.3` | Release tag `receiver-v1.1.3` |
 | iOS Companion | `1.1.1` | Source candidate build `50` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
@@ -67,7 +67,7 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.1.2
+Receiver/CLI 1.1.3
 Compatible iOS Companion 1.1.1 (build 50)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```

@@ -446,7 +446,10 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     assert "agent-managed private HTTPS ingress" not in route_language
     assert "agent-managed service plan" not in route_language
 
-    assert "(docs/setup.md)" in readme
+    assert (
+        "(https://github.com/roian6/apple-health-ai-bridge/"
+        "blob/receiver-v1.1.2/docs/setup.md)"
+    ) in readme
     assert "private HTTPS route" in readme
     ordered_steps = (
         "Choose one of the following routes",
@@ -521,9 +524,9 @@ def test_current_component_identities_are_explicit() -> None:
     server_manifest = Path("server.json").read_text()
     security = Path("SECURITY.md").read_text()
 
-    assert 'version = "1.1.2"' in pyproject
-    assert '__version__: Final = "1.1.2"' in package_init
-    assert '"version": "1.1.2"' in server_manifest
+    assert 'version = "1.1.3"' in pyproject
+    assert '__version__: Final = "1.1.3"' in package_init
+    assert '"version": "1.1.3"' in server_manifest
     assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
     assert xcode_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
     assert '?? "1.1.1"' in content_view
@@ -537,7 +540,10 @@ def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion()
     readme = Path("README.md").read_text()
     setup = Path("docs/setup.md").read_text()
 
-    assert "(docs/setup.md#remove-local-bridge-data)" in readme
+    assert (
+        "(https://github.com/roian6/apple-health-ai-bridge/"
+        "blob/receiver-v1.1.2/docs/setup.md#remove-local-bridge-data)"
+    ) in readme
     assert "health-bridge receiver purge" not in readme
     assert "health-bridge receiver purge" in setup
     assert "--confirm" in setup

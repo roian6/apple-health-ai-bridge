@@ -24,36 +24,23 @@ that developer-no-access boundary remains true.
 
 ## Install and verify the signed helper
 
-Download assets and run the commands below only after the immutable `receiver-v1.1.2` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.2`.
+Download assets and run the commands below only after the immutable `receiver-v1.1.3` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.3`.
 
-Use the Receiver/CLI `1.1.2` GitHub Release assets. Download these files with a
+Use the Receiver/CLI `1.1.3` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.2-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.2.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.2.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.2.manifest.json`;
+- `apple_health_ai_bridge-1.1.3-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.1.3.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.1.3.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.3.manifest.json`;
 - `release-metadata.json`;
-- `SHA256SUMS`.
+- `receiver-build-provenance.intoto.jsonl`;
+- `SHA256SUMS`;
+- `receiver-final-provenance.intoto.jsonl`.
 
-Do not extract the helper zip yourself. From that directory, verify the exact
-release asset set, install the wheel, structurally validate the helper, and then
-explicitly install it:
-
-```bash
-shasum -a 256 -c SHA256SUMS
-uv tool install ./apple_health_ai_bridge-1.1.2-py3-none-any.whl
-health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.2.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.2.manifest.json \
-  --json
-health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.2.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.2.manifest.json \
-  --json
-health-bridge mailbox helper status --json
-```
+Do not extract the helper zip yourself. Verify the exact release asset set and
+native proofs below before installing the wheel or helper.
 
 The expected final result is `{"code": "ready"}`. Structural `verify` is
 available on non-macOS hosts for synthetic or downloaded packets. Installation
@@ -84,16 +71,16 @@ Helper status uses fixed, path-free codes:
 
 Receiver/CLI `1.1.3` and later require two additional assets:
 `receiver-build-provenance.intoto.jsonl` and
-`receiver-final-provenance.intoto.jsonl`. This is a prospective release policy;
-the `1.1.2` install commands and its six immutable assets above remain unchanged.
+`receiver-final-provenance.intoto.jsonl`. This policy does not change the six
+immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
-For a release covered by this policy, download all eight assets into a new
-directory. Obtain the expected commit by independently verifying the signed
+Keep all eight downloaded assets in a new directory. Obtain the expected commit
+by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to that exact receiver tag and
+metadata. From the asset directory, set `tag` to `receiver-v1.1.3` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -144,6 +131,24 @@ Use a current [GitHub CLI](https://cli.github.com/manual/gh_attestation_verify)
 supporting these verification flags. Native proof failure is a release blocker.
 These attestations identify the workflow and source; they do not replace the
 helper's macOS signing, notarization, and Gatekeeper checks.
+
+## Install the verified wheel and helper
+
+After every proof and checksum check succeeds, install the wheel, structurally
+validate the helper, and explicitly install it:
+
+```bash
+uv tool install ./apple_health_ai_bridge-1.1.3-py3-none-any.whl
+health-bridge mailbox helper verify \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.3.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.3.manifest.json \
+  --json
+health-bridge mailbox helper install \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.3.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.3.manifest.json \
+  --json
+health-bridge mailbox helper status --json
+```
 
 ## Create mailbox pairing material
 

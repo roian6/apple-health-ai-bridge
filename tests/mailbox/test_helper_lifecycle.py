@@ -65,7 +65,7 @@ def allow_synthetic_distribution_policy(
 
 BUNDLE_ID = "com.example.HealthBridgeMailboxAckPublisher"
 CONTAINER_ID = "iCloud.com.example.HealthBridgeMailboxAckPublisher"
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 TAG = f"receiver-v{VERSION}"
 TAG_OBJECT = "1" * 40
 COMMIT = "2" * 40
