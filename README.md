@@ -68,18 +68,18 @@ Download [the iPhone app from the App Store](https://apps.apple.com/us/app/healt
 Install the Receiver/CLI with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.2"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.3"
 ```
 
-Follow the [setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md) to prepare a private HTTPS route, start the receiver, and verify the connection from your iPhone. This keeps the receiver reachable when you're away from home. The guide also covers a deliberate same-LAN installation and the separate [macOS iCloud delivery Beta](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/icloud-mailbox-service.md).
+Follow the [setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md) to prepare a private HTTPS route, start the receiver, and verify the connection from your iPhone. This keeps the receiver reachable when you're away from home. The guide also covers a deliberate same-LAN installation and the separate [macOS iCloud delivery Beta](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/icloud-mailbox-service.md).
 
 ### 3. Pair and sync
 
-[Pair the iPhone](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
+[Pair the iPhone](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
 
 ### 4. Connect your AI and ask
 
-[Add the bridge to your MCP client](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md#connect-an-mcp-client-intentionally), then [check your records and ask your first question](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md#connect-an-mcp-client-intentionally). If your phone is already paired, you can add the client using your existing database.
+[Add the bridge to your MCP client](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md#connect-an-mcp-client-intentionally), then [check your records and ask your first question](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md#connect-an-mcp-client-intentionally). If your phone is already paired, you can add the client using your existing database.
 
 ## Supported data
 
@@ -91,15 +91,15 @@ The MCP tools let your assistant retrieve time-series observations, workouts, sl
 
 Apple Health access and the MCP query tools are read-only. You run the receiver and choose which AI clients can read the stored history. When a client uses a cloud model, its provider receives the query results it sends; that client's settings and policies apply.
 
-Read the [privacy policy](https://healthbridge.chanhyo.dev/privacy) and [security model](SECURITY.md) for the full data-handling boundaries. For help removing your local copy, see [Remove local bridge data](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md#remove-local-bridge-data).
+Read the [privacy policy](https://healthbridge.chanhyo.dev/privacy) and [security model](SECURITY.md) for the full data-handling boundaries. For help removing your local copy, see [Remove local bridge data](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md#remove-local-bridge-data).
 
 ## Documentation
 
-- **Install and use:** [Setup and troubleshooting](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.2/docs/setup.md) · [Supported data](docs/supported-health-data.md) · [Support](https://healthbridge.chanhyo.dev/support)
+- **Install and use:** [Setup and troubleshooting](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md) · [Supported data](docs/supported-health-data.md) · [Support](https://healthbridge.chanhyo.dev/support)
 - **Understand and build:** [Architecture](docs/architecture.md) · [Batch protocol](docs/reference/batch-v1.md) · [SQLite schema](docs/reference/sqlite-v1.md) · [Brand guide](docs/brand.md)
 - **Contribute:** [Development setup](CONTRIBUTING.md) · [Contribution ideas](docs/contribution-ideas.md) · [Build the iPhone app with Xcode 16 or later](docs/self-build.md)
 
-Current components: **Receiver/CLI** `1.1.2` · **iOS Companion** `1.1.1` (build `50`) · **Batch Protocol** `1.0.0`. See [release downloads](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.2), [`component-versions.json`](component-versions.json), and the [compatibility policy](docs/versioning.md).
+Current components: **Receiver/CLI** `1.1.3` · **iOS Companion** `1.1.1` (build `50`) · **Batch Protocol** `1.0.0`. See [release downloads](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.3), [`component-versions.json`](component-versions.json), and the [compatibility policy](docs/versioning.md).
 
 ## License
 

@@ -448,7 +448,7 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
 
     assert (
         "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.2/docs/setup.md)"
+        "blob/receiver-v1.1.3/docs/setup.md)"
     ) in readme
     assert "private HTTPS route" in readme
     ordered_steps = (
@@ -542,7 +542,7 @@ def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion()
 
     assert (
         "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.2/docs/setup.md#remove-local-bridge-data)"
+        "blob/receiver-v1.1.3/docs/setup.md#remove-local-bridge-data)"
     ) in readme
     assert "health-bridge receiver purge" not in readme
     assert "health-bridge receiver purge" in setup

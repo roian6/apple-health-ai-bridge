@@ -1087,7 +1087,7 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
     for content, name, expected_tag in (
-        (readme, "README.md", "receiver-v1.1.2"),
+        (readme, "README.md", "receiver-v1.1.3"),
         (setup, "docs/setup.md", "receiver-v1.1.3"),
     ):
         pins = re.findall(
@@ -1101,6 +1101,18 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
     assert unpinned not in readme
     assert unpinned not in setup
+
+
+def test_roadmap_matches_readme_current_receiver_release() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    roadmap = (ROOT / "docs/roadmap.md").read_text(encoding="utf-8")
+    current_receiver = re.search(
+        r"Current components: \*\*Receiver/CLI\*\* `([^`]+)`", readme
+    )
+
+    assert current_receiver is not None
+    expected_prefix = "The current public release set is Receiver/CLI "
+    assert f"{expected_prefix}`{current_receiver.group(1)}`" in roadmap
 
 
 def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
