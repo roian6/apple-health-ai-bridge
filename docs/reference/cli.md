@@ -30,6 +30,8 @@ uv run health-bridge query explain-sources --db "$QA_DB"
 uv run health-bridge query supported-timeseries-types --category body
 uv run health-bridge status --db "$QA_DB" --markdown
 uv run health-bridge mcp smoke --db "$QA_DB"
+uv run health-bridge query latest-sleep-period --db "$QA_DB" --timezone Asia/Kolkata --reference-time 2026-06-08T04:00:00Z
+uv run health-bridge query sleep-report --db "$QA_DB" --timezone Asia/Kolkata --local-date 2026-06-04 --reference-time 2026-06-08T04:00:00Z
 ```
 
 The fixture produces three samples, one workout, and one sleep session. The steps
@@ -87,6 +89,8 @@ catalog require `--db PATH`.
 | `health-bridge query timeseries` | `--types STRING` (comma-separated codes), `--start-time STRING`, `--end-time STRING` | `get_timeseries`: at most 500 stored points. Spaces around type codes and empty comma entries are removed. |
 | `health-bridge query workouts` | `--start-date STRING`, `--end-date STRING` | `get_workouts`: at most 500 sessions. |
 | `health-bridge query sleep-summary` | `--start-date STRING`, `--end-date STRING` | `get_sleep_summary`: session count and stage seconds. |
+| `health-bridge query latest-sleep-period` | `--timezone STRING` (IANA key), `--reference-time STRING` (UTC timestamp) | `get_latest_sleep_period`: latest ended observed group within seven local dates, with timestamps and overlap-safe asleep union evidence. |
+| `health-bridge query sleep-report` | `--timezone STRING`; optional `--local-date STRING`, `--reference-time STRING`, `--include-intervals` flag | Recommended daily briefing: all observed periods ending on the local date, with recorded contributions, coverage and omission counts. Default date is the reference's local date; default reference captures current UTC once; interval evidence defaults off. |
 | `health-bridge query daily-summary` | `--start-date STRING`, `--end-date STRING` | `get_daily_summary`: per-day counts, statistics, and qualified totals. |
 | `health-bridge query explain-sources` | None | `explain_sources`: source and cursor metadata without cursor values. |
 
@@ -98,6 +102,21 @@ workouts/sleep by UTC start date. Daily samples use `calendar_day` metadata when
 present, otherwise UTC start date; see the MCP reference for timezone/completeness
 and aggregation semantics. Empty matches succeed with empty data and notes;
 daily queries still return entries for empty days. Missing data is unknown.
+
+`latest-sleep-period` validates its arguments identically to MCP; invalid arguments
+exit 2. Its explicit local-date search and inclusive observed-end cutoff are
+described in [the MCP contract](mcp.md#get_latest_sleep_period). It can select naps,
+excludes groups with future ends, and does not assert physiological completion.
+Inspect `truncated` before using duration evidence; absent categories are null.
+
+Use `sleep-report` for a daily briefing: fragmented sleep and a later nap remain
+separate visible periods and all eligible periods contribute. It validates CLI
+arguments identically to MCP and exits 2 on invalid input. `--include-intervals`
+adds bounded evidence; otherwise each period's `evidence` is null. There is no
+older-date fallback. See [the report contract](mcp.md#get_sleep_report) for complete
+connected membership, global caps, unknown contributions and receiver stage limits.
+Use `latest-sleep-period` for the different question of the most recently ended
+recorded period; it may select only a later nap.
 
 ## MCP
 

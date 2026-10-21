@@ -150,7 +150,9 @@ EXPECTED_TOOL_NAMES = (
     "get_timeseries",
     "get_workouts",
     "get_sleep_summary",
+    "get_latest_sleep_period",
     "get_daily_summary",
+    "get_sleep_report",
     "explain_sources",
 )
 

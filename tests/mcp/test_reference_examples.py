@@ -13,6 +13,7 @@ from typer.main import get_command
 from health_bridge.cli import app
 from health_bridge.mcp.tools import MCP_TOOL_DEFINITIONS
 from health_bridge.mcp.types import required_object
+from health_bridge.queries.latest_sleep_models import LatestSleepPeriodResult
 from health_bridge.queries.models import (
     DailySummaryResult,
     SleepSummaryResult,
@@ -21,6 +22,7 @@ from health_bridge.queries.models import (
     TimeseriesResult,
     WorkoutsResult,
 )
+from health_bridge.queries.sleep_report_models import SleepReportResult
 from health_bridge.status import BridgeStatusSnapshot
 from health_bridge.timeseries_catalog import SupportedTimeseriesCatalog
 from tests.mcp.test_mcp_server import ToolCallResponse
@@ -33,6 +35,8 @@ RESULT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "get_timeseries": TimeseriesResult,
     "get_workouts": WorkoutsResult,
     "get_sleep_summary": SleepSummaryResult,
+    "get_latest_sleep_period": LatestSleepPeriodResult,
+    "get_sleep_report": SleepReportResult,
     "get_daily_summary": DailySummaryResult,
     "explain_sources": SourcesResult,
 }
@@ -132,10 +136,12 @@ def test_reference_examples_run_through_cli_and_all_mcp_tools(tmp_path: Path) ->
                 "get_timeseries",
                 "get_workouts",
                 "get_sleep_summary",
+                "get_latest_sleep_period",
                 "get_daily_summary",
+                "get_sleep_report",
                 "explain_sources",
             ),
-            (outputs[index] for index in (2, 10, 9, 3, 4, 5, 6, 7, 8)),
+            (outputs[index] for index in (2, 10, 9, 3, 4, 5, 6, 12, 7, 13, 8)),
             strict=True,
         )
     )

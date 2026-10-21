@@ -19,6 +19,13 @@ TOOL_PARAMETERS: Final = {
     "get_timeseries": ("type_codes", "start_time", "end_time"),
     "get_workouts": ("start_date", "end_date"),
     "get_sleep_summary": ("start_date", "end_date"),
+    "get_latest_sleep_period": ("timezone", "reference_time"),
+    "get_sleep_report": (
+        "timezone",
+        "local_date",
+        "reference_time",
+        "include_intervals",
+    ),
     "get_daily_summary": ("start_date", "end_date"),
     "explain_sources": (),
 }
@@ -51,7 +58,10 @@ def test_list_preserves_tool_and_parameter_contracts(
         assert schema["type"] == "object"
         assert schema["additionalProperties"] is False
         assert set(properties) == set(parameters)
-        required = [] if name == "list_supported_timeseries_types" else list(parameters)
+        required = {
+            "list_supported_timeseries_types": [],
+            "get_sleep_report": ["timezone"],
+        }.get(name, list(parameters))
         assert schema.get("required", []) == required
 
 

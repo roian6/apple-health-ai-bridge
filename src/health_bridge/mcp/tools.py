@@ -16,11 +16,15 @@ from health_bridge.mcp.types import JsonMapping, JsonObject
 from health_bridge.queries import (
     explain_sources,
     get_daily_summary,
+    get_latest_sleep_period,
+    get_sleep_report,
     get_sleep_summary,
     get_timeseries,
     get_workouts,
     list_synced_metrics,
 )
+from health_bridge.queries.latest_sleep_models import LatestSleepArgs
+from health_bridge.queries.sleep_report_models import SleepReportArgs
 from health_bridge.status import read_status_markdown, read_status_snapshot
 from health_bridge.timeseries_catalog import list_supported_timeseries_types
 
@@ -253,6 +257,42 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
         input_schema=DATE_RANGE_INPUT_SCHEMA,
     ),
     ToolDefinition(
+        name="get_latest_sleep_period",
+        description=(
+            "Read-only latest observed sleep period ending by reference_time in a "
+            "seven-local-date window in timezone. Joins overlapping/touching session "
+            "envelopes across sources; ongoing groups excluded, naps included. "
+            "Returns UTC/local timestamps, clipped stage evidence and core/deep/rem "
+            "elapsed union, with awake/in_bed separate. No physiological completion "
+            "or source priority. At most 500 candidate sessions and 500 selected "
+            "stage intervals; check truncated and missing_data_notes."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": (
+                        "IANA timezone key, e.g. Asia/Kolkata; "
+                        "must be available locally."
+                    ),
+                },
+                "reference_time": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": UTC_TIMESTAMP_PATTERN,
+                    "description": (
+                        "Inclusive observed-end cutoff in UTC YYYY-MM-DDTHH:MM:SSZ. "
+                        "Required; no implicit clock. Runtime validates calendar "
+                        "dates and representable local window."
+                    ),
+                },
+            },
+            "required": ["timezone", "reference_time"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
         name="get_daily_summary",
         description=(
             "Read-only daily observations for [start_date, end_date). Samples "
@@ -272,6 +312,56 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
         input_schema=DATE_RANGE_INPUT_SCHEMA,
     ),
     ToolDefinition(
+        name="get_sleep_report",
+        description=(
+            "Recommended read-only daily sleep briefing: all received observed periods "
+            "ending on a local wake-date, retaining fragmented sleep and naps. "
+            "No older-date fallback or main-sleep classification. Returns recorded "
+            "overlap-safe asleep contributions, separate awake/in_bed claims, "
+            "coverage and omission counts. Complete connected membership is required; "
+            "global 500-session/stage caps withhold results on exhaustion. "
+            "Use include_intervals for calculation evidence; "
+            "not biological total sleep."
+        ),
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["timezone"],
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": "Available IANA timezone key.",
+                },
+                "local_date": {
+                    "type": ["string", "null"],
+                    "format": "date",
+                    "pattern": r"^\d{4}-\d{2}-\d{2}$",
+                    "description": (
+                        "Wake-date YYYY-MM-DD; omit or null for reference's local "
+                        "date. No older-day fallback."
+                    ),
+                },
+                "reference_time": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": UTC_TIMESTAMP_PATTERN,
+                    "description": (
+                        "UTC observed-end cutoff YYYY-MM-DDTHH:MM:SSZ; "
+                        "omit to capture current UTC once."
+                    ),
+                },
+                "include_intervals": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Include bounded sessions, clipped stages and merged "
+                        "asleep evidence; otherwise evidence is null."
+                    ),
+                },
+            },
+        },
+    ),
+    ToolDefinition(
         name="explain_sources",
         description=(
             "Read-only source provenance: source names, kinds, bundle IDs, device "
@@ -283,7 +373,7 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
         input_schema=EMPTY_INPUT_SCHEMA,
     ),
 )
-TOOL_ARGUMENT_MODELS: Final[dict[str, type[McpModel]]] = {
+TOOL_ARGUMENT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "get_bridge_status": EmptyArgs,
     "get_bridge_context_markdown": EmptyArgs,
     "list_supported_timeseries_types": SupportedTimeseriesArgs,
@@ -291,6 +381,8 @@ TOOL_ARGUMENT_MODELS: Final[dict[str, type[McpModel]]] = {
     "get_timeseries": TimeseriesArgs,
     "get_workouts": DateRangeArgs,
     "get_sleep_summary": DateRangeArgs,
+    "get_latest_sleep_period": LatestSleepArgs,
+    "get_sleep_report": SleepReportArgs,
     "get_daily_summary": DateRangeArgs,
     "explain_sources": EmptyArgs,
 }
@@ -349,6 +441,14 @@ def _call_daily_summary(db_path: Path, args: JsonMapping) -> BaseModel:
     )
 
 
+def _call_latest_sleep_period(db_path: Path, args: JsonMapping) -> BaseModel:
+    return get_latest_sleep_period(db_path, LatestSleepArgs.model_validate(args))
+
+
+def _call_sleep_report(db_path: Path, args: JsonMapping) -> BaseModel:
+    return get_sleep_report(db_path, SleepReportArgs.model_validate(args))
+
+
 def _call_explain_sources(db_path: Path, _args: JsonMapping) -> BaseModel:
     return explain_sources(db_path)
 
@@ -361,6 +461,8 @@ TOOL_CALLERS: Final[dict[str, ToolCaller]] = {
     "get_timeseries": _call_timeseries,
     "get_workouts": _call_workouts,
     "get_sleep_summary": _call_sleep_summary,
+    "get_latest_sleep_period": _call_latest_sleep_period,
+    "get_sleep_report": _call_sleep_report,
     "get_daily_summary": _call_daily_summary,
     "explain_sources": _call_explain_sources,
 }

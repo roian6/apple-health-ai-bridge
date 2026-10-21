@@ -46,7 +46,7 @@ Real-device HealthKit validation is useful, but any reported evidence must be re
 ## Interface references
 
 See the [CLI reference](docs/reference/cli.md) for command options and output
-formats, and the [MCP reference](docs/reference/mcp.md) for all nine tools,
+formats, and the [MCP reference](docs/reference/mcp.md) for all eleven tools,
 parameters, results, date boundaries, and errors.
 
 ## Automated tests
