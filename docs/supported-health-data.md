@@ -17,6 +17,11 @@ This list is the complete requested scope and the public disclosure source for A
 - `body_fat_percentage` — Body Fat Percentage
 - `body_mass_index` — Body Mass Index
 - `body_temperature` — Body Temperature
+- `dietary_carbohydrates` — Dietary Carbohydrates
+- `dietary_energy_consumed` — Dietary Energy Consumed
+- `dietary_fat_total` — Dietary Fat Total
+- `dietary_fiber` — Dietary Fiber
+- `dietary_protein` — Dietary Protein
 - `distance_cycling` — Cycling Distance
 - `distance_downhill_snow_sports` — Downhill Snow Sports Distance
 - `distance_swimming` — Swimming Distance

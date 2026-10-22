@@ -57,6 +57,7 @@ def test_timeseries_catalog_representative_batch_matches_public_json_schema(
         "distance_cycling",
         "environmental_audio_exposure",
         "hydration",
+        "dietary_protein",
     )
     health_types: list[dict[str, object]] = []
     samples: list[dict[str, object]] = []

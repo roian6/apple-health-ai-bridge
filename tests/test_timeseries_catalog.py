@@ -88,12 +88,17 @@ DOCS_BASELINE_TIMESERIES_TYPE_CODES = {
     "number_of_alcoholic_beverages",
     "nike_fuel",
     "hydration",
+    "dietary_energy_consumed",
+    "dietary_protein",
+    "dietary_carbohydrates",
+    "dietary_fat_total",
+    "dietary_fiber",
 }
 
 
 def test_timeseries_catalog_timeseries_catalog_matches_supported_doc_codes() -> None:
     assert set(TIMESERIES_BY_TYPE_CODE) == DOCS_BASELINE_TIMESERIES_TYPE_CODES
-    assert len(TIMESERIES_TYPES) == 80
+    assert len(TIMESERIES_TYPES) == 85
 
 
 def test_timeseries_catalog_has_daily_aggregation_for_every_type() -> None:
@@ -117,6 +122,7 @@ def test_timeseries_catalog_categories_match_receiver_contract() -> None:
         "environmental",
         "fitness",
         "heart",
+        "nutrition",
         "other",
         "provider_specific",
         "sleep",
@@ -181,16 +187,16 @@ def test_timeseries_catalog_catalog_reports_ios_live_readability_status() -> Non
     assert (
         by_type["sleeping_breathing_disturbances"].ios_support_status == "live_readable"
     )
-    assert catalog.ios_live_readable_type_count == 65
+    assert catalog.ios_live_readable_type_count == 70
 
 
 def test_timeseries_catalog_catalog_counts_match_filtered_returned_types() -> None:
     catalog = list_supported_timeseries_types(category="body")
     by_type = {entry.type_code: entry for entry in catalog.types}
 
-    assert catalog.total_type_count == 80
-    assert catalog.ios_live_readable_type_count == 65
-    assert catalog.ios_background_eligible_type_count == 65
+    assert catalog.total_type_count == 85
+    assert catalog.ios_live_readable_type_count == 70
+    assert catalog.ios_background_eligible_type_count == 70
     assert catalog.returned_type_count == 10
     assert set(by_type) == {
         "body_fat_mass",

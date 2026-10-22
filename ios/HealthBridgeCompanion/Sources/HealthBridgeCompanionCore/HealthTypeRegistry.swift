@@ -5,6 +5,7 @@ public struct HealthBridgeHealthType: Codable, Equatable, Hashable, Sendable {
         case activity
         case body
         case heart
+        case nutrition
         case sleep
         case workout
     }

@@ -409,6 +409,15 @@ TIMESERIES_TYPES: Final[tuple[TimeseriesType, ...]] = (
     ),
     TimeseriesType("nike_fuel", "count", "other", "Nike Fuel", "sum"),
     TimeseriesType("hydration", "mL", "other", "Hydration", "sum"),
+    TimeseriesType(
+        "dietary_energy_consumed", "kcal", "nutrition", "Dietary energy consumed", "sum"
+    ),
+    TimeseriesType("dietary_protein", "g", "nutrition", "Dietary protein", "sum"),
+    TimeseriesType(
+        "dietary_carbohydrates", "g", "nutrition", "Dietary carbohydrates", "sum"
+    ),
+    TimeseriesType("dietary_fat_total", "g", "nutrition", "Dietary total fat", "sum"),
+    TimeseriesType("dietary_fiber", "g", "nutrition", "Dietary fiber", "sum"),
 )
 
 # Legacy Apple Health Bridge codes kept query-compatible while new work can use

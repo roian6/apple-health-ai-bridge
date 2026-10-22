@@ -133,6 +133,11 @@ public enum HealthKitTypeCatalog {
         quantityEntry("number_of_alcoholic_beverages", "Number of Alcoholic Beverages", "HKQuantityTypeIdentifierNumberOfAlcoholicBeverages", "count", sensitivity: .high, aggregation: .sum),
         quantityEntry("nike_fuel", "Nike Fuel", "HKQuantityTypeIdentifierNikeFuel", "count", sensitivity: .low, aggregation: .sum),
         quantityEntry("hydration", "Hydration", "HKQuantityTypeIdentifierDietaryWater", "mL", sensitivity: .moderate, aggregation: .sum),
+        quantityEntry("dietary_energy_consumed", "Dietary Energy Consumed", "HKQuantityTypeIdentifierDietaryEnergyConsumed", "kcal", sensitivity: .moderate, aggregation: .sum),
+        quantityEntry("dietary_protein", "Dietary Protein", "HKQuantityTypeIdentifierDietaryProtein", "g", sensitivity: .moderate, aggregation: .sum),
+        quantityEntry("dietary_carbohydrates", "Dietary Carbohydrates", "HKQuantityTypeIdentifierDietaryCarbohydrates", "g", sensitivity: .moderate, aggregation: .sum),
+        quantityEntry("dietary_fat_total", "Dietary Fat Total", "HKQuantityTypeIdentifierDietaryFatTotal", "g", sensitivity: .moderate, aggregation: .sum),
+        quantityEntry("dietary_fiber", "Dietary Fiber", "HKQuantityTypeIdentifierDietaryFiber", "g", sensitivity: .moderate, aggregation: .sum),
     ]
 
     public static let entries: [HealthKitTypeCatalogEntry] = [
@@ -422,6 +427,12 @@ public enum HealthKitTypeCatalog {
                  "atrial_fibrillation_burden",
                  "insulin_delivery":
                 return .heart
+            case "dietary_energy_consumed",
+                 "dietary_protein",
+                 "dietary_carbohydrates",
+                 "dietary_fat_total",
+                 "dietary_fiber":
+                return .nutrition
             default:
                 return .activity
             }

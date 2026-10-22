@@ -122,7 +122,7 @@ def test_query_cli_outputs_json_for_documented_commands(tmp_path: Path) -> None:
     assert [output.returncode for output in outputs] == [0, 0, 0, 0, 0, 0, 0]
     assert all(output.stderr == "" for output in outputs)
     assert all(output.missing_data_notes != () for output in common_outputs)
-    assert supported_output.total_type_count == 80
+    assert supported_output.total_type_count == 85
     assert {entry.type_code for entry in supported_output.types} == {
         "body_fat_mass",
         "body_fat_percentage",

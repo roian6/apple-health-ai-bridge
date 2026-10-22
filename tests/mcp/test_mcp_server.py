@@ -283,7 +283,7 @@ def test_mcp_dispatch_calls_supported_timeseries_catalog(tmp_path: Path) -> None
     types_by_code = {entry.type_code: entry for entry in payload.types}
 
     # Then
-    assert payload.total_type_count == 80
+    assert payload.total_type_count == 85
     assert set(types_by_code) == {
         "body_fat_mass",
         "body_fat_percentage",
