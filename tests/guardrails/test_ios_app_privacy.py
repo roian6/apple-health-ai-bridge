@@ -1351,7 +1351,7 @@ def test_ios_minimum_versions_are_documented_consistently() -> None:
 
     # Then
     assert "iPhone running iOS 18 or later" in readme
-    assert "Xcode 16 or later" in readme
+    assert "(docs/self-build.md)" in readme
     assert "iPhone running iOS 18 or later" in self_build
     assert "Xcode 16 or later" in self_build
     assert "iPhone running iOS 18 or later" in testflight

@@ -1,5 +1,10 @@
 # Contributing
 
+<p>
+  <a href="https://github.com/roian6/apple-health-ai-bridge/actions/workflows/python.yml"><img src="https://img.shields.io/github/actions/workflow/status/roian6/apple-health-ai-bridge/python.yml?branch=main&amp;label=Python&amp;style=flat-square" alt="Python CI" height="20"></a>
+  <a href="https://github.com/roian6/apple-health-ai-bridge/actions/workflows/ios.yml"><img src="https://img.shields.io/github/actions/workflow/status/roian6/apple-health-ai-bridge/ios.yml?branch=main&amp;label=iOS&amp;style=flat-square" alt="iOS CI" height="20"></a>
+</p>
+
 Thanks for helping improve Apple Health AI Bridge.
 
 This project handles health-adjacent data, so contributions must preserve the local-first and privacy-first boundary before anything else.

@@ -1031,8 +1031,8 @@ def test_public_docs_name_each_version_surface_and_transition() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     versioning = VERSIONING_DOC.read_text(encoding="utf-8")
 
+    assert "(docs/versioning.md)" in readme
     for label in ("Receiver/CLI", "iOS Companion", "Batch Protocol"):
-        assert label in readme
         assert label in versioning
     assert "receiver-v1.0.2" in versioning
     assert "ios-v1.1.1-build.50" in versioning
@@ -1086,29 +1086,25 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
-    for content, name, expected_tag in (
-        (readme, "README.md", "receiver-v1.1.3"),
-        (setup, "docs/setup.md", "receiver-v1.1.3"),
-    ):
-        pins = re.findall(
-            r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)',
-            content,
-        )
-        assert pins, f"No versioned install pin found in {name}"
-        assert set(pins) == {expected_tag}, (
-            f"Found stale install pins in {name}: {pins}"
-        )
+    pin_pattern = (
+        r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)'
+    )
+    assert "(docs/setup.md)" in readme
+    assert re.findall(pin_pattern, readme) == []
+    pins = re.findall(pin_pattern, setup)
+    assert pins, "No versioned install pin found in docs/setup.md"
+    assert set(pins) == {"receiver-v1.1.3"}, (
+        f"Found stale install pins in docs/setup.md: {pins}"
+    )
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
     assert unpinned not in readme
     assert unpinned not in setup
 
 
 def test_roadmap_matches_readme_current_receiver_release() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    package = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs/roadmap.md").read_text(encoding="utf-8")
-    current_receiver = re.search(
-        r"Current components: \*\*Receiver/CLI\*\* `([^`]+)`", readme
-    )
+    current_receiver = re.search(r'^version = "([^"]+)"$', package, re.MULTILINE)
 
     assert current_receiver is not None
     expected_prefix = "The current public release set is Receiver/CLI "

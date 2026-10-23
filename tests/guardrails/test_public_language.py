@@ -209,7 +209,7 @@ def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None
     assert "<h1>Apple Health AI Bridge</h1>" in readme
     assert "Health Bridge for AI" not in readme
     assert "open-source project behind" not in readme
-    assert "https://github.com/roian6/apple-health-ai-bridge.git@" in readme
+    assert "(docs/setup.md)" in readme
 
 
 def test_readme_uses_official_app_store_install_artwork() -> None:
@@ -232,8 +232,9 @@ def test_readme_uses_official_app_store_install_artwork() -> None:
 
 
 def test_readme_links_status_badges_to_their_public_sources() -> None:
-    header = (
-        Path("README.md").read_text(encoding="utf-8").split("</div>", maxsplit=1)[0]
+    documents = "\n".join(
+        Path(document).read_text(encoding="utf-8")
+        for document in ("README.md", "CONTRIBUTING.md")
     )
     repository = "roian6/apple-health-ai-bridge"
     expected_links = (
@@ -262,7 +263,7 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
     for target, endpoint in expected_links:
         match = re.search(
             rf'<a href="{re.escape(target)}">\s*(<img\b[^>]*>)\s*</a>',
-            header,
+            documents,
         )
         assert match is not None, target
         image = unescape(match.group(1))
@@ -272,11 +273,17 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
 def test_readme_introduces_user_workflows_before_installation_details() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     introduction, setup = readme.split("## Get started", maxsplit=1)
+    setup_guide = Path("docs/setup.md").read_text(encoding="utf-8")
+    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
 
     assert any(line.startswith("> ") for line in introduction.splitlines())
     assert "```bash" not in introduction
     assert "health-bridge setup" not in introduction
-    assert "uv tool install" in setup
+    assert "(docs/setup.md)" in setup
+    assert re.search(
+        rf'uv tool install "{install_source}@receiver-v\d+\.\d+\.\d+"',
+        setup_guide,
+    )
     assert "docs/setup.md#connect-an-mcp-client-intentionally" in setup
 
 
@@ -452,10 +459,7 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     assert "agent-managed private HTTPS ingress" not in route_language
     assert "agent-managed service plan" not in route_language
 
-    assert (
-        "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.3/docs/setup.md)"
-    ) in readme
+    assert "(docs/setup.md)" in readme
     assert "private HTTPS route" in readme
     ordered_steps = (
         "Choose one of the following routes",
@@ -546,10 +550,7 @@ def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion()
     readme = Path("README.md").read_text()
     setup = Path("docs/setup.md").read_text()
 
-    assert (
-        "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.3/docs/setup.md#remove-local-bridge-data)"
-    ) in readme
+    assert "(docs/setup.md#remove-local-bridge-data)" in readme
     assert "health-bridge receiver purge" not in readme
     assert "health-bridge receiver purge" in setup
     assert "--confirm" in setup
