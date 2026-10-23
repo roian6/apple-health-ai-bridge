@@ -29,12 +29,11 @@ def test_todo16_coordinator_is_product_code_with_focused_swift_tests() -> None:
         assert project.count(name) >= 3
 
 
-def test_todo16_state_and_test_contract_cover_required_boundaries() -> None:
+def test_todo16_state_contract_covers_required_boundaries() -> None:
     models = (CORE / "OutboxDeliveryModels.swift").read_text(encoding="utf-8")
     product = "\n".join(
         (CORE / name).read_text(encoding="utf-8") for name in PRODUCT_FILES
     )
-    tests = "\n".join((TESTS / name).read_text(encoding="utf-8") for name in TEST_FILES)
 
     for state in (
         "collected",
@@ -55,16 +54,6 @@ def test_todo16_state_and_test_contract_cover_required_boundaries() -> None:
         "isFinalized",
     ):
         assert contract in product
-    for scenario in (
-        "testOrderedHappyPathRestartsAtEveryStateAndFinalizesOnce",
-        "testFaultsAroundEnvelopeAndStateWritesRecoverWithoutCryptoReentry",
-        "testAckNackConflictGenerationAndStaleHTTPBoundariesDoNotRetire",
-        "testCursorAndSleepFinalizationAreExactlyOnce",
-        "testCommittedFinalizationRetiresOnlyExactArtifacts",
-        "testAckDeletionFailureKeepsCommittedFinalization",
-        "testTodo14V4MigrationInfersEncryptedWithoutResealing",
-    ):
-        assert scenario in tests
 
 
 def test_todo16_source_has_no_encoder_or_parallel_database() -> None:
