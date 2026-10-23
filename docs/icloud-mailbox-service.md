@@ -93,8 +93,14 @@ metadata. From the asset directory, set `tag` to `receiver-v1.1.3` and
       printf "%s\n" "Release proof FAILED." >&2
     fi
     exit "$verification_status"' EXIT
-  : "${tag:?Set the verified receiver tag}"
-  : "${commit:?Set the independently verified tag target commit}"
+  if [ -z "${tag:-}" ]; then
+    printf "%s\n" "Set the verified receiver tag." >&2
+    exit 1
+  fi
+  if [ -z "${commit:-}" ]; then
+    printf "%s\n" "Set the independently verified tag target commit." >&2
+    exit 1
+  fi
   version="${tag#receiver-v}"
   repository="roian6/apple-health-ai-bridge"
   verify_subject() {

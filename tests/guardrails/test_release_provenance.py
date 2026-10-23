@@ -34,6 +34,7 @@ def run_documented_proof(
     failed_gh: int = 0,
     failed_checksum: bool = False,
     missing: Literal["tag", "commit"] | None = None,
+    empty: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Exercise the actual docs in Bash; stubs test control flow, not signatures."""
     document = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
@@ -68,13 +69,16 @@ if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
         DOC_PROOF_FAIL_GH=str(failed_gh),
         DOC_PROOF_FAIL_CHECKSUM="1" if failed_checksum else "0",
     )
+    input_control = ":"
+    if missing is not None:
+        input_control = f"{missing}=''" if empty else f"unset {missing}"
     script = "\n".join(
         [
             "set +e +u",
             "set +o pipefail",
             f"tag={TAG}",
             "commit=" + "1" * 40,
-            f"unset {missing}" if missing else ":",
+            input_control,
             'verification_flags_before="$-"',
             'verification_options_before="$(set +o)"',
             snippet,
@@ -159,11 +163,12 @@ def test_documented_proof_reports_checksum_failure(tmp_path: Path) -> None:
     assert calls == ["gh"] * 6 + ["shasum"]
 
 
+@pytest.mark.parametrize("empty", [False, True], ids=["unset", "empty"])
 @pytest.mark.parametrize("missing", ["tag", "commit"])
 def test_documented_proof_reports_missing_input(
-    tmp_path: Path, missing: Literal["tag", "commit"]
+    tmp_path: Path, missing: Literal["tag", "commit"], empty: bool
 ) -> None:
-    completed, calls = run_documented_proof(tmp_path, missing=missing)
+    completed, calls = run_documented_proof(tmp_path, missing=missing, empty=empty)
     assert completed.returncode == 0, completed.stderr
     assert "VERIFICATION_PARENT 1 yes" in completed.stdout
     assert "Release proof FAILED." in completed.stderr
