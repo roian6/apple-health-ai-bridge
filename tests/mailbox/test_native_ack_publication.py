@@ -6,17 +6,25 @@ import plistlib
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from health_bridge.mailbox import helper_distribution_contract, helper_lifecycle
 from health_bridge.mailbox.filesystem import open_mailbox_directory
+from health_bridge.mailbox.helper_lifecycle import HelperError, HelperErrorCode
 from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublicationError,
     NativeAckPublisher,
     NativeAckPublisherConfig,
 )
 from health_bridge.mailbox.publication import PublicationState
+from tests.mailbox import test_helper_distribution_contract as fixtures
+
+if TYPE_CHECKING:
+    from health_bridge.mailbox.helper_distribution_verifier import (
+        DistributionVerificationRequest,
+    )
 
 RECEIVER = "11" * 16
 DEVICE = "22" * 16
@@ -44,31 +52,77 @@ def _publisher(tmp_path: Path) -> NativeAckPublisher:
     )
 
 
-def test_production_config_derives_protocol_root_from_installed_bundle(
+@pytest.fixture
+def installed_helper(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, list[Path]]:
+    # Keep real installation/ownership validation; only signing is synthetic.
+    for name, value in (
+        (
+            "SIGNING_AUTHORITY",
+            f"Developer ID Application: {fixtures.PUBLISHER} ({fixtures.TEAM_ID})",
+        ),
+        ("TEAM_IDENTIFIER", fixtures.TEAM_ID),
+        ("BUNDLE_IDENTIFIER", fixtures.BUNDLE_ID),
+        ("ICLOUD_CONTAINER_IDENTIFIER", fixtures.CONTAINER_ID),
+    ):
+        monkeypatch.setattr(
+            helper_distribution_contract,
+            f"_APPROVED_{name}_SHA256",
+            hashlib.sha256(value.encode()).hexdigest(),
+        )
+    verified_apps: list[Path] = []
+
+    def verify_distribution(request: DistributionVerificationRequest) -> None:
+        assert request.bundle_identifier == fixtures.BUNDLE_ID
+        assert request.icloud_container_identifier == fixtures.CONTAINER_ID
+        assert request.bundle_version == fixtures.VERSION
+        assert request.bundle_build == "1"
+        assert request.distribution.team_identifier == fixtures.TEAM_ID
+        verified_apps.append(request.app)
+
+    monkeypatch.setattr(helper_lifecycle, "__version__", fixtures.VERSION)
+    monkeypatch.setattr(
+        helper_lifecycle, "verify_macos_distribution", verify_distribution
+    )
+    archive, manifest = fixtures.write_release(tmp_path, schema_version=2)
+    home = tmp_path / "home"
+    _ = helper_lifecycle.install_helper(archive, manifest, home=home, platform="darwin")
+    return home, verified_apps
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_production_config_derives_protocol_root_from_installed_bundle(
+    installed_helper: tuple[Path, list[Path]],
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
 ) -> None:
-    bundle_id = "com.example.HealthBridgeMailboxAckPublisher"
-    app = (
-        tmp_path
-        / "Library/Application Support/HealthBridge/helpers"
-        / "HealthBridgeMailboxAckPublisher.app"
-    )
-    contents = app / "Contents"
-    contents.mkdir(parents=True)
-    _ = (contents / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleIdentifier": bundle_id})
-    )
+    # Given: an installation with real manifest and ownership receipts.
+    home, verified_apps = installed_helper
+    monkeypatch.setattr(sys, "platform", platform)
 
-    config = NativeAckPublisherConfig.production(home=tmp_path)
+    # When: production resolves its configuration.
+    config = NativeAckPublisherConfig.production(home=home)
 
+    # Then: the installed bundle supplies the paths, with readiness on macOS.
     assert config.protocol_root == (
-        tmp_path
+        home
         / "Library/Containers"
-        / bundle_id
+        / fixtures.BUNDLE_ID
         / "Data/Library/Application Support/HealthBridgeAckPublisher"
     )
+    assert config.helper_executable == (
+        helper_lifecycle.HelperPaths.production(home).app
+        / "Contents/MacOS/HealthBridgeMailboxAckPublisher"
+    )
+    assert len(verified_apps) == (2 if platform == "darwin" else 1)
 
 
+@pytest.mark.parametrize(
+    ("platform", "error_message"),
+    [("linux", "bundle identity"), ("darwin", "not ready")],
+)
 @pytest.mark.parametrize(
     "bundle_id",
     [None, "", "../escape", "contains space", "a" * 256],
@@ -76,36 +130,34 @@ def test_production_config_derives_protocol_root_from_installed_bundle(
 def test_production_config_rejects_invalid_installed_bundle_identity(
     tmp_path: Path,
     bundle_id: object,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    error_message: str,
 ) -> None:
-    app = (
-        tmp_path
-        / "Library/Application Support/HealthBridge/helpers"
-        / "HealthBridgeMailboxAckPublisher.app"
-    )
+    app = helper_lifecycle.HelperPaths.production(tmp_path).app
     contents = app / "Contents"
     contents.mkdir(parents=True)
     payload = {} if bundle_id is None else {"CFBundleIdentifier": bundle_id}
     _ = (contents / "Info.plist").write_bytes(plistlib.dumps(payload))
+    monkeypatch.setattr(sys, "platform", platform)
 
-    with pytest.raises(NativeAckPublicationError, match="bundle identity"):
+    with pytest.raises(NativeAckPublicationError, match=error_message) as raised:
         _ = NativeAckPublisherConfig.production(home=tmp_path)
+
+    if platform == "darwin":
+        assert isinstance(raised.value.__cause__, HelperError)
+        assert raised.value.__cause__.code is HelperErrorCode.HELPER_DRIFT
 
 
 def test_macos_production_config_refuses_unowned_helper_before_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app = (
-        tmp_path
-        / "Library/Application Support/HealthBridge/helpers"
-        / "HealthBridgeMailboxAckPublisher.app"
-    )
+    app = helper_lifecycle.HelperPaths.production(tmp_path).app
     contents = app / "Contents"
     contents.mkdir(parents=True)
     _ = (contents / "Info.plist").write_bytes(
-        plistlib.dumps(
-            {"CFBundleIdentifier": "com.example.HealthBridgeMailboxAckPublisher"}
-        )
+        plistlib.dumps({"CFBundleIdentifier": fixtures.BUNDLE_ID})
     )
     monkeypatch.setattr(sys, "platform", "darwin")
 
@@ -113,19 +165,44 @@ def test_macos_production_config_refuses_unowned_helper_before_publication(
         _ = NativeAckPublisherConfig.production(home=tmp_path)
 
 
+def test_macos_production_config_rejects_drifted_owned_helper(
+    installed_helper: tuple[Path, list[Path]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a real owned installation whose executable no longer matches its receipt.
+    home, verified_apps = installed_helper
+    app = helper_lifecycle.HelperPaths.production(home).app
+    _ = (app / "Contents/MacOS/HealthBridgeMailboxAckPublisher").write_bytes(b"drift")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    # When: production attempts to resolve the drifted installation.
+    with pytest.raises(NativeAckPublicationError, match="not ready") as raised:
+        _ = NativeAckPublisherConfig.production(home=home)
+
+    # Then: ownership rejects it before a second platform-signature verification.
+    assert isinstance(raised.value.__cause__, HelperError)
+    assert raised.value.__cause__.code is HelperErrorCode.HELPER_DRIFT
+    assert len(verified_apps) == 1
+
+
+@pytest.mark.parametrize(
+    ("platform", "error_message"),
+    [("linux", "bundle identity"), ("darwin", "not ready")],
+)
 @pytest.mark.parametrize("symlink_component", ["app", "contents", "info"])
 def test_production_config_rejects_symlinked_bundle_path_component(
     tmp_path: Path,
     symlink_component: str,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    error_message: str,
 ) -> None:
     helpers = tmp_path / "Library/Application Support/HealthBridge/helpers"
     real_app = tmp_path / "real-helper.app"
     real_contents = real_app / "Contents"
     real_contents.mkdir(parents=True)
     _ = (real_contents / "Info.plist").write_bytes(
-        plistlib.dumps(
-            {"CFBundleIdentifier": "com.example.HealthBridgeMailboxAckPublisher"}
-        )
+        plistlib.dumps({"CFBundleIdentifier": fixtures.BUNDLE_ID})
     )
     app = helpers / "HealthBridgeMailboxAckPublisher.app"
     helpers.mkdir(parents=True)
@@ -139,8 +216,14 @@ def test_production_config_rejects_symlinked_bundle_path_component(
         contents.mkdir(parents=True)
         (contents / "Info.plist").symlink_to(real_contents / "Info.plist")
 
-    with pytest.raises(NativeAckPublicationError, match="bundle identity"):
+    monkeypatch.setattr(sys, "platform", platform)
+
+    with pytest.raises(NativeAckPublicationError, match=error_message) as raised:
         _ = NativeAckPublisherConfig.production(home=tmp_path)
+
+    if platform == "darwin":
+        assert isinstance(raised.value.__cause__, HelperError)
+        assert raised.value.__cause__.code is HelperErrorCode.HELPER_DRIFT
 
 
 def test_native_helper_has_no_destructive_cleanup_command() -> None:
