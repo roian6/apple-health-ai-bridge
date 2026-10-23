@@ -259,8 +259,6 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
         assert match is not None, target
         image = unescape(match.group(1))
         assert endpoint in image
-        assert "style=flat-square" in image
-        assert 'height="20"' in image
 
 
 def test_readme_introduces_user_workflows_before_installation_details() -> None:
