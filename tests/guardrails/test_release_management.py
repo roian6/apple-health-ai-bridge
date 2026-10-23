@@ -1102,9 +1102,10 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
 
 
 def test_roadmap_matches_readme_current_receiver_release() -> None:
-    package = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs/roadmap.md").read_text(encoding="utf-8")
-    current_receiver = re.search(r'^version = "([^"]+)"$', package, re.MULTILINE)
+    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
+    current_receiver = re.search(rf'{install_source}@receiver-v([^\s"]+)', setup)
 
     assert current_receiver is not None
     expected_prefix = "The current public release set is Receiver/CLI "
