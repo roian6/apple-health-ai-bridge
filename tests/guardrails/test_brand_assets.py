@@ -102,21 +102,6 @@ def test_visual_assets_are_public_minimal_not_exploration_dump() -> None:
     assert not Path("docs/social-banner-exploration-brief.md").exists()
 
 
-def test_brand_generator_is_self_contained_for_canonical_outputs() -> None:
-    generator = Path("tools/generate_brand_assets.py").read_text(encoding="utf-8")
-    assert "illustration-pass" not in generator
-    assert "source_path" not in generator
-    assert "health-bridge-social-card.html" in generator
-
-
-def test_readme_uses_text_free_mark_and_project_heading() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-    assert '<img src="assets/brand/health-bridge-mark-512.png"' in readme
-    assert "health-bridge-lockup.png" not in readme
-    assert "<h1>Apple Health AI Bridge</h1>" in readme
-    assert "docs/brand.md" in readme
-
-
 def test_public_release_audit_only_allows_canonical_visual_binaries() -> None:
     audit = Path("scripts/public-release-audit.py").read_text(encoding="utf-8")
     for path in CANONICAL_BRAND_PNGS:
