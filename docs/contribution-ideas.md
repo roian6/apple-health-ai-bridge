@@ -1,6 +1,6 @@
 # Contribution ideas
 
-This page lists safe starter issues and launch-feedback lanes for the public `1.0.0` release. Keep contributions synthetic, local-first, and privacy-safe.
+These are starting points for small contributions, not an assigned backlog. Check existing issues before starting so you do not duplicate work. Keep contributions synthetic, local-first, and privacy-safe.
 
 ## Good first issues
 
@@ -8,12 +8,9 @@ These are intentionally documentation, examples, or fixture-focused. They should
 
 | Candidate | Why it helps | Privacy notes |
 | --- | --- | --- |
-| Add a Claude Desktop MCP config example | Helps users connect the local MCP server | Use `.tmp/quickstart.sqlite` and synthetic data only |
-| Add a Cursor MCP config example | Helps agent users try the project from their editor | No screenshots with personal paths or health data |
-| Implement and test Windows database locking | Enables a safe native Windows receiver path | Match POSIX lifecycle/access lock semantics before documenting support |
 | Add a Linux systemd example for a local receiver | Helps self-hosted users keep the receiver running | Keep it local/private-network oriented; no public internet hardening claim |
 | Expand sample MCP prompts | Shows how agents can query status, daily summaries, workouts, sleep, and sources | Prompts must avoid diagnosis/medical advice claims |
-| Add troubleshooting for Local Network permission | Helps TestFlight/self-build users understand iPhone receiver reachability | Do not include real IPs or screenshots with health values |
+| Add troubleshooting for Local Network permission | Helps iPhone users understand receiver reachability | Do not include real IPs or screenshots with health values |
 | Improve no-data/denied-permission documentation | Explains why denied HealthKit reads can look empty | Keep wording general; no personal examples |
 | Add synthetic sleep edge-case fixture | Improves tests without private data | Synthetic fixture only |
 | Add a docs glossary | Clarifies receiver, setup page, pairing, source provenance, cursor, MCP | No implementation diary or private notes |
@@ -38,18 +35,17 @@ Use GitHub issues with one report per issue:
 - **Synthetic quickstart**: fresh checkout, `uv sync`, fixture ingest, status, MCP smoke.
 - **MCP/client integration**: Claude Desktop, Cursor, Hermes, or other MCP client config.
 - **Receiver setup**: local/private-network reachability, `/health`, pairing setup material.
-- **TestFlight/self-build iPhone path**: install, pairing, Health permission, foreground sync, recovery states.
+- **iPhone app**: App Store, TestFlight, or self-build installation, pairing, Health permission, foreground sync, and recovery states.
 - **Docs/positioning**: unclear privacy boundary, misleading wording, missing caveats.
 
-## Feedback template
+## Share feedback
 
-```text
-Flow: README / synthetic quickstart / MCP config / receiver / pairing / permission / sync / recovery / docs
-Environment: OS, Python version, uv version, MCP client, iOS/Xcode/TestFlight if relevant
-What I tried:
-Expected:
-Actual visible text or command output:
-Sensitive data included: no
-```
+Choose the matching form from the [GitHub issue forms](https://github.com/roian6/apple-health-ai-bridge/issues/new/choose).
+Use the setup feedback form for setup or sync friction, and the bug or feature
+forms for reproducible problems or proposals. Check existing issues before
+starting work.
 
-Do not include real HealthKit values, exports, receiver DBs, setup pages, pairing links, bearer tokens, token hashes, cursor values, outbox payloads, private receiver endpoints, or screenshots with health values.
+Use synthetic or redacted examples only. Never include real HealthKit values or
+exports, receiver databases, setup-page contents, pairing links, tokens, token
+hashes, cursor values, outbox payloads, private receiver endpoints, or
+screenshots with health values.

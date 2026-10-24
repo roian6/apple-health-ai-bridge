@@ -4,6 +4,32 @@ Pairing connects the iOS companion to a receiver that you run. The default flow 
 
 Setup pages, QR codes, copied links, and invitation codes are still private. Anyone who obtains an unexpired invitation may redeem it first.
 
+## User handoff checklist
+
+For Direct, finish [receiver setup and reachability checks](#create-a-setup-page)
+before following this checklist:
+
+1. Keep the receiver running.
+2. Verify `/health` using the exact base URL the iPhone will reach.
+3. Generate a fresh invitation setup page.
+4. Open it on a trusted screen.
+5. Scan the QR with iPhone Camera.
+6. If QR cannot be used, tap the setup-page button or paste its link inside Health Bridge.
+7. If link handoff is unavailable, enter the displayed server address and invitation code.
+8. Confirm that Health Bridge reports the connection as saved.
+9. Grant only the Apple Health read permissions the user wants.
+10. Tap the primary app action and verify receiver-side aggregate sync evidence.
+11. Delete the setup page after pairing or expiry.
+
+If pairing reports invalid/unavailable, generate a new invitation. That generic result intentionally does not reveal whether the old invitation was mistyped, expired, revoked, locked, used, or unknown.
+
+For Encrypted iCloud Mailbox, follow the signed-helper lifecycle and choose the
+matching enrollment path in [the Mailbox setup guide](icloud-mailbox-service.md).
+The existing URL-based path uses `health-bridge setup --transport icloud-mailbox`.
+Compatible native builds instead use the documented URL-free
+`health-bridge receiver create-pairing --transport icloud-mailbox` flow. Direct
+remains the default and never falls back to mailbox delivery.
+
 ## Native iCloud Mailbox pairing
 
 Direct remains the default. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta, and a Direct failure never switches transports automatically. Native Mailbox pairing is a separate enrollment path for compatible iPhone and Mac components using the same user-authorized iCloud container and a cancellation-capable receiver helper. It does not replace existing Direct or legacy URL-based pairing.
@@ -59,16 +85,9 @@ The manual code uses an unambiguous `5-5-5` shape. Its public selector allows th
 
 First prepare the real receiver route by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
 
-For normal onboarding, run the route-specific `health-bridge setup` command in that guide. Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
+For normal onboarding, run the route-specific `health-bridge setup` command in [Install and run core setup](setup.md#install-and-run-core-setup). Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
 
-Then derive the phone-facing health endpoint:
-
-```bash
-: "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
-PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
-```
-
-Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page.
+Then derive the phone-facing `/health` URL from `HEALTH_BRIDGE_RECEIVER_URL`. Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page. The canonical route guide also explains that local MCP smoke does not prove receiver readiness or phone reachability.
 
 If that setup invitation expired during verification, create a fresh QR-first page from the already verified batch URL. The new same-label invitation rotates the previous active one:
 
@@ -263,29 +282,6 @@ A production Universal Link still requires:
 - an `applinks:` Associated Domains entitlement.
 
 Arbitrary self-hosted receiver domains cannot all become app Universal Link domains. Until an official pairing domain is selected, the custom scheme plus manual code fallback remains the supported path.
-
-## User handoff checklist
-
-For Encrypted iCloud Mailbox, first run the explicit mailbox setup command and
-signed-helper lifecycle in
-[`icloud-mailbox-service.md`](icloud-mailbox-service.md). The public pairing
-command remains `health-bridge setup --transport icloud-mailbox`; there is no
-separate hidden mailbox pairing command. Direct remains the default and never
-falls back to mailbox delivery.
-
-1. Keep the receiver running.
-2. Verify `/health` using the exact base URL the iPhone will reach.
-3. Generate a fresh invitation setup page.
-4. Open it on a trusted screen.
-5. Scan the QR with iPhone Camera.
-6. If QR cannot be used, tap the setup-page button or paste its link inside Health Bridge.
-7. If link handoff is unavailable, enter the displayed server address and invitation code.
-8. Confirm that Health Bridge reports the connection as saved.
-9. Grant only the Apple Health read permissions the user wants.
-10. Tap the primary app action and verify receiver-side aggregate sync evidence.
-11. Delete the setup page after pairing or expiry.
-
-If pairing reports invalid/unavailable, generate a new invitation. That generic result intentionally does not reveal whether the old invitation was mistyped, expired, revoked, locked, used, or unknown.
 
 ## Security rules
 

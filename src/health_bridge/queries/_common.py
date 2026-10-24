@@ -95,18 +95,24 @@ def fetch_all_sources(connection: sqlite3.Connection) -> tuple[SourceUsed, ...]:
 
 
 def fetch_store_period(connection: sqlite3.Connection) -> Period:
-    sync_period = _fetch_latest_sync_period(connection)
+    sync_period = fetch_latest_sync_window(connection)
     if sync_period is not None:
         return sync_period
+
+    return fetch_stored_coverage(connection) or Period(start="", end="")
+
+
+def fetch_stored_coverage(connection: sqlite3.Connection) -> Period | None:
     row = PERIOD_ROW_ADAPTER.validate_python(
         connection.execute(STORE_PERIOD_SQL).fetchone(),
     )
     if row is None or row[0] is None or row[1] is None:
-        return Period(start="", end="")
+        return None
+
     return Period(start=row[0], end=row[1])
 
 
-def _fetch_latest_sync_period(connection: sqlite3.Connection) -> Period | None:
+def fetch_latest_sync_window(connection: sqlite3.Connection) -> Period | None:
     try:
         row = PERIOD_ROW_ADAPTER.validate_python(
             connection.execute(LATEST_SYNC_PERIOD_SQL).fetchone(),

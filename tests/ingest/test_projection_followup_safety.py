@@ -16,13 +16,24 @@ def test_existing_projection_state_gains_order_index_without_changing_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = tmp_path / "existing.sqlite"
+    fence_migration = database.MIGRATION_IDS.index("011_daily_projection_fence_order")
     with monkeypatch.context() as patch:
-        patch.setattr(database, "MIGRATION_IDS", database.MIGRATION_IDS[:-1])
+        patch.setattr(
+            database, "MIGRATION_IDS", database.MIGRATION_IDS[:fence_migration]
+        )
         root.ingest_root_batch(
             db, root.root_batch((root.daily_sample(),), sequence=1, statistics=True)
         )
         root.ingest_root_batch(db, root.root_batch((root.raw_sample(),), sequence=2))
     with database.connect_database(db) as connection:
+        assert (
+            fetch_text_rows(
+                connection,
+                """select name from sqlite_master where type='index'
+            and name='daily_projection_fence_order'""",
+            )
+            == []
+        )
         before = RECORD_ROWS.validate_python(
             connection.execute(
                 """select fingerprint, sequence, status from daily_projection_records

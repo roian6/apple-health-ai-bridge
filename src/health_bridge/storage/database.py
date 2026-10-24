@@ -60,7 +60,8 @@ MIGRATION_IDS: Final = (
     "009_pairing_transport",
     "010_daily_projection_state",
     "011_daily_projection_fence_order",
-    "012_mailbox_enrollment",
+    "012_catalogue_coverage_index",
+    "013_mailbox_enrollment",
 )
 
 

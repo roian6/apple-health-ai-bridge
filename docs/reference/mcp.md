@@ -43,7 +43,7 @@ The six query results (`list_synced_metrics`, `get_timeseries`, `get_workouts`,
 
 | Field | JSON type and meaning |
 | --- | --- |
-| `period` | Object with `start` and `end` strings. Echoes requested timestamps for timeseries or dates for workout/sleep/daily queries; latest successful sync window, else stored min/max times, for synced metrics/sources. Empty store bounds are `""`. |
+| `period` | Object with `start` and `end` strings. Echoes requested timestamps for timeseries or dates for workout/sleep/daily queries. For synced metrics/sources, preserves the most recently ingested successful batch window with both bounds present, else stored min/max times, else `""` bounds. Deprecated for synced metrics; use its explicit coverage fields below. Source-query semantics are unchanged. |
 | `sources_used` | Array of Source objects: `source_key`, `name`, `kind` strings identifying provenance. |
 | `missing_data_notes` | Array of strings explaining local coverage, empty data, or limitations. Missing records mean unknown availability, not zero activity. |
 | `truncated` | Boolean. Timeseries/workouts have a fixed 500-record cap and set this when more matched. Other query results currently return false. No pagination input exists. |
@@ -140,10 +140,36 @@ Result: `schema_id` is `health_bridge.supported_timeseries_catalog.v2`;
 
 Input: no arguments. Result: shared query fields plus `metrics`, an array of
 objects with string `type_code`, `display_name`, `category`, `default_unit`,
-`sensitivity`, and integer `record_count`. Entries may have zero records;
-an initialized empty store returns an empty array and an unknown-availability note.
+`sensitivity`, integer `record_count`, and nullable timestamp strings
+`first_record_start` and `latest_record_end`. Counts include all records currently
+retained in the local store. No date filter is accepted. Sample bounds are grouped
+by metric type across sources; workout and sleep bounds use their session records.
+Entries may have zero records, with null per-metric bounds.
+
+| Field | JSON type and meaning |
+| --- | --- |
+| `stored_coverage` | Null if no observations remain; otherwise an object with `start` equal to the earliest retained record start and `end` equal to the latest retained record end across samples, workouts, and sleep sessions. |
+| `latest_sync_window` | Null if no successful batch has complete window metadata; otherwise an object with `start` and `end` from the most recently ingested such batch, ordered by sync-run ID. A newer failed or windowless run does not replace it. |
+
+`period` is deprecated for this tool. Its legacy precedence and empty-string
+bounds remain unchanged for compatibility. Clients should use the two explicit
+fields instead. They can differ after a narrow, empty, or deletion-only upload.
+Deleting observations can shrink stored extents or make them null while the
+successful batch window remains populated. Definitions, sources, cursors, and
+tombstone timestamps do not contribute to stored extents. An initialized empty
+store returns an empty metric array, null explicit fields, and an
+unknown-availability note. Registered definitions can remain after every
+observation is deleted, with zero counts, null extents, and the empty-data note.
+
+Stored bounds describe record extents. They establish neither gap-free history
+nor complete backfill, permissions, freshness, or current daily projections.
+Equal bounds can describe a retained instantaneous observation. A successful
+batch window also does not establish synchronization completeness for every
+metric. Missing observations remain unknown.
+
 Sources reflect the local store. Discover sessions as `workout` and
-`sleep_analysis`, then use their dedicated tools.
+`sleep_analysis`, then use their dedicated tools. Existing clients that reject
+unknown JSON properties must allow the additive global and per-metric fields.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_synced_metrics","arguments":{}}}
@@ -163,7 +189,9 @@ no points. An empty type list can return without opening the database.
 Result: shared query fields; `requested_types` is the original array of strings;
 `points` is an array with string `type_code`, `start_time`, `end_time`, `unit`,
 numeric `value`, a `source` object (shared Source), and `metadata` (JSON object).
-Points use canonical type codes, ordered by start time then type. Selection uses
+Points use canonical type codes, ordered by start time, then type, then stored
+sample ID to make timestamp ties deterministic, including at the 500-point cap.
+Sample IDs are local identities retained during updates. Selection uses
 sample start time, not interval overlap; end times are not clipped. The fixture
 returns one steps point with `value: 4321.0`, `unit: "count"`, and
 `truncated: false`. This is stored sample data, not an automatically deduplicated

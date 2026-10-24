@@ -208,6 +208,13 @@ def requires_provenance(tag: str) -> bool:
     return parse_receiver_release_tag(tag).version.as_tuple() >= (1, 1, 3)
 
 
+def release_title(tag: str) -> str:
+    parsed = parse_receiver_release_tag(tag)
+    if parsed.version.as_tuple() < (1, 1, 4):
+        return parsed.tag
+    return f"Receiver/CLI {parsed.version}"
+
+
 def _validate_release_notes(
     versions: ReleaseVersions,
     tag: str,
@@ -1123,7 +1130,7 @@ def _verify_release_identity(
     parsed_tag = parse_receiver_release_tag(request.tag)
     if (
         payload.get("tag_name") != request.tag
-        or payload.get("name") != request.tag
+        or payload.get("name") != release_title(request.tag)
         or payload.get("draft") is not expected_draft
         or payload.get("prerelease") is not parsed_tag.is_prerelease
     ):
@@ -1503,6 +1510,7 @@ def main() -> int:  # noqa: C901, PLR0912
                     {
                         "prerelease": parsed_tag.is_prerelease,
                         "tag": parsed_tag.tag,
+                        "title": release_title(parsed_tag.tag),
                         "version": str(parsed_tag.version),
                     },
                     sort_keys=True,

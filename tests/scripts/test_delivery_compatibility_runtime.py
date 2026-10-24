@@ -11,7 +11,8 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from health_bridge.ingest import ingest_fixture
 from health_bridge.mcp.server import mcp_smoke_result
-from health_bridge.mcp.types import required_list
+from health_bridge.mcp.types import required_list, required_object
+from health_bridge.queries._common import LIMITED_STORE_NOTE
 from health_bridge.receiver.pairing import (
     ReceiverPairingBundle,
     ReceiverPairingInvitationPayload,
@@ -149,14 +150,19 @@ def test_status_and_mcp_rows_match_generated_read_only_output(tmp_path: Path) ->
     smoke = mcp_smoke_result(db_path)
     current_mcp = (json.dumps(smoke, separators=(",", ":")) + "\n").encode()
     assert (_sha256(current_mcp), len(current_mcp)) == (
-        "26b1af72553ff74b126e439fc248033d976068b9e9ccde867dcc7079e42f3e8d",
-        865,
+        "b23ccdb8aa5dc3eeb28ab1a84082c4f7b4f8dcedba0b250051a41fe146b6758c",
+        1219,
     )
     listed_tools = required_list(smoke["listed_tools"])
     assert listed_tools.count("get_latest_sleep_period") == 1
     assert listed_tools.count("get_sleep_report") == 1
     legacy_smoke = {
         **smoke,
+        # The historical matrix predates the catalogue's corrected coverage notes.
+        "call_result": {
+            **required_object(smoke["call_result"]),
+            "missing_data_notes": [LIMITED_STORE_NOTE],
+        },
         "listed_tools": [
             tool
             for tool in listed_tools

@@ -1,8 +1,15 @@
+from __future__ import annotations
+
 import json
 import struct
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from xml.etree import ElementTree as ET
+
+from tools import generate_brand_assets
+
+if TYPE_CHECKING:
+    import pytest
 
 BRAND = Path("assets/brand")
 APPICONSET = Path(
@@ -70,6 +77,27 @@ def test_brand_svgs_are_parseable_and_use_scaling_strokes() -> None:
         text = path.read_text(encoding="utf-8")
         _ = ET.parse(path)  # noqa: S314 - trusted repo-local SVG asset
         assert "vector-effect" not in text
+
+
+def test_site_export_copies_canonical_icons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "brand"
+    source.mkdir()
+    names = ("health-bridge-mark.svg", "favicon.svg", "apple-touch-icon.png")
+    for name in names:
+        _ = (source / name).write_bytes((BRAND / name).read_bytes())
+    site = tmp_path / "site"
+    (site / "assets").mkdir(parents=True)
+    monkeypatch.setattr(generate_brand_assets, "BRAND", source)
+
+    generate_brand_assets.export_site_assets(site)
+
+    for name in names:
+        assert (site / "assets" / name).read_bytes() == (source / name).read_bytes()
+    mark = ET.parse(site / "assets" / "health-bridge-mark.svg").getroot()  # noqa: S314
+    favicon = ET.parse(site / "assets" / "favicon.svg").getroot()  # noqa: S314
+    assert ET.tostring(mark) == ET.tostring(favicon)
 
 
 def test_ios_app_icon_catalog_is_complete_and_bundled() -> None:

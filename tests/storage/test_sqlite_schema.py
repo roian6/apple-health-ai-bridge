@@ -488,7 +488,8 @@ def test_initialize_database_creates_core_tables_when_database_is_empty(
         ("009_pairing_transport",),
         ("010_daily_projection_state",),
         ("011_daily_projection_fence_order",),
-        ("012_mailbox_enrollment",),
+        ("012_catalogue_coverage_index",),
+        ("013_mailbox_enrollment",),
     ]
 
 
@@ -507,7 +508,7 @@ def test_initialize_database_is_idempotent_when_called_twice(tmp_path: Path) -> 
             "select count(*) from schema_migrations",
         )
 
-    assert migration_count == 12
+    assert migration_count == 13
 
 
 def _create_legacy_sleep_revision_database(db_path: Path) -> None:

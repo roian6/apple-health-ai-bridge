@@ -32,10 +32,35 @@ class Metric(QueryModel):
     default_unit: str
     sensitivity: str
     record_count: int
+    first_record_start: str | None = None
+    latest_record_end: str | None = None
 
 
 class SyncedMetricsResult(QueryModel):
-    period: Period
+    period: Period = Field(
+        description=(
+            "Deprecated legacy metadata: latest successful batch window with complete "
+            "bounds, else stored extents, else empty strings. Use stored_coverage "
+            "and latest_sync_window instead."
+        ),
+        json_schema_extra={"deprecated": True},
+    )
+    stored_coverage: Period | None = Field(
+        default=None,
+        description=(
+            "Minimum retained record start and maximum retained record end across "
+            "samples, workouts and sleep sessions; null when none remain. These "
+            "extents do not establish continuous coverage or completeness."
+        ),
+    )
+    latest_sync_window: Period | None = Field(
+        default=None,
+        description=(
+            "Declared window of the most recently ingested successful batch with "
+            "both bounds present; null if none. Does not establish synchronization "
+            "completeness for every metric."
+        ),
+    )
     metrics: tuple[Metric, ...]
     sources_used: tuple[SourceUsed, ...]
     missing_data_notes: tuple[str, ...]
