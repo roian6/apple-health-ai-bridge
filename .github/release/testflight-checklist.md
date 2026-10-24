@@ -2,7 +2,7 @@
 
 This reusable maintainer checklist helps prepare an official TestFlight beta for Apple Health AI Bridge. The App Store is the normal iPhone installation path. TestFlight is a beta distribution path, and source-build remains separate for contributors and developers. Keep account-owned App Store Connect, signing, reviewer, support, and demo receiver material outside the public repository until it is intentionally published.
 
-Keep public install surfaces on the latest published compatible release while a candidate is in review. Do not announce a TestFlight candidate or update its public link until the matching build has passed external Beta App Review and the release packet is ready. Assign the approved build to the intended external group only at cutover, then verify its Public Link anonymously.
+Keep public install surfaces on the latest published compatible release while a candidate is in review. Before submitting the candidate for external Beta App Review, add it to the intended external group with **Automatically notify testers** deselected. Do not announce the candidate or update its public link until the matching build has passed review and the release packet is ready. At cutover, manually notify testers and verify the group's Public Link anonymously.
 
 ## What the public repository may contain
 
