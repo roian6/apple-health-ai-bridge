@@ -174,7 +174,8 @@ extension OutboxDeliveryCoordinatorTests {
         }
     }
 
-    func testEveryCommittedRetirementFaultRecoversOneFinalization() throws {
+    @MainActor
+    func testEveryCommittedRetirementFaultRecoversOneFinalization() async throws {
         let boundaries: [OutboxDeliveryCoordinator.Boundary] = [
             .beforeProgressFinalization,
             .afterProgressFinalization,
@@ -206,10 +207,12 @@ extension OutboxDeliveryCoordinatorTests {
                     throw MailboxSyntheticFailure.injected
                 }
             )
-            XCTAssertThrowsError(
-                try coordinator.finalizeCommitted(itemID: harness.fixture.item.id),
-                "target=\(target)"
-            )
+            do {
+                _ = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+                XCTFail("Expected injected failure at \(target)")
+            } catch {
+                XCTAssertTrue(error is MailboxSyntheticFailure, "target=\(target)")
+            }
 
             let restarted = try harness.restart()
             coordinator = harness.coordinator(
@@ -218,13 +221,8 @@ extension OutboxDeliveryCoordinatorTests {
                 observed: true,
                 finalizer: finalizer
             )
-            XCTAssertEqual(
-                try coordinator.finalizeCommitted(
-                    itemID: harness.fixture.item.id
-                ).phase,
-                .committedFinalized,
-                "target=\(target)"
-            )
+            let recovered = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+            XCTAssertEqual(recovered.phase, .committedFinalized, "target=\(target)")
             XCTAssertEqual(finalizer.finalizeCount, 1, "target=\(target)")
             XCTAssertNil(
                 try restarted.pendingItem(id: harness.fixture.item.id),

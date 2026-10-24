@@ -87,7 +87,8 @@ final class MailboxQAHarnessTests: XCTestCase {
         XCTAssertNotNil(faulted.envelopeSHA256)
     }
 
-    func testDurableHarnessReusesEnvelopeAndFinalizesAuthenticatedAckOnce() throws {
+    @MainActor
+    func testDurableHarnessReusesEnvelopeAndFinalizesAuthenticatedAckOnce() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString,
             isDirectory: true
@@ -139,10 +140,11 @@ final class MailboxQAHarnessTests: XCTestCase {
             support: support,
             provider: provider
         )
-        let committed = try harness.scanAndFinalize()
+        let committed = try await harness.scanAndFinalize()
         XCTAssertEqual(committed.lastPhase, .committedFinalized)
         XCTAssertEqual(committed.finalizationCount, 1)
-        XCTAssertEqual(try harness.scanAndFinalize().finalizationCount, 1)
+        let repeated = try await harness.scanAndFinalize()
+        XCTAssertEqual(repeated.finalizationCount, 1)
         XCTAssertThrowsError(try harness.advance())
     }
 
@@ -184,7 +186,8 @@ final class MailboxQAHarnessTests: XCTestCase {
         }
     }
 
-    func testTerminalAckBecomesDurableFailureAndAllowsQAOnlyCleanup() throws {
+    @MainActor
+    func testTerminalAckBecomesDurableFailureAndAllowsQAOnlyCleanup() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString,
             isDirectory: true
@@ -213,7 +216,7 @@ final class MailboxQAHarnessTests: XCTestCase {
             provider: provider
         )
 
-        let terminal = try harness.scanAndFinalize()
+        let terminal = try await harness.scanAndFinalize()
         XCTAssertEqual(terminal.lastPhase, .terminalFailure)
         let locator = try MailboxLocatorV1.resolveIsolated(
             providerRoot: provider,

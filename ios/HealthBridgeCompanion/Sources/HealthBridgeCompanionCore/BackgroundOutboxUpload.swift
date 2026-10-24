@@ -316,6 +316,38 @@ public enum DirectUploadFinalizationOutcome: Equatable, Sendable {
 }
 
 public enum DirectUploadFinalizer {
+    @MainActor
+    public static func finishForSync(
+        descriptor: DirectUploadCompletionDescriptor,
+        completion: BackgroundUploadTaskCompletion,
+        currentReceiverGeneration: String,
+        currentReceiverBindingID: String?,
+        validate: @MainActor () throws -> Void,
+        recoverSleepBaseline: @MainActor (String, UInt64) async throws -> Void,
+        retire: @MainActor (String, String) throws -> Void
+    ) async throws -> DirectUploadFinalizationOutcome {
+        let outcome = finish(
+            descriptor: descriptor, completion: completion,
+            currentReceiverGeneration: currentReceiverGeneration,
+            currentReceiverBindingID: currentReceiverBindingID,
+            recoverSleepBaseline: { _, _ in }, retire: { _, _ in }
+        )
+        switch outcome {
+        case .recovered:
+            try validate()
+            if let floor = completion.sleepMinimumResetEpoch {
+                try await recoverSleepBaseline(descriptor.itemID, floor)
+            }
+            try validate()
+        case .retired:
+            try validate()
+            try retire(descriptor.itemID, descriptor.receiverBindingID)
+        case .retained, .stale:
+            break
+        }
+        return outcome
+    }
+
     public static func finish(
         descriptor: DirectUploadCompletionDescriptor,
         completion: BackgroundUploadTaskCompletion,
