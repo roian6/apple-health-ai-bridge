@@ -162,6 +162,61 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try assertIssue96PreparationWasAbandoned(fixture, runtime: runtime)
     }
 
+    func testIssue96AutomaticSleepSnapshotInvalidationRetainsObserverGeneration() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let runtime = try await makeIssue96Runtime(fixture, barrier: barrier)
+        barrier.startDriver {
+            let revision = try fixture.sleep.revisionForSync()
+            try fixture.sleep.saveManifest(fixture.initialManifest)
+            XCTAssertNotEqual(try fixture.sleep.revisionForSync(), revision)
+        }
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(
+            reason: .observerBatch(typeCodes: ["sleep_analysis"])
+        )
+        try await barrier.joinDriver()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+
+        XCTAssertTrue(barrier.observation().actionBeforeRelease)
+        XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(recordedSleepFailure(runtime.viewModel)?.category, .cancellation)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertTrue(fixture.recorder.payloads.isEmpty)
+    }
+
+    func testIssue96AutomaticSleepFIFORetirementBlocksLane() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let runtime = try await makeIssue96Runtime(fixture, barrier: barrier)
+        let item = try fixture.outbox.enqueue(
+            Data("{\"schema_id\":\"synthetic.independent-upload\"}".utf8),
+            receiverIdentity: try XCTUnwrap(fixture.settings.receiverBindingID)
+        )
+        barrier.startDriver { try fixture.outbox.markUploaded(item) }
+
+        let result = await runtime.viewModel.processAutomaticSyncType(
+            "sleep_analysis", pendingGenerations: fixture.generations
+        )
+        try await barrier.joinDriver()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+
+        XCTAssertTrue(barrier.observation().actionBeforeRelease)
+        XCTAssertEqual(result, .blocked)
+        XCTAssertEqual(recordedSleepFailure(runtime.viewModel)?.category, .cancellation)
+        XCTAssertTrue(runtime.viewModel.statusIsError)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertTrue(fixture.recorder.payloads.isEmpty)
+    }
+
     func testIssue96ConnectionChangeDuringSleepPreparationCannotJournalOrAdvanceAnchor() async throws {
         let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }

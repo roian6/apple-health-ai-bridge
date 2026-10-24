@@ -217,7 +217,7 @@ fi
 ! /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.icloud-services:1' "$private_build_root/profile.plist" >/dev/null 2>&1
 
 submission_archive="$private_build_root/notary-upload.zip"
-/usr/bin/ditto -c -k --keepParent "$app" "$submission_archive"
+/usr/bin/ditto -c -k --norsrc --keepParent "$app" "$submission_archive"
 if ! xcrun notarytool submit "$submission_archive" \
   --keychain-profile "$notary_profile" \
   --wait \
@@ -255,7 +255,7 @@ archive="$output_dir/HealthBridgeMailboxAckPublisher-${version}.zip"
 manifest="$output_dir/HealthBridgeMailboxAckPublisher-${version}.manifest.json"
 test ! -e "$archive"
 test ! -e "$manifest"
-/usr/bin/ditto -c -k --keepParent "$app" "$archive"
+/usr/bin/ditto -c -k --norsrc --keepParent "$app" "$archive"
 chmod 600 "$archive"
 
 tag_object="$(git rev-parse "${tag}^{tag}")"
@@ -281,7 +281,6 @@ chmod 600 "$manifest"
 uv run python scripts/verify_helper_distribution.py \
   --archive "$archive" \
   --manifest "$manifest" \
-  --app "$app" \
   >"$private_build_root/distribution-verification.log" 2>&1
 
 echo "staged: $(basename "$archive")"

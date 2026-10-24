@@ -5206,8 +5206,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: executionMode,
                 pendingGenerationRetirements: pendingGenerationRetirements
             )
-        } catch is CancellationError {
-            return false
         } catch {
             guard !Task.isCancelled, terminalPayloadActionAdmissionIsOpen,
                   callIdentity == (

@@ -357,6 +357,46 @@ def test_structural_validation_rejects_links_duplicates_and_limits(
     assert raised.value.code is HelperErrorCode.UNSAFE_ARCHIVE
 
 
+@pytest.mark.parametrize(
+    "metadata_path",
+    [
+        "Contents/._Info.plist",
+        "Contents/MacOS/._HealthBridgeMailboxAckPublisher",
+        "Contents/._Resources/child",
+        "Contents/__MACOSX/child",
+        "Contents/Resources/__MACOSX/child",
+    ],
+)
+def test_install_rejects_metadata_before_filesystem_or_platform_verification(
+    tmp_path: Path,
+    metadata_path: str,
+) -> None:
+    # Given: an otherwise valid release containing AppleDouble metadata.
+    archive, manifest = _release(tmp_path)
+    _write_archive(
+        archive,
+        extra_members={f"{HELPER_APP_NAME}/{metadata_path}": b"AppleDouble"},
+    )
+    _write_manifest(manifest, archive)
+    home = tmp_path / "synthetic-home"
+    calls: list[Path] = []
+
+    # When: the production installer validates the supplied archive.
+    with pytest.raises(HelperError) as raised:
+        _ = install_helper(
+            archive,
+            manifest,
+            home=home,
+            platform="darwin",
+            verifier=_verifier(calls),
+        )
+
+    # Then: no filesystem generation or platform verification was attempted.
+    assert raised.value.code is HelperErrorCode.UNSAFE_ARCHIVE
+    assert not home.exists()
+    assert calls == []
+
+
 def test_validation_binds_archive_digest_bundle_and_release_source(
     tmp_path: Path,
 ) -> None:
