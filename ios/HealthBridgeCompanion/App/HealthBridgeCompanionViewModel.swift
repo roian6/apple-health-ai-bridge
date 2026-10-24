@@ -2597,12 +2597,31 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 previousGeneration: previousGeneration
             )
         case .invitation(let invitation):
+            let pendingPairingExists = try pairingCoordinator.hasPendingPairing()
+            let matchesPendingInvitation: Bool
+            if pendingPairingExists {
+                matchesPendingInvitation =
+                    try pairingCoordinator.pendingPairingMatches(invitation)
+            } else {
+                matchesPendingInvitation = false
+            }
+            let hasPendingCancellationRecovery =
+                try pairingCoordinator.hasPendingCancellationRecovery()
+            guard !hasPendingCancellationRecovery,
+                  !pendingPairingExists || matchesPendingInvitation else {
+                throw ReceiverPairingStateError.pendingPairingConflict
+            }
+            let preservesPendingNativeAuthority =
+                pendingPairingExists
+                && matchesPendingInvitation
+                && invitation.mailboxBootstrap != nil
             statusIsError = false
             statusMessage = "Redeeming temporary pairing invitation..."
             pauseAutomaticSyncForPendingPairing()
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                 cancelPairingOperation: false,
+                advanceGeneration: !preservesPendingNativeAuthority,
                 diagnosePairingCommitBarriers: true
             ) { expectedGeneration in
                 try await self.pairingCoordinator.pair(

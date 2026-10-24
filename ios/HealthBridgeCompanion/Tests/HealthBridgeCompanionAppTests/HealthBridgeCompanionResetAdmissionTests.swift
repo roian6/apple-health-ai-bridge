@@ -3965,6 +3965,38 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         try await assertInterruptedNativePairingRecovery(coldBootstrap: false, superseded: true)
     }
 
+    func testInterruptedNativePairingMatchingReimportCompletesPublishedRequest() async throws {
+        try await assertInterruptedNativePairingRecovery(coldBootstrap: false, superseded: false, reimport: true)
+    }
+
+    func testInterruptedNativePairingConflictingReimportDoesNotPoisonPublishedRequest() async throws {
+        try await assertInterruptedNativePairingRecovery(
+            coldBootstrap: false, superseded: false, reimport: true, conflictingReimports: true
+        )
+    }
+
+    func testInterruptedNativePairingReimportRejectsSupersededGeneration() async throws {
+        try await assertInterruptedNativePairingRecovery(coldBootstrap: false, superseded: true, reimport: true)
+    }
+
+    func testInterruptedNativePairingMatchingTextReimportCompletesPublishedRequest() async throws {
+        try await assertInterruptedNativePairingRecovery(
+            coldBootstrap: false, superseded: false, textReimport: true
+        )
+    }
+
+    func testInterruptedNativePairingConflictingTextReimportDoesNotPoisonPublishedRequest() async throws {
+        try await assertInterruptedNativePairingRecovery(
+            coldBootstrap: false, superseded: false, conflictingReimports: true, textReimport: true
+        )
+    }
+
+    func testInterruptedNativePairingTextReimportRejectsSupersededGeneration() async throws {
+        try await assertInterruptedNativePairingRecovery(
+            coldBootstrap: false, superseded: true, textReimport: true
+        )
+    }
+
     func testConfirmedPrivateResetClearsPublishedNativePairingWithoutReceipt() async throws {
         let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
         let state = ReceiverPairingStateStore(
@@ -4255,7 +4287,10 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
     }
 
-    private func assertInterruptedNativePairingRecovery(coldBootstrap: Bool, superseded: Bool) async throws {
+    private func assertInterruptedNativePairingRecovery(
+        coldBootstrap: Bool, superseded: Bool, reimport: Bool = false, conflictingReimports: Bool = false,
+        textReimport: Bool = false
+    ) async throws {
         let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
         let state = ReceiverPairingStateStore(
             pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
@@ -4316,6 +4351,44 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         let requestGeneration = try XCTUnwrap(pending.nativeExpectedGeneration)
         XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, requestGeneration)
 
+        if conflictingReimports {
+            let originalRecord = try fixture.settings.currentConnectionRecordV2()
+            let originalObject = try XCTUnwrap(JSONSerialization.jsonObject(with: invitation) as? [String: Any])
+            var conflicts: [[String: Any]] = []
+            for (key, value) in [
+                ("invitation_secret", "hbi_different_synthetic_invitation"),
+                ("expires_at", "2031-01-01T00:00:00Z"),
+            ] {
+                var changed = originalObject
+                changed[key] = value
+                conflicts.append(changed)
+            }
+            let otherPeer = try ExchangePeer(signingByte: 0x41)
+            conflicts.append(try XCTUnwrap(JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(otherPeer.invitation())) as? [String: Any]))
+            var direct = originalObject
+            direct.removeValue(forKey: "mailbox_bootstrap")
+            direct.removeValue(forKey: "mailbox_protocol_version")
+            direct["transport"] = "direct"
+            direct["receiver_url"] = "https://synthetic.invalid"
+            direct["redeem_url"] = "https://synthetic.invalid/pair/redeem"
+            conflicts.append(direct)
+            for conflict in conflicts {
+                initial.viewModel.pairingImportText = String(
+                    decoding: try JSONSerialization.data(withJSONObject: conflict), as: UTF8.self
+                )
+                await initial.viewModel.importPairingText()
+                await fixture.join(initial)
+                XCTAssertTrue(initial.viewModel.statusIsError)
+                XCTAssertEqual(try state.loadPending(), pending, "Conflicting import must retain the original request")
+                XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, requestGeneration,
+                    "Rejected invitation must not invalidate the original native authority")
+                XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), originalRecord)
+                XCTAssertEqual(requests.count, 1)
+                XCTAssertEqual(responseReads, 0)
+            }
+        }
+
         if superseded {
             _ = try fixture.settings.invalidateReceiverSettingsGeneration()
         }
@@ -4335,7 +4408,14 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             await resumed.bootstrap()
         } else {
             resumed = initial
-            await resumed.viewModel.retryPendingPairing()
+            if textReimport {
+                resumed.viewModel.pairingImportText = String(decoding: invitation, as: UTF8.self)
+                await resumed.viewModel.importPairingText()
+            } else if reimport {
+                await resumed.viewModel.importPairingURL(link)
+            } else {
+                await resumed.viewModel.retryPendingPairing()
+            }
         }
         await fixture.join(resumed)
         if superseded {
