@@ -24,9 +24,10 @@ Apple Health AI Bridge is a local-first companion that turns Apple Health data t
 
 ## User-owned receiver
 
-- Data goes to the receiver URL the user pairs in the app.
+- Direct pairing sends data to the receiver URL the user pairs in the app. Encrypted iCloud Mailbox is a separate, explicit Mac-only Beta selection that uses the user's authorized iCloud container and user-owned receiver. Direct remains the default, and failure does not trigger automatic transport fallback.
 - The default product posture is local/user-owned infrastructure.
-- Normal v2 pairing uses a short-lived single-use invitation; the app generates the long-lived device credential locally and stores it in Keychain.
+- Direct v2 pairing uses a short-lived single-use invitation; the app generates the device credential locally and stores it in Keychain. Native Mailbox pairing pins receiver keys from a private invitation and exchanges a signed, encrypted request and completion. Its 20-minute default invitation lifetime applies to new enrollment, not recovery of an exact request already committed by the receiver.
+- Native Mailbox credentials are revocation-based, not time-limited. Cancellation after publication may have occurred requires receiver confirmation and can remain pending while the provider or receiver is unavailable. Pairing metadata remains visible in the user's iCloud container, and the current implementation does not establish automatic pairing-file deletion or a retention deadline.
 - The App Review demo helper intentionally emits a revocable legacy v1 reviewer credential because Apple's review schedule is longer than the v2 invitation lifetime. That reviewer credential does not expire automatically and must be revoked after review; regenerating the packet at the same setup-page path revokes only the credential recorded by the previous reviewer packet.
 
 ## Delivery transports
@@ -34,8 +35,13 @@ Apple Health AI Bridge is a local-first companion that turns Apple Health data t
 - Direct is the default transport. A Direct failure never switches to another transport automatically.
 - Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta.
 - The Beta applies application-layer encryption and signatures before using the user's iCloud container. The user-owned receiver commits accepted batches before publishing encrypted, receiver-signed ACKs, and the app advances committed progress only after validating a committed ACK.
+- Native Mailbox enrollment uses a private invitation as its initial trust channel. The first valid installation holding the invitation may enroll; the invitation does not attest or preselect a physical device. Request and completion bodies are encrypted and authenticated. Envelope metadata, including invitation ID, sender public key, message kind, and size, remains visible to parties with container access. Cancellation and its confirmation are signed but not application-encrypted.
 - The optional mailbox receiver service is a per-user macOS LaunchAgent installed only by an explicit user command.
 - Neither the developer nor an integrated third party operates or can access the user's iCloud container or receiver. The “Data Not Collected” answer depends on preserving this boundary.
+
+## Release-owner disclosure checks
+
+Before submission, confirm the exact distributed app and helper configuration, including supported OS versions, shared authorized iCloud container, capabilities, and whether the shipped helper supports native pairing and cancellation. Confirm whether the developer or any integrated third party can access the user's container, receiver, pairing metadata, or transmitted HealthKit records. Review the live privacy policy, App Privacy answers, privacy manifest, and private App Review notes against those actual data flows and retention practices. Record the release owner's determinations outside this template. This example does not select App Privacy answers or establish App Review approval.
 
 ## Privacy posture
 

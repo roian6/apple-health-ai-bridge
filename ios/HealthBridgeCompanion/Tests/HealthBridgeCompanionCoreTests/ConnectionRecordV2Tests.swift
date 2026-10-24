@@ -3,6 +3,41 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class ConnectionRecordV2Tests: XCTestCase {
+    func testURLFreeMailboxColdRestorePreservesCommittedIdentityAndBytes() throws {
+        let suiteName = "ConnectionRecordV2Tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(generation: 41, bindingID: "synthetic-native-binding"),
+            mailboxIdentity: .available(syntheticMailboxIdentity(connectionGeneration: 41)),
+            activation: .paired(activeTransport: .mailbox),
+            transportConfigurations: [
+                .mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1()),
+            ]
+        )
+        let raw = try taggedV2Record(record)
+        let tokens = ConnectionV2CapturingTokenStore(initialToken: raw)
+        let backup = ConnectionV2CapturingTokenStore()
+
+        // Open the same committed record twice, without an HTTP credential or
+        // pending invitation. Restoration must neither re-pair nor rewrite it.
+        for _ in 0..<2 {
+            let store = ReceiverSettingsStore(
+                userDefaults: defaults, tokenStore: tokens, preCutoverBackupStore: backup
+            )
+            XCTAssertEqual(try store.currentConnectionRecordV2(), record)
+            XCTAssertEqual(store.activeTransport, .mailbox)
+            XCTAssertEqual(try store.ensureAtomicConnectionRecord(), "synthetic-native-binding")
+            XCTAssertEqual(store.receiverBindingID, "synthetic-native-binding")
+            XCTAssertEqual(store.receiverSettingsGenerationToken, "g41")
+            XCTAssertTrue(store.receiverURLString.isEmpty)
+            XCTAssertTrue(try store.loadBearerToken().isEmpty)
+            XCTAssertEqual(tokens.savedToken, raw)
+            XCTAssertEqual(tokens.saveCount, 0)
+            XCTAssertEqual(backup.saveCount, 0)
+        }
+    }
+
     func testLegacyV1BootstrapPreservesPrimaryBytes() throws {
         let suiteName = "ConnectionRecordV2Tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

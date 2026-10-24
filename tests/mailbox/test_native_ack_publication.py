@@ -327,3 +327,20 @@ def test_helper_failure_is_retryable_and_cleans_protocol_files(
     assert list((tmp_path / "protocol" / "requests").iterdir()) == []
     assert list((tmp_path / "protocol" / "staging").iterdir()) == []
     assert list((tmp_path / "protocol" / "receipts").iterdir()) == []
+
+
+def test_native_setup_refuses_helper_without_cancellation_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = _publisher(tmp_path)
+
+    def old_helper(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 0, b"native-pairing-v1:available\n")
+
+    monkeypatch.setattr(subprocess, "run", old_helper)
+    with pytest.raises(NativeAckPublicationError, match="capability"):
+        publisher.require_native_pairing()
+    assert not (tmp_path / "protocol").exists()

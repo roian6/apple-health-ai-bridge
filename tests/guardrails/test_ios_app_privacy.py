@@ -1648,13 +1648,42 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     )
     foreground_outbox_body = view_model[foreground_outbox_start:foreground_outbox_end]
     assert (
-        foreground_outbox_body.count(
-            "requireCurrentConnectionGeneration(expectedGeneration)"
-        )
-        >= 4
+        foreground_outbox_body.count("requireCurrentPayloadDeliveryTarget(target)") >= 5
     )
     assert "catch is CancellationError" in foreground_outbox_body
-    assert "bearerToken uploadBearerToken" in foreground_outbox_body
+    assert all(
+        marker in foreground_outbox_body
+        for marker in (
+            "let uploadBearerToken = try settingsStore.loadBearerToken()",
+            "bearerToken: uploadBearerToken",
+            "cursorFinalizer.recordDirectReceiverAcceptance(",
+        )
+    )
+
+    capture_start = view_model.index("private func capturePayloadDeliveryTarget()")
+    validator_start = view_model.index(
+        "private func requireCurrentPayloadDeliveryTarget(", capture_start
+    )
+    capture_body = view_model[capture_start:validator_start]
+    assert all(
+        marker in capture_body
+        for marker in (
+            "let generation = settingsStore.receiverSettingsGenerationToken",
+            "try requireCurrentConnectionGeneration(generation)",
+            "settingsStore.receiverBindingID",
+            "identity.opaqueBinding == bindingID",
+            "keys.signingKeyID == identity.deviceSigningKeyID",
+            "keys.agreementKeyID == identity.deviceAgreementKeyID",
+        )
+    )
+
+    validator_end = view_model.index("private struct PayloadDelivery", validator_start)
+    validator_body = view_model[validator_start:validator_end]
+    generation_check = validator_body.index(
+        "try requireCurrentConnectionGeneration(target.generation)"
+    )
+    target_recapture = validator_body.index("capturePayloadDeliveryTarget() == target")
+    assert generation_check < target_recapture
 
     cancel_upload_start = background_uploader.index("func cancelPendingUploads() async")
     cancel_upload_end = background_uploader.index(

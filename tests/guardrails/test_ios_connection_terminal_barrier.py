@@ -76,16 +76,58 @@ def test_pairing_ui_promotion_rechecks_the_committed_generation_after_the_barrie
 
 def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
     source = VIEW_MODEL.read_text()
+    capture_start = source.index("private func capturePayloadDeliveryTarget()")
+    target_check_start = source.index(
+        "private func requireCurrentPayloadDeliveryTarget(", capture_start
+    )
+    target_check_end = source.index(
+        "private struct PayloadDelivery", target_check_start
+    )
+    capture = source[capture_start:target_check_start]
+    target_check = source[target_check_start:target_check_end]
+
+    assert "let generation = settingsStore.receiverSettingsGenerationToken" in capture
+    assert "generation: generation" in capture
+    assert "try requireCurrentConnectionGeneration(target.generation)" in target_check
+    assert "guard try capturePayloadDeliveryTarget() == target" in target_check
+    generation_start = source.index("private func requireCurrentConnectionGeneration(")
+    generation_end = source.index(
+        "private func captureReceiverSyncProgressScope(", generation_start
+    )
+    generation_check = source[generation_start:generation_end]
+    assert "try Task.checkCancellation()" in generation_check
+    assert "connectionTerminalBarrier.allowsPostResponseMutation(" in generation_check
+    assert "capturedGeneration: expectedGeneration" in generation_check
+    assert (
+        "currentGeneration: settingsStore.receiverSettingsGenerationToken"
+        in generation_check
+    )
+
     start = source.index("private func uploadPayloadsWithOutbox(")
     end = source.index("private func refreshPendingOutboxCount()", start)
     body = source[start:end]
+    enqueue_call = body.index("enqueuePayloads(")
 
-    assert (
-        "let expectedGeneration = settingsStore.receiverSettingsGenerationToken" in body
+    assert "let expectedGeneration = target.generation" in body
+    assert body.count("requireCurrentPayloadDeliveryTarget(target)") >= 4
+    assert body.index("try requireCurrentPayloadDeliveryTarget(target)") < enqueue_call
+
+    pending_start = source.index("private func uploadPendingOutbox(")
+    pending_end = source.index(
+        "private func makeProductionMailboxDelivery()", pending_start
     )
-    assert "allowsPostResponseMutation(" in source
-    assert body.count("requireCurrentConnectionGeneration(expectedGeneration)") >= 4
-    assert "try outbox.markUploaded(item)" in body
+    pending = source[pending_start:pending_end]
+    response = pending.index(
+        "lastDirectUploadResult = try await receiverClient.upload("
+    )
+    post_response_check = pending.index(
+        "try requireCurrentPayloadDeliveryTarget(target)", response
+    )
+    acceptance = pending.index(
+        "cursorFinalizer.recordDirectReceiverAcceptance(", post_response_check
+    )
+    assert response < post_response_check < acceptance
+    assert "catch is CancellationError" in pending
 
 
 def test_terminal_request_reservation_precancels_pairing() -> None:

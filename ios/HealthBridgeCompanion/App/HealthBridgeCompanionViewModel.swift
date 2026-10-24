@@ -434,6 +434,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         mailboxKeyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
         ),
+        nativeMailboxIO: NativeMailboxPairingIO? = nil,
         readAnchoredSleepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
@@ -471,7 +472,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             client: receiverClient,
             stateStore: pairingStateStore,
             settingsStore: settingsStore,
-            mailboxKeyStore: mailboxKeyStore
+            mailboxKeyStore: mailboxKeyStore,
+            nativeMailboxIO: nativeMailboxIO
         )
         self.backgroundSyncStore = backgroundSyncStore
         self.automaticSyncDiagnosticStore = automaticSyncDiagnosticStore
@@ -556,6 +558,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             savedBearerToken = ""
             bearerTokenReadSucceeded = false
         }
+        let savedMailboxBindingID: String?
+        if atomicConnectionRecordReady, bearerTokenReadSucceeded {
+            savedMailboxBindingID = try? Self.validatedMailboxBindingID(
+                settingsStore: settingsStore,
+                mailboxKeyStore: mailboxKeyStore,
+                bearerToken: savedBearerToken
+            )
+        } else {
+            savedMailboxBindingID = nil
+        }
         let outboxIdentityMigrationSucceeded: Bool
         if let outbox,
            !outbox.destructiveRecoveryIsRequested,
@@ -577,7 +589,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 outboxIdentityMigrationSucceeded = ReceiverOutboxAdmissionPolicy.isReady(
                     pendingReceiverIdentities: try outbox.pendingItems().map(\.receiverIdentity),
                     currentBindingID: currentBindingID,
-                    hasBearerToken: !savedBearerToken.isEmpty
+                    hasBearerToken: !savedBearerToken.isEmpty,
+                    committedMailboxBindingID: savedMailboxBindingID
                 )
             } catch {
                 outboxIdentityMigrationSucceeded = false
@@ -587,10 +600,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         self.receiverURLString = settingsStore.receiverURLString
         self.bearerToken = savedBearerToken
-        let savedReceiverSettingsAreComplete = Self.receiverSettingsAreComplete(
+        let savedReceiverSettingsAreComplete = (Self.receiverSettingsAreComplete(
             urlString: settingsStore.receiverURLString,
             bearerToken: savedBearerToken
-        ) && settingsStore.receiverBindingID != nil && outboxIdentityMigrationSucceeded
+        ) || savedMailboxBindingID != nil)
+            && settingsStore.receiverBindingID != nil && outboxIdentityMigrationSucceeded
         self.receiverSettingsSaved = savedReceiverSettingsAreComplete
         self.outboxIdentityMigrationReady = outboxIdentityMigrationSucceeded
         self.backgroundSyncEnabled = backgroundSyncStore.isEnabled
@@ -631,6 +645,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         appendActivityLog(statusMessage, isError: statusIsError)
     }
 
+    private var committedMailboxBindingID: String? {
+        guard let savedBearerToken = try? settingsStore.loadBearerToken() else { return nil }
+        return try? Self.validatedMailboxBindingID(
+            settingsStore: settingsStore,
+            mailboxKeyStore: mailboxKeyStore,
+            bearerToken: savedBearerToken
+        )
+    }
+
     private var committedReceiverSettingsAreComplete: Bool {
         guard let bearerToken = try? settingsStore.loadBearerToken(),
               settingsStore.receiverBindingID != nil else {
@@ -639,7 +662,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return Self.receiverSettingsAreComplete(
             urlString: settingsStore.receiverURLString,
             bearerToken: bearerToken
-        )
+        ) || committedMailboxBindingID != nil
     }
 
     private var automaticSyncEnablePrerequisitesReady: Bool {
@@ -674,10 +697,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     var canSendConnectionTest: Bool {
-        connectionTerminalBarrier.admissionIsOpen
+        !taskUIPublicationIsSuppressed
+            && connectionTerminalBarrier.admissionIsOpen
             && !hasPendingPairing
             && receiverSettingsSaved
-            && canSaveReceiverSettings
+            && (canSaveReceiverSettings || committedMailboxBindingID != nil)
     }
 
     var canChangeAutomaticSyncSetting: Bool {
@@ -754,11 +778,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     var setupSnapshot: CompanionSetupSnapshot {
         CompanionSetupSnapshot(
             receiverURLString: receiverSettingsSaved ? receiverURLString : "",
-            hasBearerToken: receiverSettingsSaved,
+            hasBearerToken: receiverSettingsSaved
+                && !bearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             healthPermissionsRequested: healthPermissionsRequested,
             isSyncing: syncPresentationIsActive,
             statusIsError: statusIsError,
-            pendingOutboxCount: pendingOutboxCount
+            pendingOutboxCount: pendingOutboxCount,
+            hasCommittedMailboxConnection: receiverSettingsSaved && committedMailboxBindingID != nil
         )
     }
 
@@ -1235,29 +1261,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusMessage = CompanionPrivateStorageError.outboxUnavailable.localizedDescription
             return false
         }
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
             return false
         }
 
         do {
-            let expectedGeneration = settingsStore.receiverSettingsGenerationToken
-            try requireCurrentConnectionGeneration(expectedGeneration)
-            let uploadBearerToken = try settingsStore.loadBearerToken()
-            guard settingsStore.receiverURLString == url.absoluteString else {
-                throw CancellationError()
-            }
+            try requireCurrentPayloadDeliveryTarget(target)
             let upload = try await uploadPendingOutbox(
                 outbox,
-                to: url,
-                bearerToken: uploadBearerToken,
-                expectedGeneration: expectedGeneration
+                to: target
             )
             let summary = upload.summary
-            try requireCurrentConnectionGeneration(expectedGeneration)
+            try requireCurrentPayloadDeliveryTarget(target)
             refreshPendingOutboxCount()
-            if settingsStore.activeTransport == .mailbox,
+            if target.route == .mailbox,
                summary.failedCount == 0 {
                 statusIsError = false
                 statusMessage = "Secure mailbox delivery confirmed \(summary.uploadedCount) item(s). Waiting for receiver confirmation: \(pendingOutboxCount)."
@@ -1782,6 +1801,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                 cancelPairingOperation: false,
+                // Native recovery must retain the authority of its persisted request.
+                advanceGeneration: try pairingStateStore.loadPending()?.mailboxBootstrap == nil,
                 diagnosePairingCommitBarriers: true
             ) { expectedGeneration in
                 try await self.pairingCoordinator.resumePendingPairing(
@@ -2002,13 +2023,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func reloadCommittedReceiverSettings() {
         guard !taskUIPublicationIsSuppressed else { return }
-        let savedBearerToken = (try? settingsStore.loadBearerToken()) ?? ""
+        let savedBearerToken = try? settingsStore.loadBearerToken()
         receiverURLString = settingsStore.receiverURLString
-        bearerToken = savedBearerToken
-        receiverSettingsSaved = Self.receiverSettingsAreComplete(
+        bearerToken = savedBearerToken ?? ""
+        receiverSettingsSaved = savedBearerToken != nil && (Self.receiverSettingsAreComplete(
             urlString: receiverURLString,
             bearerToken: bearerToken
-        ) && settingsStore.receiverBindingID != nil
+        ) || committedMailboxBindingID != nil) && settingsStore.receiverBindingID != nil
             && outboxIdentityMigrationReady
     }
 
@@ -2598,9 +2619,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         pairingFailurePresentation = nil
         receiverURLString = receiverURL
         bearerToken = token
-        receiverSettingsSaved = canSaveReceiverSettings
-            && settingsStore.receiverBindingID != nil
-            && outboxIdentityMigrationReady
+        reloadCommittedReceiverSettings()
         let connectionChanged =
             settingsStore.receiverSettingsGenerationToken != previousGeneration
         activateAutomaticSyncIfReady(scheduleOutbox: !connectionChanged)
@@ -3326,6 +3345,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         await backgroundOutboxSchedulingTask?.value
         await foregroundCatchUpTask?.value
     }
+
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    func waitForAutomaticSyncPreferenceWorkForTesting() async {
+        let preferenceTask = automaticSyncPreferenceTask
+        await preferenceTask?.value
+    }
+    #endif
 
     func waitForAutomaticSyncDisableCleanup() async {
         _ = await automaticSyncDisableCleanupTask?.value
@@ -4208,7 +4234,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusMessage = "Connection test stopped because receiver settings are no longer ready."
             return
         }
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
             return
@@ -4216,16 +4242,25 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
         do {
             statusIsError = false
-            statusMessage = "Sending receiver test to \(url.absoluteString)..."
+            let uploadedDescription: String
+            switch target.route {
+            case .directHTTP(let url):
+                statusMessage = "Sending receiver test to \(url.absoluteString)..."
+                uploadedDescription = "Receiver accepted test batch via \(url.host() ?? url.absoluteString)"
+            case .mailbox:
+                statusMessage = "Queueing receiver test for encrypted iCloud mailbox publication..."
+                uploadedDescription = "Receiver test batch"
+            }
             let batch = ConnectionTestBatchFactory.make()
             let data = try encoder.encode(batch)
-            let deliveryResult = try await uploadPayloadsWithOutbox([data], to: url)
+            let deliveryResult = try await uploadPayloadsWithOutbox([data], to: target)
             try requireCurrentConnectionGeneration(deliveryResult.connectionGeneration)
+            try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
-            statusIsError = deliveryResult.directUpload == nil
+            statusIsError = deliveryResult.directUpload == nil && target.route != .mailbox
             statusMessage = deliveryStatusMessage(
                 deliveryResult,
-                uploadedDescription: "Receiver accepted test batch via \(url.host() ?? url.absoluteString)",
+                uploadedDescription: uploadedDescription,
                 queuedDescription: "Receiver test batch queued behind earlier pending upload(s)",
                 outboxNotice: outboxNotice
             )
@@ -4251,7 +4286,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         executionMode: HealthBridgeSyncExecutionMode,
         pendingGenerationRetirements: [String: Int] = [:]
     ) async -> QuantitySyncOutcome {
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: executionMode)
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
@@ -4274,6 +4309,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let calendar = utcCalendar()
             let sourceKey = HealthBridgeAppleHealthSource.phone.sourceKey
             failureStage = .store
+            try requireCurrentPayloadDeliveryTarget(target)
             let (cursorStore, progressScope) = try captureReceiverSyncProgressScope()
             let receiverBindingID = progressScope.receiverBindingID
             let hasUploadedStepRecords = coreLaneUploadProofStore.hasUploadedRecords(
@@ -4338,6 +4374,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: executionMode
             )
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            try requireCurrentPayloadDeliveryTarget(target)
             guard !changes.stepSamples.isEmpty
                 || !changes.deletedStepSamples.isEmpty
                 || HealthKitAnchoredCursorPolicy.hasAdvanced(
@@ -4375,7 +4412,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let uploadDescription = batch.samples.isEmpty && changes.deletedStepSamples.isEmpty
                 ? "step anchor cursor-only sync"
                 : "\(batch.samples.count) step add/update(s), \(changes.deletedStepSamples.count) step deletion(s)"
-            statusMessage = "Uploading \(uploadDescription) to \(url.host() ?? url.absoluteString)..."
+            statusMessage = target.uploadStatus(uploadDescription)
             failureStage = .encoding
             let data = try encoder.encode(batch)
             let shouldPersistAnchorCursor = shouldPersistSharedProgress
@@ -4394,9 +4431,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 : nil
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            try requireCurrentPayloadDeliveryTarget(target)
             let deliveryResult = try await uploadPayloadsWithOutbox(
                 [data],
-                to: url,
+                to: target,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
                 pendingGenerationRetirements: pendingGenerationRetirements
@@ -4405,6 +4443,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 progressScope,
                 deliveryGeneration: deliveryResult.connectionGeneration
             )
+            try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
             statusIsError = false
             let resultDescription = batch.samples.isEmpty && changes.deletedStepSamples.isEmpty
@@ -4463,7 +4502,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         pendingGenerationRetirements: [String: Int],
         stepsRawAndDailyCoverage: Bool? = nil
     ) async -> QuantitySyncOutcome {
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: executionMode)
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
@@ -4491,6 +4530,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 ?? now.addingTimeInterval(TimeInterval(-fallbackDays * 24 * 60 * 60))
             let sourceKey = HealthBridgeAppleHealthSource.phone.sourceKey
             failureStage = .store
+            try requireCurrentPayloadDeliveryTarget(target)
             let (cursorStore, progressScope) = try captureReceiverSyncProgressScope()
             let receiverBindingID = progressScope.receiverBindingID
             let cursorValue = try cursorStore.cursorValue(
@@ -4537,6 +4577,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: executionMode
             )
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            try requireCurrentPayloadDeliveryTarget(target)
             guard let aggregateBatch = DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
                 aggregates: aggregates,
                 typeCodes: typeCodes,
@@ -4572,7 +4613,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 backgroundAutomaticSyncUnknownStatistics = true
             }
 
-            statusMessage = "Uploading \(batch.samples.count) daily activity total(s) to \(url.host() ?? url.absoluteString)..."
+            statusMessage = target.uploadStatus("\(batch.samples.count) daily activity total(s)")
             failureStage = .encoding
             let data = try encoder.encode(batch)
             let cursor = shouldPersistSharedProgress && hasValues
@@ -4591,9 +4632,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            try requireCurrentPayloadDeliveryTarget(target)
             let deliveryResult = try await uploadPayloadsWithOutbox(
                 [data],
-                to: url,
+                to: target,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
                 pendingGenerationRetirements: coveredRetirements,
@@ -4603,6 +4645,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 progressScope,
                 deliveryGeneration: deliveryResult.connectionGeneration
             )
+            try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
             statusIsError = false
             statusMessage = deliveryStatusMessage(
@@ -4640,7 +4683,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     func syncRecentWorkouts() async {
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
             return
@@ -4657,6 +4700,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let startOfToday = calendar.startOfDay(for: now)
             let fallbackStart = calendar.date(byAdding: .day, value: -14, to: startOfToday)
                 ?? now.addingTimeInterval(-14 * 24 * 60 * 60)
+            try requireCurrentPayloadDeliveryTarget(target)
             let (cursorStore, progressScope) = try captureReceiverSyncProgressScope()
             let receiverBindingID = progressScope.receiverBindingID
             let cursorValue = try cursorStore.cursorValue(
@@ -4673,6 +4717,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 calendar: calendar
             )
             let workouts = try await HealthKitWorkoutReader().readWorkouts(start: start, end: end)
+            try requireCurrentPayloadDeliveryTarget(target)
             let batch = WorkoutSyncBatchFactory.makeWorkoutBatch(
                 workouts: workouts,
                 windowStart: start,
@@ -4689,7 +4734,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let uploadDescription = batch.workouts.isEmpty
                 ? "workout cursor-only sync"
                 : "\(batch.workouts.count) workouts"
-            statusMessage = "Uploading \(uploadDescription) to \(url.host() ?? url.absoluteString)..."
+            statusMessage = target.uploadStatus(uploadDescription)
             let data = try encoder.encode(batch)
             let cursor = batch.sync.cursors.first(where: {
                 $0.sourceKey == "apple_health.phone"
@@ -4704,15 +4749,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 )
             }
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            try requireCurrentPayloadDeliveryTarget(target)
             let deliveryResult = try await uploadPayloadsWithOutbox(
                 [data],
-                to: url,
+                to: target,
                 cursorCheckpoint: cursorCheckpoint
             )
             try requireCurrentReceiverSyncProgressScope(
                 progressScope,
                 deliveryGeneration: deliveryResult.connectionGeneration
             )
+            try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
             let totalMinutes = batch.workouts.reduce(0) { $0 + $1.durationSeconds } / 60
             statusIsError = false
@@ -4740,7 +4787,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         executionMode: HealthBridgeSyncExecutionMode = .foreground,
         pendingGenerationRetirements: [String: Int] = [:]
     ) async -> Bool {
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: executionMode)
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
@@ -4759,6 +4806,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let calendar = utcCalendar()
             let sourceKey = HealthBridgeAppleHealthSource.phone.sourceKey
             failureStage = .store
+            try requireCurrentPayloadDeliveryTarget(target)
             let (cursorStore, progressScope) = try captureReceiverSyncProgressScope()
             let receiverBindingID = progressScope.receiverBindingID
             let hasUploadedWorkoutRecords = coreLaneUploadProofStore.hasUploadedRecords(
@@ -4812,6 +4860,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 newestSampleEnd: changes.workouts.map(\.end).max(),
                 executionMode: executionMode
             )
+            try requireCurrentPayloadDeliveryTarget(target)
             guard !changes.workouts.isEmpty
                 || !changes.deletedWorkouts.isEmpty
                 || HealthKitAnchoredCursorPolicy.hasAdvanced(
@@ -4842,7 +4891,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let uploadDescription = batch.workouts.isEmpty && batch.deletedRecords.isEmpty
                 ? "workout anchor cursor-only sync"
                 : "\(batch.workouts.count) workout add/update(s), \(batch.deletedRecords.count) workout deletion(s)"
-            statusMessage = "Uploading \(uploadDescription) to \(url.host() ?? url.absoluteString)..."
+            statusMessage = target.uploadStatus(uploadDescription)
             failureStage = .encoding
             let data = try encoder.encode(batch)
             let shouldPersistAnchorCursor = shouldPersistSharedProgress
@@ -4861,9 +4910,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 : nil
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
+            try requireCurrentPayloadDeliveryTarget(target)
             let deliveryResult = try await uploadPayloadsWithOutbox(
                 [data],
-                to: url,
+                to: target,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
                 pendingGenerationRetirements: pendingGenerationRetirements
@@ -4872,6 +4922,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 progressScope,
                 deliveryGeneration: deliveryResult.connectionGeneration
             )
+            try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
             statusIsError = false
             let resultDescription = batch.workouts.isEmpty && batch.deletedRecords.isEmpty
@@ -4913,7 +4964,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         executionMode: HealthBridgeSyncExecutionMode = .foreground,
         pendingGenerationRetirements: [String: Int] = [:]
     ) async -> Bool {
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: executionMode)
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
@@ -4963,16 +5014,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         settingsStore.receiverSettingsGenerationToken
                             == pendingTransition.connectionGeneration
                         && settingsStore.receiverBindingID == pendingTransition.receiverBindingID
-                        && settingsStore.receiverURLString == url.absoluteString
+                        && target.generation == pendingTransition.connectionGeneration
+                        && target.bindingID == pendingTransition.receiverBindingID
                     if matchesCurrentConnection {
                         failureStage = .transport
                         let delivered = try await deliverPendingSleepTransition(
                             pendingTransition,
                             store: sleepManifestStore,
-                            to: url,
+                            to: target,
                             executionMode: executionMode,
                             pendingGenerationRetirements: pendingGenerationRetirements
                         )
+                        try requireCurrentPayloadDeliveryTarget(target)
                         if executionMode != .automatic {
                             return delivered
                         }
@@ -5000,6 +5053,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             if executionMode.shouldRequestReadAuthorization {
                 try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.sleepAnalysis])
             }
+            try requireCurrentPayloadDeliveryTarget(target)
             let now = Date()
             let currentReceiverGeneration = settingsStore.receiverSettingsGenerationToken
             guard let currentReceiverBindingID = settingsStore.receiverBindingID else {
@@ -5078,8 +5132,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(currentReceiverGeneration)
-            guard settingsStore.receiverBindingID == currentReceiverBindingID,
-                  settingsStore.receiverURLString == url.absoluteString else {
+            try requireCurrentPayloadDeliveryTarget(target)
+            guard settingsStore.receiverBindingID == currentReceiverBindingID else {
                 throw CancellationError()
             }
             failureStage = .encoding
@@ -5092,8 +5146,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(currentReceiverGeneration)
-            guard settingsStore.receiverBindingID == currentReceiverBindingID,
-                  settingsStore.receiverURLString == url.absoluteString else {
+            try requireCurrentPayloadDeliveryTarget(target)
+            guard settingsStore.receiverBindingID == currentReceiverBindingID else {
                 throw CancellationError()
             }
 
@@ -5109,7 +5163,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let uploadDescription = hasRecordChanges
                 ? "\(batch.sleepSessions.count) sleep revision(s), \(batch.deletedRecords.count) sleep deletion(s)"
                 : "sleep anchor cursor-only sync"
-            statusMessage = "Uploading \(uploadDescription) to \(url.host() ?? url.absoluteString)..."
+            statusMessage = target.uploadStatus(uploadDescription)
             let pendingTransition = SleepSyncPendingTransition(
                 payload: preparation.payload,
                 manifest: transition.manifest,
@@ -5126,7 +5180,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return try await deliverPendingSleepTransition(
                 pendingTransition,
                 store: sleepManifestStore,
-                to: url,
+                to: target,
                 executionMode: executionMode,
                 pendingGenerationRetirements: pendingGenerationRetirements
             )
@@ -5157,16 +5211,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func deliverPendingSleepTransition(
         _ pendingTransition: SleepSyncPendingTransition,
         store: SleepSyncManifestStoring,
-        to url: URL,
+        to target: PayloadDeliveryTarget,
         executionMode: HealthBridgeSyncExecutionMode,
         pendingGenerationRetirements: [String: Int]
     ) async throws -> Bool {
         guard terminalPayloadActionAdmissionIsOpen, !Task.isCancelled else {
             throw CancellationError()
         }
-        guard settingsStore.receiverSettingsGenerationToken == pendingTransition.connectionGeneration,
-              settingsStore.receiverBindingID == pendingTransition.receiverBindingID,
-              settingsStore.receiverURLString == url.absoluteString else {
+        try requireCurrentPayloadDeliveryTarget(target)
+        guard target.generation == pendingTransition.connectionGeneration,
+              target.bindingID == pendingTransition.receiverBindingID else {
             throw CancellationError()
         }
         try requireCurrentConnectionGeneration(pendingTransition.connectionGeneration)
@@ -5206,7 +5260,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let pendingItems = try outbox.pendingItems()
             var itemRemains = pendingItems.contains { $0.id == outboxItemID }
             if executionMode == .automatic,
-               settingsStore.activeTransport == .directHTTP,
+               case .directHTTP = target.route,
                itemRemains {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
                 statusIsError = false
@@ -5225,9 +5279,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 do {
                     summary = try await uploadPendingOutbox(
                         outbox,
-                        to: url,
-                        bearerToken: try settingsStore.loadBearerToken(),
-                        expectedGeneration: trackedTransition.connectionGeneration
+                        to: target
                     ).summary
                 } catch let conflict as RejectedSleepBaselineOutboxItem {
                     try recoverRejectedSleepBaseline(conflict)
@@ -5236,6 +5288,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     return false
                 }
                 try requireCurrentConnectionGeneration(trackedTransition.connectionGeneration)
+                try requireCurrentPayloadDeliveryTarget(target)
                 refreshPendingOutboxCount()
                 itemRemains = try outbox.pendingItems().contains { $0.id == outboxItemID }
             }
@@ -5361,7 +5414,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         historyDepth: HealthHistoryDepth? = nil,
         pendingGenerationRetirements: [String: Int] = [:]
     ) async {
-        guard let url = URL(string: receiverURLString) else {
+        guard let target = try? capturePayloadDeliveryTarget() else {
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: mode.executionMode)
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
@@ -5386,6 +5439,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let sourceKey = HealthBridgeAppleHealthSource.phone.sourceKey
             let progressStorage: (FileSyncCursorStore, ReceiverSyncProgressScope)
             do {
+                try requireCurrentPayloadDeliveryTarget(target)
                 progressStorage = try captureReceiverSyncProgressScope()
             } catch {
                 noteBackgroundAutomaticSyncFailure(
@@ -5440,6 +5494,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 do {
                     failureStage = .store
                     try requireCurrentReceiverSyncProgressScope(progressScope)
+                    try requireCurrentPayloadDeliveryTarget(target)
                     let sharedCursorValue = try cursorStore.cursorValue(
                         receiverBindingID: receiverBindingID,
                         sourceKey: sourceKey,
@@ -5517,6 +5572,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         executionMode: mode.executionMode
                     )
                     try requireCurrentReceiverSyncProgressScope(progressScope)
+                    try requireCurrentPayloadDeliveryTarget(target)
                     let anchorAdvanced = HealthKitAnchoredCursorPolicy.hasAdvanced(
                         from: cursorOwnership.cursorValue,
                         to: changes.anchorCursorValue
@@ -5548,6 +5604,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             retirements: pendingGenerationRetirements
                         )
                         try requireCurrentReceiverSyncProgressScope(progressScope)
+                        try requireCurrentPayloadDeliveryTarget(target)
                         continue
                     }
 
@@ -5563,9 +5620,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         : nil
                     failureStage = .transport
                     try requireCurrentReceiverSyncProgressScope(progressScope)
+                    try requireCurrentPayloadDeliveryTarget(target)
                     let deliveryResult = try await uploadPayloadsWithOutbox(
                         payloads,
-                        to: url,
+                        to: target,
                         cursorCheckpoint: cursorCheckpoint,
                         executionMode: mode.executionMode,
                         pendingGenerationRetirements: selectedEntries.first(where: { $0.typeCode == typeCode })?.aggregation == .sum
@@ -5575,11 +5633,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         progressScope,
                         deliveryGeneration: deliveryResult.connectionGeneration
                     )
+                    try requireCurrentPayloadDeliveryTarget(target)
                     await reaggregateActivityIfNeeded(
                         typeCode: typeCode, executionMode: mode.executionMode,
                         retirements: pendingGenerationRetirements
                     )
                     try requireCurrentReceiverSyncProgressScope(progressScope)
+                    try requireCurrentPayloadDeliveryTarget(target)
                     if deliveryResult.directUpload == nil {
                         queuedAnyPayload = true
                     }
@@ -5677,6 +5737,72 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         #endif
     }
 
+    // An immutable target for one collection/delivery operation, never a stored connection.
+    private struct PayloadDeliveryTarget: Equatable {
+        enum Route: Equatable {
+            case directHTTP(URL)
+            case mailbox
+        }
+
+        let route: Route
+        let generation: String
+        let bindingID: String
+
+        func uploadStatus(_ description: String) -> String {
+            switch route {
+            case .directHTTP(let url):
+                return "Uploading \(description) to \(url.host() ?? url.absoluteString)..."
+            case .mailbox:
+                return "Queueing \(description) for encrypted iCloud mailbox publication..."
+            }
+        }
+    }
+
+    private func capturePayloadDeliveryTarget() throws -> PayloadDeliveryTarget {
+        let generation = settingsStore.receiverSettingsGenerationToken
+        try requireCurrentConnectionGeneration(generation)
+        guard let bindingID = settingsStore.receiverBindingID else {
+            throw CancellationError()
+        }
+        let route: PayloadDeliveryTarget.Route
+        switch settingsStore.activeTransport {
+        case .mailbox:
+            // The canonical record also supports existing URL-bearing Mailbox connections;
+            // committedMailboxBindingID intentionally only projects HTTP-free restoration.
+            guard let record = try settingsStore.currentConnectionRecordV2(),
+                  record.activation == .paired(activeTransport: .mailbox),
+                  case .available(let identity) = record.mailboxIdentity,
+                  record.localScope.generation == settingsStore.receiverSettingsGeneration,
+                  record.localScope.bindingID == bindingID,
+                  identity.opaqueBinding == bindingID else {
+                throw ProductionMailboxDeliveryError.invalidIdentity
+            }
+            let keys = try mailboxKeyStore.publicSummary()
+            guard keys.state == .active,
+                  keys.signingKeyID == identity.deviceSigningKeyID,
+                  keys.agreementKeyID == identity.deviceAgreementKeyID else {
+                throw ProductionMailboxDeliveryError.invalidIdentity
+            }
+            route = .mailbox
+        case .directHTTP:
+            guard let url = URL(string: receiverURLString),
+                  settingsStore.receiverURLString == url.absoluteString else {
+                throw CancellationError()
+            }
+            route = .directHTTP(url)
+        case nil:
+            throw CancellationError()
+        }
+        try requireCurrentConnectionGeneration(generation)
+        guard settingsStore.receiverBindingID == bindingID else { throw CancellationError() }
+        return PayloadDeliveryTarget(route: route, generation: generation, bindingID: bindingID)
+    }
+
+    private func requireCurrentPayloadDeliveryTarget(_ target: PayloadDeliveryTarget) throws {
+        try requireCurrentConnectionGeneration(target.generation)
+        guard try capturePayloadDeliveryTarget() == target else { throw CancellationError() }
+    }
+
     private struct PayloadDelivery {
         let directUpload: ReceiverUploadResult?
         let connectionGeneration: String
@@ -5704,7 +5830,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func uploadPayloadsWithOutbox(
         _ payloads: [Data],
-        to url: URL,
+        to target: PayloadDeliveryTarget,
         cursorCheckpoint: FileOutboxCursorCheckpoint? = nil,
         executionMode: HealthBridgeSyncExecutionMode = .foreground,
         pendingGenerationRetirements: [String: Int] = [:],
@@ -5713,11 +5839,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard !hasPendingPairing, !Task.isCancelled else {
             throw CancellationError()
         }
-        let expectedGeneration = settingsStore.receiverSettingsGenerationToken
-        try requireCurrentConnectionGeneration(expectedGeneration)
-        guard settingsStore.receiverURLString == url.absoluteString else {
-            throw CancellationError()
-        }
+        let expectedGeneration = target.generation
+        try requireCurrentPayloadDeliveryTarget(target)
         lastOutboxNotice = ""
         guard !payloads.isEmpty else {
             throw ReceiverClientError.nonHTTPResponse
@@ -5729,6 +5852,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             throw CompanionPrivateStorageError.outboxUnavailable
         }
         let initialItemIDs = Set(try outbox.pendingItems().map(\.id))
+        try requireCurrentPayloadDeliveryTarget(target)
         try enqueuePayloads(
             payloads,
             into: outbox,
@@ -5741,7 +5865,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             .subtracting(initialItemIDs)
         refreshPendingOutboxCount()
 
-        if settingsStore.activeTransport == .mailbox {
+        if target.route == .mailbox {
             lastOutboxNotice = " Exact payload sequence is durably queued for encrypted iCloud mailbox publication."
             schedulePendingBackgroundOutboxUploadsIfAllowed()
             return PayloadDelivery(
@@ -5761,11 +5885,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
         let upload = try await uploadPendingOutbox(
             outbox,
-            to: url,
-            bearerToken: try settingsStore.loadBearerToken(),
-            expectedGeneration: expectedGeneration
+            to: target
         )
-        try requireCurrentConnectionGeneration(expectedGeneration)
+        try requireCurrentPayloadDeliveryTarget(target)
         let remainingItemIDs = Set(try outbox.pendingItems().map(\.id))
         refreshPendingOutboxCount()
         if upload.summary.failedCount > 0
@@ -5923,23 +6045,32 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             let currentBearerToken = try settingsStore.loadBearerToken()
             let currentBindingID = settingsStore.receiverBindingID
+            let mailboxBindingID = try Self.validatedMailboxBindingID(
+                settingsStore: settingsStore,
+                mailboxKeyStore: mailboxKeyStore,
+                bearerToken: currentBearerToken
+            )
+            let hasHTTPSettings = Self.receiverSettingsAreComplete(
+                urlString: settingsStore.receiverURLString,
+                bearerToken: currentBearerToken
+            )
             if let currentBindingID {
-                guard Self.receiverSettingsAreComplete(
-                    urlString: settingsStore.receiverURLString,
-                    bearerToken: currentBearerToken
-                ) else {
+                guard hasHTTPSettings || mailboxBindingID == currentBindingID else {
                     throw KeychainReceiverTokenStoreError.invalidData
                 }
-                _ = try outbox.migrateLegacyHashedReceiverIdentities(
-                    currentReceiverURLString: settingsStore.receiverURLString,
-                    currentBearerToken: currentBearerToken,
-                    currentBindingID: currentBindingID
-                )
+                if hasHTTPSettings {
+                    _ = try outbox.migrateLegacyHashedReceiverIdentities(
+                        currentReceiverURLString: settingsStore.receiverURLString,
+                        currentBearerToken: currentBearerToken,
+                        currentBindingID: currentBindingID
+                    )
+                }
             }
             guard ReceiverOutboxAdmissionPolicy.isReady(
                 pendingReceiverIdentities: try outbox.pendingItems().map(\.receiverIdentity),
                 currentBindingID: currentBindingID,
-                hasBearerToken: !currentBearerToken.isEmpty
+                hasBearerToken: !currentBearerToken.isEmpty,
+                committedMailboxBindingID: mailboxBindingID
             ) else {
                 throw ReceiverOutboxIdentityError.unknownReceiverIdentity
             }
@@ -6113,18 +6244,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func uploadPendingOutbox(
         _ outbox: FileOutbox,
-        to url: URL,
-        bearerToken uploadBearerToken: String,
-        expectedGeneration: String
+        to target: PayloadDeliveryTarget
     ) async throws -> (
         summary: FileOutboxFlushSummary,
         lastDirectUploadResult: ReceiverUploadResult?
     ) {
-        try requireCurrentConnectionGeneration(expectedGeneration)
-        if settingsStore.activeTransport == .mailbox {
+        let expectedGeneration = target.generation
+        try requireCurrentPayloadDeliveryTarget(target)
+        if target.route == .mailbox {
             do {
                 let summary = try await makeProductionMailboxDelivery().deliverPending()
-                try requireCurrentConnectionGeneration(expectedGeneration)
+                try requireCurrentPayloadDeliveryTarget(target)
                 let flushSummary = FileOutboxFlushSummary(
                     attemptedCount: summary.attemptedCount,
                     uploadedCount: summary.finalizedCount,
@@ -6144,14 +6274,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } catch let cancellation as CancellationError {
                 throw cancellation
             } catch {
-                try requireCurrentConnectionGeneration(expectedGeneration)
+                try requireCurrentPayloadDeliveryTarget(target)
                 mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
                 throw error
             }
         }
-        guard let receiverIdentity = settingsStore.receiverBindingID else {
+        guard case .directHTTP(let url) = target.route else {
             throw CancellationError()
         }
+        let uploadBearerToken = try settingsStore.loadBearerToken()
+        let receiverIdentity = target.bindingID
         guard let cursorStore else {
             throw CompanionPrivateStorageError.cursorStoreUnavailable
         }
@@ -6171,7 +6303,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         var failedDescriptions: [String] = []
         var lastDirectUploadResult: ReceiverUploadResult?
         for item in pendingItems {
-            try requireCurrentConnectionGeneration(expectedGeneration)
+            try requireCurrentPayloadDeliveryTarget(target)
             try outbox.requireUploadAdmission()
             attemptedCount += 1
             do {
@@ -6181,7 +6313,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     to: url,
                     bearerToken: uploadBearerToken
                 )
-                try requireCurrentConnectionGeneration(expectedGeneration)
+                try requireCurrentPayloadDeliveryTarget(target)
                 _ = try cursorFinalizer.recordDirectReceiverAcceptance(
                     itemID: item.id,
                     receiverBindingID: receiverIdentity
@@ -6192,7 +6324,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .cancelled)
                 throw CancellationError()
             } catch ReceiverClientError.sleepBaselineResetEpochConflict(let minimumResetEpoch) {
-                try requireCurrentConnectionGeneration(expectedGeneration)
+                try requireCurrentPayloadDeliveryTarget(target)
                 throw RejectedSleepBaselineOutboxItem(
                     itemID: item.id,
                     minimumResetEpoch: minimumResetEpoch,
@@ -6205,7 +6337,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 break
             }
         }
-        try requireCurrentConnectionGeneration(expectedGeneration)
+        try requireCurrentPayloadDeliveryTarget(target)
         return (
             summary: FileOutboxFlushSummary(
                 attemptedCount: attemptedCount,
@@ -6299,6 +6431,40 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         hasPendingSleepTransition = sleepStorageMayNeedRecovery()
         hasPendingOutboxDeletion = outbox?.destructiveRecoveryIsRequested ?? true
+    }
+
+    // Local restoration only: no provider lookup, key creation or delivery.
+    // HTTP-backed connections retain their existing admission path.
+    private static func validatedMailboxBindingID(
+        settingsStore: ReceiverSettingsStore,
+        mailboxKeyStore: MailboxKeyStore,
+        bearerToken: String
+    ) throws -> String? {
+        guard !receiverSettingsAreComplete(
+            urlString: settingsStore.receiverURLString,
+            bearerToken: bearerToken
+        ) else { return nil }
+        let generation = settingsStore.receiverSettingsGeneration
+        // currentConnectionRecordV2 validates canonical storage, identity keys,
+        // binding and the matching active transport configuration.
+        guard let record = try settingsStore.currentConnectionRecordV2(),
+              record.activation == .paired(activeTransport: .mailbox),
+              case .available(let identity) = record.mailboxIdentity else {
+            return nil
+        }
+        let keys = try mailboxKeyStore.publicSummary()
+        guard keys.state == .active,
+              keys.signingKeyID == identity.deviceSigningKeyID,
+              keys.agreementKeyID == identity.deviceAgreementKeyID,
+              record.localScope.bindingID == identity.opaqueBinding else {
+            throw ProductionMailboxDeliveryError.invalidIdentity
+        }
+        guard record.localScope.generation == generation,
+              settingsStore.receiverSettingsGeneration == generation,
+              settingsStore.receiverBindingID == record.localScope.bindingID else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
+        return record.localScope.bindingID
     }
 
     private static func receiverSettingsAreComplete(

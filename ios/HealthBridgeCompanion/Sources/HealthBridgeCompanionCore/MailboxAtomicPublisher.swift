@@ -74,7 +74,7 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
             try publishWithUbiquityManager(
                 envelope,
                 to: finalURL,
-                locator: locator
+                revalidate: { try revalidate(locator) }
             )
         }
         #else
@@ -124,11 +124,42 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
         }
     }
 
+    func publishPairing(_ bytes: Data, to url: URL, locator: MailboxPairingLocatorV1) throws {
+        guard ["request.hbp", "cancel.hbp"].contains(url.lastPathComponent),
+              !bytes.isEmpty, bytes.count <= 65_536 else { throw MailboxPublicationError.unsafeDestination }
+        try MailboxLocatorV1.requirePairingFile(url, locator: locator)
+        if try MailboxLocatorV1.pairingFileExists(url, locator: locator) {
+            guard try existingFinal(at: url, expected: bytes) == true else { throw MailboxPublicationError.conflict }
+            return
+        }
+        #if os(iOS)
+        try executor.run {
+            try publishWithUbiquityManager(bytes, to: url, revalidate: {
+                try MailboxLocatorV1.requirePairingFile(url, locator: locator)
+            })
+        }
+        #else
+        let temporary = locator.directory.appendingPathComponent(".pairing-\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try bytes.write(to: temporary, options: [.withoutOverwriting])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+        try sync(finalURL: temporary, lane: locator.directory)
+        try MailboxLocatorV1.revalidatePairing(locator)
+        do { try FileManager.default.moveItem(at: temporary, to: url) }
+        catch {
+            guard try existingFinal(at: url, expected: bytes) == true else { throw MailboxPublicationError.conflict }
+        }
+        #endif
+        try MailboxLocatorV1.requirePairingFile(url, locator: locator)
+        try sync(finalURL: url, lane: locator.directory)
+        guard try existingFinal(at: url, expected: bytes) == true else { throw MailboxPublicationError.conflict }
+    }
+
     #if os(iOS)
     private func publishWithUbiquityManager(
         _ envelope: Data,
         to finalURL: URL,
-        locator: MailboxResolvedLocatorV1
+        revalidate: () throws -> Void
     ) throws {
         let stagingRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-bridge-mailbox-qa", isDirectory: true)
@@ -147,7 +178,7 @@ struct FileProviderMailboxEnvelopePublisher: MailboxEnvelopePublishing {
                 ofItemAtPath: sourceURL.path
             )
             try sync(finalURL: sourceURL, lane: stagingRoot)
-            try revalidate(locator)
+            try revalidate()
             try FileManager.default.setUbiquitous(
                 true,
                 itemAt: sourceURL,

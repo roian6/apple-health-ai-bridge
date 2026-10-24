@@ -4,8 +4,7 @@ import json
 import sqlite3
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,7 +22,6 @@ from health_bridge.mailbox.connections import (
 )
 from health_bridge.receiver._mailbox_key_models import (
     MailboxKeyStoreError,
-    strict_base64url_decode,
 )
 from health_bridge.receiver.batch_acceptance import BatchAcceptanceInput
 from health_bridge.receiver.direct_http_acceptance import (
@@ -36,20 +34,20 @@ from health_bridge.receiver.direct_http_acceptance import (
 )
 from health_bridge.receiver.invitations import (
     PairingInvitationError,
-    PairingRedemptionCompletion,
     redeem_pairing_invitation,
 )
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.mailbox_pairing import (
-    MailboxPairingCompletion,
-    provision_mailbox_connection,
+    MailboxProvisioningTransaction as _MailboxProvisioningTransaction,
+)
+from health_bridge.receiver.mailbox_pairing import (
+    MailboxTransportUnavailableError,
 )
 from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
 from health_bridge.receiver.tokens import (
     ReceiverTokenPrincipal,
     authenticate_receiver_token_principal,
 )
-from health_bridge.receiver.transports import ReceiverTransport
 from health_bridge.storage.database import (
     database_lifecycle_lock,
     initialize_database,
@@ -63,7 +61,7 @@ MAX_PAIRING_REDEEM_BYTES: Final = 4_096
 PAIRING_REDEEM_LIMIT: Final = 5
 PAIRING_REDEEM_WINDOW_SECONDS: Final = 60
 PAIRING_REDEEM_MAX_CLIENTS: Final = 1_024
-JsonPayloadValue: TypeAlias = bool | int | str
+JsonPayloadValue: TypeAlias = bool | int | str | None
 JsonPayload: TypeAlias = dict[str, JsonPayloadValue]
 
 
@@ -157,44 +155,6 @@ class ReceiverHTTPServer(ThreadingHTTPServer):
         client_address: object,  # noqa: RUF100 -- stdlib override; no-excuse "# noqa: OBJECT_OK".
     ) -> None:
         """Suppress socketserver's default traceback and client-address dump."""
-
-
-@dataclass
-class _MailboxProvisioningTransaction:
-    key_store: MailboxKeyStore | None
-    connection_store: MailboxConnectionStore | None
-    device_signing_public_key: str | None
-    device_agreement_public_key: str | None
-    completion: MailboxPairingCompletion | None = None
-
-    def __call__(self, redemption: PairingRedemptionCompletion) -> None:
-        match redemption.transport:
-            case ReceiverTransport.DIRECT:
-                return
-            case ReceiverTransport.MAILBOX:
-                pass
-        if self.key_store is None or self.connection_store is None:
-            raise MailboxTransportUnavailableError
-        if (
-            self.device_signing_public_key is None
-            or self.device_agreement_public_key is None
-        ):
-            raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED)
-        _validate_mailbox_public_keys(
-            self.device_signing_public_key,
-            self.device_agreement_public_key,
-        )
-        self.completion = provision_mailbox_connection(
-            connection_store=self.connection_store,
-            key_store=self.key_store,
-            installation_id_hash=redemption.installation_id_hash,
-            device_signing_public_key=self.device_signing_public_key,
-            device_agreement_public_key=self.device_agreement_public_key,
-        )
-
-
-class MailboxTransportUnavailableError(Exception):
-    pass
 
 
 class ReceiverRequestHandler(BaseHTTPRequestHandler):
@@ -458,7 +418,7 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
     def _send_json(
         self,
         status: HTTPStatus,
-        payload: JsonPayload,
+        payload: Mapping[str, JsonPayloadValue],
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         response_body = json.dumps(
@@ -497,17 +457,6 @@ def build_receiver_server(
     )
 
 
-def _validate_mailbox_public_keys(
-    device_signing_public_key: str,
-    device_agreement_public_key: str,
-) -> None:
-    try:
-        _ = strict_base64url_decode(device_signing_public_key, 32)
-        _ = strict_base64url_decode(device_agreement_public_key, 32)
-    except MailboxKeyStoreError as exc:
-        raise MailboxConnectionError(MailboxConnectionErrorCode.MALFORMED) from exc
-
-
 def _mailbox_provisioning_transaction(
     server: ReceiverHTTPServer,
     payload: PairingRedeemRequest,
@@ -540,11 +489,17 @@ def serve_receiver(  # noqa: PLR0913 - transport dependencies are explicit.
     mailbox_root: Path | None = None,
 ) -> None:
     initialize_database(db_path)
-    worker = (
-        MailboxRuntimeWorker(db_path=db_path, mailbox_root=mailbox_root)
-        if mailbox_root is not None
-        else None
-    )
+    worker = None
+    if mailbox_root is not None:
+        if mailbox_key_store is None or mailbox_connection_store is None:
+            worker = MailboxRuntimeWorker(db_path=db_path, mailbox_root=mailbox_root)
+        else:
+            worker = MailboxRuntimeWorker(
+                db_path=db_path,
+                mailbox_root=mailbox_root,
+                pairing_keys=mailbox_key_store,
+                pairing_connections=mailbox_connection_store,
+            )
     with (
         database_lifecycle_lock(db_path, exclusive=False, create=False),
         (

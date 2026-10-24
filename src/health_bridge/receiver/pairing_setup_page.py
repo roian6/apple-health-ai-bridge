@@ -30,12 +30,14 @@ def _render_invitation_setup_page(
 ) -> str:
     qr_svg = _pairing_qr_svg(pairing_url)
     escaped_label = html.escape(bundle.label, quote=True)
-    escaped_receiver_url = html.escape(bundle.receiver_url, quote=True)
+    escaped_receiver_url = html.escape(
+        bundle.receiver_url or "Encrypted iCloud Mailbox", quote=True
+    )
     escaped_code = html.escape(bundle.invitation_code, quote=True)
     escaped_expires_at = html.escape(bundle.expires_at, quote=True)
     escaped_warning = html.escape(bundle.warning, quote=True)
     escaped_pairing_url = html.escape(pairing_url, quote=True)
-    return f"""<!doctype html>
+    page = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -125,6 +127,20 @@ def _render_invitation_setup_page(
 </body>
 </html>
 """
+
+    if bundle.mailbox_bootstrap is not None:
+        start = page.index('    <section class="fallback">')
+        stop = page.index("    </section>", start) + len("    </section>")
+        page = (
+            page[:start]
+            + (
+                "<p>Encrypted iCloud Mailbox. Use the same Apple account "
+                "on both devices "
+                "and a compatible companion and receiver helper.</p>"
+            )
+            + page[stop:]
+        )
+    return page
 
 
 def _render_legacy_setup_page(

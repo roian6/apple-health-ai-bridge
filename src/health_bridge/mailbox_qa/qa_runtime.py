@@ -40,6 +40,7 @@ from health_bridge.storage.database import initialize_database
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from health_bridge.receiver.delivery_acceptance import DeliveryTrustedConnection
     from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
 
 
@@ -106,8 +107,10 @@ class QAReceiverRequestHandler(ReceiverRequestHandler):
             _require_namespace(request.namespace, self.qa_server.namespace)
             responses: list[dict[str, bool | int | str]] = []
 
-            def provision(_completion: PairingRedemptionCompletion) -> None:
-                responses.append(provision_qa_mailbox(self.qa_server, request))
+            def provision(_completion: PairingRedemptionCompletion) -> str:
+                response, trusted = _provision_qa_mailbox(self.qa_server, request)
+                responses.append(response)
+                return trusted.enrollment_digest()
 
             _ = redeem_pairing_invitation(
                 self.qa_server.db_path,
@@ -138,6 +141,14 @@ def provision_qa_mailbox(
     server: QAReceiverHTTPServer,
     request: QAPairingRedeemRequest,
 ) -> dict[str, bool | int | str]:
+    response, _ = _provision_qa_mailbox(server, request)
+    return response
+
+
+def _provision_qa_mailbox(
+    server: QAReceiverHTTPServer,
+    request: QAPairingRedeemRequest,
+) -> tuple[dict[str, bool | int | str], DeliveryTrustedConnection]:
     key_store = MailboxKeyStore.for_testing(
         state_dir=server.runtime_root / "private/receiver-keys",
         anchor_dir=server.runtime_root / "private/receiver-anchor",
@@ -204,7 +215,7 @@ def provision_qa_mailbox(
         server.runtime_root / "private/pairing" / f"{anchor_name}.hbjcs1",
         hbjcs1_encode(document).decode("utf-8"),
     )
-    return {
+    response: dict[str, bool | int | str] = {
         "v": 1,
         "kind": "health_bridge.mailbox_qa_pairing_completion.v1",
         "namespace": server.namespace,
@@ -223,6 +234,11 @@ def provision_qa_mailbox(
             identity.agreement_public_key,
         ),
     }
+
+    trusted = connection_store.load(
+        connection_root / receiver_id.hex() / device_id.hex()
+    )
+    return response, trusted
 
 
 def _require_namespace(candidate: str, expected: str) -> None:
