@@ -649,7 +649,8 @@ final class SleepSyncBatchFactoryTests: XCTestCase {
         XCTAssertEqual(try fileURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
     }
 
-    func testSleepConflictRecoveryDurablyReservesFloorBeforeRetiringFIFOItem() throws {
+    @MainActor
+    func testSleepConflictRecoveryDurablyReservesFloorBeforeRetiringFIFOItem() async throws {
         let child = try sleepChild(
             uuid: "60000000-0000-0000-0000-000000000002",
             stage: "rem",
@@ -690,7 +691,7 @@ final class SleepSyncBatchFactoryTests: XCTestCase {
             epochFloorProvider: { 1 }
         )
 
-        try SleepBaselineRejectionRecovery.recover(
+        try await SleepBaselineRejectionRecovery.recover(
             itemID: item.id,
             minimumResetEpoch: 200,
             outbox: outbox,

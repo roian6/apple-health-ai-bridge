@@ -188,12 +188,19 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
         )
     ]
     assert "forceRepublishAll: plan.forceRepublishAll" in preparer
-    reservation = body.index("sleepManifestStore.saveManifest(reservation)")
-    journal = body.index("sleepManifestStore.savePendingTransition(pendingTransition)")
+    reservation = body.index(
+        "sleepManifestStore.saveManifestForSync(reservation, validate: validate)"
+    )
+    journal = body.index(
+        "sleepManifestStore.savePendingForSync(pendingTransition, validate: validate)"
+    )
     delivery = body.index("deliverPendingSleepTransition(", journal)
-    manifest_commit = body.index("try store.saveManifest(pendingTransition.manifest)")
+    prefix = "try await store."
+    manifest_commit = body.index(
+        f"{prefix}saveManifestForSync(pendingTransition.manifest, validate: validate)"
+    )
     journal_clear = body.index(
-        "try store.clearPendingTransition(id: pendingTransition.id)"
+        f"{prefix}clearPendingForSync(id: pendingTransition.id, validate: validate)"
     )
     assert reservation < journal < delivery < manifest_commit < journal_clear
 

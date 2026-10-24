@@ -52,7 +52,8 @@ extension OutboxDeliveryCoordinator {
     }
 
     @discardableResult
-    public func finalizeCommitted(itemID: String) throws -> FileOutboxDeliveryStateV1 {
+    @MainActor
+    public func finalizeCommitted(itemID: String) async throws -> FileOutboxDeliveryStateV1 {
         try validateCurrentOwnership()
         let current = try ownedState(itemID: itemID)
         if current.phase == .committedFinalized {
@@ -73,12 +74,22 @@ extension OutboxDeliveryCoordinator {
             itemID: itemID,
             ownership: ownership
         )
-        if try !finalizer.isFinalized(context) {
+        let validate = { @MainActor in
+            try Task.checkCancellation()
+            try self.validateCurrentOwnership()
+            guard try self.ownedState(itemID: itemID) == current else { throw CancellationError() }
+        }
+        let finalized = try await finalizer.isFinalized(context)
+        try validate()
+        if !finalized {
             try fault(.beforeProgressFinalization)
-            try finalizer.finalize(context)
+            try await finalizer.finalize(context)
+            try validate()
             try fault(.afterProgressFinalization)
         }
-        guard try finalizer.isFinalized(context) else {
+        let complete = try await finalizer.isFinalized(context)
+        try validate()
+        guard complete else {
             throw OutboxDeliveryCoordinatorError.finalizationIncomplete
         }
         let committed = FileOutboxDeliveryStateV1.committed(
