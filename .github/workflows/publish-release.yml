@@ -77,11 +77,6 @@ jobs:
           test "$GITHUB_SHA" = "$target_commit_sha"
           test "$GITHUB_WORKFLOW_SHA" = "$target_commit_sha"
           test "$GITHUB_WORKFLOW_REF" = "${GITHUB_REPOSITORY}/.github/workflows/publish-release.yml@refs/tags/${RELEASE_TAG}"
-          default_branch="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
-          default_main_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
-            --jq '.commit.sha')"
-          test "$target_commit_sha" = "$default_main_sha"
           tree_sha="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/git/commits/${target_commit_sha}" \
             --jq '.tree.sha')"
@@ -119,6 +114,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
+          python3 scripts/release_source_policy.py \
+            --repo . --tag "$RELEASE_TAG" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
           uv sync --all-extras --dev --locked
           uv run python scripts/release_tools.py verify-execution \
             --repo . --tag "$RELEASE_TAG" --commit "$PINNED_TARGET_COMMIT_SHA" \
@@ -156,19 +154,9 @@ jobs:
           uv run python scripts/release_tools.py verify-helper-draft "${common[@]}" \
             --release-json "$RUNNER_TEMP/helper-inputs.json" \
             --notes-file ".github/release/notes-${RELEASE_TAG}.md"
-          mkdir "$RUNNER_TEMP/helper-app"
-          ditto -x -k "$archive" "$RUNNER_TEMP/helper-app"
-          helper_executable="$RUNNER_TEMP/helper-app/HealthBridgeMailboxAckPublisher.app/Contents/MacOS/HealthBridgeMailboxAckPublisher"
-          test -f "$helper_executable"
-          helper_architectures="$(/usr/bin/lipo -archs "$helper_executable")"
-          if [[ "$helper_architectures" != "arm64 x86_64" && "$helper_architectures" != "x86_64 arm64" ]]; then
-            echo "helper executable is not universal2" >&2
-            exit 1
-          fi
           uv run python scripts/verify_helper_distribution.py \
             --archive "$archive" \
-            --manifest "$manifest" \
-            --app "$RUNNER_TEMP/helper-app/HealthBridgeMailboxAckPublisher.app"
+            --manifest "$manifest"
 
   publish:
     name: Verify helper and publish existing draft
@@ -248,11 +236,6 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/commits/${target_commit_sha}" \
             --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
           test "$commit_identity" = "true"
-          default_branch="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
-          default_main_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
-            --jq '.commit.sha')"
-          test "$target_commit_sha" = "$default_main_sha"
           tree_sha="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/git/commits/${target_commit_sha}" \
             --jq '.tree.sha')"
@@ -285,11 +268,15 @@ jobs:
         id: packet
         env:
           GH_TOKEN: ${{ github.token }}
+          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
           PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
           PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
+          python3 scripts/release_source_policy.py \
+            --repo . --tag "$RELEASE_TAG" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
           uv sync --all-extras --dev --locked
           uv run python scripts/release_tools.py verify-execution \
             --repo . --tag "$RELEASE_TAG" --commit "$PINNED_TARGET_COMMIT_SHA" \
@@ -405,11 +392,6 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/git/tags/${current_tag_object}" \
             --jq '.object.sha')"
           test "$current_target" = "$PINNED_TARGET_COMMIT_SHA"
-          current_default_branch="$(gh api "/repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
-          current_default_main="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/branches/${current_default_branch}" \
-            --jq '.commit.sha')"
-          test "$current_target" = "$current_default_main"
           matching_release_ids="$(gh api \
             "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
             --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
@@ -430,6 +412,9 @@ jobs:
             --tree "$PINNED_TREE_SHA" \
             --helper-sha256 "$EXPECTED_HELPER_SHA256" \
             --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
+          python3 scripts/release_source_policy.py \
+            --repo . --tag "$RELEASE_TAG" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
           gh release edit "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false

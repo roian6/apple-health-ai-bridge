@@ -434,6 +434,18 @@ def verify_macos_release_distribution(
     request: DistributionVerificationRequest,
 ) -> None:
     _validate_distribution_bundle(request)
+    architectures = _run_platform_command(
+        [
+            "/usr/bin/lipo",
+            "-archs",
+            str(request.app / "Contents/MacOS" / HELPER_EXECUTABLE_NAME),
+        ]
+    )
+    if architectures.returncode != 0 or architectures.stdout.split() not in (
+        [b"arm64", b"x86_64"],
+        [b"x86_64", b"arm64"],
+    ):
+        raise HelperError(HelperErrorCode.SIGNATURE_INVALID)
     verify_release_distribution(request, _run_codesign, _run_platform_command)
 
 
@@ -596,6 +608,7 @@ def _validate_archive_members(package: zipfile.ZipFile) -> tuple[zipfile.ZipInfo
             or path.is_absolute()
             or any(part in {"", ".", ".."} for part in path.parts)
             or any(part.endswith((".", " ")) for part in path.parts)
+            or any(part.startswith("._") or part == "__MACOSX" for part in path.parts)
             or path.parts[0] != HELPER_APP_NAME
             or canonical in seen
             or (file_type not in {0, stat.S_IFREG, stat.S_IFDIR})

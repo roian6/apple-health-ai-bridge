@@ -24,6 +24,7 @@ from release_provenance import (
     verify_execution,
     verify_provenance,
 )
+from release_source_policy import SourceRequest, resolve_release_source
 from release_versions import (
     ReleaseError,
     canonical_receiver_tag,
@@ -206,6 +207,13 @@ def _expected_receiver_tag(version: str) -> str:
 
 def requires_provenance(tag: str) -> bool:
     return parse_receiver_release_tag(tag).version.as_tuple() >= (1, 1, 3)
+
+
+def release_title(tag: str) -> str:
+    parsed = parse_receiver_release_tag(tag)
+    if parsed.version.as_tuple() < (1, 1, 4):
+        return parsed.tag
+    return f"Receiver/CLI {parsed.version}"
 
 
 def _validate_release_notes(
@@ -544,8 +552,39 @@ def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
         message = "tag target must equal the checked-out commit"
         raise ReleaseError(message)
     if request.tag_target_commit != request.default_main_commit:
-        message = "tag target must equal the trusted default-main commit"
-        raise ReleaseError(message)
+        candidate = _read_component_snapshot(
+            _git_output(
+                request.repo,
+                "show",
+                f"{request.tag_target_commit}:{COMPONENT_VERSION_INDEX}",
+            ),
+            surface="candidate component version index",
+        )
+        if candidate.release_scope != "receiver":
+            message = "tag target must equal the trusted default-main commit"
+            raise ReleaseError(message)
+        try:
+            source = resolve_release_source(
+                SourceRequest(
+                    request.repo,
+                    candidate.receiver_tag,
+                    request.tag_target_commit,
+                    _git_output(
+                        request.repo,
+                        "rev-parse",
+                        f"refs/tags/{candidate.receiver_tag}^{{tag}}",
+                    ),
+                )
+            )
+        except ReleaseError as exc:
+            message = (
+                "tag target must equal the trusted default-main commit "
+                f"or authorized maintenance source: {exc}"
+            )
+            raise ReleaseError(message) from exc
+        if source.default_main_commit != request.default_main_commit:
+            message = "default-main commit must equal fresh protected authority"
+            raise ReleaseError(message)
     expected_baseline = _git_output(
         request.repo,
         "rev-parse",
@@ -1123,7 +1162,7 @@ def _verify_release_identity(
     parsed_tag = parse_receiver_release_tag(request.tag)
     if (
         payload.get("tag_name") != request.tag
-        or payload.get("name") != request.tag
+        or payload.get("name") != release_title(request.tag)
         or payload.get("draft") is not expected_draft
         or payload.get("prerelease") is not parsed_tag.is_prerelease
     ):
@@ -1503,6 +1542,7 @@ def main() -> int:  # noqa: C901, PLR0912
                     {
                         "prerelease": parsed_tag.is_prerelease,
                         "tag": parsed_tag.tag,
+                        "title": release_title(parsed_tag.tag),
                         "version": str(parsed_tag.version),
                     },
                     sort_keys=True,

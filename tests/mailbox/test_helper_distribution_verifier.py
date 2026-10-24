@@ -135,6 +135,54 @@ def _request(app: Path) -> DistributionVerificationRequest:
 
 
 @pytest.mark.parametrize(
+    ("architectures", "returncode", "accepted"),
+    [
+        (b"arm64 x86_64\n", 0, True),
+        (b"x86_64 arm64\n", 0, True),
+        (b"arm64\n", 0, False),
+        (b"x86_64\n", 0, False),
+        (b"arm64 x86_64 i386\n", 0, False),
+        (b"", 0, False),
+        (b"arm64 x86_64\n", 1, False),
+    ],
+)
+def test_release_verifier_requires_universal2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    architectures: bytes,
+    returncode: int,
+    accepted: bool,
+) -> None:
+    app = tmp_path / HELPER_APP_NAME
+    _write_app(app)
+
+    def platform(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+        assert arguments == [
+            "/usr/bin/lipo",
+            "-archs",
+            str(app / "Contents/MacOS" / HELPER_EXECUTABLE_NAME),
+        ]
+        return subprocess.CompletedProcess(arguments, returncode, architectures, b"")
+
+    def accept_trust(
+        _request: DistributionVerificationRequest,
+        _codesign: helper_distribution_verifier.CommandRunner,
+        _platform: helper_distribution_verifier.CommandRunner,
+    ) -> None:
+        pass
+
+    monkeypatch.setattr(helper_lifecycle, "_run_platform_command", platform)
+    monkeypatch.setattr(helper_lifecycle, "verify_release_distribution", accept_trust)
+
+    if accepted:
+        verify_macos_release_distribution(_request(app))
+    else:
+        with pytest.raises(HelperError) as raised:
+            verify_macos_release_distribution(_request(app))
+        assert raised.value.code is HelperErrorCode.SIGNATURE_INVALID
+
+
+@pytest.mark.parametrize(
     ("verifier", "expected_platform_calls"),
     [
         (
@@ -209,6 +257,8 @@ def test_macos_verifier_accepts_exact_general_distribution_identity(
 
     def next_platform(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
         platform_calls.append(arguments)
+        if arguments[0] == "/usr/bin/lipo":
+            return subprocess.CompletedProcess([], 0, b"arm64 x86_64\n", b"")
         if arguments[0] == "/usr/bin/security":
             return subprocess.CompletedProcess([], 0, profile, b"")
         return subprocess.CompletedProcess([], 0, b"", b"")
@@ -223,6 +273,15 @@ def test_macos_verifier_accepts_exact_general_distribution_identity(
 
     verifier(_request(app))
 
+    if verifier is verify_macos_release_distribution:
+        expected_platform_calls = [
+            [
+                "/usr/bin/lipo",
+                "-archs",
+                str(app / "Contents/MacOS" / HELPER_EXECUTABLE_NAME),
+            ],
+            *expected_platform_calls,
+        ]
     assert [call[:3] for call in platform_calls] == expected_platform_calls
 
 
@@ -335,6 +394,8 @@ def test_macos_verifier_rejects_non_general_distribution_artifacts(
     def next_platform(
         arguments: list[str],
     ) -> subprocess.CompletedProcess[bytes]:
+        if arguments[0] == "/usr/bin/lipo":
+            return subprocess.CompletedProcess([], 0, b"arm64 x86_64\n", b"")
         if arguments[0] == "/usr/bin/security":
             return subprocess.CompletedProcess([], 0, profile_output, b"")
         if arguments[0] == "/usr/bin/xcrun":

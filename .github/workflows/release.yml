@@ -78,14 +78,11 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
             --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
           test "$commit_identity" = "true"
-          default_branch="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}" \
-            --jq '.default_branch')"
-          default_main_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
-            --jq '.commit.sha')"
+          source="$(python3 scripts/release_source_policy.py \
+            --repo . --tag "$GITHUB_REF_NAME" \
+            --commit "$target_sha" --tag-object "$tag_object_sha")"
+          default_main_sha="$(jq -r '.default_main_commit' <<< "$source")"
           [[ "$default_main_sha" =~ ^[0-9a-f]{40}$ ]]
-          test "$target_sha" = "$default_main_sha"
           baseline_sha="$(git rev-parse "${target_sha}^1")"
           [[ "$baseline_sha" =~ ^[0-9a-f]{40}$ ]]
           {
@@ -128,6 +125,8 @@ jobs:
           enable-cache: false
 
       - name: Validate tag and cross-platform versions
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           uv run python scripts/release_tools.py validate \
             --repo . \
@@ -314,12 +313,17 @@ jobs:
 
       - name: Verify downloaded release packet
         id: packet
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test ! -e dist/.git
           commit_sha="$(git rev-parse HEAD)"
           tree_sha="$(git rev-parse "${commit_sha}^{tree}")"
           test "$commit_sha" = "$PINNED_TARGET_COMMIT_SHA"
+          python3 scripts/release_source_policy.py \
+            --repo . --tag "$GITHUB_REF_NAME" \
+            --commit "$commit_sha" --tag-object "$PINNED_TAG_OBJECT_SHA"
           uv run python scripts/release_tools.py verify-execution \
             --repo . --tag "$GITHUB_REF_NAME" \
             --commit "$commit_sha" --tree "$tree_sha" --workflow release.yml
@@ -379,20 +383,24 @@ jobs:
             echo "release appeared after preflight; refusing to replace it" >&2
             exit 1
           fi
+          tag_info="$(uv run python scripts/release_tools.py tag-info \
+            --tag "$GITHUB_REF_NAME")"
+          title="$(jq -r '.title' <<< "$tag_info")"
+          version="$(jq -r '.version' <<< "$tag_info")"
+          prerelease="$(jq -r '.prerelease' <<< "$tag_info")"
           release_flags=(
             --repo "$GITHUB_REPOSITORY"
             --verify-tag
-            --title "$GITHUB_REF_NAME"
+            --title "$title"
             --notes-file ".github/release/notes-${GITHUB_REF_NAME}.md"
             --draft
           )
-          tag_info="$(uv run python scripts/release_tools.py tag-info \
-            --tag "$GITHUB_REF_NAME")"
-          version="$(jq -r '.version' <<< "$tag_info")"
-          prerelease="$(jq -r '.prerelease' <<< "$tag_info")"
           if [[ "$prerelease" = "true" ]]; then
             release_flags+=(--prerelease)
           fi
+          python3 scripts/release_source_policy.py \
+            --repo . --tag "$GITHUB_REF_NAME" \
+            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
           gh release create "$GITHUB_REF_NAME" \
             "dist/apple_health_ai_bridge-${version}-py3-none-any.whl" \
             "dist/apple_health_ai_bridge-${version}.tar.gz" \
