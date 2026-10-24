@@ -1,8 +1,8 @@
-# iOS Self-Build Guide
+# Apple Health AI Bridge iOS Self-Build Guide
 
-Apple Health AI Bridge can be tried with synthetic data on any development machine. Real Apple Health sync is a separate developer-preview path that needs an iPhone, a Mac with Xcode, signing access for a local development build, and a receiver URL the iPhone can reach.
+Apple Health AI Bridge can be tested with synthetic data on any development machine. Testing a locally built companion with real Apple Health data requires an iPhone, a Mac with Xcode, signing access for a local development build, and a receiver URL the iPhone can reach.
 
-The App Store is the normal installation path. This guide remains available for contributors and advanced users who prefer to build and sign the iOS companion themselves.
+The App Store listing is the normal installation path. This guide covers local builds for contributors and advanced users who prefer to build and sign the iOS companion themselves.
 
 ## Prerequisites
 

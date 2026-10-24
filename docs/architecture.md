@@ -1,6 +1,6 @@
 # Architecture and trust boundaries
 
-Health Bridge for AI is a local bridge between HealthKit and agent-readable tools. It is not a hosted health service.
+Apple Health AI Bridge is a local bridge between HealthKit and agent-readable tools. It is not a hosted health service.
 
 ## Data path
 

@@ -2,11 +2,11 @@
 
 This guide records the public triage, merge, and release process for Apple Health AI Bridge. It complements [CONTRIBUTING.md](../CONTRIBUTING.md), [SECURITY.md](../SECURITY.md), and [SUPPORT.md](../SUPPORT.md).
 
-## Solo-maintainer phase
+## Current repository ruleset
 
-While the repository has one direct maintainer, the main ruleset keeps pull requests, required checks, linear history, resolved review threads, squash-only merging, deletion protection, and non-fast-forward protection. The required approval count is `0`, and last-push approval is disabled because an author cannot approve their own pull request.
+The main ruleset requires one approving review and approval of the latest push. It dismisses stale reviews, requires review threads to be resolved, and allows squash merging only. It also protects required checks, linear history, branch deletion, and non-fast-forward updates.
 
-One required approval and last-push approval may be enabled when a second trusted maintainer can provide human review, or when an independently eligible native automated reviewer has been demonstrated on a real pull request. For an automated reviewer, read back the App's identity, review state, reviewed commit, and GitHub's actual approval and last-push eligibility before changing the rules. A summary comment or successful check alone is not an eligible review. Do not enable required code-owner review before an eligible code owner exists.
+Keep the approval requirement aligned with an eligible reviewer. A second trusted maintainer can provide human review; an automated reviewer counts only after it has been demonstrated as eligible on a real pull request. For an automated reviewer, read back the App's identity, review state, reviewed commit, and GitHub's actual approval and last-push eligibility before changing the rules. A summary comment or successful check alone is not an eligible review. Do not enable required code-owner review before an eligible code owner exists.
 
 The repository's `.coderabbit.yaml` configures English reviews, walkthrough summaries, incremental review, and the request-changes workflow, with author approval overrides disabled and drafts excluded. Installing the hosted CodeRabbit App and confirming its effective configuration are separate maintainer actions. This configuration does not establish that the App is installed, that its reviews satisfy a rule, or that an approval requirement has been activated.
 
