@@ -262,9 +262,10 @@ def test_nil_item_is_reconciled_by_exact_payload_before_migration() -> None:
         "\n    private func preparePrivateStorageForUploadAdmission", start
     )
     reconcile = source[start:end]
-    assert "Data(contentsOf: item.fileURL)" in reconcile
-    assert "SleepSyncValueWork.run" in reconcile
-    assert "bytes[index] == pendingTransition.payload" in reconcile
+    assert reconcile.index("SleepSyncValueWork.run") < reconcile.index(
+        "Data(contentsOf: item.fileURL)"
+    )
+    assert "Data(contentsOf: item.fileURL) == pendingTransition.payload" in reconcile
     admission_end = source.index("private func recoverRejectedSleepBaseline", end)
     admission = source[end:admission_end]
     match = admission.index("await matchingPendingSleepOutboxItems")

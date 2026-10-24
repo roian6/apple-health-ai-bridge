@@ -380,6 +380,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let sleepManifestFileURL: URL?
     private let sleepResetEpochStore: SleepResetEpochStore
     private let sleepSyncPreparer: AnchoredSleepSyncPreparer
+    var observeSleepOutboxPayloadReadForTesting: @Sendable () -> Void = {}
     private let readAnchoredSleepChanges: (@MainActor (
         String?, Date?, Date
     ) async throws -> HealthKitAnchoredSleepChanges)?
@@ -6053,15 +6054,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         in outbox: FileOutbox
     ) async throws -> [FileOutboxItem] {
         let items = try outbox.pendingItems()
-        let bytes = try items.map { item -> Data? in
-            guard item.id != pendingTransition.outboxItemID,
-                  item.receiverIdentity == pendingTransition.receiverBindingID else { return nil }
-            return try Data(contentsOf: item.fileURL)
-        }
+        let observeRead = observeSleepOutboxPayloadReadForTesting
         return try await SleepSyncValueWork.run {
-            items.enumerated().compactMap { index, item in
-                item.id == pendingTransition.outboxItemID
-                    || bytes[index] == pendingTransition.payload ? item : nil
+            try items.compactMap { item in
+                if item.id == pendingTransition.outboxItemID { return item }
+                guard item.receiverIdentity == pendingTransition.receiverBindingID else { return nil }
+                observeRead()
+                return try Data(contentsOf: item.fileURL) == pendingTransition.payload ? item : nil
             }
         }
     }
