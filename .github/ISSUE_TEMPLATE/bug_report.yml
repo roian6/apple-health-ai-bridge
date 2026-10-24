@@ -38,8 +38,8 @@ body:
     id: version
     attributes:
       label: Project version
-      description: Paste `uv run health-bridge --version` output or the relevant Git commit.
-      placeholder: "1.0.0"
+      description: Give the affected app version/build, receiver version, or Git commit. Use `health-bridge --version` for the receiver, or write unknown if you cannot find the version.
+      placeholder: "Affected component and version"
     validations:
       required: true
 
@@ -62,12 +62,12 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Include OS, Python/uv version, and iOS/Xcode/TestFlight details when relevant.
+      description: Fill in only what is relevant. Unknown details are fine; keep private hosts, account names, and local paths out.
       placeholder: |
-        OS:
-        Python:
-        uv:
-        iOS/Xcode/TestFlight:
+        Receiver OS:
+        iPhone model and iOS:
+        AI client and version:
+        App installation: App Store / TestFlight / self-build
     validations:
       required: true
 
