@@ -1,3 +1,5 @@
+import errno
+import os
 from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING
@@ -263,4 +265,75 @@ def test_local_key_failure_remains_terminal(
         with connect_database(peer.db) as db:
             assert db.execute("select count(*) from receiver_tokens").fetchone() == (0,)
     finally:
+        _ = worker.stop()
+
+
+def test_transient_local_key_io_failure_keeps_worker_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    peer = LegacyPeer(tmp_path)
+    descriptor, request = stage_native(peer)
+    directory = tmp_path / "provider" / "pairing" / descriptor.invitation_id
+    directory.mkdir(parents=True)
+    _ = publish_final(directory, "request.hbp", request)
+    lock = (tmp_path / "receiver-anchor" / "mailbox-identity.lock").stat()
+    original_fchmod = os.fchmod
+    failures = 0
+
+    def unavailable_once(fd: int, mode: int) -> None:
+        nonlocal failures
+        opened = os.fstat(fd)
+        if not failures and (opened.st_dev, opened.st_ino) == (
+            lock.st_dev,
+            lock.st_ino,
+        ):
+            failures += 1
+            raise OSError(errno.EIO, "synthetic transient key-store I/O failure")
+        original_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", unavailable_once)
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=tmp_path / "provider",
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publish_completion,
+        poll_interval_seconds=0.01,
+    )
+    attempted, resume, recovered, finish = (Event() for _ in range(4))
+    run_once = worker.run_once
+
+    def observe_cycle() -> None:
+        first = not attempted.is_set()
+        try:
+            run_once()
+        finally:
+            if first:
+                attempted.set()
+                assert resume.wait(5), "test did not release the failed I/O cycle"
+        if (directory / "completion.hbp").exists():
+            recovered.set()
+            assert finish.wait(5), "test did not release the recovered worker"
+
+    monkeypatch.setattr(worker, "run_once", observe_cycle)
+    worker.start()
+    try:
+        assert attempted.wait(5), "worker did not attempt local-key acquisition"
+        assert failures == 1
+        assert not (directory / "completion.hbp").exists()
+        resume.set()
+        assert recovered.wait(5), worker.health_error()
+        assert worker.is_alive()
+        assert not worker.terminal_error()
+        assert open_completion(
+            (directory / "completion.hbp").read_bytes(),
+            request,
+            descriptor,
+            peer.device,
+        )
+        with connect_database(peer.db) as db:
+            assert db.execute("select count(*) from receiver_tokens").fetchone() == (1,)
+    finally:
+        resume.set()
+        finish.set()
         _ = worker.stop()

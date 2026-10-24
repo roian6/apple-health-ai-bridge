@@ -37,6 +37,10 @@ from health_bridge.mailbox.filesystem import (
     revalidate_final_at,
 )
 from health_bridge.mailbox.native_ack_publication import default_native_ack_publisher
+from health_bridge.receiver._mailbox_key_models import (
+    MailboxKeyStoreError,
+    MailboxKeyStoreErrorCode,
+)
 from health_bridge.receiver.invitations import PairingInvitationError
 from health_bridge.receiver.mailbox_bootstrap import (
     MAX_PAIRING_BYTES,
@@ -724,6 +728,12 @@ class MailboxRuntimeWorker:
                 ):
                     with self._lifecycle_lock:
                         self._last_discovery_error = "mailbox_database_busy"
+                elif (
+                    isinstance(exc, MailboxKeyStoreError)
+                    and exc.code is MailboxKeyStoreErrorCode.STORAGE_UNAVAILABLE
+                ):
+                    with self._lifecycle_lock:
+                        self._last_discovery_error = "mailbox_key_storage_unavailable"
                 else:
                     with self._lifecycle_lock:
                         self._terminal_error = "mailbox_worker_terminal_error"
