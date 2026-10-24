@@ -1,6 +1,6 @@
 # Supported Apple Health data
 
-Health Bridge for AI requests **read-only** access to every runtime-available supported type in the list below. The same unified type set drives permission requests, foreground sync, observer registration, and background refresh. Apple Health's system permission sheet still lets the user allow or deny each type individually, and only allowed records can sync. The app does not request HealthKit write access.
+Apple Health AI Bridge requests **read-only** access to every runtime-available supported type in the list below. The same unified type set drives permission requests, foreground sync, observer registration, and background refresh. Apple Health's system permission sheet still lets the user allow or deny each type individually, and only allowed records can sync. The app does not request HealthKit write access.
 
 The app uses permitted records only to prepare sync batches for the receiver URL configured by the user, show sync status, and retry pending user-directed transfers. It does not use these records for advertising, tracking, data brokerage, or clinical decisions.
 
