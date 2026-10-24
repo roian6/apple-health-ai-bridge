@@ -82,7 +82,7 @@ final class MailboxQAInvocation {
                     available: UIApplication.shared.isProtectedDataAvailable
                 )
                 stage = "scan_finalize"
-                let state = try harness.scanAndFinalize()
+                let state = try await harness.scanAndFinalize()
                 try writeOutput(
                     action: request.action,
                     status: state.lastPhase?.rawValue ?? "hold",

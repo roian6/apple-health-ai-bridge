@@ -44,8 +44,9 @@ HEALTHKIT_QUANTITIES = (
 def test_sleep_transition_is_journaled_before_delivery() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     create_start = source.index("let pendingTransition = SleepSyncPendingTransition(")
+    prefix = "try await sleepManifestStore."
     journal = source.index(
-        "try sleepManifestStore.savePendingTransition(pendingTransition)",
+        f"{prefix}savePendingForSync(pendingTransition, validate: validate)",
         create_start,
     )
     delivery = source.index(
@@ -62,15 +63,19 @@ def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> No
     helper = source[helper_start:helper_end]
 
     enqueue = helper.index("let enqueueResult = try outbox.enqueueIfAbsent(")
-    track = helper.index("try store.savePendingTransition(trackedTransition)")
+    track = helper.index(
+        "try await store.savePendingForSync(trackedTransition, validate: validate)"
+    )
     absence_gate = helper.index("if itemRemains {")
+    prefix = "try await store."
     manifest_commit = helper.rindex(
-        "try store.saveManifest(pendingTransition.manifest)"
+        f"{prefix}saveManifestForSync(pendingTransition.manifest, validate: validate)"
     )
     journal_clear = helper.rindex(
-        "try store.clearPendingTransition(id: pendingTransition.id)"
+        f"{prefix}clearPendingForSync(id: pendingTransition.id, validate: validate)"
     )
-    assert enqueue < track < absence_gate < manifest_commit < journal_clear
+    acceptance = helper.index("guard lastDirectAcceptance.map(")
+    assert enqueue < track < absence_gate < acceptance < manifest_commit < journal_clear
     assert "if enqueueResult.wasInserted" in helper[track:absence_gate]
 
 
@@ -185,7 +190,9 @@ def test_rejected_sleep_epoch_recovery_is_durable_before_fifo_retirement() -> No
         "\npublic enum KeychainReceiverTokenStoreError", recovery_start
     )
     recovery = core[recovery_start:recovery_end]
-    save = recovery.index("savePendingTransition(rejectedTransition)")
+    save = recovery.index(
+        "await manifestStore.savePendingForSync(rejected, validate: check)"
+    )
     reserve = recovery.index("epochStore.reserveEpoch")
     retire = recovery.index("outbox.markUploaded")
     reset = recovery.index("manifestStore.resetSynchronizationState()")
@@ -255,8 +262,17 @@ def test_nil_item_is_reconciled_by_exact_payload_before_migration() -> None:
         "\n    private func preparePrivateStorageForUploadAdmission", start
     )
     reconcile = source[start:end]
+    assert reconcile.index("SleepSyncValueWork.run") < reconcile.index(
+        "Data(contentsOf: item.fileURL)"
+    )
     assert "Data(contentsOf: item.fileURL) == pendingTransition.payload" in reconcile
-    assert "assigningOutboxItemID(item.id)" in reconcile
+    admission_end = source.index("private func recoverRejectedSleepBaseline", end)
+    admission = source[end:admission_end]
+    match = admission.index("await matchingPendingSleepOutboxItems")
+    recheck = admission.index("try validate()", match)
+    assign = admission.index("assigningOutboxItemID(item.id)", recheck)
+    migration = admission.index("requiresInstallationSourceMigration", assign)
+    assert match < recheck < assign < migration
 
 
 def test_private_store_retry_recovery_and_manifest_probe_are_explicit() -> None:
@@ -272,8 +288,18 @@ def test_private_store_retry_recovery_and_manifest_probe_are_explicit() -> None:
         "\n    private func refreshPendingOutboxCount()", probe_start
     )
     probe = source[probe_start:probe_end]
-    assert "loadManifest()" in probe
-    assert "loadPendingTransition()" in probe
+    assert "store?.recoveryMayBeNeeded ?? true" in probe
+    preflight_start = source.index(
+        "private func preparePrivateStorageForUploadAdmission"
+    )
+    preflight_end = source.index(
+        "private func recoverRejectedSleepBaseline", preflight_start
+    )
+    preflight = source[preflight_start:preflight_end]
+    manifest_read = preflight.index("await sleepManifestStore.loadManifestForSync")
+    pending_read = preflight.index("await sleepManifestStore.loadPendingForSync")
+    ready = preflight.index("privateStorageAdmissionReady = true")
+    assert manifest_read < pending_read < ready
 
     refresh_start = source.index("private func refreshPendingOutboxCount()")
     refresh_end = source.index(
@@ -363,7 +389,13 @@ def test_missing_outbox_and_unreadable_sleep_journal_fail_closed_and_stay_visibl
     refresh = source[refresh_start:refresh_end]
     assert "sleepStorageMayNeedRecovery()" in refresh
     probe_start = source.index("private static func sleepStorageMayNeedRecovery(")
-    assert "catch" in source[probe_start:refresh_start]
+    assert "store?.recoveryMayBeNeeded ?? true" in source[probe_start:refresh_start]
+    core = FILE_OUTBOX.read_text(encoding="utf-8")
+    hint_start = core.index("public var recoveryMayBeNeeded: Bool")
+    hint_end = core.index("@MainActor", hint_start)
+    hint = core[hint_start:hint_end]
+    assert "try? revisions()" in hint
+    assert "else { return true }" in hint
 
 
 def test_core_anchored_lanes_bind_durable_payloads_to_cursor_checkpoints() -> None:
@@ -428,8 +460,10 @@ def test_sleep_journal_is_visible_and_generation_is_rechecked_after_healthkit() 
     recheck = source.index(
         "try requireCurrentConnectionGeneration(currentReceiverGeneration)", read
     )
+    prefix = "try await sleepManifestStore."
     journal = source.index(
-        "try sleepManifestStore.savePendingTransition(pendingTransition)", recheck
+        f"{prefix}savePendingForSync(pendingTransition, validate: validate)",
+        recheck,
     )
     assert read < recheck < journal
     assert "viewModel.hasPendingSleepTransition" in content

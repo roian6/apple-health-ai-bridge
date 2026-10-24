@@ -3,7 +3,8 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class OutboxDeliveryCoordinatorTests: XCTestCase {
-    func testOrderedHappyPathRestartsAtEveryStateAndFinalizesOnce() throws {
+    @MainActor
+    func testOrderedHappyPathRestartsAtEveryStateAndFinalizesOnce() async throws {
         let harness = try OutboxDeliveryHarness()
         let sealer = try CountingMailboxEnvelopeSealer(harness.fixture)
         let finalizer = CountingOutboxDeliveryFinalizer()
@@ -63,14 +64,10 @@ final class OutboxDeliveryCoordinatorTests: XCTestCase {
             observed: true,
             finalizer: finalizer
         )
-        XCTAssertEqual(
-            try coordinator.finalizeCommitted(itemID: harness.fixture.item.id).phase,
-            .committedFinalized
-        )
-        XCTAssertEqual(
-            try coordinator.finalizeCommitted(itemID: harness.fixture.item.id).phase,
-            .committedFinalized
-        )
+        let firstFinalization = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+        XCTAssertEqual(firstFinalization.phase, .committedFinalized)
+        let repeatedFinalization = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+        XCTAssertEqual(repeatedFinalization.phase, .committedFinalized)
         XCTAssertEqual(finalizer.finalizeCount, 1)
         XCTAssertNil(try outbox.pendingItem(id: harness.fixture.item.id))
         XCTAssertEqual(sealer.aeadCallCount, 1)
@@ -110,7 +107,8 @@ final class OutboxDeliveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(sealer.signerCallCount, 1)
     }
 
-    func testAckNackConflictGenerationAndStaleHTTPBoundariesDoNotRetire() throws {
+    @MainActor
+    func testAckNackConflictGenerationAndStaleHTTPBoundariesDoNotRetire() async throws {
         let harness = try OutboxDeliveryHarness()
         let finalizer = CountingOutboxDeliveryFinalizer()
         let coordinator = try advanceToProviderObserved(
@@ -197,11 +195,12 @@ final class OutboxDeliveryCoordinatorTests: XCTestCase {
             ),
             .terminalHold
         )
-        XCTAssertThrowsError(
-            try terminalCoordinator.finalizeCommitted(
-                itemID: terminalHarness.fixture.item.id
-            )
-        )
+        do {
+            _ = try await terminalCoordinator.finalizeCommitted(itemID: terminalHarness.fixture.item.id)
+            XCTFail("Terminal rejection must not finalize.")
+        } catch {
+            XCTAssertEqual(error as? OutboxDeliveryCoordinatorError, .commitProofRequired)
+        }
         XCTAssertNotNil(
             try terminalHarness.fixture.outbox.pendingItem(
                 id: terminalHarness.fixture.item.id

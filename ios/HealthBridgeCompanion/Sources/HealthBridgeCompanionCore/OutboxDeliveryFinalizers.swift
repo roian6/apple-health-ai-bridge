@@ -1,8 +1,8 @@
 import Foundation
 
 public protocol OutboxDeliveryCommitFinalizing {
-    func isFinalized(_ context: OutboxDeliveryFinalizationContext) throws -> Bool
-    func finalize(_ context: OutboxDeliveryFinalizationContext) throws
+    @MainActor func isFinalized(_ context: OutboxDeliveryFinalizationContext) async throws -> Bool
+    @MainActor func finalize(_ context: OutboxDeliveryFinalizationContext) async throws
 }
 
 public struct OutboxDeliveryNoopFinalizer: OutboxDeliveryCommitFinalizing {
@@ -148,49 +148,81 @@ public final class OutboxDeliverySleepFinalizer: OutboxDeliveryCommitFinalizing 
     private let store: any SleepSyncManifestStoring
     private let pendingTransition: SleepSyncPendingTransition
     private let transactionFinalizer: OutboxDeliveryCursorFinalizer?
+    private let validateOwner: @MainActor () throws -> Void
 
     public init(
         store: any SleepSyncManifestStoring,
         pendingTransition: SleepSyncPendingTransition,
-        transactionFinalizer: OutboxDeliveryCursorFinalizer? = nil
+        transactionFinalizer: OutboxDeliveryCursorFinalizer? = nil,
+        validateOwner: @escaping @MainActor () throws -> Void = {}
     ) {
         self.store = store
         self.pendingTransition = pendingTransition
         self.transactionFinalizer = transactionFinalizer
+        self.validateOwner = validateOwner
     }
 
+    @MainActor
     public func isFinalized(
         _ context: OutboxDeliveryFinalizationContext
-    ) throws -> Bool {
+    ) async throws -> Bool {
         try validate(context)
+        let revision = try store.revisionForSync()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try self.validateOwner()
+            guard try self.store.revisionForSync() == revision else { throw CancellationError() }
+        }
         let sleepFinalized: Bool
-        if let current = try store.loadPendingTransition() {
-            guard current == pendingTransition else {
+        let expected = pendingTransition
+        if let current = try await store.loadPendingForSync(validate: check) {
+            let matches = try await SleepSyncValueWork.run { current == expected }
+            try check()
+            guard matches else {
                 throw OutboxDeliveryCoordinatorError.ownershipMismatch
             }
             sleepFinalized = false
         } else {
-            sleepFinalized = try store.loadManifest() == pendingTransition.manifest
+            let manifest = try await store.loadManifestForSync(validate: check)
+            sleepFinalized = try await SleepSyncValueWork.run { manifest == expected.manifest }
+            try check()
         }
         guard sleepFinalized else { return false }
         return try transactionFinalizer?.isFinalized(context) ?? true
     }
 
-    public func finalize(_ context: OutboxDeliveryFinalizationContext) throws {
+    @MainActor
+    public func finalize(_ context: OutboxDeliveryFinalizationContext) async throws {
         try validate(context)
-        if let current = try store.loadPendingTransition() {
-            guard current == pendingTransition else {
+        var revision = try store.revisionForSync()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try self.validateOwner()
+            guard try self.store.revisionForSync() == revision else { throw CancellationError() }
+        }
+        let expected = pendingTransition
+        if let current = try await store.loadPendingForSync(validate: check) {
+            let matches = try await SleepSyncValueWork.run { current == expected }
+            try check()
+            guard matches else {
                 throw OutboxDeliveryCoordinatorError.ownershipMismatch
             }
-            if try store.loadManifest() != pendingTransition.manifest {
-                try store.saveManifest(pendingTransition.manifest)
+            let manifest = try await store.loadManifestForSync(validate: check)
+            let committed = try await SleepSyncValueWork.run { manifest == expected.manifest }
+            try check()
+            if !committed {
+                revision = try await store.saveManifestForSync(expected.manifest, validate: check)
             }
-            try store.clearPendingTransition(id: pendingTransition.id)
+            revision = try await store.clearPendingForSync(id: expected.id, validate: check)
         } else {
-            guard try store.loadManifest() == pendingTransition.manifest else {
+            let manifest = try await store.loadManifestForSync(validate: check)
+            let committed = try await SleepSyncValueWork.run { manifest == expected.manifest }
+            try check()
+            guard committed else {
                 throw OutboxDeliveryCoordinatorError.finalizationIncomplete
             }
         }
+        try check()
         try transactionFinalizer?.finalize(context)
     }
 
