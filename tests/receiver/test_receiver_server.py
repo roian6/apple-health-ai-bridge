@@ -1,6 +1,7 @@
 from http.client import HTTPResponse
 from io import BufferedIOBase
 from pathlib import Path
+from subprocess import run
 from threading import Thread
 from typing import Self, cast, final
 from urllib.error import HTTPError
@@ -13,6 +14,9 @@ from typing_extensions import override
 import health_bridge.receiver.server as receiver_server_module
 from health_bridge.contract import HealthBridgeBatchV1
 from health_bridge.contract.batch_v1 import SyncCursor
+from health_bridge.mcp.server import dispatch_request
+from health_bridge.mcp.types import required_list, required_object, required_string
+from health_bridge.queries.models import WorkoutsResult
 from health_bridge.queries.timeseries import get_timeseries
 from health_bridge.receiver.server import (
     ReceiverRequestHandler,
@@ -21,7 +25,11 @@ from health_bridge.receiver.server import (
 )
 from health_bridge.receiver.tokens import create_receiver_token
 from health_bridge.storage import initialize_database
-from health_bridge.storage.database import database_lifecycle_lock
+from health_bridge.storage.database import (
+    connect_readonly_database,
+    database_lifecycle_lock,
+)
+from health_bridge.storage.sqlite_rows import TEXT_ROWS_ADAPTER, fetch_one_int
 
 
 class ReceiverIngestResponse(BaseModel):
@@ -205,6 +213,147 @@ def test_receiver_accepts_authorized_batch_and_ingests_records(
         assert body.sample_count == 3
         assert points[0].type_code == "steps"
         assert points[0].value == 4321.0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_receiver_preserves_workout_types_and_updates_other_in_cli_and_mcp(
+    tmp_path: Path,
+) -> None:
+    # Given: four free-form types and an older export needing reclassification.
+    db_path = tmp_path / "receiver.sqlite"
+    fixture = HealthBridgeBatchV1.model_validate_json(
+        Path("fixtures/health_bridge_batch_v1.synthetic.json").read_bytes()
+    )
+    workout_types = (
+        "tennis",
+        "hockey",
+        "other",
+        "healthkit_activity_18446744073709551615",
+    )
+    original = fixture.workouts[0]
+    workouts = tuple(
+        original.model_copy(
+            update={
+                "client_record_id": f"synthetic-issue113-{index}",
+                "workout_type": kind,
+            }
+        )
+        for index, kind in enumerate(workout_types)
+    )
+    legacy = original.model_copy(
+        update={
+            "client_record_id": "synthetic-issue113-reclassified",
+            "workout_type": "other",
+        }
+    )
+    batch = fixture.model_copy(
+        update={
+            "samples": (),
+            "workouts": (*workouts, legacy),
+            "sleep_sessions": (),
+            "deleted_records": (),
+            "sync": fixture.sync.model_copy(update={"cursors": ()}),
+        }
+    )
+    correction = batch.model_copy(
+        update={"workouts": (legacy.model_copy(update={"workout_type": "tennis"}),)}
+    )
+    initialize_database(db_path)
+    token = create_receiver_token(
+        db_path, label="issue113-synthetic", token="hb_receiver_secret"
+    ).token
+    server = build_receiver_server(db_path, host="127.0.0.1", port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    row_ids: list[int] = []
+    try:
+        # When: the same source/client record is first other, then tennis.
+        for payload, reclassified_type in ((batch, "other"), (correction, "tennis")):
+            request = Request(
+                f"http://127.0.0.1:{server_port(server)}/v1/batches",
+                data=payload.model_dump_json(by_alias=True).encode(),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with open_http_response(request) as response:
+                assert response.status == 202
+                assert (
+                    ReceiverIngestResponse.model_validate_json(response.read()).status
+                    == "succeeded"
+                )
+
+            # Then: CLI and real MCP dispatch expose exact types without duplicates.
+            cli = run(
+                [
+                    "health-bridge",
+                    "query",
+                    "workouts",
+                    "--db",
+                    str(db_path),
+                    "--start-date",
+                    "2026-06-01",
+                    "--end-date",
+                    "2026-06-08",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            assert cli.returncode == 0, cli.stderr
+            assert cli.stderr == ""
+            cli_result = WorkoutsResult.model_validate_json(cli.stdout)
+            mcp = dispatch_request(
+                db_path,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 113,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_workouts",
+                        "arguments": {
+                            "start_date": "2026-06-01",
+                            "end_date": "2026-06-08",
+                        },
+                    },
+                },
+            )
+            content = required_list(required_object(mcp["result"])["content"])
+            mcp_result = WorkoutsResult.model_validate_json(
+                required_string(required_object(content[0])["text"])
+            )
+            assert mcp_result == cli_result
+            assert sorted(item.workout_type for item in cli_result.workouts) == sorted(
+                (*workout_types, reclassified_type)
+            )
+            assert all(
+                item.source.source_key == legacy.source_key
+                for item in cli_result.workouts
+            )
+            with connect_readonly_database(db_path) as connection:
+                assert fetch_one_int(connection, "select count(*) from workouts") == 5
+                assert TEXT_ROWS_ADAPTER.validate_python(
+                    connection.execute(
+                        """select workout_type from workouts
+                        join sources using (source_id)
+                        where source_key = ? and client_record_id = ?""",
+                        (legacy.source_key, legacy.client_record_id),
+                    ).fetchall()
+                ) == [(reclassified_type,)]
+                row_ids.append(
+                    fetch_one_int(
+                        connection,
+                        "select workout_id from workouts where client_record_id = ?",
+                        (legacy.client_record_id,),
+                    )
+                )
+        assert row_ids[0] == row_ids[1]
     finally:
         server.shutdown()
         server.server_close()

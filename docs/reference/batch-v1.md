@@ -94,6 +94,33 @@ Workouts use `client_record_id`, `source_key`, `workout_type`, `start_time`,
 `end_time`, and measured fields such as duration, energy, and distance where
 present.
 
+The companion exports known HealthKit activities as stable lowercase snake-case
+names, such as `tennis`, `hockey`, and `underwater_diving`. Existing names remain
+unchanged: `running`, `walking`, `cycling`, `swimming`, `hiking`, `yoga`,
+`traditional_strength_training`, `functional_strength_training`, `hiit`,
+`rowing`, `elliptical`, `pilates`, `core_training`, `dance`, and `mind_and_body`.
+Historical activity types retain distinct names rather than being merged into
+their newer replacements.
+
+Only HealthKit's actual Other activity exports as `other`. An unmapped activity
+exports as `healthkit_activity_<rawValue>`, where `<rawValue>` is the original
+unsigned integer in decimal, without truncation or a sign. For example, raw value
+9999 becomes `healthkit_activity_9999`. The receiver accepts these nonempty
+strings without a fixed activity enum; storage, CLI, and MCP preserve them.
+Workout identity remains `hk-workout-<lowercase HealthKit UUID>`. Re-exporting the
+same workout with the same source updates its stored type rather than adding
+another workout.
+
+### Previously exported workout types
+
+Updating the companion affects newly converted records. It does not reconstruct
+types already exported as `other`, and retrying an already-encoded queued batch
+keeps that batch's original type. `Sync Now` uses anchored workout queries, so it
+does not guarantee a fresh read of unchanged historical workouts. A record that
+is reread and re-exported can update in place, but this is not a historical repair
+or arbitrary-date backfill facility. Do not reset private sync state or delete
+receiver records to try to recover a lost activity type.
+
 ## Sleep
 
 Sleep sessions contain session-level identity plus stage intervals. Intervals
