@@ -973,14 +973,14 @@ def test_ios_unpaired_connection_error_is_visible_and_retryable() -> None:
         disconnected_subtitle
     )
     assert 'Button("Retry Pairing")' in content_view
-    assert (
-        'Button("Clear Pending Pairing and Disconnect", role: .destructive)'
-        in content_view
+    cancel_action = content_view.index(
+        "showPendingPairingCancellationConfirmation = true"
     )
-    cancel_button_start = content_view.index(
-        'Button("Clear Pending Pairing and Disconnect", role: .destructive)'
-    )
-    cancel_button = content_view[cancel_button_start : cancel_button_start + 400]
+    cancel_button_start = content_view.rfind("Button(", 0, cancel_action)
+    assert cancel_button_start >= 0
+    cancel_button_end = content_view.index(".cardStyle()", cancel_action)
+    cancel_button = content_view[cancel_button_start:cancel_button_end]
+    assert "role: .destructive" in cancel_button
     assert ".disabled(viewModel.isPairing)" in cancel_button
     background_uploader = Path(
         "ios/HealthBridgeCompanion/App/BackgroundURLSessionOutboxUploader.swift"
@@ -1003,8 +1003,11 @@ def test_pairing_recovery_is_visible_for_failed_connection_replacement() -> None
     setup_branch = "if viewModel.setupState == .unpaired {"
     assert recovery in content
     assert content.index(recovery) < content.index(setup_branch)
-    assert "Clear Pending Pairing and Disconnect" in content
-    assert "also removes the currently saved connection" in content
+    recovery_card = content.split("private var pairingRecoveryCard:", maxsplit=1)[
+        1
+    ].split("private var manualPairingFields:", maxsplit=1)[0]
+    assert "isPresented: $showPendingPairingCancellationConfirmation" in recovery_card
+    assert "await viewModel.cancelPendingPairing()" in recovery_card
 
 
 def test_different_setup_link_is_rejected_before_bootstrap_retry() -> None:
@@ -1650,13 +1653,42 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     )
     foreground_outbox_body = view_model[foreground_outbox_start:foreground_outbox_end]
     assert (
-        foreground_outbox_body.count(
-            "requireCurrentConnectionGeneration(expectedGeneration)"
-        )
-        >= 4
+        foreground_outbox_body.count("requireCurrentPayloadDeliveryTarget(target)") >= 5
     )
     assert "catch is CancellationError" in foreground_outbox_body
-    assert "bearerToken uploadBearerToken" in foreground_outbox_body
+    assert all(
+        marker in foreground_outbox_body
+        for marker in (
+            "let uploadBearerToken = try settingsStore.loadBearerToken()",
+            "bearerToken: uploadBearerToken",
+            "cursorFinalizer.recordDirectReceiverAcceptance(",
+        )
+    )
+
+    capture_start = view_model.index("private func capturePayloadDeliveryTarget()")
+    validator_start = view_model.index(
+        "private func requireCurrentPayloadDeliveryTarget(", capture_start
+    )
+    capture_body = view_model[capture_start:validator_start]
+    assert all(
+        marker in capture_body
+        for marker in (
+            "let generation = settingsStore.receiverSettingsGenerationToken",
+            "try requireCurrentConnectionGeneration(generation)",
+            "settingsStore.receiverBindingID",
+            "identity.opaqueBinding == bindingID",
+            "keys.signingKeyID == identity.deviceSigningKeyID",
+            "keys.agreementKeyID == identity.deviceAgreementKeyID",
+        )
+    )
+
+    validator_end = view_model.index("private struct PayloadDelivery", validator_start)
+    validator_body = view_model[validator_start:validator_end]
+    generation_check = validator_body.index(
+        "try requireCurrentConnectionGeneration(target.generation)"
+    )
+    target_recapture = validator_body.index("capturePayloadDeliveryTarget() == target")
+    assert generation_check < target_recapture
 
     cancel_upload_start = background_uploader.index("func cancelPendingUploads() async")
     cancel_upload_end = background_uploader.index(

@@ -181,6 +181,7 @@ def create_pairing_material(
         config.database_path,
         label=f"{config.namespace}-device",
         receiver_url=f"http://{config.host}:{config.port}/v1/batches",
+        transport="mailbox",
     )
     request = {
         "v": 1,

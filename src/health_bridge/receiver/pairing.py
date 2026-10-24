@@ -4,10 +4,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar, Final, Literal, Self
 from urllib.parse import parse_qs, urlencode, urlparse
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from health_bridge.receiver._mailbox_key_models import strict_base64url_encode
 from health_bridge.receiver.invitations import create_pairing_invitation
+from health_bridge.receiver.mailbox_bootstrap import BootstrapDescriptor
+from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.tokens import create_receiver_token
 from health_bridge.receiver.transports import ReceiverTransport
 
@@ -23,7 +27,7 @@ PAIRING_WARNING: Final = (
 )
 PAIRING_INVITATION_WARNING: Final = (
     "This setup contains a temporary, single-use invitation. "
-    "Import it on your own device before it expires, then delete the setup artifact."
+    "Keep it private and open it on your own iPhone before it expires."
 )
 EMPTY_BEARER_MESSAGE: Final = "Pairing bundle bearer credential must not be empty."
 INVALID_DEEP_LINK_MESSAGE: Final = "Pairing deep link must use healthbridge://pair."
@@ -38,6 +42,10 @@ CROSS_ORIGIN_REDEEM_MESSAGE: Final = (
 
 def _exclude_direct_transport(value: ReceiverTransport) -> bool:
     return value is ReceiverTransport.DIRECT
+
+
+def _exclude_missing_bootstrap(value: BootstrapDescriptor | None) -> bool:
+    return value is None
 
 
 def _exclude_missing_mailbox_protocol(value: Literal[1] | None) -> bool:
@@ -92,8 +100,11 @@ class ReceiverPairingInvitationPayload(BaseModel):
     )
     schema_version: Literal["2.0.0"] = PAIRING_INVITATION_SCHEMA_VERSION
     label: str
-    receiver_url: str
-    redeem_url: str
+    receiver_url: str | None = None
+    redeem_url: str | None = None
+    mailbox_bootstrap: BootstrapDescriptor | None = Field(
+        default=None, exclude_if=_exclude_missing_bootstrap
+    )
     invitation_secret: str
     expires_at: str
     transport: ReceiverTransport = Field(
@@ -107,6 +118,16 @@ class ReceiverPairingInvitationPayload(BaseModel):
 
     @model_validator(mode="after")
     def require_consistent_transport(self) -> Self:
+        if self.mailbox_bootstrap is not None:
+            if (
+                self.transport is not ReceiverTransport.MAILBOX
+                or self.mailbox_protocol_version != 1
+                or self.receiver_url is not None
+                or self.redeem_url is not None
+            ):
+                raise ReceiverPairingBundleError(INVALID_PAYLOAD_MESSAGE)
+        else:
+            _validate_pairing_urls(self.receiver_url or "", self.redeem_url or "")
         match self.transport:
             case ReceiverTransport.DIRECT if self.mailbox_protocol_version is None:
                 return self
@@ -120,13 +141,15 @@ class ReceiverPairingInvitationPayload(BaseModel):
         cls,
         *,
         label: str,
-        receiver_url: str,
-        redeem_url: str,
+        receiver_url: str | None,
+        redeem_url: str | None,
         invitation_secret: str,
         expires_at: str,
         transport: ReceiverTransport = ReceiverTransport.DIRECT,
+        mailbox_bootstrap: BootstrapDescriptor | None = None,
     ) -> Self:
-        _validate_pairing_urls(receiver_url, redeem_url)
+        if mailbox_bootstrap is None:
+            _validate_pairing_urls(receiver_url or "", redeem_url or "")
         if not invitation_secret.strip():
             raise ReceiverPairingBundleError(INVALID_PAYLOAD_MESSAGE)
         return cls(
@@ -136,6 +159,7 @@ class ReceiverPairingInvitationPayload(BaseModel):
             invitation_secret=invitation_secret,
             expires_at=expires_at,
             transport=transport,
+            mailbox_bootstrap=mailbox_bootstrap,
             mailbox_protocol_version=(
                 1 if transport is ReceiverTransport.MAILBOX else None
             ),
@@ -151,8 +175,11 @@ class ReceiverPairingInvitationBundle(BaseModel):
     schema_version: Literal["2.0.0"] = PAIRING_INVITATION_SCHEMA_VERSION
     invitation_id: str
     label: str
-    receiver_url: str
-    redeem_url: str
+    receiver_url: str | None
+    redeem_url: str | None
+    mailbox_bootstrap: BootstrapDescriptor | None = Field(
+        default=None, exclude_if=_exclude_missing_bootstrap
+    )
     invitation_secret: str
     invitation_code: str
     created_at: str
@@ -175,6 +202,7 @@ class ReceiverPairingInvitationBundle(BaseModel):
             invitation_secret=self.invitation_secret,
             expires_at=self.expires_at,
             transport=self.transport,
+            mailbox_bootstrap=self.mailbox_bootstrap,
         )
 
 
@@ -201,7 +229,7 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
     db_path: Path,
     *,
     label: str,
-    receiver_url: str,
+    receiver_url: str | None,
     transport: ReceiverTransport | Literal["direct", "mailbox"] = (
         ReceiverTransport.DIRECT
     ),
@@ -209,8 +237,15 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
     expires_in: timedelta | None = None,
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
+    mailbox_key_store: MailboxKeyStore | None = None,
 ) -> ReceiverPairingInvitationBundle:
     invitation_ttl = timedelta(minutes=20) if expires_in is None else expires_in
+    identity = (
+        (mailbox_key_store or MailboxKeyStore.production()).load_or_create()
+        if receiver_url is None
+        and ReceiverTransport(transport) is ReceiverTransport.MAILBOX
+        else None
+    )
     issued = create_pairing_invitation(
         db_path,
         label=label,
@@ -221,6 +256,17 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
         invitation_secret=invitation_secret,
         invitation_code=invitation_code,
     )
+    bootstrap = None
+    if identity is not None:
+        bootstrap = BootstrapDescriptor(
+            invitation_id=UUID(issued.invitation_id).hex,
+            receiver_signing_public_key=strict_base64url_encode(
+                identity.signing_public_key
+            ),
+            receiver_agreement_public_key=strict_base64url_encode(
+                identity.agreement_public_key
+            ),
+        )
     return ReceiverPairingInvitationBundle(
         invitation_id=issued.invitation_id,
         label=issued.label,
@@ -231,6 +277,7 @@ def create_receiver_pairing_invitation_bundle(  # noqa: PLR0913 - deterministic 
         created_at=issued.created_at,
         expires_at=issued.expires_at,
         transport=issued.transport,
+        mailbox_bootstrap=bootstrap,
         mailbox_protocol_version=(
             1 if issued.transport is ReceiverTransport.MAILBOX else None
         ),
@@ -277,7 +324,6 @@ def pairing_invitation_from_deep_link(
         invitation = ReceiverPairingInvitationPayload.model_validate_json(decoded)
     except (ValueError, ValidationError, json.JSONDecodeError) as exc:
         raise ReceiverPairingBundleError(INVALID_PAYLOAD_MESSAGE) from exc
-    _validate_pairing_urls(invitation.receiver_url, invitation.redeem_url)
     return invitation
 
 
