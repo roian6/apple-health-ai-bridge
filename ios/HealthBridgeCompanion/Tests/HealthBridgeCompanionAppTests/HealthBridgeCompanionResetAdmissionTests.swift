@@ -189,6 +189,14 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertTrue(fixture.recorder.payloads.isEmpty)
     }
 
+    func testIssue96PendingPayloadReadAllowsMainActor() async throws {
+        try await runIssue96PendingPayloadRead(invalidateFIFO: false)
+    }
+
+    func testIssue96PendingPayloadReadRejectsChangedFIFO() async throws {
+        try await runIssue96PendingPayloadRead(invalidateFIFO: true)
+    }
+
     func testIssue96AutomaticSleepFIFORetirementBlocksLane() async throws {
         let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }
@@ -2916,6 +2924,60 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         #endif
     }
 
+    private func runIssue96PendingPayloadRead(invalidateFIFO: Bool) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(addedSamples: [], deletedSamples: [],
+                anchorCursorValue: fixture.nextAnchor, receivedAt: Date()),
+            receiverSettingsGeneration: fixture.settings.receiverSettingsGenerationToken,
+            historyDepth: .allAvailable, historyStartDate: nil
+        ))
+        let pending = SleepSyncPendingTransition(
+            payload: try HealthBridgeBatchEncoder().encode(transition.batch),
+            manifest: transition.manifest,
+            receiverBindingID: try XCTUnwrap(fixture.settings.receiverBindingID),
+            connectionGeneration: fixture.settings.receiverSettingsGenerationToken
+        )
+        try fixture.sleep.savePendingTransition(pending)
+        let item = try fixture.outbox.enqueue(
+            pending.payload, receiverIdentity: pending.receiverBindingID
+        )
+        barrier.startDriver {
+            if invalidateFIFO {
+                _ = try fixture.outbox.enqueue(
+                    Data("{\"schema_id\":\"synthetic.concurrent-upload\"}".utf8),
+                    receiverIdentity: pending.receiverBindingID
+                )
+            }
+        }
+
+        let runtime = try await makeIssue96CodecRuntime(
+            fixture, store: fixture.sleep,
+            beforeBootstrap: { model in
+                model.observeSleepOutboxPayloadReadForTesting = { barrier.blockPreparation() }
+            }
+        )
+        try await barrier.joinDriver()
+        runtime.automaticSyncRuntime.stopAdmission()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+
+        XCTAssertTrue(barrier.observation().entered)
+        XCTAssertTrue(barrier.observation().actionBeforeRelease)
+        let retained = try XCTUnwrap(fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(retained.id, pending.id)
+        XCTAssertEqual(retained.outboxItemID, invalidateFIFO ? nil : item.id)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        XCTAssertEqual(try fixture.outbox.pendingItems().count, invalidateFIFO ? 2 : 1)
+        #endif
+    }
+
     private func runIssue96CodecCase(
         _ scenario: Issue96CodecCase,
         blocking: Bool,
@@ -3069,7 +3131,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         _ fixture: DirectSleepPreparationFixture,
         store: FileSleepSyncManifestStore,
         admissionClosed: @escaping @MainActor () -> Void = {},
-        terminalDrain: @escaping @MainActor () async -> Bool = { true }
+        terminalDrain: @escaping @MainActor () async -> Bool = { true },
+        beforeBootstrap: @MainActor (HealthBridgeCompanionViewModel) -> Void = { _ in }
     ) async throws -> HealthBridgeCompanionApplicationRuntime {
         PayloadFenceURLProtocol.networkRecorder = fixture.recorder
         let viewModel = try makeViewModel(
@@ -3094,6 +3157,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             scheduleDirectBackgroundUploads: { 0 },
             terminalBackgroundPayloadDrain: terminalDrain, platformBackgroundPayloadDrain: { true }
         )
+        beforeBootstrap(viewModel)
         await viewModel.bootstrap()
         await viewModel.waitForBootstrapAndForegroundWork()
         XCTAssertTrue(viewModel.canSyncSleep, "Synthetic Direct bootstrap must be ready.")
