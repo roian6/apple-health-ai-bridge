@@ -1,4 +1,6 @@
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +11,9 @@ from health_bridge.contract._delivery_common import b64encode
 from health_bridge.contract._hbjcs1 import hbjcs1_decode
 from health_bridge.contract.delivery_v1 import DevicePrincipal, OpaqueBinding
 from health_bridge.mailbox.connections import MailboxConnectionError
+from health_bridge.mailbox.publication import publish_final
+from health_bridge.receiver import invitations
+from health_bridge.receiver._mailbox_key_models import MailboxPrivateIdentity
 from health_bridge.receiver.delivery_acceptance import DeliveryAcceptanceService
 from health_bridge.receiver.invitations import PairingInvitationError
 from health_bridge.receiver.mailbox_bootstrap import (
@@ -18,11 +23,91 @@ from health_bridge.receiver.mailbox_bootstrap import (
     open_pairing_request,
     seal_pairing_request,
 )
+from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.mailbox_pairing import redeem_native_pairing
+from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
 from health_bridge.storage.database import connect_database
 from tests.receiver.delivery_acceptance_support import NOW_MS, counts
 from tests.receiver.native_pairing_support import LegacyPeer, stage_native
 from tests.receiver.test_mailbox_bootstrap import open_completion
+from tests.receiver.test_mailbox_cancellation import cancellation, publish_response
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_settled_worker_avoids_crypto_until_provider_inputs_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    # Given a genuinely authenticated, committed and published terminal response.
+    peer = LegacyPeer(tmp_path)
+    descriptor, request = stage_native(peer)
+    root = tmp_path / "provider"
+    directory = root / "pairing" / descriptor.invitation_id
+    directory.mkdir(parents=True)
+    _ = publish_final(directory, "request.hbp", request)
+    if cancelled:
+        _ = publish_final(
+            directory,
+            "cancel.hbp",
+            cancellation(request, descriptor.invitation_id, peer.device),
+        )
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publish_response,
+    )
+    worker.run_once()
+    private_acquisitions = 0
+    transactions: list[str] = []
+    original_private = MailboxKeyStore.private_identity
+
+    @contextmanager
+    def database(path: Path) -> Generator[sqlite3.Connection, None, None]:
+        with connect_database(path) as connection:
+            connection.set_trace_callback(transactions.append)
+            yield connection
+
+    def private_identity(store: MailboxKeyStore) -> MailboxPrivateIdentity:
+        nonlocal private_acquisitions
+        private_acquisitions += 1
+        return original_private(store)
+
+    monkeypatch.setattr(MailboxKeyStore, "private_identity", private_identity)
+    monkeypatch.setattr(invitations, "connect_database", database)
+    # When unchanged terminal invitations are observed in subsequent real cycles.
+    for _ in range(3):
+        worker.run_once()
+    # Then no repeated protocol crypto or helper publication occurs.
+    assert private_acquisitions == 0
+    assert not transactions
+    # Replaced request and response identities both require authentication again.
+    response_name = "cancelled.hbp" if cancelled else "completion.hbp"
+    for name in ("request.hbp", response_name):
+        content = (directory / name).read_bytes()
+        (directory / name).unlink()
+        _ = publish_final(directory, name, content)
+        private_acquisitions = 0
+        worker.run_once()
+        assert private_acquisitions > 0
+    # Changed files must leave the cache, including a cancel after completion.
+    receipt = (directory / response_name).read_bytes()
+    if not cancelled:
+        _ = publish_final(
+            directory,
+            "cancel.hbp",
+            cancellation(request, descriptor.invitation_id, peer.device),
+        )
+    else:
+        (directory / "cancel.hbp").unlink()
+        _ = publish_final(directory, "cancel.hbp", b"{}")
+    private_acquisitions = 0
+    worker.run_once()
+    assert private_acquisitions > 0
+    if not cancelled:
+        assert (directory / "cancelled.hbp").exists()
+    else:
+        assert (directory / response_name).read_bytes() == receipt
 
 
 @pytest.mark.parametrize(

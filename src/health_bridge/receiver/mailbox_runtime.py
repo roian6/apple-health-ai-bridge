@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -316,6 +317,14 @@ def _lane_signature(directory: MailboxDirectoryHandle) -> MailboxLaneSignature |
     return tuple(signature for signature in signatures if signature is not None)
 
 
+@dataclass(frozen=True, slots=True)
+class _SettledPairing:
+    request: FileIdentity
+    cancellation: FileIdentity | None
+    response: FileIdentity
+    directories: tuple[tuple[int, int], ...]
+
+
 @final
 class MailboxRuntimeWorker:
     def __init__(  # noqa: PLR0913 - explicit bounded worker policy inputs.
@@ -368,6 +377,8 @@ class MailboxRuntimeWorker:
         self._terminal_error: str | None = None
         self._idle_signatures: dict[Path, tuple[MailboxLaneSignature, float]] = {}
         self._confirmed_pairings: dict[str, FileIdentity] = {}
+        self._settled_pairings: dict[str, _SettledPairing] = {}
+        self._pairing_cursor = 0
 
     def _bootstrap_once(self) -> bool:
         native_rows: list[tuple[str, str | None]] = []
@@ -409,10 +420,21 @@ class MailboxRuntimeWorker:
                 for key, value in self._confirmed_pairings.items()
                 if key in active
             }
-            for invitation_id, _ in native_rows:
-                self._pair_native_invitation(
+            self._settled_pairings = {
+                key: value
+                for key, value in self._settled_pairings.items()
+                if key in active
+            }
+            for offset in range(len(native_rows)):
+                index = (self._pairing_cursor + offset) % len(native_rows)
+                invitation_id, _ = native_rows[index]
+                if self._pair_native_invitation(
                     invitation_id, self._pairing_keys, self._pairing_connections
-                )
+                ):
+                    # One protocol/helper attempt per cycle, including restart.
+                    # Round-robin avoids an invalid peer starving later rows.
+                    self._pairing_cursor = (index + 1) % len(native_rows)
+                    break
         return False
 
     def run_once(self) -> None:
@@ -494,11 +516,12 @@ class MailboxRuntimeWorker:
         invitation_id: str,
         keys: MailboxKeyStore,
         connections: MailboxConnectionStore,
-    ) -> None:
+    ) -> bool:
         component = UUID(invitation_id).hex
         root_fd = -1
         pairing_fd = -1
         invitation_fd = -1
+        attempted = False
         try:
             root_fd = open_directory(self._mailbox_root)
             pairing_fd = open_directory_at(root_fd, "pairing")
@@ -507,27 +530,55 @@ class MailboxRuntimeWorker:
                 invitation_fd, "request.hbp", maximum_bytes=MAX_PAIRING_BYTES
             )
             path = self._mailbox_root / "pairing" / component
+            directories = (
+                (self._mailbox_root, root_fd),
+                (self._mailbox_root / "pairing", pairing_fd),
+                (path, invitation_fd),
+            )
 
             def validate_request() -> None:
                 _validate_bootstrap_files(
-                    (
-                        (self._mailbox_root, root_fd),
-                        (self._mailbox_root / "pairing", pairing_fd),
-                        (path, invitation_fd),
-                    ),
+                    directories,
                     (invitation_fd, request.identity),
                 )
 
             identity = keys.load_or_create()
+            cancel = (
+                read_final_at(
+                    invitation_fd, "cancel.hbp", maximum_bytes=MAX_PAIRING_BYTES
+                )
+                if (path / "cancel.hbp").exists()
+                else None
+            )
+            cancellation_identity = None if cancel is None else cancel.identity
+            namespace = tuple(
+                (entry.st_dev, entry.st_ino)
+                for _, fd in directories
+                for entry in (os.fstat(fd),)
+            )
+            final_name = "completion.hbp" if cancel is None else "cancelled.hbp"
+            cached = self._settled_pairings.get(component)
+            validate_request()
+            if (
+                cached is not None
+                and cached.request == request.identity
+                and cached.cancellation == cancellation_identity
+                and cached.directories == namespace
+                and revalidate_final_at(invitation_fd, final_name, cached.response)
+            ):
+                _require_pairing_file(
+                    invitation_fd, "cancel.hbp", cancellation_identity
+                )
+                validate_request()
+                return False
+            _ = self._settled_pairings.pop(component, None)
+            attempted = True
             descriptor = BootstrapDescriptor(
                 invitation_id=component,
                 receiver_signing_public_key=b64encode(identity.signing_public_key),
                 receiver_agreement_public_key=b64encode(identity.agreement_public_key),
             )
-            if (path / "cancel.hbp").exists():
-                cancel = read_final_at(
-                    invitation_fd, "cancel.hbp", maximum_bytes=MAX_PAIRING_BYTES
-                )
+            if cancel is not None:
 
                 def validate_cancel() -> None:
                     validate_request()
@@ -541,34 +592,32 @@ class MailboxRuntimeWorker:
                     keys,
                     validate_request=validate_cancel,
                 )
-                self._publish_pairing_response(
-                    path,
-                    invitation_fd,
-                    response,
-                    validate_cancel,
-                    final_name="cancelled.hbp",
-                )
-                return
+                validate_publication = validate_cancel
+            else:
 
-            def validate_registration() -> None:
-                validate_request()
-                _require_no_cancel(
-                    path, invitation_fd, request.content, descriptor, keys
-                )
+                def validate_registration() -> None:
+                    validate_request()
+                    _require_no_cancel(
+                        path, invitation_fd, request.content, descriptor, keys
+                    )
 
-            response = redeem_native_pairing(
-                self._db_path,
-                request.content,
-                descriptor,
-                (keys, connections),
-                validate_request=validate_registration,
-            )
-            self._publish_pairing_response(
+                response = redeem_native_pairing(
+                    self._db_path,
+                    request.content,
+                    descriptor,
+                    (keys, connections),
+                    validate_request=validate_registration,
+                )
+                validate_publication = validate_request
+            published = self._publish_pairing_response(
                 path,
                 invitation_fd,
                 response,
-                validate_request,
-                final_name="completion.hbp",
+                validate_publication,
+                final_name=final_name,
+            )
+            self._settled_pairings[component] = _SettledPairing(
+                request.identity, cancellation_identity, published, namespace
             )
         except (
             OSError,
@@ -583,7 +632,9 @@ class MailboxRuntimeWorker:
             MailboxConnectionError,
             ValueError,
         ):
-            return
+            return attempted
+        else:
+            return True
         finally:
             for descriptor_fd in (invitation_fd, pairing_fd, root_fd):
                 if descriptor_fd >= 0:
@@ -597,18 +648,17 @@ class MailboxRuntimeWorker:
         validate: Callable[[], None],
         *,
         final_name: str,
-    ) -> None:
+    ) -> FileIdentity:
         validate()
         if (path / final_name).exists():
             published = read_final_at(
                 invitation_fd, final_name, maximum_bytes=MAX_PAIRING_BYTES
             )
             validate()
-            if (
-                published.content != response
-                or self._confirmed_pairings.get(path.name) == published.identity
-            ):
-                return
+            if published.content != response:
+                raise NativePairingError
+            if self._confirmed_pairings.get(path.name) == published.identity:
+                return published.identity
         publisher = (
             self._pairing_publisher or default_native_ack_publisher().publish_pairing
         )
@@ -617,7 +667,11 @@ class MailboxRuntimeWorker:
         published = read_final_at(
             invitation_fd, final_name, maximum_bytes=MAX_PAIRING_BYTES
         )
+        validate()
+        if published.content != response:
+            raise NativePairingError
         self._confirmed_pairings[path.name] = published.identity
+        return published.identity
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -716,6 +770,14 @@ def _require_no_cancel(
         raise NativePairingError
 
 
-def _require_pairing_file(directory_fd: int, name: str, identity: FileIdentity) -> None:
+def _require_pairing_file(
+    directory_fd: int, name: str, identity: FileIdentity | None
+) -> None:
+    if identity is None:
+        try:
+            _ = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise MailboxDiscoveryError(MailboxDiscoveryErrorCode.NAMESPACE_DETACHED)
     if not revalidate_final_at(directory_fd, name, identity):
         raise MailboxDiscoveryError(MailboxDiscoveryErrorCode.NAMESPACE_DETACHED)

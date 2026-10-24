@@ -41,6 +41,58 @@ def publish_response(directory: Path, content: bytes) -> None:
     _ = publish_final(directory, name, content)
 
 
+@pytest.mark.parametrize("restarted", [False, True])
+def test_native_bootstrap_bounds_helper_work_across_restart(
+    tmp_path: Path, restarted: bool
+) -> None:
+    # Given two authenticated cancellations, including a superseded invitation.
+    peer = LegacyPeer(tmp_path)
+    root = tmp_path / "provider"
+    for _ in range(2):
+        descriptor, request = stage_native(peer)
+        directory = root / "pairing" / descriptor.invitation_id
+        directory.mkdir(parents=True)
+        _ = publish_final(directory, "request.hbp", request)
+        _ = publish_final(
+            directory,
+            "cancel.hbp",
+            cancellation(request, descriptor.invitation_id, peer.device),
+        )
+    publications: list[bytes] = []
+
+    def publish(path: Path, content: bytes) -> None:
+        publications.append(content)
+        publish_response(path, content)
+
+    if restarted:
+        previous = MailboxRuntimeWorker(
+            db_path=peer.db,
+            mailbox_root=root,
+            pairing_keys=peer.receiver,
+            pairing_connections=peer.connections,
+            pairing_publisher=publish,
+        )
+        previous.run_once()
+        previous.run_once()
+        assert len(publications) == 2
+        publications.clear()
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publish,
+    )
+    # When one real bootstrap cycle runs, even after losing in-memory receipts.
+    worker.run_once()
+    # Then at most one slow native publication is attempted in that cycle.
+    assert len(publications) == 1
+    worker.run_once()
+    assert len(publications) == 2
+    worker.run_once()
+    assert len(publications) == 2
+
+
 @pytest.mark.parametrize("committed", [False, True])
 def test_cancellation_revokes_exact_request_across_restart(
     tmp_path: Path, committed: bool
