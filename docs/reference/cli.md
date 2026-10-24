@@ -48,6 +48,13 @@ examples. Remove your temporary directory when finished.
 | `health-bridge status` | `--db PATH`; optional `--json`, `--markdown`, `--output PATH` | Default: table counts and `last_sync_status`, plus `last_sync_error` when present. JSON is the [MCP status model](mcp.md#get_bridge_status); Markdown is its context rendering. JSON/Markdown are mutually exclusive. `--output` requires one and writes it to a file, printing `wrote: PATH`. |
 | `health-bridge setup` | Options below | Initializes local onboarding, creates a private pairing page, verifies local MCP, and emits a human-readable summary or `--json` manifest. Does not start the receiver. |
 
+Migration `012_catalogue_coverage_index` builds a samples covering index for
+catalogue counts and timestamp bounds. Upgrading a populated database needs
+additional disk space for the index and temporary build files. Initialization,
+including the first ingest after upgrade, builds it synchronously and can wait
+for readers or writers. Repeated initialization does not rebuild it. Read-only
+queries can still read an unmigrated database without creating the index.
+
 Setup options:
 
 | Option | Type/default and purpose |
@@ -84,7 +91,7 @@ catalog require `--db PATH`.
 
 | Command | Additional inputs | Output |
 | --- | --- | --- |
-| `health-bridge query synced-metrics` | None | `list_synced_metrics`: local catalog and counts. |
+| `health-bridge query synced-metrics` | None | `list_synced_metrics`: all retained record counts, per-metric bounds, nullable `stored_coverage` record extents, and separate nullable `latest_sync_window` batch metadata. Legacy `period` is preserved and deprecated; see the MCP reference for coverage limitations. |
 | `health-bridge query supported-timeseries-types` | Optional `--category STRING`, exact case-sensitive filter; no DB required | `list_supported_timeseries_types`: support/aggregation catalog. |
 | `health-bridge query timeseries` | `--types STRING` (comma-separated codes), `--start-time STRING`, `--end-time STRING` | `get_timeseries`: at most 500 stored points. Spaces around type codes and empty comma entries are removed. |
 | `health-bridge query workouts` | `--start-date STRING`, `--end-date STRING` | `get_workouts`: at most 500 sessions. |

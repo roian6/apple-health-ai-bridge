@@ -211,9 +211,14 @@ MCP_TOOL_DEFINITIONS: Final[tuple[ToolDefinition, ...]] = (
     ToolDefinition(
         name="list_synced_metrics",
         description=(
-            "Read-only local metric catalog with record counts, units, sensitivity, "
-            "and source provenance. Use to discover stored types before querying; "
-            "catalog entries can have zero records. Use get_workouts and "
+            "Read-only local metric catalog with all-retained-record counts, "
+            "per-metric first_record_start/latest_record_end, units, sensitivity, "
+            "and source provenance. Takes no date filter. stored_coverage gives "
+            "retained record extents, not continuous coverage or completeness; "
+            "latest_sync_window separately describes the most recently ingested "
+            "successful batch with complete window metadata. period is deprecated "
+            "legacy metadata. Catalog entries can have zero records and null "
+            "extents. Use get_workouts and "
             "get_sleep_summary for workout and sleep_analysis sessions. Missing "
             "records mean unknown availability, not zero activity."
         ),
