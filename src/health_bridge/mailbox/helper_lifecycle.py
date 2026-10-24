@@ -596,6 +596,7 @@ def _validate_archive_members(package: zipfile.ZipFile) -> tuple[zipfile.ZipInfo
             or path.is_absolute()
             or any(part in {"", ".", ".."} for part in path.parts)
             or any(part.endswith((".", " ")) for part in path.parts)
+            or any(part.startswith("._") or part == "__MACOSX" for part in path.parts)
             or path.parts[0] != HELPER_APP_NAME
             or canonical in seen
             or (file_type not in {0, stat.S_IFREG, stat.S_IFDIR})
