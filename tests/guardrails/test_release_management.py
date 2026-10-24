@@ -258,7 +258,7 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "--repo",
         str(ROOT),
         "--tag",
-        "receiver-v1.1.3",
+        "receiver-v1.1.4",
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -266,9 +266,9 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     assert output.model_dump() == {
         "ios_build": _current_ios_build(),
         "ios_marketing_version": "1.1.1",
-        "project_version": "1.1.3",
+        "project_version": "1.1.4",
         "release_scope": "receiver",
-        "tag": "receiver-v1.1.3",
+        "tag": "receiver-v1.1.4",
     }
 
 
@@ -370,7 +370,7 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "version": "1.0.0",
         },
         "ios_companion": {"build": "50", "marketing_version": "1.1.1"},
-        "receiver_cli": {"release_tag": "receiver-v1.1.3", "version": "1.1.3"},
+        "receiver_cli": {"release_tag": "receiver-v1.1.4", "version": "1.1.4"},
         "release_scope": "receiver",
         "schema_id": "health_bridge.component_versions.v1",
     }
@@ -433,7 +433,7 @@ def test_release_validate_rejects_noncanonical_or_mismatched_tag(tag: str) -> No
 
     assert completed.returncode == 1
     assert completed.stdout == ""
-    assert "receiver-v1.1.3" in completed.stderr
+    assert "receiver-v1.1.4" in completed.stderr
 
 
 def test_receiver_and_ios_semver_order_does_not_define_compatibility(
@@ -1174,8 +1174,8 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
     for content, name, expected_tag in (
-        (readme, "README.md", "receiver-v1.1.2"),
-        (setup, "docs/setup.md", "receiver-v1.1.3"),
+        (readme, "README.md", "receiver-v1.1.4"),
+        (setup, "docs/setup.md", "receiver-v1.1.4"),
     ):
         pins = re.findall(
             r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)',
@@ -1197,7 +1197,7 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
 
     assert re.search(r"\]\(setup\.md(?:#[^)]+)?\)", self_build)
     assert "(icloud-mailbox-service.md)" in setup
-    release_notes_path = ROOT / ".github/release/notes-receiver-v1.1.3.md"
+    release_notes_path = ROOT / ".github/release/notes-receiver-v1.1.4.md"
     assert release_notes_path.is_file()
     release_notes = release_notes_path.read_text(encoding="utf-8")
     expected_assets = set(re.findall(r"^- `([^`]+)`[.;]?", release_notes, re.MULTILINE))
@@ -1211,12 +1211,12 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     assert downloaded_assets == expected_assets
     assert set(
         re.findall(r"apple_health_ai_bridge-[\w.]+-py3-none-any\.whl", mailbox)
-    ) == {"apple_health_ai_bridge-1.1.3-py3-none-any.whl"}
+    ) == {"apple_health_ai_bridge-1.1.4-py3-none-any.whl"}
     assert set(
         re.findall(
             r"HealthBridgeMailboxAckPublisher-[\d.]+(?:zip|manifest\.json)", mailbox
         )
     ) == {
-        "HealthBridgeMailboxAckPublisher-1.1.3.zip",
-        "HealthBridgeMailboxAckPublisher-1.1.3.manifest.json",
+        "HealthBridgeMailboxAckPublisher-1.1.4.zip",
+        "HealthBridgeMailboxAckPublisher-1.1.4.manifest.json",
     }

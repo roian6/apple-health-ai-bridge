@@ -42,12 +42,12 @@ def test_current_receiver_preserves_ios_1_1_1_build_50() -> None:
         / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
     ).read_text()
 
-    assert project["version"] == "1.1.3"
-    assert '__version__: Final = "1.1.3"' in package_init
-    assert server["version"] == "1.1.3"
-    assert receiver == {"release_tag": "receiver-v1.1.3", "version": "1.1.3"}
+    assert project["version"] == "1.1.4"
+    assert '__version__: Final = "1.1.4"' in package_init
+    assert server["version"] == "1.1.4"
+    assert receiver == {"release_tag": "receiver-v1.1.4", "version": "1.1.4"}
     assert component_versions["release_scope"] == "receiver"
-    assert helper_info["CFBundleShortVersionString"] == "1.1.3"
+    assert helper_info["CFBundleShortVersionString"] == "1.1.4"
     assert helper_info["CFBundleVersion"] == "1"
     assert ios == {"build": "50", "marketing_version": "1.1.1"}
     assert ios_project.count("MARKETING_VERSION = 1.1.1;") == 2
@@ -63,7 +63,7 @@ def test_current_receiver_lock_matches_project_version() -> None:
     packages = [package for package in lock.package if package.name == project.name]
 
     assert len(packages) == 1
-    assert packages[0].version == project.version == "1.1.3"
+    assert packages[0].version == project.version == "1.1.4"
 
 
 def test_receiver_1_1_1_release_notes_are_receiver_only_and_helper_bound() -> None:
