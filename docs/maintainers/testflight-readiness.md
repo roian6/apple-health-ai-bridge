@@ -1,8 +1,8 @@
 # TestFlight Readiness
 
-This maintainer checklist helps prepare an official TestFlight beta for Apple Health AI Bridge. Keep account-owned App Store Connect, signing, reviewer, support, and demo receiver material outside the public repository until it is intentionally published.
+This reusable maintainer checklist helps prepare an official TestFlight beta for Apple Health AI Bridge. The App Store is the normal iPhone installation path. TestFlight is a beta distribution path, and source-build remains separate for contributors and developers. Keep account-owned App Store Connect, signing, reviewer, support, and demo receiver material outside the public repository until it is intentionally published.
 
-For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (39)` candidate must pass external Beta App Review and its Public Link must be anonymously verified before the matching Receiver/CLI `receiver-v1.1.0` release and install surface are announced. Batch Protocol remains `health_bridge.batch.v1 (1.0.0)`. Self-build remains supported, but it does not bypass this release-order gate for the official surfaces.
+Keep public install surfaces on the latest published compatible release while a candidate is in review. Do not announce a TestFlight candidate or update its public link until the matching build has passed external Beta App Review and the release packet is ready. Assign the approved build to its intended external group only at cutover, then verify its Public Link anonymously. Self-build remains supported as a separate developer path and does not bypass the release gates for official surfaces.
 
 ## What the public repository may contain
 
@@ -27,7 +27,7 @@ For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (39)` candidat
 
 ### Account and identity
 
-- [ ] The coordinated identity is iOS Companion `1.1.0 (39)`, Receiver/CLI `1.1.0` at `receiver-v1.1.0`, and Batch Protocol `health_bridge.batch.v1 (1.0.0)`.
+- [ ] Record the candidate's iOS Companion version and build, Receiver/CLI version and tag, and Batch Protocol version in the private release packet. Confirm they match the declared release scope and compatibility notes.
 - [ ] Apple Developer Program membership is active.
 - [ ] Individual vs organization seller path is decided.
 - [ ] App Store Connect access is available.
@@ -56,7 +56,7 @@ For the coordinated 1.1.0 release, the exact iOS Companion `1.1.0 (39)` candidat
 - [ ] Receiver disconnect and queued-data handling are understandable.
 - [ ] Direct is described as the default transport with no automatic fallback.
 - [ ] Encrypted iCloud Mailbox is described as an explicit opt-in, Mac-only Beta using application-layer encryption, a user-owned iCloud container and receiver, signed ACK/commit semantics, and an optional per-user macOS LaunchAgent.
-- [ ] Receiver/CLI `1.1.0` remains unpublished until a newly built exact-source signed ACK helper, public manifest, and final helper-inclusive `SHA256SUMS` pass the two-phase release workflow.
+- [ ] For a Receiver/CLI release, confirm the matching exact-source signed helper, public manifest, signing and notarization checks, eight-asset packet, checksums, and both provenance bundles pass the release criteria before publication. An iOS-only checkpoint keeps the compatible published Receiver/CLI release.
 
 ### Demo and reviewer access
 
@@ -110,16 +110,18 @@ Then use the private signing/archive flow for TestFlight upload.
 
 When code changes after an approved beta build, prepare a new candidate rather than treating the old approval as validation of the new tree:
 
-1. keep the same marketing version while the first App Store version is still unreleased, unless release scope deliberately changes;
+1. choose the marketing version for the intended release scope;
 2. increment to a unique App Store Connect build number;
 3. rerun Swift, simulator, unsigned iPhoneOS, archive, and artifact readback gates;
 4. upload and verify processing against the exact source commit;
 5. expect the new build to require its own external Beta App Review before external testers can use it.
 
-## Public wording after TestFlight exists
+## Public install guidance
 
-Safe README wording after intentional publication:
+Direct ordinary users to the current App Store release and the project's install
+status page. Advertise a TestFlight beta only after its approval, group assignment,
+and anonymous Public Link checks pass.
 
-> Official TestFlight beta is available as a convenience install path. The source code remains open, and self-build remains supported for developers who prefer to run their own build.
-
-Avoid implying that TestFlight is required for the open-source code path or that a future paid/App Store build hides core source code.
+Use the exact iOS Companion version/build and Receiver/CLI compatibility from the
+release packet, not a copied historical example. Keep self-build documented as a
+separate contributor path, and do not describe source validation as distribution approval.

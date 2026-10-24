@@ -38,7 +38,7 @@ def run_documented_proof(
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Exercise the actual docs in Bash; stubs test control flow, not signatures."""
     document = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
-    section = document.split("## Downloadable proof for future releases\n", 1)[1]
+    section = document.split("## Verify published release provenance\n", 1)[1]
     snippet = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
     controls = tmp_path / "shell-controls"
     controls.mkdir()
