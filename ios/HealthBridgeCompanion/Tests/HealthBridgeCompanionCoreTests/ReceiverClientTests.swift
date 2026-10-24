@@ -3,6 +3,9 @@ import Foundation
 import FoundationNetworking
 #endif
 import XCTest
+#if canImport(ObjectiveC)
+import ObjectiveC
+#endif
 @testable import HealthBridgeCompanionCore
 
 final class ReceiverClientTests: XCTestCase {
@@ -17,6 +20,89 @@ final class ReceiverClientTests: XCTestCase {
         XCTAssertFalse(configuration.waitsForConnectivity)
         XCTAssertEqual(configuration.timeoutIntervalForRequest, 120)
         XCTAssertEqual(configuration.timeoutIntervalForResource, 3_600)
+    }
+
+    #if canImport(ObjectiveC)
+    func testOwnedSessionReleasesDelegateWhenClientIsReleased() async throws {
+        let released = expectation(description: "Owned session released its delegate")
+        var client: ReceiverClient? = ReceiverClient()
+        let session = try XCTUnwrap(Mirror(reflecting: try XCTUnwrap(client)).children
+            .compactMap { $0.value as? URLSession }.first)
+        defer { session.invalidateAndCancel() }
+        try autoreleasepool {
+            let delegate = try XCTUnwrap(session.delegate)
+            objc_setAssociatedObject(
+                delegate, Unmanaged.passUnretained(released).toOpaque(),
+                ReceiverSessionReleaseObserver { released.fulfill() }, .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+            )
+        }
+
+        client = nil
+
+        await fulfillment(of: [released], timeout: 5)
+    }
+    #endif
+
+    func testInjectedSessionRemainsUsableAfterClientIsReleased() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        var client: ReceiverClient? = ReceiverClient(session: session)
+        XCTAssertNotNil(client)
+        client = nil
+        MockURLProtocol.requestHandler = { request in
+            MockURLProtocolResponse(
+                response: try XCTUnwrap(HTTPURLResponse(
+                    url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )),
+                body: Data()
+            )
+        }
+
+        let (_, response) = try await session.data(from: XCTUnwrap(URL(string: "https://synthetic.example/health")))
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+    }
+
+    func testNutritionSupportRequiresRecognizedResponseHeaders() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = ReceiverClient(session: session)
+        let cases: [([String: String], NutritionSupport)] = [
+            (["Content-Type": "application/json", "Cache-Control": "no-store"], .supported),
+            ([:], .unknown),
+            (["Content-Type": "text/html", "Cache-Control": "no-store"], .unknown),
+            (["Content-Type": "application/json"], .unknown),
+            (["Content-Type": "application/json", "Cache-Control": "max-age=60"], .unknown),
+            (["Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"], .unknown),
+        ]
+        for (headers, expected) in cases {
+            MockURLProtocol.requestHandler = { request in
+                XCTAssertEqual(request.httpMethod, "GET")
+                XCTAssertEqual(request.url?.absoluteString, "https://synthetic.example/v1/capabilities")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer synthetic-token")
+                XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+                return MockURLProtocolResponse(
+                    response: try XCTUnwrap(HTTPURLResponse(
+                        url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil,
+                        headerFields: headers
+                    )),
+                    body: Data("""
+                    {"schema_id":"health_bridge.receiver_capabilities.v1",
+                     "batch_schema_id":"health_bridge.batch.v1","nutrition_supported":true}
+                    """.utf8)
+                )
+            }
+            let support = await client.nutritionSupport(
+                forBatchURL: try XCTUnwrap(URL(string: "https://synthetic.example/v1/batches?drop=true#drop")),
+                bearerToken: "synthetic-token"
+            )
+            XCTAssertEqual(support, expected, "\(headers)")
+        }
     }
 
     func testRedirectPolicyAllowsOnlyTheConfiguredOrigin() throws {
@@ -1258,6 +1344,18 @@ final class ReceiverClientTests: XCTestCase {
         return ReceiverClient(session: URLSession(configuration: configuration))
     }
 }
+
+#if canImport(ObjectiveC)
+private final class ReceiverSessionReleaseObserver {
+    private let onRelease: () -> Void
+
+    init(_ onRelease: @escaping () -> Void) {
+        self.onRelease = onRelease
+    }
+
+    deinit { onRelease() }
+}
+#endif
 
 private let validInvitationJSON = """
 {

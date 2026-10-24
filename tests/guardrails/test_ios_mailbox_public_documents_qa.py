@@ -74,6 +74,25 @@ def _source_members(project: str, target_name: str) -> set[str]:
     return members
 
 
+def test_source_phases_do_not_share_build_file_objects() -> None:
+    project = PROJECT.read_text(encoding="utf-8")
+    phases = cast(
+        "list[str]",
+        re.findall(
+            r"isa = PBXSourcesBuildPhase;.*?files = \((.*?)\);",
+            project,
+            re.DOTALL,
+        ),
+    )
+    assert phases
+    build_files = [
+        build_file
+        for phase in phases
+        for build_file in cast("list[str]", re.findall(r"\b[A-F0-9]{24}\b", phase))
+    ]
+    assert len(build_files) == len(set(build_files))
+
+
 def test_public_documents_build_and_install_guards_use_exact_lane_tuple() -> None:
     build = BUILD_GUARD.read_text(encoding="utf-8")
     install = INSTALL_GUARD.read_text(encoding="utf-8")

@@ -741,11 +741,12 @@ def test_receiver_suppresses_default_socketserver_traceback_for_unexpected_error
         "authenticate_receiver_token_principal",
         fail_unexpectedly,
     )
+    # The injected failure precedes body reads; unread body bytes can cause TCP RST.
     with running_receiver(db_path) as origin, pytest.raises(RemoteDisconnected):
         _ = open_http_response(
             Request(
                 f"{origin}/v1/batches",
-                data=b"{}",
+                data=b"",
                 headers={"Authorization": "Bearer synthetic-invalid-token"},
                 method="POST",
             )
