@@ -28,7 +28,63 @@ from health_bridge.storage.database import (
     initialize_database,
 )
 from tests.receiver.delivery_acceptance_support import NOW_MS
-from tests.receiver.native_pairing_support import LegacyPeer
+from tests.receiver.native_pairing_support import LegacyPeer, stage_native
+
+
+def test_bootstrap_worker_retries_real_sqlite_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given a real rollback-journal EXCLUSIVE writer and the real bootstrap reader.
+    peer = LegacyPeer(tmp_path)
+    _ = stage_native(peer)
+    root = tmp_path / "provider"
+    root.mkdir()
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        poll_interval_seconds=0.01,
+    )
+    attempted, resume, recovered = Event(), Event(), Event()
+    failures: list[OSError | sqlite3.Error] = []
+    run_once = worker.run_once
+
+    def observe_cycle() -> None:
+        first = not attempted.is_set()
+        try:
+            run_once()
+            if not first:
+                recovered.set()
+        except (OSError, sqlite3.Error) as exc:
+            failures.append(exc)
+            raise
+        finally:
+            if first:
+                attempted.set()
+                assert resume.wait(5), "test did not release the contended cycle"
+
+    monkeypatch.setattr(worker, "run_once", observe_cycle)
+    try:
+        with connect_database(peer.db) as writer:
+            _ = writer.execute("begin exclusive")
+            # When a real worker cycle exceeds the SQLite reader's busy timeout.
+            worker.start()
+            assert attempted.wait(5), "worker did not attempt the locked read"
+            # Then the original SQLite busy code survives the query wrapper.
+            assert len(failures) == 1
+            failure = failures[0]
+            assert isinstance(failure, sqlite3.OperationalError)
+            assert failure.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            writer.rollback()
+        resume.set()
+        assert recovered.wait(5), "worker did not recover after contention ended"
+    finally:
+        resume.set()
+        stopped = worker.stop()
+    assert stopped
+    assert not worker.terminal_error()
+    assert worker.health_error() is None
 
 
 def test_bootstrap_shared_read_coexists_with_writer(tmp_path: Path) -> None:

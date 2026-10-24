@@ -211,4 +211,8 @@ def connect_live_readonly_database(
     except DatabaseReadError as exc:
         if isinstance(exc.__cause__, BlockingIOError):
             raise exc.__cause__ from exc
+        if isinstance(exc.__cause__, sqlite3.OperationalError) and getattr(
+            exc.__cause__, "sqlite_errorcode", None
+        ) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            raise exc.__cause__ from exc
         raise
