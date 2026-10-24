@@ -87,7 +87,7 @@ publication. This obligation applies prospectively; it does not assert that thes
 analyses ran for historical immutable releases.
 
 1. collect merged work labeled `release-note` or `breaking-change`;
-2. update each changed authoritative version source, `component-versions.json`, and release notes in one reviewed pull request;
+2. update each changed authoritative version source, `component-versions.json`, and release notes drafted from the [release notes template](../.github/release/release-notes-template.md) in one reviewed pull request;
 3. state the exact compatible iOS Companion version/build and exact compatible Batch Protocol schema identifier/version in the release notes;
 4. run the full public, Python, and iOS gates;
 5. create a signed annotated component-scoped tag for the exact approved default-branch commit;

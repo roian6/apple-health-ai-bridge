@@ -6,6 +6,11 @@ The App Store is the normal iPhone installation path. TestFlight is for beta
 distribution, and source-build remains a separate path for contributors and
 developers.
 
+Prepare future Receiver/CLI notes with the
+[release notes template](release-notes-template.md). Keep the release scope,
+component compatibility, and published notes body aligned with the versioned
+source and the checks below.
+
 A coordinated release is a cutover, not a source-only preview. Before announcing the new GitHub Release or updating the official website install surface, the matching signed iOS build must pass external Beta App Review. The tagged-release workflow separately validates an annotated GitHub-verified tag and commit, reruns the exact-tag Python and iOS source gates, creates an attested helper-pending draft with the wheel, sdist, and source-bound metadata, and deliberately does not publish it. The bound manual continuation publishes only after the owner supplies the newly signed exact-source helper and public manifest. Keep version-specific public surfaces on HOLD until the signed iOS candidate, exact helper, GitHub Release, and coordinated cutover checks below all pass; verify the Public Link anonymously immediately after the approved build is intentionally assigned.
 
 A private TestFlight candidate may be archived, uploaded, assigned to a private tester group, and submitted for external Beta App Review before the public tag only when the private release packet records the exact source commit and tree, signed archive metadata and checksum, complete source/package gates, and real-device smoke evidence. This validation does not authorize a public TestFlight link, App Store submission, GitHub Release, or website cutover. Before any version-specific public action, verify the final reviewed snapshot against the approved signed candidate, confirm external approval, publish the required checksums and provenance, and then verify anonymous Public Link access after assignment.

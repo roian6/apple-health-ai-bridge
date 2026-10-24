@@ -27,7 +27,7 @@
 
 - [ ] User-visible change; add the `release-note` label after maintainer triage.
 - [ ] No user-visible release note required.
-- [ ] Release-facing changes name Receiver/CLI, iOS Companion version/build, Batch Protocol, and `release_scope` independently; historical notes remain unchanged.
+- [ ] For release-facing changes, use the [release notes template](release/release-notes-template.md) and state exact component compatibility; historical notes remain unchanged.
 
 ## Breaking change
 
