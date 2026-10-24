@@ -38,15 +38,14 @@ Use GitHub issues with one report per issue:
 - **iPhone app**: App Store, TestFlight, or self-build installation, pairing, Health permission, foreground sync, and recovery states.
 - **Docs/positioning**: unclear privacy boundary, misleading wording, missing caveats.
 
-## Feedback template
+## Share feedback
 
-```text
-Flow: README / synthetic quickstart / MCP config / receiver / pairing / permission / sync / recovery / docs
-Environment: OS, Python version, uv version, MCP client, iOS/Xcode/TestFlight if relevant
-What I tried:
-Expected:
-Actual visible text or command output:
-Sensitive data included: no
-```
+Choose the matching form from the [GitHub issue forms](https://github.com/roian6/apple-health-ai-bridge/issues/new/choose).
+Use the setup feedback form for setup or sync friction, and the bug or feature
+forms for reproducible problems or proposals. Check existing issues before
+starting work.
 
-Do not include real HealthKit values, exports, receiver DBs, setup pages, pairing links, bearer tokens, token hashes, cursor values, outbox payloads, private receiver endpoints, or screenshots with health values.
+Use synthetic or redacted examples only. Never include real HealthKit values or
+exports, receiver databases, setup-page contents, pairing links, tokens, token
+hashes, cursor values, outbox payloads, private receiver endpoints, or
+screenshots with health values.

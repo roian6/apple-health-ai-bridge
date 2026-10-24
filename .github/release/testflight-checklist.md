@@ -93,22 +93,23 @@ Then use the private signing/archive flow for TestFlight upload.
 
 ### Fresh-user physical gate
 
-- [ ] This is a clean uninstall/reinstall run, not an upgrade install or private-state reset.
-- [ ] Bundle absence was verified before installing the sealed candidate.
-- [ ] First launch showed **Not Connected** with no saved receiver, pending pairing, recovery banner, or queued upload before any setup payload was delivered.
-- [ ] The exact advertised `/health` URL was reachable from the iPhone's active LAN or VPN route.
-- [ ] Pairing used the setup-page QR and iPhone Camera; `devicectl --payload-url` was not used.
-- [ ] The app was not relaunched between Camera handoff and pairing commit.
-- [ ] Receiver baseline and final aggregate evidence show exactly one invitation redemption and one active mapped credential.
-- [ ] Native Local Network and Apple Health permission prompts were exercised by a human.
-- [ ] First sync used **All** history and was allowed to finish while progressing, without an outer operation timeout; **Cancel** preserved already queued uploads.
-- [ ] First sync and unchanged-data idempotence produced the required sync-run/accepted-batch deltas with zero duplicate device, credential, and record identities.
-- [ ] Receiver-offline **Sync Now** returned within eight seconds (five-second preflight plus at most three seconds scheduling overhead), without Health collection, enqueue, or per-lane upload attempts.
-- [ ] A separate mid-transfer outage created a durable queue, preserved it across background/foreground, and same-receiver recovery drained it to zero without duplicates.
-- [ ] **Check Connection** performed no durable synthetic write.
-- [ ] The report labels whether Keychain freshness was proven on a never-installed/erased device or remains unproven on a container-clean device.
-- [ ] If Linux is under test, receiver PID/database/request/redemption/ingest evidence remained Linux-owned; a Mac-hosted receiver was not substituted.
-- [ ] `scripts/validate-fresh-device-evidence.py` returned PASS using independently computed expected source-tree, app-executable, and receiver-executable hashes; the strict private aggregate evidence file was not committed.
+The detailed procedure, evidence fields, and validator requirements are in
+[`docs/qa/public-release-qa.md`](../../docs/qa/public-release-qa.md). Before
+cutover, confirm a clean uninstall/reinstall, absent bundle, and empty
+**Not Connected** first launch; verify the advertised `/health` route, scan the
+setup-page QR with the iPhone Camera, and do not relaunch before pairing commits.
+`devicectl --payload-url` was not used. Exercise native permission prompts and
+record exactly one invitation redemption and one active mapped credential.
+
+Complete **All** history sync and unchanged-data idempotence with zero duplicate
+device, credential, and record identities. Receiver-offline **Sync Now** must
+finish within eight seconds, without Health collection, enqueue, or per-lane
+upload attempts. Separately verify durable mid-transfer queue recovery to zero
+against the same receiver and a write-free **Check Connection**. Label whether
+Keychain freshness is proven or remains `container-clean, keychain freshness
+unproven`. Run `scripts/validate-fresh-device-evidence.py` with independently
+computed expected hashes; keep the strict aggregate evidence private. Checklist
+prose is not release evidence.
 
 When code changes after an approved beta build, prepare a new candidate rather than treating the old approval as validation of the new tree:
 
