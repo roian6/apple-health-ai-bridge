@@ -287,6 +287,7 @@ public final class ReceiverClient: @unchecked Sendable {
     private static let uploadStallTimeout: TimeInterval = 120
     private static let uploadResourceTimeout: TimeInterval = 3_600
     private let session: URLSession
+    private let ownsSession: Bool
 
     public static func foregroundSessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.default
@@ -297,11 +298,18 @@ public final class ReceiverClient: @unchecked Sendable {
     }
 
     public init(session: URLSession? = nil) {
+        ownsSession = session == nil
         self.session = session ?? URLSession(
             configuration: Self.foregroundSessionConfiguration(),
             delegate: ReceiverURLSessionRedirectDelegate(),
             delegateQueue: nil
         )
+    }
+
+    deinit {
+        if ownsSession {
+            session.invalidateAndCancel()
+        }
     }
 
     public static func healthURL(forBatchURL batchURL: URL) -> URL {
@@ -346,7 +354,9 @@ public final class ReceiverClient: @unchecked Sendable {
         do {
             let (data, response) = try await session.data(for: request)
             guard !Task.isCancelled, let http = response as? HTTPURLResponse,
-                  http.statusCode == 200, http.url == url else { return .unknown }
+                  http.statusCode == 200, http.url == url,
+                  http.value(forHTTPHeaderField: "Content-Type") == "application/json",
+                  http.value(forHTTPHeaderField: "Cache-Control") == "no-store" else { return .unknown }
             return NutritionSupport.decode(data)
         } catch {
             // A failed fresh probe must never inherit an earlier success.

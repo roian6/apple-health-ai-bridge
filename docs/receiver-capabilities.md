@@ -30,6 +30,9 @@ Unknown additional fields may be ignored. `ReceiverCapabilitiesV1` in
 `health_bridge.contract.receiver_capabilities` implements this body contract.
 HTTP status, authenticated destination and connection identity must also be
 checked by the consumer; parsing a body alone is not authentication.
+The companion also requires the exact `Content-Type: application/json` and
+`Cache-Control: no-store` response headers before decoding. Missing or different
+header values leave support unknown.
 
 Missing, malformed, invalid or revoked credentials receive HTTP 401 with
 `{"error":"unauthorized"}` and `WWW-Authenticate: Bearer`. An authentication

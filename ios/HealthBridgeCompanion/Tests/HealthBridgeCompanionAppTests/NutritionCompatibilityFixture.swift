@@ -78,7 +78,7 @@ final class NutritionURLProtocol: URLProtocol, @unchecked Sendable {
             let (status, data) = try receiver.respond(request, body: body)
             let response = try XCTUnwrap(HTTPURLResponse(
                 url: try XCTUnwrap(request.url), statusCode: status, httpVersion: nil,
-                headerFields: ["Content-Type": "application/json"]
+                headerFields: ["Content-Type": "application/json", "Cache-Control": "no-store"]
             ))
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
