@@ -1088,9 +1088,7 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     ).read_text()
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
     healthkit_read_types = Path("docs/supported-health-data.md").read_text()
-    review_notes = Path(
-        "docs/maintainers/app-review-notes-template.example.md"
-    ).read_text()
+    review_notes = Path(".github/release/app-review-notes-template.md").read_text()
 
     assert "QuantityObservationStore" in background_sync
     assert "supportedAutomaticQuantityTypeCodes" in background_sync
@@ -1317,16 +1315,20 @@ def test_ios_app_review_notes_template_is_privacy_safe_and_actionable() -> None:
     # Given / When
     template = Path("docs/maintainers/app-review-notes-template.example.md")
     text = template.read_text()
+    canonical_template = Path(".github/release/app-review-notes-template.md")
+    canonical_text = canonical_template.read_text()
 
     # Then
-    assert "Read-only HealthKit" in text
-    assert "User-owned receiver" in text
-    assert "No ads, tracking, data brokers, or hidden telemetry" in text
-    assert "No clinical decision support or readiness scoring" in text
-    assert "Demo access" in text
-    assert "Deletion and revocation" in text
-    assert "<private-demo-receiver>" in text
-    assert "outside Git" in text
+    assert "../../.github/release/app-review-notes-template.md" in text
+    assert canonical_template.is_file()
+    assert "Read-only HealthKit" in canonical_text
+    assert "User-owned receiver" in canonical_text
+    assert "No ads, tracking, data brokers, or hidden telemetry" in canonical_text
+    assert "No clinical decision support or readiness scoring" in canonical_text
+    assert "Demo access" in canonical_text
+    assert "Deletion and revocation" in canonical_text
+    assert "<private-demo-receiver>" in canonical_text
+    assert "outside Git" in canonical_text
 
 
 def test_ios_companion_is_iphone_only() -> None:

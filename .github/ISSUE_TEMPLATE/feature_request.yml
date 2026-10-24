@@ -31,20 +31,32 @@ body:
       description: Explain affected HealthKit types or local records, new permissions, read-only boundaries, and any network, hosted, telemetry, analytics, advertising, or third-party AI path.
       placeholder: |
         HealthKit types or local records:
-        New permission required: yes/no
-        Read-only access preserved: yes/no
-        New network or hosted path: yes/no
-        Telemetry, analytics, advertising, or third-party AI: yes/no
+        New permission required: yes/no/unknown
+        Read-only access preserved: yes/no/unknown
+        New network or hosted path: yes/no/unknown
+        Telemetry, analytics, advertising, or third-party AI: yes/no/unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: app-review-impact
+    attributes:
+      label: App Review impact
+      description: Would this affect privacy copy, App Review notes, screenshots, entitlements, or App Privacy Details? Choose Unsure if you cannot determine the impact.
+      options:
+        - No known impact
+        - May affect App Review
+        - Unsure
     validations:
       required: true
 
   - type: textarea
-    id: app-review-impact
+    id: app-review-details
     attributes:
-      label: App Review impact
-      description: Would this require changes to privacy copy, App Review notes, screenshots, entitlements, or App Privacy Details?
+      label: App Review details
+      description: Optional context about possible changes to privacy copy, review notes, screenshots, entitlements, or App Privacy Details.
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: alternatives

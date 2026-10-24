@@ -243,7 +243,7 @@ def test_public_copy_does_not_claim_every_observer_registration_succeeds() -> No
     architecture = (ROOT / "docs" / "architecture.md").read_text()
     testflight = (ROOT / ".github" / "release" / "testflight-checklist.md").read_text()
     review_notes = (
-        ROOT / "docs" / "maintainers" / "app-review-notes-template.example.md"
+        ROOT / ".github" / "release" / "app-review-notes-template.md"
     ).read_text()
 
     assert "Full observer registration" not in readme

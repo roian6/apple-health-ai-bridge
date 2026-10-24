@@ -1,5 +1,5 @@
 name: Setup feedback
-description: Report friction in quickstart, MCP, receiver, pairing, TestFlight, or self-build flows
+description: Report setup or sync friction with the iPhone app, receiver, or AI client
 title: "[Setup]: "
 labels: ["question"]
 body:
@@ -11,6 +11,7 @@ body:
         - README synthetic quickstart
         - MCP client setup
         - Local or private receiver setup
+        - App Store installation
         - iOS self-build
         - TestFlight installation
         - Pairing or setup page
@@ -25,14 +26,11 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Include only non-sensitive version information.
+      description: Fill in only the relevant components. Unknown details are fine; do not include private hosts, account names, or local paths.
       placeholder: |
-        OS:
-        Python:
-        uv:
-        health-bridge version:
-        MCP client:
-        iPhone/iOS/Xcode/TestFlight:
+        Receiver OS and version:
+        iPhone/iOS and app version:
+        AI client and version:
     validations:
       required: true
 
@@ -56,10 +54,10 @@ body:
     id: visible-error
     attributes:
       label: Visible error
-      description: Paste only redacted visible error text. Do not include payloads, tokens, setup links, receiver databases, or real health values.
+      description: Optional. If an error appeared, paste only its redacted visible text. For other setup friction, describe what happened in the steps above. Do not include payloads, tokens, setup links, receiver databases, or real health values.
       render: text
     validations:
-      required: true
+      required: false
 
   - type: checkboxes
     id: privacy
