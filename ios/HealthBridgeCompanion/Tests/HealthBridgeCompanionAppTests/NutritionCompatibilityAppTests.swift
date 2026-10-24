@@ -1,9 +1,55 @@
 import Foundation
+import SwiftUI
+import UIKit
 import XCTest
 @testable import HealthBridgeCompanion
 
 @MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
+    func testStoppedSyncDoesNotDuplicateNutritionNotice() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        fixture.receiver.capability = .legacy
+        let vm = try await fixture.makeViewModel()
+        await vm.syncSupportedQuantityMetrics()
+        let notice = vm.nutritionNotice
+        XCTAssertFalse(notice.isEmpty)
+
+        vm.statusIsError = true
+        vm.statusMessage = "Synthetic failure"
+        vm.statusMessage = "Sync stopped: \(vm.statusMessage)"
+        vm.statusMessage = "Retry stopped: \(vm.statusMessage)"
+
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let appeared = expectation(description: "Production status view appeared")
+            let host = UIHostingController(rootView: ContentView(viewModel: vm).onAppear { appeared.fulfill() })
+            let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
+            window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+            window.overrideUserInterfaceStyle = style
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            defer { window.isHidden = true }
+            await fulfillment(of: [appeared], timeout: 5)
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+                XCTAssertTrue(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "nutrition-stopped-\(style == .light ? "light" : "dark")"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        XCTAssertEqual(vm.statusMessage, "Retry stopped: Sync stopped: Synthetic failure")
+        XCTAssertEqual(
+            vm.displayStatusMessage,
+            CompanionPrimaryStatusMessage.sanitized(from: vm.statusMessage, isError: true) + " " + notice
+        )
+        XCTAssertEqual(vm.displayStatusMessage.components(separatedBy: notice).count, 2)
+        XCTAssertFalse(try XCTUnwrap(vm.activityLogMessages.last).contains(notice))
+    }
+
     func testDirectNutritionPreparationAllowsMainActor() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

@@ -211,11 +211,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         didSet { appendActivityLog(publishedStatusMessage, isError: publishedStatusIsError) }
     }
     var statusMessage: String {
-        get { publishedStatusMessage + (nutritionNotice.isEmpty ? "" : " " + nutritionNotice) }
+        get { publishedStatusMessage }
         set {
             guard !taskUIPublicationIsSuppressed else { return }
             publishedStatusMessage = newValue
         }
+    }
+    var displayStatusMessage: String {
+        let message = CompanionPrimaryStatusMessage.sanitized(
+            from: statusMessage, isError: statusIsError
+        )
+        return message + (nutritionNotice.isEmpty ? "" : " " + nutritionNotice)
     }
     @Published private var publishedPendingOutboxCount = 0
     var pendingOutboxCount: Int {
