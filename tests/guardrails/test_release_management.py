@@ -326,6 +326,8 @@ def test_release_workflow_passes_derived_title_to_create(
         "TITLE_QA_ARGS": str(captured),
         "GITHUB_REF_NAME": tag,
         "GITHUB_REPOSITORY": "synthetic/release",
+        "PINNED_TARGET_COMMIT_SHA": "1" * 40,
+        "PINNED_TAG_OBJECT_SHA": "2" * 40,
     }
     completed = subprocess.run(
         [
@@ -335,6 +337,7 @@ def test_release_workflow_passes_derived_title_to_create(
             "-c",
             f"""set -euo pipefail
 uv() {{ "$TITLE_QA_PYTHON" "$TITLE_QA_TOOL" "${{@:4}}"; }}
+python3() {{ test "$1" = scripts/release_source_policy.py; }}
 gh() {{ printf "%s\\0" "$@" > "$TITLE_QA_ARGS"; }}
 {snippet}
 """,
