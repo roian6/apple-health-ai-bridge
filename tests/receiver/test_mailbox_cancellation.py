@@ -1,4 +1,5 @@
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,12 +13,14 @@ from health_bridge.mailbox.connections import (
 )
 from health_bridge.mailbox.publication import publish_final
 from health_bridge.receiver.delivery_acceptance import DeliveryAcceptanceService
+from health_bridge.receiver.invitations import create_pairing_invitation
 from health_bridge.receiver.mailbox_bootstrap import PAIRING_DOMAIN
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
 from health_bridge.storage.database import connect_database
 from tests.receiver.delivery_acceptance_support import NOW_MS, counts
 from tests.receiver.native_pairing_support import LegacyPeer, stage_native
+from tests.receiver.test_mailbox_bootstrap import open_completion
 
 
 def cancellation(request: bytes, invitation: str, device: MailboxKeyStore) -> bytes:
@@ -166,6 +169,91 @@ def test_cancellation_revokes_exact_request_across_restart(
         with connect_database(peer.db) as db:
             assert db.execute("select count(*) from receiver_tokens").fetchone() == (0,)
     assert counts(peer.db) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("restarted", [False, True])
+def test_older_native_request_recovers_beyond_first_invitation_page(
+    tmp_path: Path, cancelled: bool, restarted: bool
+) -> None:
+    peer = LegacyPeer(tmp_path)
+    descriptor, request = stage_native(peer)
+    root = tmp_path / "provider"
+    directory = root / "pairing" / descriptor.invitation_id
+    directory.mkdir(parents=True)
+    _ = publish_final(directory, "request.hbp", request)
+    publications: list[bytes] = []
+
+    def publish(path: Path, content: bytes) -> None:
+        publications.append(content)
+        publish_response(path, content)
+
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publish,
+    )
+    worker.run_once()
+    assert open_completion(
+        (directory / "completion.hbp").read_bytes(), request, descriptor, peer.device
+    )
+    (directory / "completion.hbp").unlink()
+    for _ in range(128):
+        _ = create_pairing_invitation(
+            peer.db,
+            label="newer-synthetic",
+            receiver_url=None,
+            transport="mailbox",
+            now=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+    if cancelled:
+        _ = publish_final(
+            directory,
+            "cancel.hbp",
+            cancellation(request, descriptor.invitation_id, peer.device),
+        )
+    if restarted:
+        worker = MailboxRuntimeWorker(
+            db_path=peer.db,
+            mailbox_root=root,
+            pairing_keys=peer.receiver,
+            pairing_connections=peer.connections,
+            pairing_publisher=publish,
+        )
+    publications.clear()
+    # Drive a finite number of real cycles, not a timing-dependent wait.
+    for _ in range(3):
+        before = len(publications)
+        worker.run_once()
+        assert len(publications) - before <= 1
+    response_name = "cancelled.hbp" if cancelled else "completion.hbp"
+    assert (directory / response_name).exists()
+    response = (directory / response_name).read_bytes()
+    assert publications == [response]
+    if cancelled:
+        decoded = hbjcs1_decode(response)
+        assert isinstance(decoded, dict)
+        signature = decoded.pop("signature")
+        assert isinstance(signature, str)
+        assert decoded["request_sha256"] == hashlib.sha256(request).hexdigest()
+        assert decoded["invitation_id"] == descriptor.invitation_id
+        Ed25519PublicKey.from_public_bytes(
+            b64decode(descriptor.receiver_signing_public_key, length=32)
+        ).verify(
+            b64decode(signature, length=64),
+            PAIRING_DOMAIN + b"cancelled/signature\0" + hbjcs1_encode(decoded),
+        )
+        with connect_database(peer.db) as db:
+            assert db.execute(
+                "select count(*) from receiver_tokens where revoked_at is null"
+            ).fetchone() == (0,)
+    else:
+        assert open_completion(response, request, descriptor, peer.device)
+    for _ in range(3):
+        worker.run_once()
+    assert publications == [response]
 
 
 def test_wrong_peer_cannot_cancel_committed_request(tmp_path: Path) -> None:

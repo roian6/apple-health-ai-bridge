@@ -378,7 +378,7 @@ class MailboxRuntimeWorker:
         self._idle_signatures: dict[Path, tuple[MailboxLaneSignature, float]] = {}
         self._confirmed_pairings: dict[str, FileIdentity] = {}
         self._settled_pairings: dict[str, _SettledPairing] = {}
-        self._pairing_cursor = 0
+        self._pairing_cursor = ""
 
     def _bootstrap_once(self) -> bool:
         native_rows: list[tuple[str, str | None]] = []
@@ -396,13 +396,16 @@ class MailboxRuntimeWorker:
                     ).fetchone()
                     is not None
                 )
+                query = """select pairing_invitation_id, redeemed_at
+                    from pairing_invitations where transport = 'mailbox'
+                    and receiver_url = '' and pairing_invitation_id > ?
+                    order by pairing_invitation_id limit 128"""
+                rows = database.execute(query, (self._pairing_cursor,)).fetchall()
+                if not rows and self._pairing_cursor:
+                    self._pairing_cursor = ""
+                    rows = database.execute(query, (self._pairing_cursor,)).fetchall()
                 native_rows = TypeAdapter(list[tuple[str, str | None]]).validate_python(
-                    database.execute(
-                        """select pairing_invitation_id, redeemed_at
-                        from pairing_invitations where transport = 'mailbox'
-                        and receiver_url = ''
-                        order by created_at desc limit 128""",
-                    ).fetchall()
+                    rows
                 )
             try:
                 entry = self._mailbox_root.lstat()
@@ -414,26 +417,16 @@ class MailboxRuntimeWorker:
                 ) from None
             if not stat.S_ISDIR(entry.st_mode):
                 raise MailboxDiscoveryError(MailboxDiscoveryErrorCode.UNSAFE_ROOT)
-            active = {UUID(row[0]).hex for row in native_rows}
-            self._confirmed_pairings = {
-                key: value
-                for key, value in self._confirmed_pairings.items()
-                if key in active
-            }
-            self._settled_pairings = {
-                key: value
-                for key, value in self._settled_pairings.items()
-                if key in active
-            }
-            for offset in range(len(native_rows)):
-                index = (self._pairing_cursor + offset) % len(native_rows)
-                invitation_id, _ = native_rows[index]
-                if self._pair_native_invitation(
+            # Retained invitations remain eligible across pages. Authenticated
+            # caches survive page boundaries and revalidate each visited input.
+            for invitation_id, _ in native_rows:
+                attempted = self._pair_native_invitation(
                     invitation_id, self._pairing_keys, self._pairing_connections
-                ):
+                )
+                self._pairing_cursor = invitation_id
+                if attempted:
                     # One protocol/helper attempt per cycle, including restart.
-                    # Round-robin avoids an invalid peer starving later rows.
-                    self._pairing_cursor = (index + 1) % len(native_rows)
+                    # Keyset progress avoids an invalid peer starving older rows.
                     break
         return False
 
