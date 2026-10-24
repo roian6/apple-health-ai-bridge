@@ -19,21 +19,15 @@
 ## Tests
 
 - [ ] Added automated regression tests for major functionality or behavior-changing bug fixes; reproduced fixes with a failing test, or explained why no testable behavior changed.
-- [ ] `bash scripts/swift-analysis.sh` and existing Swift/Xcode gates run for Swift changes.
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run ruff check .`
-- [ ] `uv run basedpyright`
-- [ ] `uv run bandit -r src -q`
-- [ ] `uv run pip-audit --local --skip-editable`
-- [ ] `uv run pytest -q`
-- [ ] Swift package tests / Xcode build run if iOS code changed.
-- [ ] `uv run python scripts/public-release-audit.py --strict` if public docs, templates, assets, privacy copy, or release surfaces changed.
+- [ ] Python quality, security, type, and test gates run: `uv run ruff format --check .`, `uv run ruff check .`, `uv run basedpyright`, `uv run bandit -r src -q`, `uv run pip-audit --local --skip-editable`, and `uv run pytest -q`.
+- [ ] `uv run python scripts/public-release-audit.py --strict` run if public docs, templates, assets, privacy copy, or release surfaces changed.
+- [ ] `bash scripts/swift-analysis.sh`, Swift package tests, and relevant unsigned Xcode builds run for Swift/iOS changes.
 
 ## Release note
 
 - [ ] User-visible change; add the `release-note` label after maintainer triage.
 - [ ] No user-visible release note required.
-- [ ] Release-facing changes name Receiver/CLI, iOS Companion version/build, Batch Protocol, and `release_scope` independently; historical notes remain unchanged.
+- [ ] For release-facing changes, use the [release notes template](release/release-notes-template.md) and state exact component compatibility; historical notes remain unchanged.
 
 ## Breaking change
 

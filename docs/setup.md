@@ -1,4 +1,4 @@
-# Set up Health Bridge for AI
+# Set up Apple Health AI Bridge
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 

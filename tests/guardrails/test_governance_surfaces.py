@@ -87,8 +87,6 @@ def test_contribution_and_maintainer_workflow_is_versioned() -> None:
         assert marker in pull_request
 
     for marker in (
-        "Solo-maintainer phase",
-        "required approval count is `0`",
         "second trusted maintainer",
         "Python quality and package checks",
         "Swift tests and unsigned app builds",

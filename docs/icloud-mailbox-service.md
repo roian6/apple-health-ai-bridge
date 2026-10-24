@@ -22,9 +22,12 @@ project developer does not have access to either endpoint or the transmitted
 HealthKit records. App Store Connect may remain “Data Not Collected” only while
 that developer-no-access boundary remains true.
 
-## Install and verify the signed helper
+## Install and verify Receiver/CLI 1.1.3
 
-Download assets and run the commands below only after the immutable `receiver-v1.1.3` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.3`.
+These install and verification instructions apply to the published Receiver/CLI
+`1.1.3` release. Download its complete asset set and verify the release identity,
+provenance, and checksums below before installing anything. Do not substitute
+`main` or an older helper; the receiver and helper must both be version `1.1.3`.
 
 Use the Receiver/CLI `1.1.3` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
@@ -67,9 +70,9 @@ Helper status uses fixed, path-free codes:
 | `helper_drift` | Owned metadata, app bytes, identity, permissions, or signature changed. |
 | `unsupported_host` | Installed-helper inspection is unavailable on this host. |
 
-## Downloadable proof for future releases
+## Verify published release provenance
 
-Receiver/CLI `1.1.3` and later require two additional assets:
+For Receiver/CLI `1.1.3` and later, verify the two required provenance assets:
 `receiver-build-provenance.intoto.jsonl` and
 `receiver-final-provenance.intoto.jsonl`. This policy does not change the six
 immutable assets of the historical `1.1.2` release.
