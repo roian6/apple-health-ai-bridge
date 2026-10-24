@@ -287,6 +287,7 @@ public final class ReceiverClient: @unchecked Sendable {
     private static let uploadStallTimeout: TimeInterval = 120
     private static let uploadResourceTimeout: TimeInterval = 3_600
     private let session: URLSession
+    private let ownsSession: Bool
 
     public static func foregroundSessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.default
@@ -297,11 +298,18 @@ public final class ReceiverClient: @unchecked Sendable {
     }
 
     public init(session: URLSession? = nil) {
+        ownsSession = session == nil
         self.session = session ?? URLSession(
             configuration: Self.foregroundSessionConfiguration(),
             delegate: ReceiverURLSessionRedirectDelegate(),
             delegateQueue: nil
         )
+    }
+
+    deinit {
+        if ownsSession {
+            session.invalidateAndCancel()
+        }
     }
 
     public static func healthURL(forBatchURL batchURL: URL) -> URL {
@@ -328,6 +336,32 @@ public final class ReceiverClient: @unchecked Sendable {
             throw ReceiverClientError.unsuccessfulStatusCode(statusCode: httpResponse.statusCode, responseBody: data)
         }
         return ReceiverUploadResult(statusCode: httpResponse.statusCode, responseBody: data)
+    }
+
+    public func nutritionSupport(forBatchURL batchURL: URL, bearerToken: String) async -> NutritionSupport {
+        let token = bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty,
+              var components = URLComponents(url: batchURL, resolvingAgainstBaseURL: false) else {
+            return .unknown
+        }
+        components.path = "/v1/capabilities"
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { return .unknown }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = Self.healthCheckTimeout
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard !Task.isCancelled, let http = response as? HTTPURLResponse,
+                  http.statusCode == 200, http.url == url,
+                  http.value(forHTTPHeaderField: "Content-Type") == "application/json",
+                  http.value(forHTTPHeaderField: "Cache-Control") == "no-store" else { return .unknown }
+            return NutritionSupport.decode(data)
+        } catch {
+            // A failed fresh probe must never inherit an earlier success.
+            return .unknown
+        }
     }
 
     public func redeem(

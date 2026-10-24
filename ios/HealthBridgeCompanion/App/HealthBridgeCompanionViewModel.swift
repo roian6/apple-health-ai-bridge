@@ -133,7 +133,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     viewModel.statusMessage = "Sync stopped: \(viewModel.statusMessage)"
                     return
                 }
-                if viewModel.shouldStopManualSyncForPendingMailboxAcknowledgment() {
+                if await viewModel.shouldStopManualSyncForPendingMailboxAcknowledgment() {
                     viewModel.statusIsError = false
                     viewModel.statusMessage = "Sync paused while the encrypted iCloud mailbox waits for authenticated receiver confirmation. Queued uploads: \(viewModel.pendingOutboxCount)."
                     return
@@ -172,7 +172,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     return false
                 }
             }
-            if viewModel.shouldStopManualSyncForPendingMailboxAcknowledgment() {
+            if await viewModel.shouldStopManualSyncForPendingMailboxAcknowledgment() {
                 viewModel.statusIsError = false
                 viewModel.statusMessage = "Sync paused after durably publishing one FIFO head to the encrypted iCloud mailbox. Receiver confirmation remains pending: \(viewModel.pendingOutboxCount)."
                 return false
@@ -216,6 +216,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             guard !taskUIPublicationIsSuppressed else { return }
             publishedStatusMessage = newValue
         }
+    }
+    var displayStatusMessage: String {
+        let message = CompanionPrimaryStatusMessage.sanitized(
+            from: statusMessage, isError: statusIsError
+        )
+        return message + (nutritionNotice.isEmpty ? "" : " " + nutritionNotice)
     }
     @Published private var publishedPendingOutboxCount = 0
     var pendingOutboxCount: Int {
@@ -298,6 +304,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var healthPermissionsRequested: Bool
 
     @Published var healthPermissionNotice = ""
+    @Published private(set) var nutritionNotice = ""
     @Published var healthPermissionNoticeIsError = false
     @Published var isRequestingHealthPermissions = false
     @Published var isCheckingConnection = false
@@ -1074,6 +1081,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusIsError = true
             statusMessage = "Local bridge check failed: \(describe(error))"
         }
+    }
+
+    private func refreshNutritionSupport() async throws -> NutritionSupport {
+        let generation = settingsStore.receiverSettingsGenerationToken
+        let binding = settingsStore.receiverBindingID
+        guard let url = URL(string: settingsStore.receiverURLString) else {
+            return .unknown
+        }
+        let token = try settingsStore.loadBearerToken()
+        let support = await receiverClient.nutritionSupport(forBatchURL: url, bearerToken: token)
+        try requireCurrentConnectionGeneration(generation)
+        guard settingsStore.receiverBindingID == binding,
+              settingsStore.receiverURLString == url.absoluteString,
+              try settingsStore.loadBearerToken() == token else { throw CancellationError() }
+        nutritionNotice = support.notice
+        return support
     }
 
     func checkConnection() async {
@@ -3392,7 +3415,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             case .publishFIFOHead:
                 summary = try await delivery.publishPendingFIFOHead()
             case .advanceOrReconcileFIFOHead:
-                switch try delivery.pendingFIFOHeadBackgroundPhase() {
+                switch try await delivery.pendingFIFOHeadBackgroundPhase() {
                 case .reconcileFIFOHeadAcknowledgment:
                     summary = try await delivery.reconcilePendingFIFOHeadAcknowledgment(
                         afterAcknowledgmentCheckpoint: backgroundSyncStore
@@ -5460,10 +5483,29 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let availableRawTypeCodes = HealthKitReadTypeCatalog.availableTypeCodes(
                 forTypeCodes: rawTypeCodes
             )
+            let nutritionSupport: NutritionSupport
+            do {
+                nutritionSupport = availableRawTypeCodes.contains(where: NutritionCompatibility.isNutrition)
+                    ? try await refreshNutritionSupport() : .unknown
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                noteBackgroundAutomaticSyncFailure(
+                    stage: .store, error: error, executionMode: mode.executionMode
+                )
+                statusIsError = true
+                statusMessage = "\(mode.failurePrefix): \(describe(error))"
+                return
+            }
             let selectedTypeCodes = GenericQuantityCoveragePolicy
                 .coveragePlan(availableTypeCodes: availableRawTypeCodes)
                 .availableEntries
                 .map(\.typeCode)
+                .filter {
+                    !NutritionCompatibility.isNutrition($0)
+                        || (nutritionSupport == .supported && NutritionCompatibility.typeCodes.contains($0))
+                }
             guard !selectedTypeCodes.isEmpty else {
                 statusIsError = false
                 statusMessage = mode.emptySelectionMessage
@@ -5604,6 +5646,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         executionMode: mode.executionMode
                     )
                     try requireCurrentReceiverSyncProgressScope(progressScope)
+                    if NutritionCompatibility.isNutrition(typeCode) {
+                        nutritionNotice = changes.samples.isEmpty && changes.deletedSamples.isEmpty
+                            ? "Nutrition has no observed data. Read access is unknown; this is not a numeric zero."
+                            : ""
+                    }
                     let anchorAdvanced = HealthKitAnchoredCursorPolicy.hasAdvanced(
                         from: cursorOwnership.cursorValue,
                         to: changes.anchorCursorValue
@@ -5784,9 +5831,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return "\(queuedDescription) in local outbox for FIFO retry. \(cursorDetail) Pending outbox: \(pendingOutboxCount).\(outboxNotice)"
     }
 
-    private func shouldStopManualSyncForPendingMailboxAcknowledgment() -> Bool {
-        pendingOutboxCount > 0
-            && settingsStore.activeTransport == .mailbox
+    private func shouldStopManualSyncForPendingMailboxAcknowledgment() async -> Bool {
+        guard pendingOutboxCount > 0, settingsStore.activeTransport == .mailbox,
+              let outbox, let binding = settingsStore.receiverBindingID else { return false }
+        do {
+            try await preparePendingNutrition(outbox)
+            return try !outbox.nutritionCompatibleItems(for: binding, support: .unknown).isEmpty
+        } catch {
+            return true
+        }
     }
 
     private func uploadPayloadsWithOutbox(
@@ -6247,6 +6300,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard let cursorStore else {
             throw CompanionPrivateStorageError.cursorStoreUnavailable
         }
+        try await preparePendingNutrition(outbox)
         let cursorFinalizer = OutboxDeliveryCursorFinalizer(
             outbox: outbox,
             cursorStore: cursorStore,
@@ -6256,7 +6310,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         _ = try cursorFinalizer.finalizeDirectAcknowledgments(
             receiverBindingID: receiverIdentity
         )
-        let pendingItems = try outbox.uploadablePendingItems(for: receiverIdentity)
+        let allPending = try outbox.uploadablePendingItems(for: receiverIdentity)
+        let hasNutrition = try outbox.containsPreparedNutrition(in: allPending)
+        let support = hasNutrition ? try await refreshNutritionSupport() : NutritionSupport.unknown
+        try requireCurrentConnectionGeneration(expectedGeneration)
+        guard self.outbox === outbox, terminalPayloadActionAdmissionIsOpen,
+              try outbox.uploadablePendingItems(for: receiverIdentity) == allPending else {
+            throw CancellationError()
+        }
+        let pendingItems = hasNutrition
+            ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
+            : allPending
         var attemptedCount = 0
         var uploadedCount = 0
         var failedItemIDs: [String] = []
@@ -6326,7 +6390,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             cursorStore: cursorStore,
             proofStore: coreLaneUploadProofStore,
             pendingGenerationStore: backgroundSyncStore,
-            sleepStore: sleepManifestStore
+            sleepStore: sleepManifestStore,
+            receiverClient: receiverClient
         )
     }
 
@@ -6354,6 +6419,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return "Secure mailbox background delivery advanced one queued item. Waiting for receiver confirmation: \(pendingCount)."
         case .reconcileFIFOHeadAcknowledgment:
             return "Secure mailbox background acknowledgment phase confirmed \(summary.finalizedCount) item(s). Waiting: \(pendingCount)."
+        }
+    }
+
+    private func preparePendingNutrition(_ outbox: FileOutbox) async throws {
+        let generation = settingsStore.receiverSettingsGenerationToken
+        let binding = settingsStore.receiverBindingID
+        let url = settingsStore.receiverURLString
+        let retry = bootstrapRetryGeneration
+        try await outbox.prepareNutritionCompatibility {
+            try self.requireCurrentConnectionGeneration(generation)
+            guard self.outbox === outbox, self.terminalPayloadActionAdmissionIsOpen,
+                  self.settingsStore.receiverBindingID == binding,
+                  self.settingsStore.receiverURLString == url,
+                  self.bootstrapRetryGeneration == retry else { throw CancellationError() }
         }
     }
 
