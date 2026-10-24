@@ -434,6 +434,18 @@ def verify_macos_release_distribution(
     request: DistributionVerificationRequest,
 ) -> None:
     _validate_distribution_bundle(request)
+    architectures = _run_platform_command(
+        [
+            "/usr/bin/lipo",
+            "-archs",
+            str(request.app / "Contents/MacOS" / HELPER_EXECUTABLE_NAME),
+        ]
+    )
+    if architectures.returncode != 0 or architectures.stdout.split() not in (
+        [b"arm64", b"x86_64"],
+        [b"x86_64", b"arm64"],
+    ):
+        raise HelperError(HelperErrorCode.SIGNATURE_INVALID)
     verify_release_distribution(request, _run_codesign, _run_platform_command)
 
 
