@@ -59,13 +59,41 @@ def authorization(target: str) -> str:
     )
 
 
+def clone_maintenance_base(source: Path, repo: Path) -> None:
+    _ = git_output(
+        repo.parent, "clone", "--shared", "--no-checkout", str(source), str(repo)
+    )
+    _ = git_output(repo, "checkout", "-B", BRANCH, BASE)
+
+
+def test_fixture_resets_inherited_maintenance_branch_without_changing_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _ = git_output(
+        tmp_path, "clone", "--shared", "--no-checkout", str(ROOT), str(source)
+    )
+    original = git_output(ROOT, "rev-parse", "HEAD")
+    original_branch = git_output(ROOT, "branch", "--show-current")
+    _ = git_output(source, "checkout", "-B", BRANCH, original)
+    repo = tmp_path / "repo"
+
+    clone_maintenance_base(source, repo)
+
+    assert git_output(repo, "branch", "--show-current") == BRANCH
+    assert git_output(repo, "rev-parse", "HEAD") == BASE
+    assert git_output(source, "branch", "--show-current") == BRANCH
+    assert git_output(source, "rev-parse", "HEAD") == original
+    assert git_output(ROOT, "branch", "--show-current") == original_branch
+    assert git_output(ROOT, "rev-parse", "HEAD") == original
+
+
 @pytest.fixture
 def maintenance_graph(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> MaintenanceGraph:
     repo = tmp_path / "repo"
-    _ = git_output(tmp_path, "clone", "--shared", "--no-checkout", str(ROOT), str(repo))
-    _ = git_output(repo, "checkout", "-b", BRANCH, BASE)
+    clone_maintenance_base(ROOT, repo)
     for name in (
         "pyproject.toml",
         "component-versions.json",
@@ -420,6 +448,14 @@ def test_normal_main_needs_no_maintenance_record(
     completed = run_source(graph)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["default_main_commit"] == graph.target
+    validated = validate_transition(
+        graph.repo,
+        tag=TAG,
+        tag_target=graph.target,
+        default_main=graph.target,
+        baseline=BASE,
+    )
+    assert validated.returncode == 0, validated.stderr
 
 
 def test_branch_response_must_name_authorized_ref(
@@ -519,21 +555,22 @@ def test_authority_cannot_relax_receiver_only_constraints(
     assert "preserve base iOS source/build and Batch Protocol" in completed.stderr
 
 
-@pytest.mark.parametrize("ancestry", ["unrelated", "merge", "reused-version"])
-def test_authority_cannot_relax_first_parent_transition(
+@pytest.mark.parametrize("ancestry", ["unrelated", "merge", "intermediate-merge"])
+def test_authority_cannot_relax_linear_ancestry(
     maintenance_graph: MaintenanceGraph,
     ancestry: str,
 ) -> None:
     graph = maintenance_graph
     parents = () if ancestry == "unrelated" else (BASE, graph.main)
-    if ancestry == "reused-version":
+    if ancestry == "intermediate-merge":
+        graph = replace_candidate(graph, (BASE, graph.main))
         parents = (graph.target,)
     graph = replace_candidate(graph, parents)
     completed = run_source(graph)
     assert completed.returncode == 1
 
 
-def test_transition_rejects_false_first_parent(
+def test_transition_rejects_false_maintenance_base(
     maintenance_graph: MaintenanceGraph,
 ) -> None:
     graph = maintenance_graph
@@ -545,7 +582,7 @@ def test_transition_rejects_false_first_parent(
         baseline=graph.main,
     )
     assert completed.returncode == 1
-    assert "baseline must equal the tag target's first parent" in completed.stderr
+    assert "baseline must equal the authorized maintenance base" in completed.stderr
 
 
 def test_transition_rejects_stale_default_main_input(
@@ -563,6 +600,208 @@ def test_transition_rejects_stale_default_main_input(
     assert (
         "default-main commit must equal fresh protected authority" in completed.stderr
     )
+
+
+@pytest.fixture
+def linear_maintenance_graph(maintenance_graph: MaintenanceGraph) -> MaintenanceGraph:
+    graph = maintenance_graph
+    _ = (graph.repo / "maintenance-followup.txt").write_text("synthetic CI repair\n")
+    return replace_candidate(graph, (graph.target,))
+
+
+def test_linear_maintenance_resolves_published_base(
+    linear_maintenance_graph: MaintenanceGraph,
+) -> None:
+    graph = linear_maintenance_graph
+    parent = git_output(graph.repo, "rev-parse", "HEAD^1")
+    assert parent != BASE
+    assert git_output(graph.repo, "rev-parse", f"{parent}^1") == BASE
+    for commit in (parent, graph.target):
+        index = TypeAdapter(dict[str, JsonValue]).validate_json(
+            git_output(graph.repo, "show", f"{commit}:component-versions.json")
+        )
+        assert required_object(index["receiver_cli"])["version"] == "1.1.4"
+
+    completed = run_source(graph)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "default_main_commit": graph.main,
+        "baseline_commit": BASE,
+    }
+
+
+def test_linear_maintenance_validates_against_authorized_base(
+    linear_maintenance_graph: MaintenanceGraph,
+) -> None:
+    graph = linear_maintenance_graph
+    completed = validate_transition(
+        graph.repo,
+        tag=TAG,
+        tag_target=graph.target,
+        default_main=graph.main,
+        baseline=BASE,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("baseline", ["parent", "target", "main", "forged"])
+def test_linear_maintenance_rejects_caller_chosen_baseline(
+    linear_maintenance_graph: MaintenanceGraph, baseline: str
+) -> None:
+    graph = linear_maintenance_graph
+    candidates = {
+        "parent": git_output(graph.repo, "rev-parse", "HEAD^1"),
+        "target": graph.target,
+        "main": graph.main,
+        "forged": "b" * 40,
+    }
+    completed = validate_transition(
+        graph.repo,
+        tag=TAG,
+        tag_target=graph.target,
+        default_main=graph.main,
+        baseline=candidates[baseline],
+    )
+    assert completed.returncode == 1
+    assert "baseline must equal the authorized maintenance base" in completed.stderr
+
+
+def test_default_main_keeps_actual_first_parent_for_linear_graph(
+    linear_maintenance_graph: MaintenanceGraph,
+) -> None:
+    graph = linear_maintenance_graph
+    metadata = read_transport(graph)
+    metadata["/branches/main"] = {"commit": {"sha": graph.target}, "protected": True}
+    _ = graph.transport.write_text(json.dumps(metadata))
+    completed = run_source(graph)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "default_main_commit": graph.target,
+        "baseline_commit": git_output(graph.repo, "rev-parse", "HEAD^1"),
+    }
+    rejected = validate_transition(
+        graph.repo,
+        tag=TAG,
+        tag_target=graph.target,
+        default_main=graph.target,
+        baseline=BASE,
+    )
+    assert rejected.returncode == 1
+    assert "baseline must equal the tag target's first parent" in rejected.stderr
+
+
+@pytest.mark.parametrize("boundary", ["receiver", "ios", "batch"])
+def test_linear_maintenance_rejects_drift_in_preparation_parent(
+    maintenance_graph: MaintenanceGraph, boundary: str
+) -> None:
+    graph = maintenance_graph
+    index = graph.repo / "component-versions.json"
+    original = index.read_text()
+    document = TypeAdapter(dict[str, JsonValue]).validate_json(original)
+    if boundary == "receiver":
+        document["receiver_cli"] = {
+            "version": "1.1.5",
+            "release_tag": "receiver-v1.1.5",
+        }
+    elif boundary == "ios":
+        required_object(document["ios_companion"])["build"] = "999"
+    else:
+        required_object(document["batch_protocol"])["version"] = "1.1.0"
+    _ = index.write_text(json.dumps(document))
+    graph = replace_candidate(graph, (BASE,))
+    _ = index.write_text(original)
+    graph = replace_candidate(graph, (graph.target,))
+    completed = run_source(graph)
+    assert completed.returncode == 1
+    assert "preserve base iOS source/build and Batch Protocol" in completed.stderr
+
+
+def test_authority_cannot_replace_published_base_with_preparation(
+    linear_maintenance_graph: MaintenanceGraph,
+) -> None:
+    graph = linear_maintenance_graph
+    parent = git_output(graph.repo, "rev-parse", "HEAD^1")
+    document = TypeAdapter(dict[str, JsonValue]).validate_json(
+        authorization(graph.target)
+    )
+    records = document["releases"]
+    assert isinstance(records, list)
+    required_object(records[0])["base_commit"] = parent
+    graph = publish_authority(graph, json.dumps(document))
+    completed = run_source(graph)
+    assert completed.returncode == 1
+    assert "immutable base tag/commit mismatch" in completed.stderr
+    rejected = validate_transition(
+        graph.repo,
+        tag=TAG,
+        tag_target=graph.target,
+        default_main=graph.main,
+        baseline=parent,
+    )
+    assert rejected.returncode == 1
+    assert "immutable base tag/commit mismatch" in rejected.stderr
+
+
+def test_workflow_threads_resolved_maintenance_baseline_to_validate(
+    linear_maintenance_graph: MaintenanceGraph, tmp_path: Path
+) -> None:
+    graph = linear_maintenance_graph
+    workflow = (ROOT / ".github/workflows/release.yml").read_text()
+    pin = '          source="$(' + workflow.split('          source="$(', 1)[1]
+    pin = pin.split("\n\n  python:", 1)[0]
+    pin = "\n".join(line.removeprefix("          ") for line in pin.splitlines())
+    pin = pin.replace(
+        "python3 scripts/release_source_policy.py",
+        shlex.join([sys.executable, str(ROOT / "scripts/release_source_policy.py")]),
+    )
+    output = tmp_path / "workflow-output"
+    environment = os.environ | {
+        "GITHUB_REF_NAME": TAG,
+        "target_sha": graph.target,
+        "tag_object_sha": git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}"),
+        "GITHUB_OUTPUT": str(output),
+    }
+    pinned = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", pin],
+        cwd=graph.repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pinned.returncode == 0, pinned.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values["baseline_commit_sha"] == BASE
+    assert values["default_main_commit_sha"] == graph.main
+    step = workflow.split(
+        "      - name: Validate tag and cross-platform versions\n", 1
+    )[1]
+    validate = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+    validate = "\n".join(
+        line.removeprefix("          ") for line in validate.splitlines()
+    )
+    validate = validate.replace(
+        "uv run python scripts/release_tools.py",
+        shlex.join([sys.executable, str(ROOT / "scripts/release_tools.py")]),
+    )
+    environment.update(
+        {
+            "PINNED_TARGET_COMMIT_SHA": values["target_commit_sha"],
+            "PINNED_DEFAULT_MAIN_COMMIT_SHA": values["default_main_commit_sha"],
+            "PINNED_BASELINE_COMMIT_SHA": values["baseline_commit_sha"],
+        }
+    )
+    validated = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", validate],
+        cwd=graph.repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert validated.returncode == 0, validated.stderr
+    assert json.loads(validated.stdout)["project_version"] == "1.1.4"
 
 
 SOURCE_STAGES = [
