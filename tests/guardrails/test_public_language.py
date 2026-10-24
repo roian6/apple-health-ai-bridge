@@ -285,6 +285,7 @@ def test_readme_introduces_user_workflows_before_installation_details() -> None:
         setup_guide,
     )
     assert "docs/setup.md#connect-an-mcp-client-intentionally" in setup
+    assert "(#choose-your-ai)" in setup
 
 
 def test_readme_keeps_continuous_value_with_ios_timing_boundary() -> None:

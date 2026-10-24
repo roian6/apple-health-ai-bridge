@@ -1,0 +1,157 @@
+{
+  "accessDate": "2026-10-23",
+  "scope": "Product identification in client setup documentation; no vendor endorsement.",
+  "packaging": "Original artwork. Legacy archive SVGs use LF line endings; new files document their exact packaging individually.",
+  "assets": [
+    {
+      "file": "cursor-cube-2d-light.svg",
+      "product": "Cursor",
+      "finalDownloadURL": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+      "archiveMember": "General Logos/Cube/SVG/CUBE_2D_LIGHT.svg",
+      "originalSHA256": "c483c02f78eb2619778fdd959e72a9adfac4844854472cd2653d4cbfd60e4d71",
+      "packagedSHA256": "58d7237ab77e9ed8d5f8b297577bf673b21c1fe6a1610d6f1bc8598e886d18c6",
+      "viewBox": "0 0 466.73 532.09"
+    },
+    {
+      "file": "cursor-cube-2d-dark.svg",
+      "product": "Cursor",
+      "finalDownloadURL": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+      "archiveMember": "General Logos/Cube/SVG/CUBE_2D_DARK.svg",
+      "originalSHA256": "cd0e3e5d8991a4cdd4577f8896cd063105207665165c73e25a1ff918dd367eb7",
+      "packagedSHA256": "0c1940179c8fe0a877c331a1e19a2cb9437a8f9633594e1d81f9ffba106615ff",
+      "viewBox": "0 0 466.73 532.09"
+    },
+    {
+      "file": "opencode-logo-dark.svg",
+      "product": "OpenCode",
+      "finalDownloadURL": "https://opencode.ai/opencode-brand-assets.zip",
+      "archiveMember": "OpenCode Brand Assets/Logo/opencode-logo-dark.svg",
+      "originalSHA256": "4e84f87aa7bc2a5f8a72eeb08d3d4f1836b422189256d0bd5e7bfabc830d7ed0",
+      "packagedSHA256": "adb18785e2daa330f69852fbe4e1493be4400b1cc760877b99c9c2d01571e679",
+      "viewBox": "0 0 240 300"
+    },
+    {
+      "file": "opencode-logo-light.svg",
+      "product": "OpenCode",
+      "finalDownloadURL": "https://opencode.ai/opencode-brand-assets.zip",
+      "archiveMember": "OpenCode Brand Assets/Logo/opencode-logo-light.svg",
+      "originalSHA256": "5eeb3a5f14dbbccc03111296ecfd3cd05cc98844150d4f9d77ba921847953380",
+      "packagedSHA256": "937ed3491969912299db5a8b85199ae51da29cc1a5e22f4e1e5b158cd3ed9202",
+      "viewBox": "0 0 240 300"
+    },
+    {
+      "file": "vscode.svg",
+      "product": "Visual Studio Code",
+      "finalDownloadURL": "https://code.visualstudio.com/assets/branding/visual-studio-code-icons.zip",
+      "archiveMember": "visual-studio-code-icons/vscode.svg",
+      "originalSHA256": "74ad401c6487a0dc5af1f6b2935556ab2d3553ae45effc7e1697b4d117d046b6",
+      "packagedSHA256": "74ad401c6487a0dc5af1f6b2935556ab2d3553ae45effc7e1697b4d117d046b6",
+      "viewBox": "0 0 100 100"
+    },
+    {
+      "file": "antigravity.svg",
+      "product": "Antigravity CLI",
+      "identityURL": "https://antigravity.google/",
+      "finalDownloadURL": "https://antigravity.google/favicon.svg",
+      "originalSHA256": "de7911c3d206a3d2fe3d5b4e76e84b185c581d7a259406f64db247b5b824f02e",
+      "packagedSHA256": "de7911c3d206a3d2fe3d5b4e76e84b185c581d7a259406f64db247b5b824f02e",
+      "viewBox": "0 0 136 136",
+      "sourceRole": "Official product-family favicon; not a separate CLI-specific mark.",
+      "packaging": "Unchanged original SVG, including its native color-scheme rule.",
+      "accessDate": "2026-10-24"
+    },
+    {
+      "file": "claude-code-mark.svg",
+      "product": "Claude Code",
+      "identityURL": "https://code.claude.com/docs/en/vs-code",
+      "finalDownloadURL": "https://anthropic.gallerycdn.vsassets.io/extensions/anthropic/claude-code/2.1.310/1792798885198/Microsoft.VisualStudio.Services.Icons.Default",
+      "originalSHA256": "7241633e5a39b44a947c7b9a821637f30d6e86716e7a8c847136d91f9c3f6ba1",
+      "packagedSHA256": "44463f9c3a2f88807b4641a9bbbacd666a63e3b769e803f80ae04b05def6523f",
+      "viewBox": "0 0 266 266",
+      "sourceRole": "Anthropic-published Claude Code extension icon, using the Claude family symbol.",
+      "packaging": "Original 266 x 266 PNG bytes embedded in a self-contained SVG; no resampling.",
+      "accessDate": "2026-10-24"
+    },
+    {
+      "file": "claude-desktop-mark.svg",
+      "product": "Claude Desktop",
+      "identityURL": "https://www.claude.com/download",
+      "finalDownloadURL": "https://assets.claude.com/95a868946ac8a31e5ff832e2899f294aa368b836.png",
+      "originalSHA256": "4004381309500f25e49a1ae639912ce307ea81da74cc383954a1ac8b9d343fe6",
+      "packagedSHA256": "fe4e5a8aaf39813bc593e6ec03e425c502060908532901b1b20e3b6ef06d4817",
+      "viewBox": "0 0 32 32",
+      "sourceRole": "Shared Claude family favicon from the official download page, not an extracted native app icon.",
+      "packaging": "Original 32 x 32 PNG bytes embedded in a self-contained SVG; no resampling.",
+      "accessDate": "2026-10-24"
+    },
+    {
+      "file": "codex-openai-mark.svg",
+      "product": "Codex CLI",
+      "identityURL": "https://developers.openai.com/codex/ide/",
+      "finalDownloadURL": "https://openai.gallerycdn.vsassets.io/extensions/openai/chatgpt/26.51021.22027/1792788319200/Microsoft.VisualStudio.Services.Icons.Default",
+      "originalSHA256": "2ce1c57dd3b312417106a487815ab1235bddce17e1fa9b32a2f048bd71ee25d3",
+      "packagedSHA256": "dd1f697aa831b61e28c9770b69b106528fdf6a6e35d17544ecb7d10e48b54643",
+      "viewBox": "0 0 385 385",
+      "sourceRole": "OpenAI-published Codex extension artwork; shared OpenAI family mark, not a claimed unique Codex symbol.",
+      "packaging": "Original 385 x 385 PNG bytes embedded in a self-contained SVG; original black square retained.",
+      "accessDate": "2026-10-24"
+    },
+    {
+      "file": "hermes-agent.svg",
+      "product": "Hermes Agent",
+      "identityURL": "https://github.com/NousResearch/hermes-agent",
+      "finalDownloadURL": "https://raw.githubusercontent.com/NousResearch/hermes-agent/5894e750c3dba980d43b25aa29e3958149ba2c61/website/static/img/favicon.svg",
+      "originalSHA256": "6c4968c1a46f104559684826ed8061fad6052711ff0af9c6b36a6ce674536684",
+      "packagedSHA256": "6c4968c1a46f104559684826ed8061fad6052711ff0af9c6b36a6ce674536684",
+      "viewBox": "0 0 1024 1024",
+      "sourceRole": "Official Hermes Agent documentation favicon.",
+      "packaging": "Unchanged original SVG, including its white tile and original clipping.",
+      "accessDate": "2026-10-24"
+    },
+    {
+      "file": "openclaw.svg",
+      "product": "OpenClaw",
+      "identityURL": "https://github.com/openclaw/openclaw",
+      "finalDownloadURL": "https://raw.githubusercontent.com/openclaw/openclaw/61bd8a5ea12ea2531e61c3c41065309ef22d6a4a/apps/linux/src-tauri/icons/icon.svg",
+      "originalSHA256": "9eb03f05096830f46db0eeacf3f47fbf60a07f7f95ea41c639b0b3702ec598db",
+      "packagedSHA256": "9eb03f05096830f46db0eeacf3f47fbf60a07f7f95ea41c639b0b3702ec598db",
+      "viewBox": "0 0 120 120",
+      "sourceRole": "Official static OpenClaw Linux app icon.",
+      "packaging": "Unchanged original SVG, including original gradients and transparency.",
+      "accessDate": "2026-10-24"
+    }
+  ],
+  "policyReads": [
+    {
+      "requestedURL": "https://cursor.com/brand",
+      "finalURL": "https://cursor.com/brand",
+      "httpStatus": 200
+    },
+    {
+      "requestedURL": "https://opencode.ai/brand",
+      "finalURL": "https://opencode.ai/brand",
+      "httpStatus": 200
+    },
+    {
+      "requestedURL": "https://code.visualstudio.com/brand",
+      "finalURL": "https://code.visualstudio.com/brand",
+      "httpStatus": 200
+    },
+    {
+      "requestedURL": "https://openai.com/brand/",
+      "finalURL": "https://openai.com/brand/",
+      "httpStatus": 403
+    },
+    {
+      "requestedURL": "https://www.anthropic.com/legal/trademark-guidelines",
+      "finalURL": "https://www.anthropic.com/legal/trademark-guidelines",
+      "httpStatus": 200
+    },
+    {
+      "requestedURL": "https://antigravity.google/docs/mcp",
+      "finalURL": "https://antigravity.google/docs/mcp",
+      "httpStatus": 200
+    }
+  ],
+  "updatedDate": "2026-10-24"
+}

@@ -34,7 +34,35 @@ You'll need an **iPhone running iOS 18 or later**, a **macOS or Linux computer**
 1. **Install the app.** Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806).
 2. **Set up the receiver.** Follow the [setup guide](docs/setup.md), including a private HTTPS route for sync away from home.
 3. **Pair your iPhone.** [Scan the pairing QR](docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
-4. **Connect your AI.** [Add the bridge to your client](docs/setup.md#connect-an-mcp-client-intentionally), then [ask your first question](docs/setup.md#ask-your-first-question).
+4. **Connect your AI.** [Choose your client](#choose-your-ai), then [ask your first question](docs/setup.md#ask-your-first-question).
+
+## Choose your AI
+
+Choose a [client-specific setup recipe](docs/clients.md#choose-your-ai-client):
+
+<p>
+  <a href="docs/clients.md#antigravity-cli"><img src="assets/clients/antigravity.svg" alt="" width="24" height="24"> Antigravity CLI</a>
+  &nbsp; · &nbsp;
+  <a href="docs/clients.md#claude-code"><img src="assets/clients/claude-code-mark.svg" alt="" width="24" height="24"> Claude Code</a>
+  &nbsp; · &nbsp;
+  <a href="docs/clients.md#claude-desktop"><img src="assets/clients/claude-desktop-mark.svg" alt="" width="24" height="24"> Claude Desktop</a>
+</p>
+<p>
+  <a href="docs/clients.md#codex-cli"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"> Codex CLI</a>
+  &nbsp; · &nbsp;
+  <a href="docs/clients.md#cursor"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/cursor-cube-2d-dark.svg"><img src="assets/clients/cursor-cube-2d-light.svg" alt="" width="21" height="24"></picture> Cursor</a>
+  &nbsp; · &nbsp;
+  <a href="docs/clients.md#hermes-agent"><img src="assets/clients/hermes-agent.svg" alt="" width="24" height="24"> Hermes Agent</a>
+</p>
+<p>
+  <a href="docs/clients.md#openclaw-manual-configuration"><img src="assets/clients/openclaw.svg" alt="" width="24" height="24"> OpenClaw</a>
+  &nbsp; · &nbsp;
+  <a href="docs/clients.md#opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/opencode-logo-dark.svg"><img src="assets/clients/opencode-logo-light.svg" alt="" width="19" height="24"></picture> OpenCode</a>
+  &nbsp; · &nbsp;
+  <a href="docs/clients.md#vs-code-local-format"><img src="assets/clients/vscode.svg" alt="" width="24" height="24"> Visual Studio Code</a>
+</p>
+
+[And more](docs/setup.md#connect-an-mcp-client-intentionally). Other clients with local stdio MCP support can connect too.
 
 ## Supported data
 
