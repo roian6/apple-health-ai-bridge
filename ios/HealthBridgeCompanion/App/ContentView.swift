@@ -497,7 +497,7 @@ private struct ReceiverSettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This permanently deletes unsent local Health payloads and resets local sync cursors so the next connection rebuilds receiver history. If the saved connection is unreadable, it is also removed. Apple Health data itself is not deleted.")
+            Text("This permanently deletes unsent local Health payloads, pending pairing and local sync progress so the next connection can rebuild history, and removes any unreadable saved connection. This does not delete Apple Health data or revoke receiver enrollment.")
         }
         .confirmationDialog(
             "Reset lost mailbox connection key?",

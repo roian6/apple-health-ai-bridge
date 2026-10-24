@@ -3965,6 +3965,62 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         try await assertInterruptedNativePairingRecovery(coldBootstrap: false, superseded: true)
     }
 
+    func testConfirmedPrivateResetClearsPublishedNativePairingWithoutReceipt() async throws {
+        let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
+        let state = ReceiverPairingStateStore(
+            pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+            cancellationStore: MemoryReceiverTokenStore()
+        )
+        let peer = try ExchangePeer()
+        let directory = fixture.root.appendingPathComponent("native-private-reset")
+        var publications = 0
+        let io = NativeMailboxPairingIO(resolve: { _ in
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            return directory
+        }, publish: { url, bytes in
+            guard url.deletingLastPathComponent().standardizedFileURL.path == directory.standardizedFileURL.path,
+                  url.lastPathComponent == "request.hbp"
+                else { throw ExchangeFailure.invalidPeer }
+            XCTAssertTrue(try XCTUnwrap(state.loadPending()).publicationMayHaveOccurred)
+            publications += 1
+            try ExchangePeer.write(bytes, to: url)
+        }, read: { _ in nil }, hydrate: { _ in }, wait: { throw ExchangeFailure.responseUnavailable })
+        let runtime = try fixture.makeRuntime(cleanup: nil, nativeMailboxIO: io, pairingStateStore: state)
+        addTeardownBlock { @MainActor in
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.ownersStarted, fixture.ownersFinished)
+            fixture.removeOwnedStores()
+        }
+        let keys = try fixture.keys.loadOrCreate()
+        await runtime.bootstrap()
+        let invitation = try JSONEncoder().encode(peer.invitation())
+        let link = try XCTUnwrap(URL(string: "healthbridge://pair?payload=\(ExchangePeer.b64(invitation))"))
+        await runtime.viewModel.importPairingURL(link)
+        await fixture.join(runtime)
+        let pending = try XCTUnwrap(state.loadPending())
+        XCTAssertTrue(pending.publicationMayHaveOccurred)
+        XCTAssertFalse(pending.nativeCancellationConfirmed)
+        XCTAssertEqual(publications, 1)
+        XCTAssertTrue(runtime.viewModel.hasPendingPairing)
+
+        await runtime.viewModel.clearPendingOutbox()
+        await fixture.join(runtime)
+
+        XCTAssertNil(try state.loadPending())
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertFalse(runtime.viewModel.hasPendingPairing)
+        XCTAssertFalse(runtime.viewModel.hasPendingOutboxDeletion)
+        XCTAssertFalse(runtime.viewModel.statusIsError, runtime.viewModel.statusMessage)
+        XCTAssertTrue(try fixture.settings.receiverSettingsAreCleared())
+        XCTAssertEqual(try fixture.keys.loadOrCreate(), keys)
+        XCTAssertEqual(publications, 1, "Explicit local reset must not invent remote confirmation")
+        XCTAssertFalse(fixture.background.isEnabled)
+        XCTAssertTrue(fixture.reads.isEmpty)
+    }
+
     func testPublishedNativePairingCancellationReachesAuthenticatedReceipt() async throws {
         try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: true)
     }

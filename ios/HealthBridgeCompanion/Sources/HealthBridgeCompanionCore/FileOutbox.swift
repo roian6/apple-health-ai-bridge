@@ -3342,7 +3342,7 @@ public final class ReceiverPairingStateStore {
     }
 
     public func resetPrivatePairingState() throws {
-        try clearPending()
+        try pendingStore.saveToken("")
         try finishPendingCancellation()
     }
 

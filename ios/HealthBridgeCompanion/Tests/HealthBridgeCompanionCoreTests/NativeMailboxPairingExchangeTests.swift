@@ -156,6 +156,35 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         XCTAssertFalse(try f.state().hasPendingCancellation())
         XCTAssertNotEqual(f.settings.activeTransport, .mailbox)
     }
+    func testExplicitPrivateResetClearsPublishedNativeAuthority() async throws {
+        let f = try ExchangeFixture()
+        defer { f.close() }
+        f.allowCompletion = false
+        do {
+            _ = try await f.coordinator().pair(invitation: f.peer.invitation())
+            return XCTFail("Unavailable completion must leave a pending request")
+        } catch ExchangeFailure.responseUnavailable {
+            XCTAssertEqual(f.requests.count, 1)
+        }
+        let state = f.state()
+        let pending = try XCTUnwrap(state.loadPending())
+        XCTAssertTrue(pending.publicationMayHaveOccurred)
+        XCTAssertFalse(pending.nativeCancellationConfirmed)
+        XCTAssertThrowsError(try state.clearPending()) { error in
+            XCTAssertEqual(error as? ReceiverPairingStateError, .nativeCancellationRequiresReceipt)
+        }
+        try state.beginPendingCancellation(
+            expectedGeneration: f.settings.receiverSettingsGenerationToken)
+
+        try state.resetPrivatePairingState()
+
+        XCTAssertNil(try state.loadPending())
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertEqual(try state.loadOrCreateInstallationID(), pending.installationID)
+        XCTAssertEqual(f.requests.count, 1)
+        XCTAssertEqual(f.cancelPublications, 0)
+    }
+
     func testPeerCompletionUsesJSONNullForURLFreeReceiver() throws {
         let peer = try ExchangePeer()
         let probe = try PeerWireSelfTestProbe(receiverSigning: peer.signing.publicKey.rawRepresentation,
