@@ -3965,6 +3965,155 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         try await assertInterruptedNativePairingRecovery(coldBootstrap: false, superseded: true)
     }
 
+    func testPublishedNativePairingCancellationReachesAuthenticatedReceipt() async throws {
+        try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: true)
+    }
+
+    func testPublishedNativePairingCancellationRetriesMissingAndInvalidReceipt() async throws {
+        try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: false)
+    }
+
+    func testPublishedNativePairingCancellationResumesAfterColdBootstrap() async throws {
+        try await assertPublishedNativeCancellation(coldBootstrap: true, immediateReceipt: false)
+    }
+
+    func testPublishedNativePairingCancellationPreservesExistingDirectConnection() async throws {
+        try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: true, preserveDirect: true)
+    }
+
+    private func assertPublishedNativeCancellation(
+        coldBootstrap: Bool, immediateReceipt: Bool, preserveDirect: Bool = false
+    ) async throws {
+        let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
+        if preserveDirect {
+            try fixture.settings.save(
+                receiverURLString: "https://receiver.invalid/v1/batches",
+                bearerToken: "synthetic-existing-direct"
+            )
+        }
+        let state = ReceiverPairingStateStore(
+            pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+            cancellationStore: MemoryReceiverTokenStore()
+        )
+        let peer = try ExchangePeer()
+        let privateRoot = fixture.root.appendingPathComponent("native-cancel")
+        var requests: [Data] = []
+        var cancellations: [Data] = []
+        var receiptAvailable = immediateReceipt
+        let io = NativeMailboxPairingIO(resolve: { descriptor in
+            XCTAssertEqual(descriptor, try peer.invitation().mailboxBootstrap)
+            let directory = privateRoot.appendingPathComponent(descriptor.invitationID)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            return directory
+        }, publish: { url, bytes in
+            guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
+                else { throw ExchangeFailure.invalidPeer }
+            let pending = try XCTUnwrap(state.loadPending())
+            let request = try XCTUnwrap(pending.sealedRequest)
+            XCTAssertTrue(pending.publicationMayHaveOccurred)
+            switch url.lastPathComponent {
+            case "request.hbp":
+                XCTAssertEqual(bytes, request)
+                requests.append(bytes)
+            case "cancel.hbp":
+                cancellations.append(bytes)
+                try ExchangePeer.write(peer.cancelled(cancel: bytes, request: request),
+                    to: url.deletingLastPathComponent().appendingPathComponent("cancelled.hbp"))
+            default:
+                throw ExchangeFailure.invalidPeer
+            }
+            try ExchangePeer.write(bytes, to: url)
+        }, read: { url in
+            guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
+                else { throw ExchangeFailure.invalidPeer }
+            guard url.lastPathComponent == "cancelled.hbp", receiptAvailable else { return nil }
+            return try Data(contentsOf: url)
+        }, hydrate: { url in
+            guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
+                else { throw ExchangeFailure.invalidPeer }
+        }, wait: { throw ExchangeFailure.responseUnavailable })
+        let initial = try fixture.makeRuntime(cleanup: nil, nativeMailboxIO: io, pairingStateStore: state)
+        addTeardownBlock { @MainActor in
+            initial.automaticSyncRuntime.stopAdmission()
+            await initial.automaticSyncRuntime.cancelAndWait()
+            await fixture.join(initial)
+            XCTAssertEqual(fixture.ownersStarted, fixture.ownersFinished)
+            fixture.removeOwnedStores()
+        }
+        let originalKeys = try fixture.keys.loadOrCreate()
+        await initial.bootstrap()
+        let invitation = try JSONEncoder().encode(peer.invitation())
+        let link = try XCTUnwrap(URL(string: "healthbridge://pair?payload=\(ExchangePeer.b64(invitation))"))
+        await initial.viewModel.importPairingURL(link)
+        await fixture.join(initial)
+        let pending = try XCTUnwrap(state.loadPending())
+        let request = try XCTUnwrap(pending.sealedRequest)
+        let generation = try XCTUnwrap(pending.nativeExpectedGeneration)
+        XCTAssertEqual(requests, [request])
+        XCTAssertTrue(pending.publicationMayHaveOccurred)
+        let cursorBytes = try Data(contentsOf: fixture.cursors.fileURL)
+        let connectionBeforeCancellation = try fixture.settings.currentConnectionRecordV2()
+
+        await initial.viewModel.cancelPendingPairing()
+        await fixture.join(initial)
+        XCTAssertEqual(cancellations.count, 1, "App cancellation must publish request-bound native intent")
+        var resumed = initial
+        if !immediateReceipt {
+            XCTAssertEqual(try state.loadPending(), pending)
+            XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+            XCTAssertTrue(initial.viewModel.hasPendingPairing)
+            XCTAssertTrue(initial.viewModel.statusIsError)
+            XCTAssertTrue(try state.hasPendingCancellation())
+
+            receiptAvailable = true
+            peer.receiptTamper = "requestDigest"
+            await initial.viewModel.retryPendingPairing()
+            await fixture.join(initial)
+            XCTAssertEqual(cancellations.count, 2, "Retry must reach the native exchange despite pending cleanup")
+            XCTAssertEqual(try state.loadPending(), pending, "An unrelated receipt cannot erase pending authority")
+            XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+            XCTAssertTrue(initial.viewModel.hasPendingPairing)
+            XCTAssertTrue(initial.viewModel.statusIsError)
+
+            peer.receiptTamper = nil
+            if coldBootstrap {
+                initial.automaticSyncRuntime.stopAdmission()
+                await initial.automaticSyncRuntime.cancelAndWait()
+                await fixture.join(initial)
+                resumed = try fixture.makeRuntime(cleanup: nil, nativeMailboxIO: io, pairingStateStore: state)
+                let restored = resumed
+                addTeardownBlock { @MainActor in
+                    restored.automaticSyncRuntime.stopAdmission()
+                    await restored.automaticSyncRuntime.cancelAndWait()
+                    await fixture.join(restored)
+                }
+                await resumed.bootstrap()
+            } else {
+                await resumed.viewModel.retryPendingPairing()
+            }
+            await fixture.join(resumed)
+            XCTAssertEqual(cancellations.count, 3)
+        }
+        XCTAssertNil(try state.loadPending())
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertNil(fixture.settings.terminalCancellationExpectedGeneration)
+        XCTAssertFalse(resumed.viewModel.hasPendingPairing)
+        XCTAssertFalse(resumed.viewModel.statusIsError, resumed.viewModel.statusMessage)
+        XCTAssertEqual(resumed.viewModel.receiverSettingsSaved, preserveDirect)
+        XCTAssertEqual(try fixture.settings.receiverSettingsAreCleared(), !preserveDirect)
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), connectionBeforeCancellation)
+        XCTAssertEqual(resumed.viewModel.receiverURLString, fixture.settings.receiverURLString)
+        XCTAssertEqual(resumed.viewModel.bearerToken, try fixture.settings.loadBearerToken())
+        XCTAssertEqual(requests.count, cancellations.count + 1)
+        XCTAssertTrue(requests.allSatisfy { $0 == request })
+        XCTAssertEqual(try fixture.keys.loadOrCreate(), originalKeys)
+        XCTAssertEqual(try Data(contentsOf: fixture.cursors.fileURL), cursorBytes)
+        XCTAssertFalse(fixture.background.isEnabled)
+        XCTAssertTrue(fixture.reads.isEmpty)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+    }
+
     private func assertInterruptedNativePairingRecovery(coldBootstrap: Bool, superseded: Bool) async throws {
         let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
         let state = ReceiverPairingStateStore(

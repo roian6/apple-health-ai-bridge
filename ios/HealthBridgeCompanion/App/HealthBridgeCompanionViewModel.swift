@@ -1759,9 +1759,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return
         }
         let recoverCommittedReceiverRemoval: Bool
+        let recoverNativeCancellation: Bool
         do {
             recoverCommittedReceiverRemoval =
                 try settingsStore.committedReceiverRemovalCancellationGeneration() != nil
+            recoverNativeCancellation = try !recoverCommittedReceiverRemoval
+                && pairingCoordinator.hasPendingCancellationRecovery()
+                && pairingStateStore.loadPending()?.mailboxBootstrap != nil
+            if recoverNativeCancellation {
+                try retryPrivateStoreInitialization()
+            }
         } catch {
             return
         }
@@ -1780,7 +1787,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         do {
             hasPendingPairing = true
             if try pairingCoordinator.hasPendingCancellationRecovery() {
-                _ = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
+                let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                     cancelPairingOperation: false,
                     advanceGeneration: false,
                     recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval
@@ -1790,12 +1797,25 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         try self.settingsStore.resetInvalidConnectionRecord()
                         return true
                     }
+                    if recoverNativeCancellation {
+                        _ = try await self.pairingCoordinator.resumePendingPairing(
+                            expectedGeneration: expectedGeneration
+                        )
+                        return true
+                    }
                     return try self.pairingCoordinator.finishPendingCancellationIfNeeded(
                         expectedGeneration: expectedGeneration
                     )
                 }
+                try requireCommittedConnectionGenerationWhileHoldingRequestGate(transition.committedGeneration)
                 reloadCommittedReceiverSettings()
                 pairingFailurePresentation = nil
+                if recoverNativeCancellation {
+                    statusIsError = transition.postCommitRecoveryRequired
+                    statusMessage = transition.postCommitRecoveryRequired
+                        ? "Cancelled pending pairing. Private cleanup will finish during recovery."
+                        : "Cancelled pending pairing. Start a fresh pairing invitation."
+                }
                 return
             }
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
@@ -1888,14 +1908,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 cancelPairingOperation: true,
                 advanceGeneration: false
             ) { expectedGeneration in
-                try self.pairingCoordinator.cancelPendingPairing(
+                let outcome = try self.pairingCoordinator.cancelPendingPairing(
                     expectedGeneration: expectedGeneration
                 )
+                if outcome == .committedCleanupPending,
+                   try self.pairingStateStore.loadPending()?.mailboxBootstrap != nil {
+                    _ = try await self.pairingCoordinator.resumePendingPairing(
+                        expectedGeneration: expectedGeneration
+                    )
+                    return ReceiverPairingCancellationOutcome.completed
+                }
+                return outcome
             }
             try requireCommittedConnectionGenerationWhileHoldingRequestGate(transition.committedGeneration)
-            receiverURLString = ReceiverSettingsStore.defaultReceiverURLString
-            bearerToken = ""
-            receiverSettingsSaved = false
+            reloadCommittedReceiverSettings()
             let cancellationCleanupRecoveryRequired =
                 transition.result == .committedCleanupPending
             let cleanupRecoveryRequired =
@@ -1911,10 +1937,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 || cancellationCleanupRecoveryRequired
             if cleanupRecoveryRequired {
                 statusIsError = true
-                statusMessage = "Cancelled pending pairing and cleared the uncertain connection. Private cleanup will finish during recovery."
+                statusMessage = "Cancelled pending pairing. Private cleanup will finish during recovery."
             } else {
                 statusIsError = false
-                statusMessage = "Cancelled pending pairing and cleared the uncertain active connection. Start a fresh pairing invitation."
+                statusMessage = "Cancelled pending pairing. Start a fresh pairing invitation."
             }
         } catch {
             reloadCommittedReceiverSettings()

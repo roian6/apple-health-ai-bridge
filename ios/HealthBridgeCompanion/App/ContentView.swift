@@ -152,25 +152,25 @@ struct ContentView: View {
                 }
                 .disabled(viewModel.isPairing)
             }
-            Button("Clear Pending Pairing and Disconnect", role: .destructive) {
+            Button("Cancel Pending Pairing", role: .destructive) {
                 showPendingPairingCancellationConfirmation = true
             }
             .disabled(viewModel.isPairing)
         }
         .cardStyle()
         .confirmationDialog(
-            "Clear pending pairing and disconnect?",
+            "Cancel pending pairing?",
             isPresented: $showPendingPairingCancellationConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Clear Pending Pairing and Disconnect", role: .destructive) {
+            Button("Cancel Pending Pairing", role: .destructive) {
                 Task {
                     await viewModel.cancelPendingPairing()
                 }
             }
             Button("Keep Pending Pairing", role: .cancel) {}
         } message: {
-            Text("This removes the pending invitation and also removes the currently saved connection. Apple Health data is not deleted.")
+            Text("This cancels the saved pairing attempt and may disconnect the saved receiver. Any required receiver confirmation must finish before cleanup. Apple Health data is not deleted.")
         }
     }
 
