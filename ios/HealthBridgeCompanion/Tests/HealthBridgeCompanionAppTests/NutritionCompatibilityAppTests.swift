@@ -6,6 +6,62 @@ import XCTest
 
 @MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
+    func testCapabilityTokenFailureDoesNotReportQuantitySyncSuccess() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let vm = try await fixture.makeViewModel()
+        vm.statusIsError = false
+        // Generation, binding and URL reads succeed; the bearer-token read fails.
+        fixture.tokenStore.loadsBeforeFailure = 3
+
+        await vm.syncSupportedQuantityMetrics()
+
+        XCTAssertEqual(fixture.tokenStore.failedLoads, 1)
+        XCTAssertTrue(vm.statusIsError)
+        XCTAssertTrue(fixture.reads.isEmpty)
+        XCTAssertTrue(fixture.receiver.records.isEmpty)
+        XCTAssertNil(try fixture.cursor("weight"))
+        vm.statusIsError = false
+        let cancelled = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            await vm.syncSupportedQuantityMetrics()
+        }
+        await cancelled.value
+        XCTAssertFalse(vm.statusIsError)
+        XCTAssertTrue(fixture.reads.isEmpty)
+    }
+
+    func testCapabilityTokenFailureDoesNotBlockPublishedMailboxACK() async throws {
+        let fixture = try NutritionMailboxFixture()
+        defer { fixture.base.cleanup() }
+        let original = try fixture.base.enqueueMixed()
+        let delivery = fixture.delivery()
+        _ = try await delivery.publishPendingFIFOHead()
+        _ = try fixture.receiveAndAcknowledge(original)
+        // Five metadata reads and two five-read validations precede the token.
+        fixture.base.tokenStore.loadsBeforeFailure = 15
+        do {
+            let phase = try await delivery.pendingFIFOHeadBackgroundPhase()
+            XCTAssertEqual(phase, .reconcileFIFOHeadAcknowledgment)
+        } catch {
+            XCTFail("Capability token failure blocked ACK phase selection: \(error)")
+        }
+        XCTAssertEqual(fixture.base.tokenStore.failedLoads, 1)
+        fixture.base.tokenStore.loadsBeforeFailure = 15
+
+        do {
+            let result = try await delivery.reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+            XCTAssertEqual(result.finalizedCount, 1)
+        } catch {
+            XCTFail("Capability token failure blocked authenticated ACK finalization: \(error)")
+        }
+
+        XCTAssertEqual(fixture.base.tokenStore.failedLoads, 2)
+        XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
+        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(fixture.base.receiver.records.count, 2)
+    }
+
     func testStoppedSyncDoesNotDuplicateNutritionNotice() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

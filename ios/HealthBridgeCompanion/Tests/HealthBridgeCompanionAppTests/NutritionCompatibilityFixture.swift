@@ -93,6 +93,7 @@ final class NutritionFixture {
     let root: URL
     let suite = "NutritionCompatibility.\(UUID().uuidString)"
     let defaults: UserDefaults
+    let tokenStore = NutritionTokenStore()
     let settings: ReceiverSettingsStore
     let outbox: FileOutbox
     let cursors: FileSyncCursorStore
@@ -108,7 +109,7 @@ final class NutritionFixture {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         settings = ReceiverSettingsStore(
-            userDefaults: defaults, tokenStore: NutritionTokenStore(),
+            userDefaults: defaults, tokenStore: tokenStore,
             preCutoverBackupStore: NutritionTokenStore(), synchronize: { true }
         )
         try settings.save(receiverURLString: "http://127.0.0.1:8765/v1/batches",

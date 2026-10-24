@@ -961,7 +961,7 @@ public final class ProductionMailboxDelivery {
         let pending = try outbox.pendingItems()
         guard try outbox.containsPreparedNutrition(in: pending),
               let url = URL(string: receiverURL) else { return }
-        let token = try settingsStore.loadBearerToken()
+        guard let token = try? settingsStore.loadBearerToken() else { return }
         let support = await receiverClient.nutritionSupport(forBatchURL: url, bearerToken: token)
         try validate()
         guard settingsStore.receiverSettingsGenerationToken == generation,

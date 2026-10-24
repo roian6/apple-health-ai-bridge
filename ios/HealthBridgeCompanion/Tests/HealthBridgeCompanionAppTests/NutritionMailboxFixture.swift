@@ -5,7 +5,19 @@ import XCTest
 
 final class NutritionTokenStore: ReceiverTokenStoring {
     private var token = ""
-    func loadToken() throws -> String { token }
+    var loadsBeforeFailure: Int?
+    private(set) var failedLoads = 0
+    func loadToken() throws -> String {
+        if let remaining = loadsBeforeFailure {
+            if remaining == 0 {
+                loadsBeforeFailure = nil
+                failedLoads += 1
+                throw KeychainReceiverTokenStoreError.unavailable
+            }
+            loadsBeforeFailure = remaining - 1
+        }
+        return token
+    }
     func saveToken(_ token: String) throws { self.token = token }
 }
 

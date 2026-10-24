@@ -5487,7 +5487,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             do {
                 nutritionSupport = availableRawTypeCodes.contains(where: NutritionCompatibility.isNutrition)
                     ? try await refreshNutritionSupport() : .unknown
+            } catch is CancellationError {
+                return
             } catch {
+                guard !Task.isCancelled else { return }
+                noteBackgroundAutomaticSyncFailure(
+                    stage: .store, error: error, executionMode: mode.executionMode
+                )
+                statusIsError = true
+                statusMessage = "\(mode.failurePrefix): \(describe(error))"
                 return
             }
             let selectedTypeCodes = GenericQuantityCoveragePolicy
