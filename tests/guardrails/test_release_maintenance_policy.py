@@ -176,7 +176,9 @@ def test_authorized_maintenance_preserves_real_default_main(
     assert completed.returncode == 0, completed.stderr
 
 
-def run_source(graph: MaintenanceGraph) -> subprocess.CompletedProcess[str]:
+def run_source(
+    graph: MaintenanceGraph, *, tag_object: str | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -188,12 +190,81 @@ def run_source(graph: MaintenanceGraph) -> subprocess.CompletedProcess[str]:
             "--commit",
             graph.target,
             "--tag-object",
-            git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}"),
+            tag_object
+            if tag_object is not None
+            else git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}"),
         ],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+@pytest.mark.parametrize("command", ["gh", "git"])
+def test_stalled_source_lookup_has_clean_bounded_failure(
+    maintenance_graph: MaintenanceGraph, command: str
+) -> None:
+    graph = maintenance_graph
+    tag_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
+    executable = graph.transport.parent / command
+    _ = executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(0.5)\n")
+    executable.chmod(0o700)
+    runner = graph.transport.parent / "timeout_runner.py"
+    _ = runner.write_text(
+        f"""import sys
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+import release_source_policy as policy
+policy._LOOKUP_TIMEOUT_SECONDS = 0.05
+raise SystemExit(policy.main())
+"""
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(runner),
+            "--repo",
+            str(graph.repo),
+            "--tag",
+            TAG,
+            "--commit",
+            graph.target,
+            "--tag-object",
+            tag_object,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == f"release source {command} lookup timed out\n"
+
+
+def test_different_local_tag_object_is_rejected(
+    maintenance_graph: MaintenanceGraph,
+) -> None:
+    graph = maintenance_graph
+    requested_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
+    _ = git_output(
+        graph.repo,
+        "-c",
+        "user.name=Synthetic",
+        "-c",
+        "user.email=synthetic",
+        "tag",
+        "-f",
+        "-a",
+        TAG,
+        "-m",
+        "synthetic different local tag object",
+    )
+    assert git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}") != requested_object
+    completed = run_source(graph, tag_object=requested_object)
+    assert completed.returncode == 1
+    assert "signed tag identity or target mismatch" in completed.stderr
 
 
 def read_transport(graph: MaintenanceGraph) -> JsonObject:
@@ -303,6 +374,7 @@ def test_duplicate_records_are_rejected(maintenance_graph: MaintenanceGraph) -> 
         (("", "default_branch"), "other"),
         (("/git/tags/{base_object}", "object", "sha"), "b" * 40),
         ((f"/git/ref/tags/{TAG}", "object", "sha"), "b" * 40),
+        ((f"/git/ref/tags/{TAG}", "object", "type"), "commit"),
         (("/git/tags/{tag_object}", "object", "sha"), BASE),
         (("/git/tags/{tag_object}", "verification", "verified"), False),
         (("/git/tags/{tag_object}", "tag"), "receiver-v1.1.5"),
