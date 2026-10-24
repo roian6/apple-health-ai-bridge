@@ -29,7 +29,7 @@ from health_bridge.storage.database import (
     connect_readonly_database,
     database_lifecycle_lock,
 )
-from health_bridge.storage.sqlite_rows import fetch_one_int
+from health_bridge.storage.sqlite_rows import TEXT_ROWS_ADAPTER, fetch_one_int
 
 
 class ReceiverIngestResponse(BaseModel):
@@ -338,6 +338,14 @@ def test_receiver_preserves_workout_types_and_updates_other_in_cli_and_mcp(
             )
             with connect_readonly_database(db_path) as connection:
                 assert fetch_one_int(connection, "select count(*) from workouts") == 5
+                assert TEXT_ROWS_ADAPTER.validate_python(
+                    connection.execute(
+                        """select workout_type from workouts
+                        join sources using (source_id)
+                        where source_key = ? and client_record_id = ?""",
+                        (legacy.source_key, legacy.client_record_id),
+                    ).fetchall()
+                ) == [(reclassified_type,)]
                 row_ids.append(
                     fetch_one_int(
                         connection,
