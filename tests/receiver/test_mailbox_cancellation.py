@@ -1,6 +1,7 @@
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -12,8 +13,8 @@ from health_bridge.mailbox.connections import (
     MailboxTrustedConnectionRecord,
 )
 from health_bridge.mailbox.publication import publish_final
+from health_bridge.receiver import invitations
 from health_bridge.receiver.delivery_acceptance import DeliveryAcceptanceService
-from health_bridge.receiver.invitations import create_pairing_invitation
 from health_bridge.receiver.mailbox_bootstrap import PAIRING_DOMAIN
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
@@ -174,8 +175,18 @@ def test_cancellation_revokes_exact_request_across_restart(
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("restarted", [False, True])
 def test_older_native_request_recovers_beyond_first_invitation_page(
-    tmp_path: Path, cancelled: bool, restarted: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+    restarted: bool,
 ) -> None:
+    invitation_ids = iter(
+        [
+            UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            *(UUID(int=number, version=4) for number in range(1, 129)),
+        ]
+    )
+    monkeypatch.setattr(invitations, "uuid4", lambda: next(invitation_ids))
     peer = LegacyPeer(tmp_path)
     descriptor, request = stage_native(peer)
     root = tmp_path / "provider"
@@ -201,13 +212,18 @@ def test_older_native_request_recovers_beyond_first_invitation_page(
     )
     (directory / "completion.hbp").unlink()
     for _ in range(128):
-        _ = create_pairing_invitation(
+        _ = invitations.create_pairing_invitation(
             peer.db,
             label="newer-synthetic",
             receiver_url=None,
             transport="mailbox",
             now=datetime(2099, 1, 1, tzinfo=UTC),
         )
+    with connect_database(peer.db) as db:
+        assert db.execute(
+            "select count(*) from pairing_invitations where pairing_invitation_id < ?",
+            (str(UUID(descriptor.invitation_id)),),
+        ).fetchone() == (128,)
     if cancelled:
         _ = publish_final(
             directory,
@@ -223,12 +239,14 @@ def test_older_native_request_recovers_beyond_first_invitation_page(
             pairing_publisher=publish,
         )
     publications.clear()
+    response_name = "cancelled.hbp" if cancelled else "completion.hbp"
     # Drive a finite number of real cycles, not a timing-dependent wait.
-    for _ in range(3):
+    for cycle in range(3):
         before = len(publications)
         worker.run_once()
         assert len(publications) - before <= 1
-    response_name = "cancelled.hbp" if cancelled else "completion.hbp"
+        if cycle == 0:
+            assert not (directory / response_name).exists()
     assert (directory / response_name).exists()
     response = (directory / response_name).read_bytes()
     assert publications == [response]
