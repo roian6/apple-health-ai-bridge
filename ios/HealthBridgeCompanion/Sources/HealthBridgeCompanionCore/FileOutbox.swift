@@ -495,6 +495,7 @@ public final class FileOutbox {
         var receiverIdentity: String?
         var mailboxBinding: FileOutboxMailboxBindingV1?
         var deliveryState: FileOutboxDeliveryStateV1?
+        var nutritionProjectionPrepared: Bool? = nil
     }
 
     private struct SequenceManifest: Codable, Equatable {
@@ -620,6 +621,8 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    var observeNutritionCodec: @Sendable () -> Void = {}
+    var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
 
     #if !HEALTH_BRIDGE_MAILBOX_QA
     public weak var automaticSyncDiagnosticDraft: AutomaticSyncDiagnosticDraft?
@@ -1119,7 +1122,20 @@ public final class FileOutbox {
     }
 
     public func pendingItems() throws -> [FileOutboxItem] {
-        let manifest = try reconciledManifest()
+        try pendingItems(in: reconciledManifest())
+    }
+
+    func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
+        try requireUploadAdmission()
+        guard let manifest = try loadManifest() else { throw CancellationError() }
+        let known = Set(manifest.entries.map(\.id))
+        guard try payloadFileURLs().allSatisfy({ known.contains(payloadID(for: $0)) }) else {
+            throw CancellationError()
+        }
+        return try pendingItems(in: manifest)
+    }
+
+    private func pendingItems(in manifest: SequenceManifest) throws -> [FileOutboxItem] {
         let payloadIDs = Set(try payloadFileURLs().map { payloadID(for: $0) })
         return manifest.entries
             .sorted { $0.sequence < $1.sequence }
@@ -1214,7 +1230,7 @@ public final class FileOutbox {
         }) else {
             throw FileOutboxCursorCheckpointError.checkpointMismatch
         }
-        guard transactionIndex == 0 else {
+        guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
@@ -1291,7 +1307,7 @@ public final class FileOutbox {
                 try persistEnqueueTransactions(transactions)
             }
             _ = try reconciledManifest()
-            guard transactionIndex == 0,
+            guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
                   updated.directAcknowledgedIDs == Set(updated.entries.map(\.id)) else {
                 return nil
             }
@@ -1313,17 +1329,45 @@ public final class FileOutbox {
     ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         _ = try reconciledManifest()
-        guard let transaction = try loadEnqueueTransactions().first,
-              let finalizationRecord = transaction.finalizationRecord,
-              transaction.entries.allSatisfy({
-                  $0.receiverIdentity == receiverIdentity
-              }),
-              finalizationRecord.cursorCheckpoint?.receiverIdentity
-                == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
-              transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)) else {
-            return nil
+        let transactions = try loadEnqueueTransactions()
+        for (index, transaction) in transactions.enumerated() {
+            guard let finalizationRecord = transaction.finalizationRecord,
+                  transaction.entries.allSatisfy({ $0.receiverIdentity == receiverIdentity }),
+                  finalizationRecord.cursorCheckpoint?.receiverIdentity
+                    == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
+                  transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)),
+                  try canFinalizeNutritionIndependentTransaction(index, in: transactions) else {
+                continue
+            }
+            return finalizationRecord
         }
-        return finalizationRecord
+        return nil
+    }
+
+    private func canFinalizeNutritionIndependentTransaction(
+        _ index: Int, in transactions: [EnqueueTransaction]
+    ) throws -> Bool {
+        guard index > 0 else { return true }
+        let target = transactions[index]
+        for previous in transactions.prefix(index) {
+            guard previous.entries.allSatisfy({
+                $0.receiverIdentity == target.entries.first?.receiverIdentity
+            }) else { return false }
+            if let left = previous.cursorCheckpoint, let right = target.cursorCheckpoint,
+               left.receiverIdentity == right.receiverIdentity,
+               left.sourceKey == right.sourceKey, left.cursorKind == right.cursorKind { return false }
+            if !Set(previous.pendingGenerationRetirements?.keys.map { $0 } ?? [])
+                .isDisjoint(with: target.pendingGenerationRetirements?.keys.map { $0 } ?? []) {
+                return false
+            }
+            // Only held nutrition can be bypassed, never another ordinary FIFO lane.
+            for entry in previous.entries where !previous.directAcknowledgedIDs.contains(entry.id) {
+                guard let item = try pendingItem(id: entry.id) else { return false }
+                guard let prepared = try preparedNutritionPayload(for: item),
+                      prepared.containsNutrition else { return false }
+            }
+        }
+        return true
     }
 
     public func uploadablePendingItems(for receiverIdentity: String) throws -> [FileOutboxItem] {
@@ -1344,6 +1388,28 @@ public final class FileOutbox {
             try requireDirectRetirementAllowed(itemID: item.id)
         }
         return uploadable
+    }
+
+    func prepareNutritionProjection(for item: FileOutboxItem, payload: Data) throws {
+        let manifest = try reconciledManifest()
+        guard let entry = manifest.entries.first(where: { $0.id == item.id }),
+              let identity = entry.receiverIdentity else {
+            throw ReceiverOutboxIdentityError.missingReceiverIdentity
+        }
+        guard entry.nutritionProjectionPrepared != true else { return }
+        // Persist the child before the marker. A crash between these writes can
+        // replay stable record identities, but cannot lose supported records.
+        let projection = try enqueueIfAbsent(payload, receiverIdentity: identity).item
+        preparedNutritionPayloads[projection.id] = PreparedNutritionPayload(
+            revision: try NutritionPayloadRevision(projection.fileURL),
+            containsNutrition: false, permitsSupported: true, projection: nil
+        )
+        var updated = try reconciledManifest()
+        guard let index = updated.entries.firstIndex(where: { $0.id == item.id }) else {
+            throw SequenceError.invalidManifest
+        }
+        updated.entries[index].nutritionProjectionPrepared = true
+        try persistManifest(updated)
     }
 
     public func pendingItem(id: String) throws -> FileOutboxItem? {
@@ -1556,7 +1622,7 @@ public final class FileOutbox {
         }) else {
             return nil
         }
-        guard transactionIndex == 0 else {
+        guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
@@ -2744,6 +2810,7 @@ public protocol SleepSyncManifestStoring: AnyObject {
     @MainActor func savePendingForSync(_ transition: SleepSyncPendingTransition, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
     @MainActor func clearPendingForSync(id: String, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
 }
+#endif
 
 public enum SleepSyncValueWork {
     public static func run<Value: Sendable>(
@@ -2764,6 +2831,7 @@ public enum SleepSyncValueWork {
     }
 }
 
+#if !HEALTH_BRIDGE_MAILBOX_QA
 public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
     enum CodecOperation: Hashable, Sendable {
         case decodeManifest

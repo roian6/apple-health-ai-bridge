@@ -1,0 +1,148 @@
+import CryptoKit
+import Foundation
+import XCTest
+@testable import HealthBridgeCompanion
+
+final class NutritionTokenStore: ReceiverTokenStoring {
+    private var token = ""
+    func loadToken() throws -> String { token }
+    func saveToken(_ token: String) throws { self.token = token }
+}
+
+final class NutritionKeychain: MailboxKeychainClient {
+    private var items: [String: Data] = [:]
+    private var trust: [String: Data] = [:]
+    func withExclusiveAccess<T>(service: String, _ body: () throws -> T) throws -> T { try body() }
+    func data(service: String, account: String) throws -> Data? { items[service + ":" + account] }
+    func store(_ data: Data, service: String, account: String) throws { items[service + ":" + account] = data }
+    func remove(service: String, account: String) throws { items.removeValue(forKey: service + ":" + account) }
+    func trustData(service: String, record: MailboxTrustRecord) throws -> Data? { trust[service + ":" + record.rawValue] }
+    func storeTrust(_ data: Data, service: String, record: MailboxTrustRecord) throws {
+        trust[service + ":" + record.rawValue] = data
+    }
+    func removeTrust(service: String, record: MailboxTrustRecord) throws {
+        trust.removeValue(forKey: service + ":" + record.rawValue)
+    }
+}
+
+@MainActor
+final class NutritionMailboxFixture {
+    let base: NutritionFixture
+    let keys: MailboxKeyStore
+    let identity: MailboxConnectionIdentityV1
+    let context: MailboxAckContext
+    let locator: MailboxResolvedLocatorV1
+    let signing = Curve25519.Signing.PrivateKey()
+    let agreement = Curve25519.KeyAgreement.PrivateKey()
+    var envelopeNumber: UInt8 = 0
+
+    init() throws {
+        base = try NutritionFixture()
+        keys = MailboxKeyStore(service: base.suite, keychain: NutritionKeychain())
+        let device = try keys.loadOrCreate()
+        let receiverID = Data(repeating: 0x71, count: 16)
+        let deviceID = Data(repeating: 0x72, count: 16)
+        identity = MailboxConnectionIdentityV1(
+            receiverID: receiverID.hexV1, deviceID: deviceID.hexV1, devicePrincipal: "synthetic-nutrition",
+            deviceSigningKeyID: device.signingKeyID, deviceAgreementKeyID: device.agreementKeyID,
+            receiverSigningKeyID: try DeliveryProtocolV1.keyID(
+                algorithm: "ed25519", publicKey: signing.publicKey.rawRepresentation
+            ),
+            receiverAgreementKeyID: try DeliveryProtocolV1.keyID(
+                algorithm: "x25519", publicKey: agreement.publicKey.rawRepresentation
+            ),
+            receiverSigningPublicKey: signing.publicKey.rawRepresentation.base64URLEncodedString(),
+            receiverAgreementPublicKey: agreement.publicKey.rawRepresentation.base64URLEncodedString(),
+            opaqueBinding: Data(repeating: 0x73, count: 32).base64URLEncodedString(), connectionGeneration: 1
+        )
+        try base.settings.saveMailboxPairing(
+            receiverURLString: "http://127.0.0.1:8765/v1/batches", bearerToken: "synthetic-nutrition",
+            mailboxIdentity: identity, expectedGeneration: base.settings.receiverSettingsGenerationToken
+        )
+        context = MailboxAckContext(
+            receiverID: receiverID, deviceID: deviceID, receiverBindingID: identity.opaqueBinding,
+            connectionGeneration: 1, deviceAgreementPrivateKey: try keys.agreementPrivateKey(),
+            deviceAgreementKeyID: device.agreementKeyID,
+            receiverSigningPublicKey: signing.publicKey, receiverSigningKeyID: identity.receiverSigningKeyID,
+            receiverAgreementPublicKey: agreement.publicKey, receiverAgreementKeyID: identity.receiverAgreementKeyID,
+            deviceSigningPublicKey: try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey),
+            deviceSigningKeyID: device.signingKeyID
+        )
+        let provider = base.root.appendingPathComponent("provider")
+        try FileManager.default.createDirectory(at: provider, withIntermediateDirectories: true)
+        locator = try MailboxLocatorV1.resolveIsolated(
+            providerRoot: provider, containerIdentifier: "synthetic.nutrition",
+            receiverComponent: identity.receiverID, deviceComponent: identity.deviceID,
+            localRecordURL: base.root.appendingPathComponent("local/locator.json")
+        )
+    }
+
+    func components() -> ProductionMailboxComponents {
+        let location = locator
+        let lookup = FileOutboxMailboxAckLookup(outbox: base.outbox, deviceSigningPublicKey: context.deviceSigningPublicKey)
+        let transport = MailboxTransport(
+            outbox: base.outbox,
+            context: MailboxTransportContext(
+                receiverID: context.receiverID, deviceID: context.deviceID,
+                receiverBindingID: identity.opaqueBinding, connectionGeneration: 1,
+                receiverAgreementPublicKey: agreement.publicKey, receiverAgreementKeyID: identity.receiverAgreementKeyID,
+                deviceSigningPublicKey: context.deviceSigningPublicKey, deviceSigningKeyID: identity.deviceSigningKeyID
+            ),
+            sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keys), locate: { location },
+            publisher: POSIXMailboxEnvelopePublisher(),
+            envelopeID: { [self] in envelopeNumber += 1; return Data(repeating: envelopeNumber, count: 16) },
+            nowMilliseconds: { 1_790_000_000_000 },
+            isCancelled: { withUnsafeCurrentTask { $0?.isCancelled ?? false } },
+            observe: { url, digest in
+                SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined() == digest
+            }
+        )
+        return ProductionMailboxComponents(
+            identity: identity, deviceSigningPublicKey: context.deviceSigningPublicKey, ackContext: context,
+            transport: transport, ackLookup: lookup,
+            scanner: MailboxAckScanner(context: context, lookup: lookup, locate: { location }), locate: { location }
+        )
+    }
+
+    func delivery() -> ProductionMailboxDelivery {
+        let components = components()
+        return ProductionMailboxDelivery(
+            settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
+            keyStore: keys, componentsFactory: { components }, receiverClient: base.client
+        )
+    }
+
+    func receiveAndAcknowledge(_ item: FileOutboxItem) throws -> HealthBridgeBatchV1 {
+        let envelopeID = try components().transport.finalizedEnvelopeID(itemID: item.id)
+        let lane = try XCTUnwrap(locator.lanes[.deliveries])
+        let name = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .delivery)
+        let opened = try DeliveryProtocolV1.openDelivery(
+            Data(contentsOf: lane.appendingPathComponent(name)),
+            context: DeliveryEnvelopeOpenContext(
+                receiverID: context.receiverID, deviceID: context.deviceID, connectionGeneration: 1,
+                receiverAgreementPrivateKey: agreement, senderSigningPublicKey: context.deviceSigningPublicKey
+            )
+        )
+        let payload = try Data(contentsOf: item.fileURL)
+        XCTAssertEqual(opened.plaintext, payload)
+        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: payload)
+        var request = URLRequest(url: try XCTUnwrap(URL(string: base.settings.receiverURLString)))
+        request.httpMethod = "POST"
+        XCTAssertEqual(try base.receiver.respond(request, body: payload).0, 202)
+        let ack = try DeliveryProtocolV1.sealAck(
+            DeliveryReceiptV1(
+                result: .committed,
+                payloadSHA256: SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined(),
+                receiptID: 1, datasetGeneration: 1, committedAtMS: 1_790_000_000_000, errorCode: nil
+            ),
+            context: DeliveryAckSealContext(
+                envelopeID: envelopeID, receiverID: context.receiverID, deviceID: context.deviceID,
+                connectionGeneration: 1, deviceAgreementPublicKey: context.deviceAgreementPrivateKey.publicKey,
+                receiverSigningPrivateKey: signing, receiverAgreementPrivateKey: agreement
+            )
+        )
+        let ackName = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .acknowledgment)
+        try ack.write(to: XCTUnwrap(locator.lanes[.acks]).appendingPathComponent(ackName), options: [.atomic])
+        return batch
+    }
+}

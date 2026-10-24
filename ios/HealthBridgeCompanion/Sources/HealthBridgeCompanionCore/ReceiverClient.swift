@@ -330,6 +330,30 @@ public final class ReceiverClient: @unchecked Sendable {
         return ReceiverUploadResult(statusCode: httpResponse.statusCode, responseBody: data)
     }
 
+    public func nutritionSupport(forBatchURL batchURL: URL, bearerToken: String) async -> NutritionSupport {
+        let token = bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty,
+              var components = URLComponents(url: batchURL, resolvingAgainstBaseURL: false) else {
+            return .unknown
+        }
+        components.path = "/v1/capabilities"
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { return .unknown }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = Self.healthCheckTimeout
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard !Task.isCancelled, let http = response as? HTTPURLResponse,
+                  http.statusCode == 200, http.url == url else { return .unknown }
+            return NutritionSupport.decode(data)
+        } catch {
+            // A failed fresh probe must never inherit an earlier success.
+            return .unknown
+        }
+    }
+
     public func redeem(
         pendingPairing: ReceiverPendingPairing,
         mailboxPublicIdentity: MailboxPublicIdentity? = nil

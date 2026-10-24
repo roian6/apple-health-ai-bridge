@@ -116,6 +116,8 @@ public final class ProductionMailboxDelivery {
     private let sleepStore: (any SleepSyncManifestStoring)?
     private let keyStore: MailboxKeyStore
     private let componentsFactory: (() throws -> ProductionMailboxComponents)?
+    private let receiverClient: ReceiverClient
+    private var nutritionSupport = NutritionSupport.unknown
 
     public convenience init(
         settingsStore: ReceiverSettingsStore,
@@ -126,7 +128,8 @@ public final class ProductionMailboxDelivery {
         sleepStore: (any SleepSyncManifestStoring)? = nil,
         keyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
-        )
+        ),
+        receiverClient: ReceiverClient = ReceiverClient()
     ) {
         self.init(
             settingsStore: settingsStore,
@@ -136,7 +139,8 @@ public final class ProductionMailboxDelivery {
             pendingGenerationStore: pendingGenerationStore,
             sleepStore: sleepStore,
             keyStore: keyStore,
-            componentsFactory: nil
+            componentsFactory: nil,
+            receiverClient: receiverClient
         )
     }
 
@@ -148,7 +152,8 @@ public final class ProductionMailboxDelivery {
         pendingGenerationStore: BackgroundSyncSettingsStore? = nil,
         sleepStore: (any SleepSyncManifestStoring)? = nil,
         keyStore: MailboxKeyStore,
-        componentsFactory: (() throws -> ProductionMailboxComponents)?
+        componentsFactory: (() throws -> ProductionMailboxComponents)?,
+        receiverClient: ReceiverClient = ReceiverClient()
     ) {
         self.settingsStore = settingsStore
         self.outbox = outbox
@@ -158,6 +163,7 @@ public final class ProductionMailboxDelivery {
         self.sleepStore = sleepStore
         self.keyStore = keyStore
         self.componentsFactory = componentsFactory
+        self.receiverClient = receiverClient
     }
 
     public func validateAvailability() throws {
@@ -165,7 +171,9 @@ public final class ProductionMailboxDelivery {
         _ = try components.locate()
     }
 
-    public func pendingFIFOHeadBackgroundPhase() throws -> ProductionMailboxBackgroundPhase {
+    @MainActor
+    public func pendingFIFOHeadBackgroundPhase() async throws -> ProductionMailboxBackgroundPhase {
+        try await refreshNutritionSupport()
         let components = try backgroundComponents()
         guard let item = try backgroundPendingItems(components: components).first else {
             return .none
@@ -192,6 +200,7 @@ public final class ProductionMailboxDelivery {
         -> ProductionMailboxBackgroundDeliverySummary
     {
         try Task.checkCancellation()
+        try await refreshNutritionSupport()
         let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         let components = try backgroundComponents()
         let items = try backgroundPendingItems(components: components)
@@ -245,6 +254,7 @@ public final class ProductionMailboxDelivery {
             .backgroundAcknowledgmentFileLimit
     ) async throws -> ProductionMailboxBackgroundDeliverySummary {
         try Task.checkCancellation()
+        try await refreshNutritionSupport()
         let components = try backgroundComponents()
         let items = try backgroundPendingItems(components: components)
         guard let item = items.first else {
@@ -454,6 +464,7 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     public func deliverPending() async throws -> ProductionMailboxDeliverySummary {
+        try await refreshNutritionSupport()
         let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         let components: ProductionMailboxComponents
         do {
@@ -465,9 +476,7 @@ public final class ProductionMailboxDelivery {
         }
         let items: [FileOutboxItem]
         do {
-            items = try outbox.pendingItems().filter {
-                $0.receiverIdentity == components.identity.opaqueBinding
-            }
+            items = try backgroundPendingItems(components: components)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -548,7 +557,7 @@ public final class ProductionMailboxDelivery {
         let pendingFIFOHead: FileOutboxItem?
         let pendingFIFOHeadEnvelopeID: Data?
         do {
-            pendingFIFOHead = try outbox.pendingItems().first
+            pendingFIFOHead = try backgroundPendingItems(components: components).first
             if let pendingFIFOHead,
                pendingFIFOHead.receiverIdentity == components.identity.opaqueBinding,
                pendingFIFOHead.deliveryState?.phase == .providerObserved {
@@ -582,7 +591,7 @@ public final class ProductionMailboxDelivery {
             do {
                 try Task.checkCancellation()
                 guard settingsStore.receiverSettingsGenerationToken == receiverGeneration,
-                      try outbox.pendingItems().first == pendingFIFOHead else {
+                      try backgroundPendingItems(components: components).first == pendingFIFOHead else {
                     throw ProductionMailboxDeliveryError.itemUnavailable
                 }
                 exactReport = try components.scanner.scanExact(envelopeID: pendingFIFOHeadEnvelopeID)
@@ -709,7 +718,7 @@ public final class ProductionMailboxDelivery {
         var finalizedCount = 0
         while true {
             try Task.checkCancellation()
-            guard let item = try outbox.pendingItems().first,
+            guard let item = try backgroundPendingItems(components: components).first,
                   item.receiverIdentity == components.identity.opaqueBinding,
                   item.deliveryState?.phase == .ackVerified else {
                 return finalizedCount
@@ -867,7 +876,7 @@ public final class ProductionMailboxDelivery {
                 transactionFinalizer: transactionFinalizer,
                 validateOwner: {
                     try self.validateSleepConnection(components: components, generation: generation)
-                    guard let head = try self.outbox.pendingItems().first,
+                    guard let head = try self.backgroundPendingItems(components: components).first,
                           head.id == itemID, let state = head.deliveryState,
                           state.phase == .ackVerified,
                           state.ownership?.receiverGeneration == generation,
@@ -923,13 +932,46 @@ public final class ProductionMailboxDelivery {
         components: ProductionMailboxComponents
     ) throws -> [FileOutboxItem] {
         do {
-            return try outbox.pendingItems().filter {
-                $0.receiverIdentity == components.identity.opaqueBinding
-            }
+            return try outbox.preparedNutritionItems(
+                for: components.identity.opaqueBinding, support: nutritionSupport
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             throw ProductionMailboxDeliveryPhaseError.loadPending
+        }
+    }
+
+    @MainActor
+    private func refreshNutritionSupport() async throws {
+        nutritionSupport = .unknown
+        let generation = settingsStore.receiverSettingsGenerationToken
+        let binding = settingsStore.receiverBindingID
+        let receiverURL = settingsStore.receiverURLString
+        let transport = settingsStore.activeTransport
+        let validate = { @MainActor in
+            try Task.checkCancellation()
+            try self.outbox.requireUploadAdmission()
+            guard self.settingsStore.receiverSettingsGenerationToken == generation,
+                  self.settingsStore.receiverBindingID == binding,
+                  self.settingsStore.receiverURLString == receiverURL,
+                  self.settingsStore.activeTransport == transport else { throw CancellationError() }
+        }
+        try await outbox.prepareNutritionCompatibility(validate: validate)
+        let pending = try outbox.pendingItems()
+        guard try outbox.containsPreparedNutrition(in: pending),
+              let url = URL(string: receiverURL) else { return }
+        let token = try settingsStore.loadBearerToken()
+        let support = await receiverClient.nutritionSupport(forBatchURL: url, bearerToken: token)
+        try validate()
+        guard settingsStore.receiverSettingsGenerationToken == generation,
+              settingsStore.receiverBindingID == binding,
+              settingsStore.receiverURLString == url.absoluteString,
+              try settingsStore.loadBearerToken() == token,
+              try outbox.pendingItems() == pending else { throw CancellationError() }
+        nutritionSupport = support
+        if let binding {
+            _ = try outbox.nutritionCompatibleItems(for: binding, support: support)
         }
     }
 

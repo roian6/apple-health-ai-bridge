@@ -1,0 +1,66 @@
+{
+  "cases": [
+    {
+      "id": "C1",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testLegacyReceiverWithholdsNutritionWhileWeightSyncs",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testNutritionPayloadCodecDoesNotOccupyMainActor",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testDirectNutritionPreparationAllowsMainActor",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testMailboxNutritionPreparationAllowsMainActor",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testBackgroundNutritionPreparationHonorsAdmissionAfterWorker"
+      ]
+    },
+    {
+      "id": "C2",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testUnknownOfflineRetainsDurableWorkWithoutClaimingDelivery",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testCapabilityRequiresBothSchemasAndJSONBoolean",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testFutureNutritionDoesNotInheritFiveTypeCapability"
+      ]
+    },
+    {
+      "id": "C3",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testFailedACKRetriesStableNutritionIdentity"
+      ]
+    },
+    {
+      "id": "C4",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testCatalogOnlyNutritionIsWithheldWithoutDroppingSupportedCatalog",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testSupportedCheckpointCanFinalizePastHeldNutrition",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testFreshBackgroundCompletionFinalizesSupportedCheckpoint",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testAcknowledgedSupportedCheckpointRecoversAfterReopen",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testMixedDurableRetryUpgradePreservesAnchorAndDeduplicates",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testPreparedSelectionCannotCreateProjection"
+      ]
+    },
+    {
+      "id": "C5",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testHeldOriginalSurvivesProjectionACKAndReopen",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testMixedDurableRetryUpgradePreservesAnchorAndDeduplicates"
+      ]
+    },
+    {
+      "id": "C6",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testReplacementDoesNotInheritSupportedCapability",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testMailboxLegacyMixedUpgradeAuthenticatedACKAndDeduplication",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testMailboxUnknownProbeNeverPublishesNutrition",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testCancelledNutritionPreparationCannotPublishPlan",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testChangedNutritionPayloadCannotPublishPlan",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testResetDuringNutritionPreparationCannotPublishPlan",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityTests/testChangedNutritionOwnerCannotPublishPlan",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testDirectNutritionReplacementDuringWorkerCannotDeliver"
+      ]
+    },
+    {
+      "id": "C7",
+      "appSelectors": [
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testNoObservedNutritionIsNotZeroWhileSupportedSyncContinues",
+        "HealthBridgeCompanionAppTests/NutritionCompatibilityAppTests/testRealZeroNutritionRemainsAnObservedRecord"
+      ]
+    }
+  ]
+}

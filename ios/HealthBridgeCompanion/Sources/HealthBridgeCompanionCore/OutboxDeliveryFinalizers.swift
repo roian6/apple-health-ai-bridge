@@ -46,6 +46,19 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     }
 
     @discardableResult
+    @MainActor
+    public func recordDirectReceiverAcceptanceForSync(
+        itemID: String,
+        receiverBindingID: String,
+        validate: @MainActor () throws -> Void
+    ) async throws -> Bool {
+        try await outbox.prepareNutritionCompatibility(validate: validate)
+        return try recordDirectReceiverAcceptance(
+            itemID: itemID, receiverBindingID: receiverBindingID
+        )
+    }
+
+    @discardableResult
     public func recordDirectReceiverAcceptance(
         itemID: String,
         receiverBindingID: String

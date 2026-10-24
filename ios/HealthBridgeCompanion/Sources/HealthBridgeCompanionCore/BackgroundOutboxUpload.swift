@@ -324,7 +324,7 @@ public enum DirectUploadFinalizer {
         currentReceiverBindingID: String?,
         validate: @MainActor () throws -> Void,
         recoverSleepBaseline: @MainActor (String, UInt64) async throws -> Void,
-        retire: @MainActor (String, String) throws -> Void
+        retire: @MainActor (String, String) async throws -> Void
     ) async throws -> DirectUploadFinalizationOutcome {
         let outcome = finish(
             descriptor: descriptor, completion: completion,
@@ -341,7 +341,8 @@ public enum DirectUploadFinalizer {
             try validate()
         case .retired:
             try validate()
-            try retire(descriptor.itemID, descriptor.receiverBindingID)
+            try await retire(descriptor.itemID, descriptor.receiverBindingID)
+            try validate()
         case .retained, .stale:
             break
         }

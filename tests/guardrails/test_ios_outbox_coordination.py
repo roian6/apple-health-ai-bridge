@@ -111,7 +111,9 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
     assert async_join.index("try validate()") < async_join.index(
         "try await recoverSleepBaseline("
     )
-    assert "try validate()\n            try retire(" in async_join
+    async_retire = "try await retire(descriptor.itemID, descriptor.receiverBindingID)"
+    assert f"try validate()\n            {async_retire}" in async_join
+    assert f"{async_retire}\n            try validate()" in async_join
 
     outbox = FILE_OUTBOX.read_text()
     accepted_start = outbox.index("public func recordDirectUploadAccepted(")
