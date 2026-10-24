@@ -310,15 +310,22 @@ def helper_packet(
     return args
 
 
-def remote_release(dist: Path, repo: Path, output: Path) -> None:
+def remote_release(
+    dist: Path,
+    repo: Path,
+    output: Path,
+    *,
+    tag: str = TAG,
+    title: str | None = None,
+) -> None:
     _ = output.write_text(
         json.dumps(
             {
-                "tag_name": TAG,
-                "name": TAG,
+                "tag_name": tag,
+                "name": title if title is not None else tag,
                 "draft": True,
                 "prerelease": False,
-                "body": (repo / f".github/release/notes-{TAG}.md").read_text(),
+                "body": (repo / f".github/release/notes-{tag}.md").read_text(),
                 "assets": [
                     {
                         "name": path.name,
@@ -332,6 +339,105 @@ def remote_release(dist: Path, repo: Path, output: Path) -> None:
             }
         )
     )
+
+
+@pytest.mark.parametrize(
+    "title_case",
+    [
+        ("1.1.3", "receiver-v1.1.3", "Receiver/CLI 1.1.3"),
+        ("1.1.4", "Receiver/CLI 1.1.4", "receiver-v1.1.4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        (command, mutation)
+        for command in (
+            "verify-core-draft",
+            "verify-helper-draft",
+            "verify-final-draft",
+            "verify-final-published",
+        )
+        for mutation in ("none", "other-title", "arbitrary-title", "body")
+    ],
+)
+def test_release_stages_require_exact_title_and_source_body(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+    native_transport_mock: Path,
+    title_case: tuple[str, str, str],
+    scenario: tuple[str, Literal["none", "other-title", "arbitrary-title", "body"]],
+) -> None:
+    version, title, other_title = title_case
+    command, mutation = scenario
+    tag = f"receiver-v{version}"
+    write_release_tree(
+        receiver_release_repo,
+        ReleaseTree(version, tag, "receiver", "1.1.0", "39", "1.0.0"),
+    )
+    _ = commit_release_tree(receiver_release_repo, "synthetic release title boundary")
+    args = build_helper_packet(tmp_path, receiver_release_repo, version)
+    dist = tmp_path / "dist"
+    mock_bundle(
+        dist,
+        native_transport_mock,
+        BUILD,
+        {
+            f"apple_health_ai_bridge-{version}-py3-none-any.whl",
+            f"apple_health_ai_bridge-{version}.tar.gz",
+            "release-metadata.json",
+        },
+    )
+    if command == "verify-core-draft":
+        for path in dist.glob("HealthBridgeMailboxAckPublisher-*"):
+            path.unlink()
+        args = args[: args.index("--helper-sha256")]
+    elif command in {"verify-final-draft", "verify-final-published"}:
+        checksum = run_tool(
+            "final-checksums", *args, "--output", str(dist / "SHA256SUMS")
+        )
+        assert checksum.returncode == 0, checksum.stderr
+        mock_bundle(
+            dist,
+            native_transport_mock,
+            FINAL,
+            {
+                f"HealthBridgeMailboxAckPublisher-{version}.zip",
+                f"HealthBridgeMailboxAckPublisher-{version}.manifest.json",
+                "SHA256SUMS",
+            },
+        )
+    remote = tmp_path / "release.json"
+    remote_release(dist, receiver_release_repo, remote, tag=tag, title=title)
+    payload = TypeAdapter(ReleaseRecord).validate_json(remote.read_text())
+    payload["draft"] = command != "verify-final-published"
+    match mutation:
+        case "none":
+            pass
+        case "other-title":
+            payload["name"] = other_title
+        case "arbitrary-title":
+            payload["name"] = "Untrusted release title"
+        case "body":
+            payload["body"] += "\n"
+        case _:
+            assert_never(mutation)
+    _ = remote.write_text(json.dumps(payload))
+
+    result = run_tool(
+        command,
+        *args,
+        "--release-json",
+        str(remote),
+        "--notes-file",
+        str(receiver_release_repo / f".github/release/notes-{tag}.md"),
+    )
+
+    assert (result.returncode == 0) is (mutation == "none"), result.stderr
+    if mutation == "body":
+        assert "release body does not match exact notes" in result.stderr
+    elif mutation != "none":
+        assert "release metadata is not exact" in result.stderr
 
 
 def test_helper_stage_verifies_three_native_subjects(
