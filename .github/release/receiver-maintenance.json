@@ -1,4 +1,12 @@
 {
   "schema_id": "health_bridge.receiver_maintenance.v1",
-  "releases": []
+  "releases": [
+    {
+      "tag": "receiver-v1.1.4",
+      "branch_ref": "refs/heads/fix/receiver-1.1.4",
+      "base_tag": "receiver-v1.1.3",
+      "base_commit": "a4fd59e2f222251ab9ff76cb0eb08524035fcb6d",
+      "target_commit": "191188444258f9a0f46221229b078abc428f6dac"
+    }
+  ]
 }
