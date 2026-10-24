@@ -3981,8 +3981,17 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: true, preserveDirect: true)
     }
 
+    func testLocallyCommittedNativePairingCancellationRetriesPendingCleanup() async throws {
+        try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: false, locallyCommitted: true)
+    }
+
+    func testLocallyCommittedNativePairingCancellationRecoversAfterColdBootstrap() async throws {
+        try await assertPublishedNativeCancellation(coldBootstrap: true, immediateReceipt: false, locallyCommitted: true)
+    }
+
     private func assertPublishedNativeCancellation(
-        coldBootstrap: Bool, immediateReceipt: Bool, preserveDirect: Bool = false
+        coldBootstrap: Bool, immediateReceipt: Bool, preserveDirect: Bool = false,
+        locallyCommitted: Bool = false
     ) async throws {
         let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
         if preserveDirect {
@@ -3991,8 +4000,9 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
                 bearerToken: "synthetic-existing-direct"
             )
         }
+        let pendingStore = MemoryReceiverTokenStore()
         let state = ReceiverPairingStateStore(
-            pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+            pendingStore: pendingStore, installationIDStore: MemoryReceiverTokenStore(),
             cancellationStore: MemoryReceiverTokenStore()
         )
         let peer = try ExchangePeer()
@@ -4016,6 +4026,10 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             case "request.hbp":
                 XCTAssertEqual(bytes, request)
                 requests.append(bytes)
+                if locallyCommitted {
+                    try ExchangePeer.write(peer.completion(request: request, pending: pending),
+                        to: url.deletingLastPathComponent().appendingPathComponent("completion.hbp"))
+                }
             case "cancel.hbp":
                 cancellations.append(bytes)
                 try ExchangePeer.write(peer.cancelled(cancel: bytes, request: request),
@@ -4027,6 +4041,10 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }, read: { url in
             guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
                 else { throw ExchangeFailure.invalidPeer }
+            if locallyCommitted, url.lastPathComponent == "completion.hbp" {
+                pendingStore.rejectNextEmptySave = true
+                return try Data(contentsOf: url)
+            }
             guard url.lastPathComponent == "cancelled.hbp", receiptAvailable else { return nil }
             return try Data(contentsOf: url)
         }, hydrate: { url in
@@ -4054,6 +4072,16 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         XCTAssertTrue(pending.publicationMayHaveOccurred)
         let cursorBytes = try Data(contentsOf: fixture.cursors.fileURL)
         let connectionBeforeCancellation = try fixture.settings.currentConnectionRecordV2()
+        let cancellationGeneration = fixture.settings.receiverSettingsGenerationToken
+        if locallyCommitted {
+            XCTAssertFalse(pendingStore.rejectNextEmptySave, "The real pending erase must have been attempted")
+            let committed = try XCTUnwrap(connectionBeforeCancellation)
+            XCTAssertEqual(committed.activation, .paired(activeTransport: .mailbox))
+            XCTAssertEqual(committed.localScope.bindingID, peer.expectedBinding)
+            XCTAssertEqual(committed.localScope.generation, try XCTUnwrap(UInt64(generation.dropFirst())) + 1)
+        } else {
+            XCTAssertEqual(cancellationGeneration, generation)
+        }
 
         await initial.viewModel.cancelPendingPairing()
         await fixture.join(initial)
@@ -4061,7 +4089,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         var resumed = initial
         if !immediateReceipt {
             XCTAssertEqual(try state.loadPending(), pending)
-            XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+            XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, cancellationGeneration)
             XCTAssertTrue(initial.viewModel.hasPendingPairing)
             XCTAssertTrue(initial.viewModel.statusIsError)
             XCTAssertTrue(try state.hasPendingCancellation())
@@ -4072,7 +4100,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             await fixture.join(initial)
             XCTAssertEqual(cancellations.count, 2, "Retry must reach the native exchange despite pending cleanup")
             XCTAssertEqual(try state.loadPending(), pending, "An unrelated receipt cannot erase pending authority")
-            XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+            XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, cancellationGeneration)
             XCTAssertTrue(initial.viewModel.hasPendingPairing)
             XCTAssertTrue(initial.viewModel.statusIsError)
 
@@ -4102,13 +4130,25 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         XCTAssertFalse(resumed.viewModel.statusIsError, resumed.viewModel.statusMessage)
         XCTAssertEqual(resumed.viewModel.receiverSettingsSaved, preserveDirect)
         XCTAssertEqual(try fixture.settings.receiverSettingsAreCleared(), !preserveDirect)
-        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), connectionBeforeCancellation)
+        if locallyCommitted {
+            XCTAssertEqual(try fixture.settings.currentConnectionRecordV2()?.activation, .unpaired)
+        } else {
+            XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), connectionBeforeCancellation)
+        }
         XCTAssertEqual(resumed.viewModel.receiverURLString, fixture.settings.receiverURLString)
         XCTAssertEqual(resumed.viewModel.bearerToken, try fixture.settings.loadBearerToken())
         XCTAssertEqual(requests.count, cancellations.count + 1)
         XCTAssertTrue(requests.allSatisfy { $0 == request })
         XCTAssertEqual(try fixture.keys.loadOrCreate(), originalKeys)
-        XCTAssertEqual(try Data(contentsOf: fixture.cursors.fileURL), cursorBytes)
+        if locallyCommitted {
+            XCTAssertNil(try fixture.cursors.cursorValue(
+                receiverBindingID: fixture.identity.opaqueBinding,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+            ))
+        } else {
+            XCTAssertEqual(try Data(contentsOf: fixture.cursors.fileURL), cursorBytes)
+        }
         XCTAssertFalse(fixture.background.isEnabled)
         XCTAssertTrue(fixture.reads.isEmpty)
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
@@ -5193,10 +5233,15 @@ private final class MailboxLaunchNoNetworkURLProtocol: URLProtocol, @unchecked S
 
 private final class MemoryReceiverTokenStore: ReceiverTokenStoring {
     private var token = ""
+    var rejectNextEmptySave = false
 
     func loadToken() throws -> String { token }
 
     func saveToken(_ token: String) throws {
+        if token.isEmpty, rejectNextEmptySave {
+            rejectNextEmptySave = false
+            throw ExchangeFailure.pendingCleanupUnavailable
+        }
         self.token = token
     }
 }
@@ -6032,7 +6077,7 @@ extension HealthBridgeCompanionResetAdmissionTests {
     }
 }
 
-private enum ExchangeFailure: Error { case responseUnavailable, invalidPeer }
+private enum ExchangeFailure: Error { case responseUnavailable, invalidPeer, pendingCleanupUnavailable }
 
 // Independent synthetic receiver: current Python wire, CryptoKit and HBJCS1 only.
 // Deliberately does not use any future native request/completion codec.

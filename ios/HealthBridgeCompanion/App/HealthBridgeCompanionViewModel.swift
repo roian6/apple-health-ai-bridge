@@ -1761,11 +1761,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let recoverCommittedReceiverRemoval: Bool
         let recoverNativeCancellation: Bool
         do {
-            recoverCommittedReceiverRemoval =
-                try settingsStore.committedReceiverRemovalCancellationGeneration() != nil
-            recoverNativeCancellation = try !recoverCommittedReceiverRemoval
-                && pairingCoordinator.hasPendingCancellationRecovery()
+            recoverNativeCancellation = try pairingCoordinator.hasPendingCancellationRecovery()
                 && pairingStateStore.loadPending()?.mailboxBootstrap != nil
+            recoverCommittedReceiverRemoval = try !recoverNativeCancellation
+                && settingsStore.committedReceiverRemovalCancellationGeneration() != nil
             if recoverNativeCancellation {
                 try retryPrivateStoreInitialization()
             }
