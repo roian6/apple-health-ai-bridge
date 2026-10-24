@@ -21,6 +21,7 @@ else:
 REPOSITORY: Final = "roian6/apple-health-ai-bridge"
 AUTHORITY_PATH: Final = ".github/release/receiver-maintenance.json"
 SHA: Final = re.compile(r"[0-9a-f]{40}")
+_LOOKUP_TIMEOUT_SECONDS: Final = 120
 JsonValue: TypeAlias = (
     "str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]"
 )
@@ -72,9 +73,18 @@ def _run(repo: Path, command: str, *args: str) -> str:
     if executable is None:
         message = f"release source requires {command}"
         raise ReleaseError(message)
-    completed = subprocess.run(  # noqa: S603
-        [executable, *args], cwd=repo, capture_output=True, text=True, check=False
-    )
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [executable, *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        message = f"release source {command} lookup timed out"
+        raise ReleaseError(message) from exc
     if completed.returncode:
         message = f"release source {command} lookup failed"
         raise ReleaseError(message)
