@@ -30,10 +30,19 @@ keys, duplicate tags/branches/targets, and incomplete records fail closed.
 
 The live protected maintenance branch HEAD and signed annotated release tag
 must both resolve to that exact target. The target must descend linearly from
-the pinned base; its real first parent must still carry the base receiver
-version. The target declares `receiver` scope, advances only the receiver patch,
+the pinned base without merge commits. Untagged preparation and reviewed
+follow-up commits may already carry the target receiver version; the immediate
+parent must carry either the base or target receiver identity. The target
+declares `receiver` scope, advances only the receiver patch from the published base,
 and preserves the base iOS source tree, iOS version/build and Batch Protocol
 identity/version. The ordinary component-source checks still apply.
+
+For authorized maintenance, the resolver returns the record's verified
+`base_commit` as `baseline_commit`. The workflow passes that value to transition
+validation, which refreshes authority and rejects any different caller-supplied
+baseline. Default-main releases still use their actual first parent. A follow-up
+target requires a new reviewed main authorization for its exact commit; the
+maintenance source cannot authorize itself.
 
 The shared release-source resolver refreshes GitHub tag/commit identity and
 default-main authority during tagged verification, packet verification, draft

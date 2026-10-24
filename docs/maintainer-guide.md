@@ -91,7 +91,7 @@ analyses ran for historical immutable releases.
 3. state the exact compatible iOS Companion version/build and exact compatible Batch Protocol schema identifier/version in the release notes;
 4. run the full public, Python, and iOS gates;
 5. create a signed annotated component-scoped tag for the exact approved default-branch commit, or the receiver maintenance target authorized below;
-6. let the protected exact-tag workflow verify the source authority and its actual first-parent baseline, then build, verify, attest, and publish an immutable release;
+6. let the protected exact-tag workflow verify source authority and the resolver's transition baseline (the first parent for main, the authorized immutable base for maintenance), then build, verify, attest, and publish an immutable release;
 7. verify the remote tag, release assets, checksums, attestations, and linked site state.
 
 Treat source-release status and TestFlight/App Store distribution status as separate facts.
@@ -117,6 +117,12 @@ passed, use a separate reviewed main PR to add its exact authorization to
 [versioning](versioning.md#receiver-maintenance-source) in `releases`. Do not
 reserve a target with a placeholder SHA. Until that PR merges, the empty list
 intentionally blocks non-main releases.
+
+Reviewed linear follow-ups may retain the prepared receiver version. Update the
+main authorization to the final reviewed target while retaining the immutable
+published base tag/commit. Do not reset the version or substitute the follow-up's
+immediate parent for that base. Every target change requires fresh checks and
+review before the authorization is updated.
 
 Create the signed annotated tag only on the authorized squash target. Keep the
 existing maintainer/tag/commit identity checks, protected `github-release`

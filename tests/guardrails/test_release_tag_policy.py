@@ -55,7 +55,7 @@ def test_tagged_workflow_pins_default_main_and_transition_baseline() -> None:
         "baseline_commit_sha:",
         "python3 scripts/release_source_policy.py",
         "--tag-object",
-        'git rev-parse "${target_sha}^1"',
+        "jq -r '.baseline_commit'",
         "--tag-target-commit",
         "--default-main-commit",
         "--baseline-commit",
@@ -66,10 +66,10 @@ def test_tagged_workflow_pins_default_main_and_transition_baseline() -> None:
         assert marker in workflow
 
 
-def test_tagged_workflow_uses_first_parent_without_rejecting_merge_commits() -> None:
+def test_tagged_workflow_uses_resolver_without_rejecting_main_merge_commits() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
-    assert 'git rev-parse "${target_sha}^1"' in workflow
+    assert "jq -r '.baseline_commit'" in workflow
     assert "git rev-list --parents" not in workflow
     assert "wc -w" not in workflow
 

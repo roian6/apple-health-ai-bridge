@@ -289,7 +289,8 @@ def _validate_maintenance(
             "release_tag": entry.base_tag,
             "version": str(parse_receiver_release_tag(entry.base_tag).version),
         }
-        or parent.get("receiver_cli") != base.get("receiver_cli")
+        or parent.get("receiver_cli")
+        not in (base.get("receiver_cli"), candidate.get("receiver_cli"))
         or _object(candidate.get("receiver_cli"))
         != {
             "release_tag": entry.tag,
@@ -333,7 +334,7 @@ def resolve_release_source(request: SourceRequest) -> ReleaseSource:
     for entry in _authorizations(request.repo, main):
         if entry.tag == request.tag and entry.target_commit == request.commit:
             _validate_maintenance(request, source, entry)
-            return source
+            return ReleaseSource(main, entry.base_commit)
     message = (
         "tag target must equal the trusted default-main commit "
         "or exact maintenance authorization"

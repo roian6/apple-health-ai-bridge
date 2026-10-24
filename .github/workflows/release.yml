@@ -83,7 +83,7 @@ jobs:
             --commit "$target_sha" --tag-object "$tag_object_sha")"
           default_main_sha="$(jq -r '.default_main_commit' <<< "$source")"
           [[ "$default_main_sha" =~ ^[0-9a-f]{40}$ ]]
-          baseline_sha="$(git rev-parse "${target_sha}^1")"
+          baseline_sha="$(jq -r '.baseline_commit' <<< "$source")"
           [[ "$baseline_sha" =~ ^[0-9a-f]{40}$ ]]
           {
             echo "tag_object_sha=$tag_object_sha"
