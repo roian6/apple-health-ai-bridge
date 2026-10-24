@@ -841,14 +841,15 @@ public final class ReceiverPairingCoordinator {
         let device = try NativeMailboxPairing.verifyRequest(pending, keys: mailboxKeyStore)
         let identity = try NativeMailboxPairing.identity(pending, device: device)
         try requireNativeAuthority(pending, identity: identity)
-        // A crash, cancelled Task, or provider error after this write is ambiguous.
-        // Only a request-bound cancellation receipt may retire that authority.
-        pending = try stateStore.markNativePublication(pending)
         guard let descriptor = pending.mailboxBootstrap, let request = pending.sealedRequest,
               let generation = pending.nativeExpectedGeneration else { throw ReceiverPairingRedeemError.invalidResponse }
         let io = nativeMailboxIO ?? NativeMailboxPairingIO.live()
         try requireNativeAuthority(pending, identity: identity)
         let directory = try io.resolve(descriptor)
+        try requireNativeAuthority(pending, identity: identity)
+        // A crash, cancelled Task, or provider error after this write is ambiguous.
+        // Only a request-bound cancellation receipt may retire that authority.
+        pending = try stateStore.markNativePublication(pending)
         try requireNativeAuthority(pending, identity: identity)
         try io.publish(directory.appendingPathComponent("request.hbp"), request)
         try requireNativeAuthority(pending, identity: identity)

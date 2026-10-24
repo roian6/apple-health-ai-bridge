@@ -185,6 +185,49 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         XCTAssertEqual(f.cancelPublications, 0)
     }
 
+    func testUnavailableNativeContainerCanCancelWithoutReceipt() async throws {
+        let f = try ExchangeFixture()
+        defer { f.close() }
+        f.resolveAction = { throw ExchangeFailure.responseUnavailable }
+        let coordinator = f.coordinator()
+        do {
+            _ = try await coordinator.pair(invitation: f.peer.invitation())
+            return XCTFail("Unavailable directory must prevent publication")
+        } catch ExchangeFailure.responseUnavailable {
+            XCTAssertEqual(f.resolutions, 1)
+        }
+        let pending = try XCTUnwrap(f.state().loadPending())
+        XCTAssertNotNil(pending.sealedRequest)
+        XCTAssertFalse(pending.publicationMayHaveOccurred)
+        XCTAssertTrue(f.requests.isEmpty)
+
+        try coordinator.beginPendingCancellation()
+        _ = try coordinator.cancelPendingPairing()
+        _ = try await coordinator.resumePendingPairing()
+
+        XCTAssertNil(try f.state().loadPending())
+        XCTAssertFalse(try f.state().hasPendingCancellation())
+        XCTAssertEqual(f.resolutions, 1)
+        XCTAssertEqual(f.cancelPublications, 0)
+    }
+
+    func testNativeResolutionRechecksGenerationBeforePublication() async throws {
+        let f = try ExchangeFixture()
+        defer { f.close() }
+        let settings = f.settings
+        let originalGeneration = settings.receiverSettingsGenerationToken
+        f.resolveAction = { _ = try settings.invalidateReceiverSettingsGeneration() }
+        do {
+            _ = try await f.coordinator().pair(invitation: f.peer.invitation())
+            return XCTFail("Superseded authority must not publish")
+        } catch {
+            XCTAssertNotEqual(settings.receiverSettingsGenerationToken, originalGeneration)
+        }
+        XCTAssertEqual(f.resolutions, 1)
+        XCTAssertTrue(f.requests.isEmpty)
+        XCTAssertFalse(try XCTUnwrap(f.state().loadPending()).publicationMayHaveOccurred)
+    }
+
     func testPeerCompletionUsesJSONNullForURLFreeReceiver() throws {
         let peer = try ExchangePeer()
         let probe = try PeerWireSelfTestProbe(receiverSigning: peer.signing.publicKey.rawRepresentation,
@@ -246,6 +289,7 @@ private final class ExchangeFixture {
     var publishedPending: ReceiverPendingPairing?
     var completionReads = 0, cancelPublications = 0, receiptReads = 0, resolutions = 0
     var allowCompletion = true, allowReceipt = true
+    var resolveAction: (() throws -> Void)?
 
     init() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("NativeExchange-\(UUID().uuidString)")
@@ -274,6 +318,7 @@ private final class ExchangeFixture {
         NativeMailboxPairingIO(resolve: { [self] descriptor in
             resolutions += 1
             XCTAssertEqual(descriptor, try peer.invitation().mailboxBootstrap)
+            try resolveAction?()
             let directory = root.appendingPathComponent("provider/pairing/\(descriptor.invitationID)")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             return directory
@@ -284,6 +329,7 @@ private final class ExchangeFixture {
             }
             if url.lastPathComponent == "request.hbp" {
                 let staged = try XCTUnwrap(state().loadPending())
+                XCTAssertTrue(staged.publicationMayHaveOccurred)
                 let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(pending.token.utf8)) as? [String: Any])
                 let sealed = try XCTUnwrap(object["sealedRequest"] as? String)
                 XCTAssertEqual(Data(base64Encoded: sealed), bytes, "Durable exact request must precede publication")

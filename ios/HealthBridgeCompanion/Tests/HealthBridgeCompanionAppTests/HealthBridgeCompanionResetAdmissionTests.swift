@@ -4021,6 +4021,51 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         XCTAssertTrue(fixture.reads.isEmpty)
     }
 
+    func testUnavailableNativeContainerCanBeCancelledLocally() async throws {
+        let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
+        let state = ReceiverPairingStateStore(
+            pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+            cancellationStore: MemoryReceiverTokenStore()
+        )
+        let peer = try ExchangePeer()
+        var resolutions = 0
+        var publications = 0
+        let io = NativeMailboxPairingIO(resolve: { _ in
+            resolutions += 1
+            throw ExchangeFailure.responseUnavailable
+        }, publish: { _, _ in publications += 1 }, read: { _ in nil },
+            hydrate: { _ in }, wait: { throw ExchangeFailure.responseUnavailable })
+        let runtime = try fixture.makeRuntime(cleanup: nil, nativeMailboxIO: io, pairingStateStore: state)
+        addTeardownBlock { @MainActor in
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.ownersStarted, fixture.ownersFinished)
+            fixture.removeOwnedStores()
+        }
+        await runtime.bootstrap()
+        let invitation = try JSONEncoder().encode(peer.invitation())
+        let link = try XCTUnwrap(URL(string: "healthbridge://pair?payload=\(ExchangePeer.b64(invitation))"))
+        await runtime.viewModel.importPairingURL(link)
+        await fixture.join(runtime)
+        XCTAssertTrue(runtime.viewModel.hasPendingPairing)
+        XCTAssertFalse(try XCTUnwrap(state.loadPending()).publicationMayHaveOccurred)
+        XCTAssertEqual(resolutions, 1)
+        XCTAssertEqual(publications, 0)
+
+        await runtime.viewModel.cancelPendingPairing()
+        await fixture.join(runtime)
+
+        XCTAssertNil(try state.loadPending())
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertNil(fixture.settings.terminalCancellationExpectedGeneration)
+        XCTAssertFalse(runtime.viewModel.hasPendingPairing)
+        XCTAssertFalse(runtime.viewModel.statusIsError, runtime.viewModel.statusMessage)
+        XCTAssertEqual(resolutions, 1, "A never-published cancellation must not require the unavailable provider")
+        XCTAssertEqual(publications, 0)
+        XCTAssertTrue(try fixture.settings.receiverSettingsAreCleared())
+    }
+
     func testPublishedNativePairingCancellationReachesAuthenticatedReceipt() async throws {
         try await assertPublishedNativeCancellation(coldBootstrap: false, immediateReceipt: true)
     }
