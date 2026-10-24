@@ -10,7 +10,37 @@ Apple Health AI Bridge contains independently released components. Always includ
 | iOS Companion | `1.1.1` | Source candidate build `50` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). The index declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
+The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). The index declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. A normal tagged release requires the tag target to equal the live default-main commit. The candidate is compared with its actual first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
+
+### Receiver maintenance source
+
+A receiver patch may use a protected maintenance branch when later main changes
+must be excluded. The sole exception authority is
+[`.github/release/receiver-maintenance.json`](../.github/release/receiver-maintenance.json)
+read from the live protected default-main Git commit. The file defaults to an
+empty `releases` list, which authorizes no maintenance release. A candidate's
+copy of the file and workflow dispatch inputs cannot grant authorization.
+
+Each record has exactly five string fields: `tag`, `branch_ref`, `base_tag`,
+`base_commit`, and `target_commit`. It pins one canonical receiver tag, its
+`refs/heads/fix/receiver-<version>` branch, the immutable preceding receiver tag
+and peeled commit, and the exact reviewed target commit. The version must be
+the next patch on the base's major/minor line. Unknown fields, duplicate JSON
+keys, duplicate tags/branches/targets, and incomplete records fail closed.
+
+The live protected maintenance branch HEAD and signed annotated release tag
+must both resolve to that exact target. The target must descend linearly from
+the pinned base; its real first parent must still carry the base receiver
+version. The target declares `receiver` scope, advances only the receiver patch,
+and preserves the base iOS source tree, iOS version/build and Batch Protocol
+identity/version. The ordinary component-source checks still apply.
+
+The shared release-source resolver refreshes GitHub tag/commit identity and
+default-main authority during tagged verification, packet verification, draft
+creation, macOS helper verification, continuation, and immediately before final
+publication. Moving a branch or revoking its record prevents subsequent stages.
+`default_main_commit` always identifies actual default main; it never identifies
+the maintenance target. iOS checkpoint tags retain their main-only policy.
 
 ## Version surfaces
 

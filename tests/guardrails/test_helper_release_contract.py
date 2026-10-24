@@ -367,7 +367,7 @@ def test_manual_continuation_is_bound_and_never_replaces_published_release() -> 
         "tag_object_sha",
         "target_commit_sha",
         "tree_sha",
-        "default_branch",
+        "scripts/release_source_policy.py",
         "verification.verified == true",
         "draft == true",
         "published_at == null",

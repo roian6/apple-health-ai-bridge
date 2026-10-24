@@ -90,11 +90,41 @@ analyses ran for historical immutable releases.
 2. update each changed authoritative version source, `component-versions.json`, and release notes drafted from the [release notes template](../.github/release/release-notes-template.md) in one reviewed pull request;
 3. state the exact compatible iOS Companion version/build and exact compatible Batch Protocol schema identifier/version in the release notes;
 4. run the full public, Python, and iOS gates;
-5. create a signed annotated component-scoped tag for the exact approved default-branch commit;
-6. let the protected exact-tag workflow compare the tag with default main and its predecessor baseline, then build, verify, attest, and publish an immutable release;
+5. create a signed annotated component-scoped tag for the exact approved default-branch commit, or the receiver maintenance target authorized below;
+6. let the protected exact-tag workflow verify the source authority and its actual first-parent baseline, then build, verify, attest, and publish an immutable release;
 7. verify the remote tag, release assets, checksums, attestations, and linked site state.
 
 Treat source-release status and TestFlight/App Store distribution status as separate facts.
+
+### Protected receiver maintenance patches
+
+For `receiver-v1.1.4`, the maintenance source is
+`refs/heads/fix/receiver-1.1.4`, based on immutable `receiver-v1.1.3` at
+`a4fd59e2f222251ab9ff76cb0eb08524035fcb6d`. Keep later main product changes out of
+that branch. Backport only the reviewed release policy and required fixes; do
+not reset main or substitute the maintenance SHA for default main.
+
+Protect the exact maintenance branch with reviewed squash merges, the same
+required checks and latest-push approval requirements, and deletion/force-push
+protection. The checked-in Python, iOS and CodeQL workflows accept PRs and run
+on pushes to this exact branch. Confirm the effective hosted checks and rules
+before merging; source configuration alone does not provision protection.
+
+After the maintenance PR's GitHub squash commit is known and its checks have
+passed, use a separate reviewed main PR to add its exact authorization to
+`.github/release/receiver-maintenance.json`. Retain the root schema identifier
+`health_bridge.receiver_maintenance.v1` and put the five fields documented in
+[versioning](versioning.md#receiver-maintenance-source) in `releases`. Do not
+reserve a target with a placeholder SHA. Until that PR merges, the empty list
+intentionally blocks non-main releases.
+
+Create the signed annotated tag only on the authorized squash target. Keep the
+existing maintainer/tag/commit identity checks, protected `github-release`
+environment, tag rules and exact-tag dispatch requirements. Maintenance records
+do not authorize branch-based dispatch, expand environment policies, waive
+checks, or replace release artifacts. The eight-asset set, SHA-256 verification,
+helper validation, and build/final attestations remain required. Source review,
+hosted governance readiness, and actual release publication are separate gates.
 
 ## Response targets
 

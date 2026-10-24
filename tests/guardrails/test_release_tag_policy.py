@@ -53,7 +53,8 @@ def test_tagged_workflow_pins_default_main_and_transition_baseline() -> None:
     required_markers = (
         "default_main_commit_sha:",
         "baseline_commit_sha:",
-        'test "$target_sha" = "$default_main_sha"',
+        "python3 scripts/release_source_policy.py",
+        "--tag-object",
         'git rev-parse "${target_sha}^1"',
         "--tag-target-commit",
         "--default-main-commit",

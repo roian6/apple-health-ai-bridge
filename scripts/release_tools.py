@@ -24,6 +24,7 @@ from release_provenance import (
     verify_execution,
     verify_provenance,
 )
+from release_source_policy import SourceRequest, resolve_release_source
 from release_versions import (
     ReleaseError,
     canonical_receiver_tag,
@@ -551,8 +552,39 @@ def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
         message = "tag target must equal the checked-out commit"
         raise ReleaseError(message)
     if request.tag_target_commit != request.default_main_commit:
-        message = "tag target must equal the trusted default-main commit"
-        raise ReleaseError(message)
+        candidate = _read_component_snapshot(
+            _git_output(
+                request.repo,
+                "show",
+                f"{request.tag_target_commit}:{COMPONENT_VERSION_INDEX}",
+            ),
+            surface="candidate component version index",
+        )
+        if candidate.release_scope != "receiver":
+            message = "tag target must equal the trusted default-main commit"
+            raise ReleaseError(message)
+        try:
+            source = resolve_release_source(
+                SourceRequest(
+                    request.repo,
+                    candidate.receiver_tag,
+                    request.tag_target_commit,
+                    _git_output(
+                        request.repo,
+                        "rev-parse",
+                        f"refs/tags/{candidate.receiver_tag}^{{tag}}",
+                    ),
+                )
+            )
+        except ReleaseError as exc:
+            message = (
+                "tag target must equal the trusted default-main commit "
+                f"or authorized maintenance source: {exc}"
+            )
+            raise ReleaseError(message) from exc
+        if source.default_main_commit != request.default_main_commit:
+            message = "default-main commit must equal fresh protected authority"
+            raise ReleaseError(message)
     expected_baseline = _git_output(
         request.repo,
         "rev-parse",
