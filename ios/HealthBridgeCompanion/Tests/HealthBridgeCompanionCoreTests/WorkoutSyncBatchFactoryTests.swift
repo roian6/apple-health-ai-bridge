@@ -1,7 +1,168 @@
 import XCTest
+#if canImport(HealthKit)
+import HealthKit
+#endif
 @testable import HealthBridgeCompanionCore
 
 final class WorkoutSyncBatchFactoryTests: XCTestCase {
+#if canImport(HealthKit)
+    func testHealthKitActivitiesKeepTheirIdentityThroughExport() throws {
+        let activities: [(HKWorkoutActivityType, String)] = [
+            (.americanFootball, "american_football"),
+            (.archery, "archery"),
+            (.australianFootball, "australian_football"),
+            (.badminton, "badminton"),
+            (.baseball, "baseball"),
+            (.basketball, "basketball"),
+            (.bowling, "bowling"),
+            (.boxing, "boxing"),
+            (.climbing, "climbing"),
+            (.cricket, "cricket"),
+            (.crossTraining, "cross_training"),
+            (.curling, "curling"),
+            (.cycling, "cycling"),
+            (.dance, "dance"),
+            (.danceInspiredTraining, "dance_inspired_training"),
+            (.elliptical, "elliptical"),
+            (.equestrianSports, "equestrian_sports"),
+            (.fencing, "fencing"),
+            (.fishing, "fishing"),
+            (.functionalStrengthTraining, "functional_strength_training"),
+            (.golf, "golf"),
+            (.gymnastics, "gymnastics"),
+            (.handball, "handball"),
+            (.hiking, "hiking"),
+            (.hockey, "hockey"),
+            (.hunting, "hunting"),
+            (.lacrosse, "lacrosse"),
+            (.martialArts, "martial_arts"),
+            (.mindAndBody, "mind_and_body"),
+            (.mixedMetabolicCardioTraining, "mixed_metabolic_cardio_training"),
+            (.paddleSports, "paddle_sports"),
+            (.play, "play"),
+            (.preparationAndRecovery, "preparation_and_recovery"),
+            (.racquetball, "racquetball"),
+            (.rowing, "rowing"),
+            (.rugby, "rugby"),
+            (.running, "running"),
+            (.sailing, "sailing"),
+            (.skatingSports, "skating_sports"),
+            (.snowSports, "snow_sports"),
+            (.soccer, "soccer"),
+            (.softball, "softball"),
+            (.squash, "squash"),
+            (.stairClimbing, "stair_climbing"),
+            (.surfingSports, "surfing_sports"),
+            (.swimming, "swimming"),
+            (.tableTennis, "table_tennis"),
+            (.tennis, "tennis"),
+            (.trackAndField, "track_and_field"),
+            (.traditionalStrengthTraining, "traditional_strength_training"),
+            (.volleyball, "volleyball"),
+            (.walking, "walking"),
+            (.waterFitness, "water_fitness"),
+            (.waterPolo, "water_polo"),
+            (.waterSports, "water_sports"),
+            (.wrestling, "wrestling"),
+            (.yoga, "yoga"),
+            (.barre, "barre"),
+            (.coreTraining, "core_training"),
+            (.crossCountrySkiing, "cross_country_skiing"),
+            (.downhillSkiing, "downhill_skiing"),
+            (.flexibility, "flexibility"),
+            (.highIntensityIntervalTraining, "hiit"),
+            (.jumpRope, "jump_rope"),
+            (.kickboxing, "kickboxing"),
+            (.pilates, "pilates"),
+            (.snowboarding, "snowboarding"),
+            (.stairs, "stairs"),
+            (.stepTraining, "step_training"),
+            (.wheelchairWalkPace, "wheelchair_walk_pace"),
+            (.wheelchairRunPace, "wheelchair_run_pace"),
+            (.taiChi, "tai_chi"),
+            (.mixedCardio, "mixed_cardio"),
+            (.handCycling, "hand_cycling"),
+            (.discSports, "disc_sports"),
+            (.fitnessGaming, "fitness_gaming"),
+            (.cardioDance, "cardio_dance"),
+            (.socialDance, "social_dance"),
+            (.pickleball, "pickleball"),
+            (.cooldown, "cooldown"),
+            (.swimBikeRun, "swim_bike_run"),
+            (.transition, "transition"),
+            (.other, "other"),
+        ]
+        for (activity, expected) in activities {
+            try assertExportedActivity(activity, equals: expected)
+        }
+        if #available(iOS 17.0, macOS 14.0, *) {
+            try assertExportedActivity(.underwaterDiving, equals: "underwater_diving")
+        }
+    }
+
+    func testUnmappedHealthKitActivitiesPreserveUnsignedRawValuesThroughExport() throws {
+        let activities: [(UInt, String)] = [
+            (0, "healthkit_activity_0"),
+            (81, "healthkit_activity_81"),
+            (2998, "healthkit_activity_2998"),
+            (2999, "healthkit_activity_2999"),
+            (9999, "healthkit_activity_9999"),
+            (UInt.max, "healthkit_activity_18446744073709551615"),
+        ]
+        for (rawValue, expected) in activities {
+            let activity = try XCTUnwrap(HKWorkoutActivityType(rawValue: rawValue))
+            try assertExportedActivity(activity, equals: expected, unmapped: true)
+        }
+    }
+
+    private func assertExportedActivity(
+        _ activity: HKWorkoutActivityType,
+        equals expected: String,
+        unmapped: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let start = try date("2026-06-09T10:00:00Z")
+        let end = try date("2026-06-09T10:45:00Z")
+        // HealthKit validates constructor inputs against this SDK's known types.
+        // Override only the activity getter to model a future/unknown SDK value.
+        let workoutClass: HKWorkout.Type = unmapped ? UnmappedActivityWorkout.self : HKWorkout.self
+        let workout = workoutClass.init(
+            activityType: unmapped ? .other : activity,
+            start: start,
+            end: end,
+            duration: 2700,
+            totalEnergyBurned: nil,
+            totalDistance: nil,
+            metadata: nil
+        )
+        (workout as? UnmappedActivityWorkout)?.unmappedActivity = activity
+        let summary = workoutSummary(for: workout)
+        XCTAssertEqual(summary.workoutType, expected, file: file, line: line)
+        XCTAssertEqual(summary.uuid, workout.uuid, file: file, line: line)
+        let batch = WorkoutSyncBatchFactory.makeAnchoredWorkoutBatch(
+            workouts: [summary],
+            deletedWorkouts: [],
+            anchorCursorValue: "synthetic-anchor",
+            windowStart: start,
+            windowEnd: end,
+            generatedAt: end
+        )
+        let encoded = try HealthBridgeBatchEncoder().encode(batch)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let records = try XCTUnwrap(object["workouts"] as? [[String: Any]])
+        XCTAssertEqual(records.count, 1, file: file, line: line)
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record["workout_type"] as? String, expected, file: file, line: line)
+        XCTAssertEqual(
+            record["client_record_id"] as? String,
+            "hk-workout-\(workout.uuid.uuidString.lowercased())",
+            file: file,
+            line: line
+        )
+    }
+#endif
+
     func testFactoryBuildsStableWorkoutRecordsForReceiverContract() throws {
         let generatedAt = try date("2026-06-10T08:00:00Z")
         let windowStart = try date("2026-06-01T00:00:00Z")
@@ -293,6 +454,16 @@ final class WorkoutSyncBatchFactoryTests: XCTestCase {
         XCTAssertEqual(batch.workouts.map(\.workoutType), ["walking", "running"])
     }
 }
+
+#if canImport(HealthKit)
+private final class UnmappedActivityWorkout: HKWorkout, @unchecked Sendable {
+    var unmappedActivity: HKWorkoutActivityType = .other
+
+    override var workoutActivityType: HKWorkoutActivityType {
+        unmappedActivity
+    }
+}
+#endif
 
 private func date(_ string: String) throws -> Date {
     let formatter = ISO8601DateFormatter()
