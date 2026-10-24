@@ -551,6 +551,12 @@ def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
     if checked_out != request.tag_target_commit:
         message = "tag target must equal the checked-out commit"
         raise ReleaseError(message)
+    expected_baseline = _git_output(
+        request.repo,
+        "rev-parse",
+        f"{request.tag_target_commit}^1",
+    )
+    baseline_error = "baseline must equal the tag target's first parent"
     if request.tag_target_commit != request.default_main_commit:
         candidate = _read_component_snapshot(
             _git_output(
@@ -585,14 +591,10 @@ def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
         if source.default_main_commit != request.default_main_commit:
             message = "default-main commit must equal fresh protected authority"
             raise ReleaseError(message)
-    expected_baseline = _git_output(
-        request.repo,
-        "rev-parse",
-        f"{request.tag_target_commit}^1",
-    )
+        expected_baseline = source.baseline_commit
+        baseline_error = "baseline must equal the authorized maintenance base"
     if request.baseline_commit != expected_baseline:
-        message = "baseline must equal the tag target's first parent"
-        raise ReleaseError(message)
+        raise ReleaseError(baseline_error)
     return _read_component_snapshot(
         _git_output(
             request.repo,
