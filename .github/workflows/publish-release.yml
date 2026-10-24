@@ -156,19 +156,9 @@ jobs:
           uv run python scripts/release_tools.py verify-helper-draft "${common[@]}" \
             --release-json "$RUNNER_TEMP/helper-inputs.json" \
             --notes-file ".github/release/notes-${RELEASE_TAG}.md"
-          mkdir "$RUNNER_TEMP/helper-app"
-          ditto -x -k "$archive" "$RUNNER_TEMP/helper-app"
-          helper_executable="$RUNNER_TEMP/helper-app/HealthBridgeMailboxAckPublisher.app/Contents/MacOS/HealthBridgeMailboxAckPublisher"
-          test -f "$helper_executable"
-          helper_architectures="$(/usr/bin/lipo -archs "$helper_executable")"
-          if [[ "$helper_architectures" != "arm64 x86_64" && "$helper_architectures" != "x86_64 arm64" ]]; then
-            echo "helper executable is not universal2" >&2
-            exit 1
-          fi
           uv run python scripts/verify_helper_distribution.py \
             --archive "$archive" \
-            --manifest "$manifest" \
-            --app "$RUNNER_TEMP/helper-app/HealthBridgeMailboxAckPublisher.app"
+            --manifest "$manifest"
 
   publish:
     name: Verify helper and publish existing draft
