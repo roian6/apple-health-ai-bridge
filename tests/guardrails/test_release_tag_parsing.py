@@ -51,6 +51,7 @@ def test_tag_info_uses_canonical_receiver_tag_parser(
     assert json.loads(completed.stdout) == {
         "prerelease": prerelease,
         "tag": tag,
+        "title": tag,
         "version": version,
     }
 

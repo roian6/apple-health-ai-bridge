@@ -383,17 +383,18 @@ jobs:
             echo "release appeared after preflight; refusing to replace it" >&2
             exit 1
           fi
+          tag_info="$(uv run python scripts/release_tools.py tag-info \
+            --tag "$GITHUB_REF_NAME")"
+          title="$(jq -r '.title' <<< "$tag_info")"
+          version="$(jq -r '.version' <<< "$tag_info")"
+          prerelease="$(jq -r '.prerelease' <<< "$tag_info")"
           release_flags=(
             --repo "$GITHUB_REPOSITORY"
             --verify-tag
-            --title "$GITHUB_REF_NAME"
+            --title "$title"
             --notes-file ".github/release/notes-${GITHUB_REF_NAME}.md"
             --draft
           )
-          tag_info="$(uv run python scripts/release_tools.py tag-info \
-            --tag "$GITHUB_REF_NAME")"
-          version="$(jq -r '.version' <<< "$tag_info")"
-          prerelease="$(jq -r '.prerelease' <<< "$tag_info")"
           if [[ "$prerelease" = "true" ]]; then
             release_flags+=(--prerelease)
           fi

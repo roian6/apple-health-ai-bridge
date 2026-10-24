@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -269,6 +270,92 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "release_scope": "receiver",
         "tag": "receiver-v1.1.3",
     }
+
+
+@pytest.mark.parametrize(
+    ("tag", "version", "title", "prerelease"),
+    [
+        ("v1.0.0", "1.0.0", "v1.0.0", False),
+        ("v1.0.1", "1.0.1", "v1.0.1", False),
+        ("receiver-v0.9.0", "0.9.0", "receiver-v0.9.0", True),
+        ("receiver-v1.1.2", "1.1.2", "receiver-v1.1.2", False),
+        ("receiver-v1.1.3", "1.1.3", "receiver-v1.1.3", False),
+        ("receiver-v1.1.4", "1.1.4", "Receiver/CLI 1.1.4", False),
+        ("receiver-v1.2.0", "1.2.0", "Receiver/CLI 1.2.0", False),
+        ("receiver-v2.0.0", "2.0.0", "Receiver/CLI 2.0.0", False),
+    ],
+)
+def test_tag_info_derives_exact_release_title(
+    tag: str, version: str, title: str, prerelease: bool
+) -> None:
+    completed = _run_release_tool("tag-info", "--tag", tag)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "tag": tag,
+        "version": version,
+        "title": title,
+        "prerelease": prerelease,
+    }
+
+
+@pytest.mark.parametrize(
+    ("tag", "title"),
+    [
+        ("receiver-v1.1.3", "receiver-v1.1.3"),
+        ("receiver-v1.1.4", "Receiver/CLI 1.1.4"),
+    ],
+)
+def test_release_workflow_passes_derived_title_to_create(
+    tmp_path: Path, tag: str, title: str
+) -> None:
+    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split(
+        "      - name: Create and verify helper-pending draft release\n", 1
+    )[1]
+    # Run the real title extraction and flag assembly, not GitHub transport.
+    start = min(
+        step.index("          tag_info="), step.index("          release_flags=(")
+    )
+    snippet = step[start:].split('          draft_release_id=""', 1)[0]
+    captured = tmp_path / "create-args"
+    environment = {
+        **os.environ,
+        "TITLE_QA_PYTHON": sys.executable,
+        "TITLE_QA_TOOL": str(RELEASE_TOOL),
+        "TITLE_QA_ARGS": str(captured),
+        "GITHUB_REF_NAME": tag,
+        "GITHUB_REPOSITORY": "synthetic/release",
+        "PINNED_TARGET_COMMIT_SHA": "1" * 40,
+        "PINNED_TAG_OBJECT_SHA": "2" * 40,
+    }
+    completed = subprocess.run(
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            f"""set -euo pipefail
+uv() {{ "$TITLE_QA_PYTHON" "$TITLE_QA_TOOL" "${{@:4}}"; }}
+python3() {{ test "$1" = scripts/release_source_policy.py; }}
+gh() {{ printf "%s\\0" "$@" > "$TITLE_QA_ARGS"; }}
+{snippet}
+""",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    arguments = captured.read_bytes().decode().split("\0")[:-1]
+    assert arguments[:3] == ["release", "create", tag]
+    assert arguments[arguments.index("--title") + 1] == title
+    assert arguments[arguments.index("--notes-file") + 1] == (
+        f".github/release/notes-{tag}.md"
+    )
 
 
 def test_component_version_index_matches_current_release_surfaces() -> None:
