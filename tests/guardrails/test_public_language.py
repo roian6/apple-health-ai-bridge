@@ -5,6 +5,8 @@ from html import unescape
 from pathlib import Path
 from typing import cast
 
+from health_bridge import __version__
+
 FORBIDDEN_PHRASES = (
     "medical advice",
     "diagnosis",
@@ -448,7 +450,7 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
 
     assert (
         "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.4/docs/setup.md)"
+        "blob/receiver-v1.1.3/docs/setup.md)"
     ) in readme
     assert "private HTTPS route" in readme
     ordered_steps = (
@@ -524,9 +526,9 @@ def test_current_component_identities_are_explicit() -> None:
     server_manifest = Path("server.json").read_text()
     security = Path("SECURITY.md").read_text()
 
-    assert 'version = "1.1.4"' in pyproject
-    assert '__version__: Final = "1.1.4"' in package_init
-    assert '"version": "1.1.4"' in server_manifest
+    assert f'version = "{__version__}"' in pyproject
+    assert f'__version__: Final = "{__version__}"' in package_init
+    assert f'"version": "{__version__}"' in server_manifest
     assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
     assert xcode_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
     assert '?? "1.1.1"' in content_view
@@ -542,7 +544,7 @@ def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion()
 
     assert (
         "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.4/docs/setup.md#remove-local-bridge-data)"
+        "blob/receiver-v1.1.3/docs/setup.md#remove-local-bridge-data)"
     ) in readme
     assert "health-bridge receiver purge" not in readme
     assert "health-bridge receiver purge" in setup

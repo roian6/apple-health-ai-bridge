@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         DistributionVerificationRequest,
     )
 
+from health_bridge import __version__
 from health_bridge.cli import app
 from health_bridge.mailbox import helper_lifecycle
 from health_bridge.mailbox.helper_lifecycle import (
@@ -65,7 +66,7 @@ def allow_synthetic_distribution_policy(
 
 BUNDLE_ID = "com.example.HealthBridgeMailboxAckPublisher"
 CONTAINER_ID = "iCloud.com.example.HealthBridgeMailboxAckPublisher"
-VERSION = "1.1.4"
+VERSION = __version__
 TAG = f"receiver-v{VERSION}"
 TAG_OBJECT = "1" * 40
 COMMIT = "2" * 40

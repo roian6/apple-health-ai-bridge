@@ -1,211 +1,44 @@
 from __future__ import annotations
 
 import json
-import os
-import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, TypeAlias
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import JsonValue, TypeAdapter
 
+from tests.guardrails.release_git_fixtures import synthetic_release_base
+from tests.guardrails.release_policy_fixtures import (
+    POLICY,
+    REPOSITORY,
+    TAG,
+    ReleaseGraph,
+    obj,
+    policy_document,
+    release_graph,
+    replace_target,
+)
 from tests.guardrails.release_version_fixtures import (
     ROOT,
     commit_release_tree,
     git_output,
-    validate_transition,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-BASE = "a4fd59e2f222251ab9ff76cb0eb08524035fcb6d"
-BASE_TAG = "receiver-v1.1.3"
-TAG = "receiver-v1.1.4"
-BRANCH = "fix/receiver-1.1.4"
-POLICY = ".github/release/receiver-maintenance.json"
-JsonObject: TypeAlias = dict[str, JsonValue]
-
-
-def required_object(value: JsonValue) -> JsonObject:
-    assert isinstance(value, dict)
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class MaintenanceGraph:
-    repo: Path
-    target: str
-    main: str
-    transport: Path
-
-
-def authorization(target: str) -> str:
-    return json.dumps(
-        {
-            "schema_id": "health_bridge.receiver_maintenance.v1",
-            "releases": [
-                {
-                    "tag": TAG,
-                    "branch_ref": f"refs/heads/{BRANCH}",
-                    "base_tag": BASE_TAG,
-                    "base_commit": BASE,
-                    "target_commit": target,
-                }
-            ],
-        }
-    )
-
-
-def clone_maintenance_base(source: Path, repo: Path) -> None:
-    _ = git_output(
-        repo.parent, "clone", "--shared", "--no-checkout", str(source), str(repo)
-    )
-    _ = git_output(repo, "checkout", "-B", BRANCH, BASE)
-
-
-def test_fixture_resets_inherited_maintenance_branch_without_changing_source(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source"
-    _ = git_output(
-        tmp_path, "clone", "--shared", "--no-checkout", str(ROOT), str(source)
-    )
-    original = git_output(ROOT, "rev-parse", "HEAD")
-    original_branch = git_output(ROOT, "branch", "--show-current")
-    _ = git_output(source, "checkout", "-B", BRANCH, original)
-    repo = tmp_path / "repo"
-
-    clone_maintenance_base(source, repo)
-
-    assert git_output(repo, "branch", "--show-current") == BRANCH
-    assert git_output(repo, "rev-parse", "HEAD") == BASE
-    assert git_output(source, "branch", "--show-current") == BRANCH
-    assert git_output(source, "rev-parse", "HEAD") == original
-    assert git_output(ROOT, "branch", "--show-current") == original_branch
-    assert git_output(ROOT, "rev-parse", "HEAD") == original
+PREFIX = f"/repos/{REPOSITORY}"
 
 
 @pytest.fixture
-def maintenance_graph(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> MaintenanceGraph:
-    repo = tmp_path / "repo"
-    clone_maintenance_base(ROOT, repo)
-    for name in (
-        "pyproject.toml",
-        "component-versions.json",
-        "macos/HealthBridgeMailboxAckPublisher/Info.plist",
-    ):
-        path = repo / name
-        _ = path.write_text(path.read_text().replace("1.1.3", "1.1.4"))
-    notes = repo / ".github/release" / f"notes-{TAG}.md"
-    _ = notes.write_text(
-        (repo / ".github/release" / f"notes-{BASE_TAG}.md")
-        .read_text()
-        .replace("1.1.3", "1.1.4")
-    )
-    target = commit_release_tree(repo, "synthetic receiver patch")
-    _ = git_output(
-        repo,
-        "-c",
-        "user.name=Synthetic",
-        "-c",
-        "user.email=synthetic",
-        "tag",
-        "-a",
-        TAG,
-        "-m",
-        "synthetic tag; signature metadata mocked",
-    )
-    _ = git_output(
-        repo, "checkout", "-B", "main", git_output(ROOT, "rev-parse", "HEAD")
-    )
-    _ = (repo / POLICY).write_text(authorization(target))
-    main = commit_release_tree(repo, "synthetic protected authorization")
-    _ = git_output(repo, "checkout", "--detach", target)
-    transport = tmp_path / "transport.json"
-    tag_object = git_output(repo, "rev-parse", f"refs/tags/{TAG}")
-    base_object = git_output(repo, "rev-parse", f"refs/tags/{BASE_TAG}")
-    tagger_account = "23256775+roian6"
-    committer_account = "noreply"
-    metadata = {
-        "": {"default_branch": "main"},
-        "/branches/main": {"commit": {"sha": main}, "protected": True},
-        f"/branches/{BRANCH}": {
-            "name": BRANCH,
-            "commit": {"sha": target},
-            "protected": True,
-        },
-        f"/git/ref/tags/{TAG}": {"object": {"sha": tag_object, "type": "tag"}},
-        f"/git/ref/tags/{BASE_TAG}": {"object": {"sha": base_object, "type": "tag"}},
-        f"/git/tags/{base_object}": {"object": {"sha": BASE, "type": "commit"}},
-        f"/git/tags/{tag_object}": {
-            "tag": TAG,
-            "object": {"sha": target, "type": "commit"},
-            "verification": {"verified": True, "reason": "valid"},
-            "tagger": {
-                "name": "Chanhyo Jung",
-                "email": f"{tagger_account}@users.noreply.github.com",
-            },
-        },
-        f"/commits/{target}": {
-            "author": {"login": "roian6"},
-            "committer": {"login": "web-flow"},
-            "commit": {
-                "verification": {"verified": True, "reason": "valid"},
-                "author": {"name": "Chanhyo Jung"},
-                "committer": {
-                    "name": "GitHub",
-                    "email": f"{committer_account}@github.com",
-                },
-            },
-        },
-    }
-    _ = transport.write_text(json.dumps(metadata))
-    _ = git_output(repo, "remote", "set-url", "origin", str(repo))
-    gh = tmp_path / "gh"
-    _ = gh.write_text(
-        f"""#!{sys.executable}
-import json, os, pathlib, sys
-route = sys.argv[2].removeprefix('/repos/roian6/apple-health-ai-bridge')
-payload = json.loads(pathlib.Path(os.environ['SOURCE_TRANSPORT']).read_text())
-if route not in payload: sys.exit(19)
-print(json.dumps(payload[route]))
-"""
-    )
-    gh.chmod(0o700)
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("SOURCE_TRANSPORT", str(transport))
-    monkeypatch.setenv("GITHUB_REPOSITORY", "roian6/apple-health-ai-bridge")
-    return MaintenanceGraph(repo, target, main, transport)
-
-
-def test_authorized_maintenance_preserves_real_default_main(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    # Given: real divergent Git objects, with authority only in protected main.
-    graph = maintenance_graph
-    assert graph.target != graph.main
-    assert not (graph.repo / POLICY).exists()
-
-    # When: the existing release CLI validates the actual maintenance target.
-    completed = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.main,
-        baseline=BASE,
-    )
-
-    # Then: maintenance authority permits the patch without relabeling main.
-    assert completed.returncode == 0, completed.stderr
+def graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReleaseGraph:
+    return release_graph(tmp_path, monkeypatch)
 
 
 def run_source(
-    graph: MaintenanceGraph, *, tag_object: str | None = None
+    graph: ReleaseGraph, *, local_tag: bool = False
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -214,13 +47,12 @@ def run_source(
             "--repo",
             str(graph.repo),
             "--tag",
-            TAG,
+            graph.tag,
             "--commit",
             graph.target,
             "--tag-object",
-            tag_object
-            if tag_object is not None
-            else git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}"),
+            graph.tag_object,
+            *(["--local-tag"] if local_tag else []),
         ],
         capture_output=True,
         text=True,
@@ -228,640 +60,386 @@ def run_source(
     )
 
 
-@pytest.mark.parametrize("command", ["gh", "git"])
-def test_stalled_source_lookup_has_clean_bounded_failure(
-    maintenance_graph: MaintenanceGraph, command: str
-) -> None:
-    graph = maintenance_graph
-    tag_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
-    executable = graph.transport.parent / command
-    _ = executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(0.5)\n")
-    executable.chmod(0o700)
-    runner = graph.transport.parent / "timeout_runner.py"
-    _ = runner.write_text(
-        f"""import sys
-sys.path.insert(0, {str(ROOT / "scripts")!r})
-import release_source_policy as policy
-policy._LOOKUP_TIMEOUT_SECONDS = 0.05
-raise SystemExit(policy.main())
-"""
-    )
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-S",
-            str(runner),
-            "--repo",
-            str(graph.repo),
-            "--tag",
-            TAG,
-            "--commit",
-            graph.target,
-            "--tag-object",
-            tag_object,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-    assert completed.returncode == 1
-    assert completed.stdout == ""
-    assert completed.stderr == f"release source {command} lookup timed out\n"
-
-
-def test_different_local_tag_object_is_rejected(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = maintenance_graph
-    requested_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
-    _ = git_output(
-        graph.repo,
-        "-c",
-        "user.name=Synthetic",
-        "-c",
-        "user.email=synthetic",
-        "tag",
-        "-f",
-        "-a",
-        TAG,
-        "-m",
-        "synthetic different local tag object",
-    )
-    assert git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}") != requested_object
-    completed = run_source(graph, tag_object=requested_object)
-    assert completed.returncode == 1
-    assert "signed tag identity or target mismatch" in completed.stderr
-
-
-def read_transport(graph: MaintenanceGraph) -> JsonObject:
-    return TypeAdapter(dict[str, JsonValue]).validate_json(graph.transport.read_text())
-
-
-def publish_authority(graph: MaintenanceGraph, raw: str | None) -> MaintenanceGraph:
+def publish_policy(graph: ReleaseGraph, raw: str) -> ReleaseGraph:
     _ = git_output(graph.repo, "checkout", "main")
-    if raw is None:
-        (graph.repo / POLICY).unlink()
-    else:
-        _ = (graph.repo / POLICY).write_text(raw)
-    main = commit_release_tree(graph.repo, "synthetic authority revision")
+    _ = (graph.repo / POLICY).write_text(raw)
+    main = commit_release_tree(graph.repo, "synthetic policy revision")
     _ = git_output(graph.repo, "checkout", "--detach", graph.target)
-    metadata = read_transport(graph)
-    metadata["/branches/main"] = {"commit": {"sha": main}, "protected": True}
-    _ = graph.transport.write_text(json.dumps(metadata))
+    payload = graph.read()
+    payload[PREFIX + "/branches/main"] = {
+        "name": "main",
+        "protected": True,
+        "commit": {"sha": main},
+    }
+    graph.write(payload)
     return replace(graph, main=main)
 
 
-def test_source_cli_reports_real_main_and_first_parent(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = maintenance_graph
-    completed = run_source(graph)
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {
-        "default_main_commit": graph.main,
-        "baseline_commit": BASE,
+@pytest.mark.parametrize("detached", [False, True])
+def test_fixture_ignores_arbitrary_caller_refs(tmp_path: Path, detached: bool) -> None:
+    source = tmp_path / "caller"
+    _ = synthetic_release_base(source, "release")
+    _ = git_output(source, "tag", TAG)
+    if detached:
+        _ = git_output(source, "checkout", "--detach")
+    refs = git_output(source, "show-ref")
+    head = git_output(source, "rev-parse", "HEAD")
+    branch = git_output(source, "branch", "--show-current")
+    isolated = tmp_path / "isolated"
+    _ = synthetic_release_base(isolated, "release")
+    assert git_output(isolated, "tag", "--list", TAG) == ""
+    assert git_output(source, "show-ref") == refs
+    assert git_output(source, "rev-parse", "HEAD") == head
+    assert git_output(source, "branch", "--show-current") == branch
+
+
+def test_exact_reviewed_source_resolves_published_baseline(graph: ReleaseGraph) -> None:
+    result = run_source(graph)
+    assert result.returncode == 0, result.stderr
+    receipt = TypeAdapter(dict[str, JsonValue]).validate_json(result.stdout)
+    assert receipt["source_commit"] == graph.target
+    assert receipt["baseline_commit"] == graph.base
+    assert obj(receipt["baseline"])["release_id"] == 3
+    assert receipt["pull_request"] == 42
+    assert receipt["check_runs"] == {
+        "Python quality and package checks": 1000,
+        "Swift tests and unsigned app builds": 1100,
+        "Analyze Python": 1200,
     }
 
 
+def test_main_and_release_advancement_preserve_candidate(graph: ReleaseGraph) -> None:
+    _ = git_output(graph.repo, "checkout", "release")
+    _ = (graph.repo / "later.txt").write_text("synthetic later source")
+    later = commit_release_tree(graph.repo, "later reviewed source")
+    _ = git_output(graph.repo, "checkout", "--detach", graph.target)
+    payload = graph.read()
+    obj(payload[PREFIX + "/branches/release"])["commit"] = {"sha": later}
+    graph.write(payload)
+    policy = policy_document()
+    policy["revoked_commits"] = ["a" * 40]
+    graph = publish_policy(graph, json.dumps(policy))
+    result = run_source(graph)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["source_commit"] == graph.target
+
+
+@pytest.mark.parametrize("raw", ["{}", "[]", "invalid JSON", '{"schema_id":"wrong"}'])
+def test_candidate_cannot_supply_missing_main_policy(
+    graph: ReleaseGraph, raw: str
+) -> None:
+    graph = publish_policy(graph, raw)
+    _ = (graph.repo / POLICY).write_text(json.dumps(policy_document()))
+    graph = replace_target(graph, (graph.target,))
+    result = run_source(graph)
+    assert result.returncode == 1
+    assert "checkout must be clean" not in result.stderr
+
+
 @pytest.mark.parametrize(
-    "raw",
+    "field", ["revoked_commits", "revoked_tag_objects", "retired_tags"]
+)
+def test_explicit_revocation_is_fresh(graph: ReleaseGraph, field: str) -> None:
+    assert run_source(graph).returncode == 0
+    policy = policy_document()
+    policy[field] = (
+        [graph.target]
+        if field == "revoked_commits"
+        else [graph.tag_object]
+        if field == "revoked_tag_objects"
+        else [
+            {
+                "tag": TAG,
+                "tag_object": graph.tag_object,
+                "commit": graph.target,
+                "reason": "synthetic retired candidate",
+            }
+        ]
+    )
+    graph = publish_policy(graph, json.dumps(policy))
+    result = run_source(graph)
+    assert result.returncode == 1
+    assert "revoked or retired" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("route", "keys", "value"),
     [
-        None,
-        "{}",
-        "[]",
-        "invalid JSON",
-        '{"schema_id":"health_bridge.receiver_maintenance.v1","releases":[]}',
-        '{"schema_id":"health_bridge.receiver_maintenance.v1","releases":[],"extra":true}',
-        '{"schema_id":"health_bridge.receiver_maintenance.v1","releases":[],"releases":[]}',
+        ("/branches/main", ("protected",), False),
+        ("/branches/main", ("name",), "release"),
+        ("/branches/release", ("protected",), False),
+        ("/branches/release", ("name",), "other"),
+        ("/branches/release", ("commit", "sha"), "b" * 40),
+        ("", ("default_branch",), "other"),
+        ("/rulesets/7", ("enforcement",), "evaluate"),
+        ("/rulesets/7", ("bypass_actors",), [{"actor_id": 1}]),
+        ("/git/ref/tags/" + TAG, ("object", "type"), "commit"),
+        ("/git/ref/tags/" + TAG, ("object", "sha"), "b" * 40),
+        ("/git/tags/{tag_object}", ("object", "sha"), "b" * 40),
+        ("/git/tags/{tag_object}", ("verification", "verified"), False),
+        ("/git/tags/{tag_object}", ("tag",), "receiver-v9.9.9"),
+        ("/commits/{target}", ("commit", "verification", "verified"), False),
+        ("/commits/{target}", ("committer", "login"), "other"),
+        ("/commits/{target}", ("sha",), "b" * 40),
+        ("/commits/{target}", ("author", "login"), "other"),
+        ("/git/tags/{tag_object}", ("tagger", "email"), "other"),
+        ("/pulls/42", ("merged",), False),
+        ("/pulls/42", ("merge_commit_sha",), "b" * 40),
+        ("/pulls/42", ("base", "ref"), "main"),
+        ("/pulls/42", ("head", "repo", "full_name"), "other/repository"),
     ],
 )
-def test_missing_or_malformed_main_authority_rejects_candidate_local_record(
-    maintenance_graph: MaintenanceGraph,
-    raw: str | None,
+def test_wrong_source_or_governance_holds_before_qualification(
+    graph: ReleaseGraph,
+    route: str,
+    keys: tuple[str, ...],
+    value: JsonValue,
 ) -> None:
-    graph = publish_authority(maintenance_graph, raw)
-    _ = (graph.repo / POLICY).write_text(authorization(graph.target))
-    completed = run_source(graph)
-    assert completed.returncode == 1, completed.stdout
+    payload = graph.read()
+    node = obj(
+        payload[PREFIX + route.format(target=graph.target, tag_object=graph.tag_object)]
+    )
+    for key in keys[:-1]:
+        node = obj(node[key])
+    node[keys[-1]] = value
+    graph.write(payload)
+    result = run_source(graph)
+    assert result.returncode == 1, result.stdout
+
+
+@pytest.mark.parametrize(
+    "state", ["COMMENTED", "DISMISSED", "CHANGES_REQUESTED", "SKIPPED"]
+)
+def test_review_skip_is_never_approval(graph: ReleaseGraph, state: str) -> None:
+    payload = graph.read()
+    payload[PREFIX + "/pulls/42/reviews?per_page=100&page=1"] = [
+        {"state": state, "commit_id": graph.target, "user": {"login": "reviewer"}}
+    ]
+    graph.write(payload)
+    assert run_source(graph).returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("reviewer", "sha"), [("synthetic-author", "target"), ("reviewer", "base")]
+)
+def test_review_must_approve_latest_head_by_other_author(
+    graph: ReleaseGraph, reviewer: str, sha: str
+) -> None:
+    payload = graph.read()
+    payload[PREFIX + "/pulls/42/reviews?per_page=100&page=1"] = [
+        {
+            "state": "APPROVED",
+            "commit_id": getattr(graph, sha),
+            "author_association": "COLLABORATOR",
+            "user": {"login": reviewer},
+        }
+    ]
+    graph.write(payload)
+    assert run_source(graph).returncode == 1
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("target_commit", "b" * 40),
-        ("target_commit", "B" * 40),
-        ("target_commit", "short"),
-        ("target_commit", None),
-        ("branch_ref", "refs/heads/main"),
-        ("branch_ref", "refs/heads/fix/receiver-1.1.5"),
-        ("base_commit", "b" * 40),
-        ("base_tag", "receiver-v1.1.2"),
-        ("tag", "receiver-v1.2.0"),
-        ("extra", "unreviewed"),
+        ("conclusion", "failure"),
+        ("conclusion", "skipped"),
+        ("status", "in_progress"),
+        ("head_sha", "b" * 40),
+        ("head_branch", "main"),
+        ("path", ".github/workflows/other.yml"),
+        ("event", "pull_request"),
     ],
 )
-def test_closed_record_rejects_different_or_malformed_binding(
-    maintenance_graph: MaintenanceGraph,
-    field: str,
-    value: JsonValue,
+def test_checks_bind_successful_release_push_execution(
+    graph: ReleaseGraph, field: str, value: str
 ) -> None:
-    graph = maintenance_graph
-    document = TypeAdapter(dict[str, JsonValue]).validate_json(
-        authorization(graph.target)
+    payload = graph.read()
+    route = (
+        PREFIX
+        + f"/actions/workflows/python.yml/runs?head_sha={graph.target}"
+        + "&event=push&per_page=100&page=1"
     )
-    records = document["releases"]
-    assert isinstance(records, list)
-    required_object(records[0])[field] = value
-    graph = publish_authority(graph, json.dumps(document))
-    completed = run_source(graph)
-    assert completed.returncode == 1, completed.stdout
-
-
-def test_duplicate_records_are_rejected(maintenance_graph: MaintenanceGraph) -> None:
-    graph = maintenance_graph
-    document = TypeAdapter(dict[str, JsonValue]).validate_json(
-        authorization(graph.target)
-    )
-    records = document["releases"]
-    assert isinstance(records, list)
-    records.append(records[0])
-    graph = publish_authority(graph, json.dumps(document))
-    completed = run_source(graph)
-    assert completed.returncode == 1
-    assert "unique next-patch branch" in completed.stderr
+    runs = obj(payload[route])["workflow_runs"]
+    assert isinstance(runs, list)
+    obj(runs[0])[field] = value
+    graph.write(payload)
+    assert run_source(graph).returncode == 1
 
 
 @pytest.mark.parametrize(
-    ("keys", "value"),
-    [
-        (("/branches/main", "protected"), False),
-        ((f"/branches/{BRANCH}", "protected"), False),
-        ((f"/branches/{BRANCH}", "commit", "sha"), BASE),
-        (("", "default_branch"), "other"),
-        (("/git/tags/{base_object}", "object", "sha"), "b" * 40),
-        ((f"/git/ref/tags/{TAG}", "object", "sha"), "b" * 40),
-        ((f"/git/ref/tags/{TAG}", "object", "type"), "commit"),
-        (("/git/tags/{tag_object}", "object", "sha"), BASE),
-        (("/git/tags/{tag_object}", "verification", "verified"), False),
-        (("/git/tags/{tag_object}", "tag"), "receiver-v1.1.5"),
-        (("/git/tags/{tag_object}", "tagger", "email"), "untrusted"),
-        (("/commits/{target}", "commit", "verification", "verified"), False),
-        (("/commits/{target}", "author", "login"), "untrusted"),
-        (("/commits/{target}", "committer", "login"), "untrusted"),
-    ],
+    "state", ["draft", "prerelease", "missing-publication", "duplicate"]
 )
-def test_live_source_boundaries_fail_closed(
-    maintenance_graph: MaintenanceGraph,
-    keys: tuple[str, ...],
-    value: JsonValue,
+def test_baseline_requires_unique_published_stable_release(
+    graph: ReleaseGraph, state: str
 ) -> None:
-    graph = maintenance_graph
-    metadata = read_transport(graph)
-    tag_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
-    base_object = git_output(graph.repo, "rev-parse", f"refs/tags/{BASE_TAG}")
-    selected = metadata
-    for key in keys[:-1]:
-        selected = required_object(
-            selected[
-                key.format(
-                    tag_object=tag_object,
-                    base_object=base_object,
-                    target=graph.target,
-                )
-            ]
-        )
-    selected[keys[-1]] = value
-    _ = graph.transport.write_text(json.dumps(metadata))
-    completed = run_source(graph)
-    assert completed.returncode == 1, completed.stdout
-
-
-def test_normal_main_needs_no_maintenance_record(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = maintenance_graph
-    metadata = read_transport(graph)
-    metadata["/branches/main"] = {"commit": {"sha": graph.target}, "protected": True}
-    _ = graph.transport.write_text(json.dumps(metadata))
-    completed = run_source(graph)
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout)["default_main_commit"] == graph.target
-    validated = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.target,
-        baseline=BASE,
-    )
-    assert validated.returncode == 0, validated.stderr
-
-
-def test_branch_response_must_name_authorized_ref(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = maintenance_graph
-    metadata = read_transport(graph)
-    required_object(metadata[f"/branches/{BRANCH}"])["name"] = "different-branch"
-    _ = graph.transport.write_text(json.dumps(metadata))
-    completed = run_source(graph)
-    assert completed.returncode == 1, completed.stdout
-
-
-def test_revocation_is_fresh_on_every_call(maintenance_graph: MaintenanceGraph) -> None:
-    graph = maintenance_graph
-    assert run_source(graph).returncode == 0
-    graph = publish_authority(
-        graph, '{"schema_id":"health_bridge.receiver_maintenance.v1","releases":[]}'
-    )
-    completed = run_source(graph)
-    assert completed.returncode == 1
-    assert "exact maintenance authorization" in completed.stderr
-
-
-def replace_candidate(
-    graph: MaintenanceGraph, parents: tuple[str, ...]
-) -> MaintenanceGraph:
-    _ = git_output(graph.repo, "add", ".")
-    tree = git_output(graph.repo, "write-tree")
-    parent_args = [argument for parent in parents for argument in ("-p", parent)]
-    target = git_output(
-        graph.repo,
-        "-c",
-        "user.name=Synthetic",
-        "-c",
-        "user.email=synthetic",
-        "commit-tree",
-        tree,
-        *parent_args,
-        "-m",
-        "synthetic alternate candidate",
-    )
-    _ = git_output(graph.repo, "reset", "--hard", target)
-    _ = git_output(
-        graph.repo,
-        "-c",
-        "user.name=Synthetic",
-        "-c",
-        "user.email=synthetic",
-        "tag",
-        "-f",
-        "-a",
-        TAG,
-        "-m",
-        "synthetic replacement tag",
-    )
-    metadata = read_transport(graph)
-    old_object = required_object(
-        required_object(metadata[f"/git/ref/tags/{TAG}"])["object"]
-    )["sha"]
-    assert isinstance(old_object, str)
-    new_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
-    tag = required_object(metadata.pop(f"/git/tags/{old_object}"))
-    tag["object"] = {"sha": target, "type": "commit"}
-    metadata[f"/git/tags/{new_object}"] = tag
-    metadata[f"/git/ref/tags/{TAG}"] = {"object": {"sha": new_object, "type": "tag"}}
-    metadata[f"/commits/{target}"] = metadata.pop(f"/commits/{graph.target}")
-    metadata[f"/branches/{BRANCH}"] = {
-        "name": BRANCH,
-        "commit": {"sha": target},
-        "protected": True,
-    }
-    _ = graph.transport.write_text(json.dumps(metadata))
-    return publish_authority(replace(graph, target=target), authorization(target))
-
-
-@pytest.mark.parametrize("boundary", ["ios-source", "ios-build", "batch", "scope"])
-def test_authority_cannot_relax_receiver_only_constraints(
-    maintenance_graph: MaintenanceGraph,
-    boundary: str,
-) -> None:
-    graph = maintenance_graph
-    index = graph.repo / "component-versions.json"
-    document = TypeAdapter(dict[str, JsonValue]).validate_json(index.read_text())
-    if boundary == "ios-source":
-        _ = (graph.repo / "ios/unauthorized.swift").write_text("// synthetic change\n")
-    elif boundary == "ios-build":
-        required_object(document["ios_companion"])["build"] = "999"
-    elif boundary == "batch":
-        required_object(document["batch_protocol"])["version"] = "1.1.0"
+    payload = graph.read()
+    releases = payload[PREFIX + "/releases?per_page=100&page=1"]
+    assert isinstance(releases, list)
+    release = obj(releases[0])
+    if state == "duplicate":
+        releases.append(release)
+    elif state == "missing-publication":
+        release["published_at"] = None
     else:
-        document["release_scope"] = "coordinated"
-    _ = index.write_text(json.dumps(document))
-    graph = replace_candidate(graph, (BASE,))
-    completed = run_source(graph)
-    assert completed.returncode == 1
-    assert "preserve base iOS source/build and Batch Protocol" in completed.stderr
+        release[state] = True
+    graph.write(payload)
+    assert run_source(graph).returncode == 1
 
 
-@pytest.mark.parametrize("ancestry", ["unrelated", "merge", "intermediate-merge"])
-def test_authority_cannot_relax_linear_ancestry(
-    maintenance_graph: MaintenanceGraph,
-    ancestry: str,
+def test_unpublished_candidate_tag_and_draft_are_not_baseline(
+    graph: ReleaseGraph,
 ) -> None:
-    graph = maintenance_graph
-    parents = () if ancestry == "unrelated" else (BASE, graph.main)
-    if ancestry == "intermediate-merge":
-        graph = replace_candidate(graph, (BASE, graph.main))
-        parents = (graph.target,)
-    graph = replace_candidate(graph, parents)
-    completed = run_source(graph)
-    assert completed.returncode == 1
-
-
-def test_transition_rejects_false_maintenance_base(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = maintenance_graph
-    completed = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.main,
-        baseline=graph.main,
-    )
-    assert completed.returncode == 1
-    assert "baseline must equal the authorized maintenance base" in completed.stderr
-
-
-def test_transition_rejects_stale_default_main_input(
-    maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = maintenance_graph
-    completed = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=BASE,
-        baseline=BASE,
-    )
-    assert completed.returncode == 1
-    assert (
-        "default-main commit must equal fresh protected authority" in completed.stderr
-    )
-
-
-@pytest.fixture
-def linear_maintenance_graph(maintenance_graph: MaintenanceGraph) -> MaintenanceGraph:
-    graph = maintenance_graph
-    _ = (graph.repo / "maintenance-followup.txt").write_text("synthetic CI repair\n")
-    return replace_candidate(graph, (graph.target,))
-
-
-def test_linear_maintenance_resolves_published_base(
-    linear_maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = linear_maintenance_graph
-    parent = git_output(graph.repo, "rev-parse", "HEAD^1")
-    assert parent != BASE
-    assert git_output(graph.repo, "rev-parse", f"{parent}^1") == BASE
-    for commit in (parent, graph.target):
-        index = TypeAdapter(dict[str, JsonValue]).validate_json(
-            git_output(graph.repo, "show", f"{commit}:component-versions.json")
-        )
-        assert required_object(index["receiver_cli"])["version"] == "1.1.4"
-
-    completed = run_source(graph)
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {
-        "default_main_commit": graph.main,
-        "baseline_commit": BASE,
-    }
-
-
-def test_linear_maintenance_validates_against_authorized_base(
-    linear_maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = linear_maintenance_graph
-    completed = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.main,
-        baseline=BASE,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-@pytest.mark.parametrize("baseline", ["parent", "target", "main", "forged"])
-def test_linear_maintenance_rejects_caller_chosen_baseline(
-    linear_maintenance_graph: MaintenanceGraph, baseline: str
-) -> None:
-    graph = linear_maintenance_graph
-    candidates = {
-        "parent": git_output(graph.repo, "rev-parse", "HEAD^1"),
-        "target": graph.target,
-        "main": graph.main,
-        "forged": "b" * 40,
-    }
-    completed = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.main,
-        baseline=candidates[baseline],
-    )
-    assert completed.returncode == 1
-    assert "baseline must equal the authorized maintenance base" in completed.stderr
-
-
-def test_default_main_keeps_actual_first_parent_for_linear_graph(
-    linear_maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = linear_maintenance_graph
-    metadata = read_transport(graph)
-    metadata["/branches/main"] = {"commit": {"sha": graph.target}, "protected": True}
-    _ = graph.transport.write_text(json.dumps(metadata))
-    completed = run_source(graph)
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {
-        "default_main_commit": graph.target,
-        "baseline_commit": git_output(graph.repo, "rev-parse", "HEAD^1"),
-    }
-    rejected = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.target,
-        baseline=BASE,
-    )
-    assert rejected.returncode == 1
-    assert "baseline must equal the tag target's first parent" in rejected.stderr
-
-
-@pytest.mark.parametrize("boundary", ["receiver", "ios", "batch"])
-def test_linear_maintenance_rejects_drift_in_preparation_parent(
-    maintenance_graph: MaintenanceGraph, boundary: str
-) -> None:
-    graph = maintenance_graph
-    index = graph.repo / "component-versions.json"
-    original = index.read_text()
-    document = TypeAdapter(dict[str, JsonValue]).validate_json(original)
-    if boundary == "receiver":
-        document["receiver_cli"] = {
-            "version": "1.1.5",
-            "release_tag": "receiver-v1.1.5",
-        }
-    elif boundary == "ios":
-        required_object(document["ios_companion"])["build"] = "999"
-    else:
-        required_object(document["batch_protocol"])["version"] = "1.1.0"
-    _ = index.write_text(json.dumps(document))
-    graph = replace_candidate(graph, (BASE,))
-    _ = index.write_text(original)
-    graph = replace_candidate(graph, (graph.target,))
-    completed = run_source(graph)
-    assert completed.returncode == 1
-    assert "preserve base iOS source/build and Batch Protocol" in completed.stderr
-
-
-def test_authority_cannot_replace_published_base_with_preparation(
-    linear_maintenance_graph: MaintenanceGraph,
-) -> None:
-    graph = linear_maintenance_graph
-    parent = git_output(graph.repo, "rev-parse", "HEAD^1")
-    document = TypeAdapter(dict[str, JsonValue]).validate_json(
-        authorization(graph.target)
-    )
-    records = document["releases"]
-    assert isinstance(records, list)
-    required_object(records[0])["base_commit"] = parent
-    graph = publish_authority(graph, json.dumps(document))
-    completed = run_source(graph)
-    assert completed.returncode == 1
-    assert "immutable base tag/commit mismatch" in completed.stderr
-    rejected = validate_transition(
-        graph.repo,
-        tag=TAG,
-        tag_target=graph.target,
-        default_main=graph.main,
-        baseline=parent,
-    )
-    assert rejected.returncode == 1
-    assert "immutable base tag/commit mismatch" in rejected.stderr
-
-
-def test_workflow_threads_resolved_maintenance_baseline_to_validate(
-    linear_maintenance_graph: MaintenanceGraph, tmp_path: Path
-) -> None:
-    graph = linear_maintenance_graph
-    workflow = (ROOT / ".github/workflows/release.yml").read_text()
-    pin = '          source="$(' + workflow.split('          source="$(', 1)[1]
-    pin = pin.split("\n\n  python:", 1)[0]
-    pin = "\n".join(line.removeprefix("          ") for line in pin.splitlines())
-    pin = pin.replace(
-        "python3 scripts/release_source_policy.py",
-        shlex.join([sys.executable, str(ROOT / "scripts/release_source_policy.py")]),
-    )
-    output = tmp_path / "workflow-output"
-    environment = os.environ | {
-        "GITHUB_REF_NAME": TAG,
-        "target_sha": graph.target,
-        "tag_object_sha": git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}"),
-        "GITHUB_OUTPUT": str(output),
-    }
-    pinned = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", pin],
-        cwd=graph.repo,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert pinned.returncode == 0, pinned.stderr
-    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert values["baseline_commit_sha"] == BASE
-    assert values["default_main_commit_sha"] == graph.main
-    step = workflow.split(
-        "      - name: Validate tag and cross-platform versions\n", 1
-    )[1]
-    validate = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
-    validate = "\n".join(
-        line.removeprefix("          ") for line in validate.splitlines()
-    )
-    validate = validate.replace(
-        "uv run python scripts/release_tools.py",
-        shlex.join([sys.executable, str(ROOT / "scripts/release_tools.py")]),
-    )
-    environment.update(
+    payload = graph.read()
+    releases = payload[PREFIX + "/releases?per_page=100&page=1"]
+    assert isinstance(releases, list)
+    releases.append(
         {
-            "PINNED_TARGET_COMMIT_SHA": values["target_commit_sha"],
-            "PINNED_DEFAULT_MAIN_COMMIT_SHA": values["default_main_commit_sha"],
-            "PINNED_BASELINE_COMMIT_SHA": values["baseline_commit_sha"],
+            "id": 4,
+            "tag_name": TAG,
+            "draft": True,
+            "prerelease": False,
+            "published_at": None,
         }
     )
-    validated = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", validate],
-        cwd=graph.repo,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert validated.returncode == 0, validated.stderr
-    assert json.loads(validated.stdout)["project_version"] == "1.1.4"
+    graph.write(payload)
+    result = run_source(graph)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["baseline_commit"] == graph.base
 
 
-SOURCE_STAGES = [
-    ("release.yml", "Verify and pin tag object and target commit"),
-    ("release.yml", "Verify downloaded release packet"),
-    ("release.yml", "Create and verify helper-pending draft release"),
-    ("publish-release.yml", "Download exact bound draft helper assets"),
-    ("publish-release.yml", "Download exact remote helper-pending asset set"),
-    ("publish-release.yml", "Reverify exact draft and publish once"),
-]
-
-
-@pytest.mark.parametrize(("workflow", "step"), SOURCE_STAGES)
-@pytest.mark.parametrize("authorized", [True, False])
-def test_each_workflow_source_gate_executes_the_authoritative_decision(
-    maintenance_graph: MaintenanceGraph,
-    workflow: str,
-    step: str,
-    authorized: bool,
+@pytest.mark.parametrize(
+    "shape", ["followup", "reviewed-merge", "unrelated", "unreviewed-merge"]
+)
+def test_frozen_source_uses_published_baseline_across_reviewed_graphs(
+    graph: ReleaseGraph, shape: str
 ) -> None:
-    graph = maintenance_graph
-    if not authorized:
-        graph = publish_authority(
-            graph, '{"schema_id":"health_bridge.receiver_maintenance.v1","releases":[]}'
+    previous = graph.target
+    parents = (
+        ()
+        if shape == "unrelated"
+        else (previous, graph.main)
+        if "merge" in shape
+        else (previous,)
+    )
+    graph = replace_target(graph, parents)
+    if shape == "reviewed-merge":
+        payload = graph.read()
+        obj(obj(payload[PREFIX + "/pulls/42"])["head"]).update(
+            {"ref": "main", "sha": graph.main}
         )
-    text = (ROOT / ".github/workflows" / workflow).read_text()
-    body = text.split(f"      - name: {step}\n", 1)[1].split("\n      - name:", 1)[0]
-    lines = body.splitlines()
-    start = next(
-        i
-        for i, line in enumerate(lines)
-        if "python3 scripts/release_source_policy.py" in line
+        payload[PREFIX + "/pulls/42/reviews?per_page=100&page=1"] = [
+            {
+                "state": "APPROVED",
+                "author_association": "COLLABORATOR",
+                "commit_id": graph.main,
+                "user": {"login": "reviewer"},
+            }
+        ]
+        graph.write(payload)
+    result = run_source(graph)
+    accepted = shape in {"followup", "reviewed-merge"}
+    assert (result.returncode == 0) is accepted, result.stderr
+    if accepted:
+        receipt = graph.transport.parent / "receipt.json"
+        _ = receipt.write_text(result.stdout)
+        validation = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/release_tools.py"),
+                "validate",
+                "--repo",
+                str(graph.repo),
+                "--tag",
+                graph.tag,
+                "--tag-target-commit",
+                graph.target,
+                "--default-main-commit",
+                graph.main,
+                "--baseline-commit",
+                graph.base,
+                "--source-receipt",
+                str(receipt),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert validation.returncode == 0, validation.stderr
+        assert git_output(graph.repo, "rev-parse", "HEAD^1") == previous
+        assert json.loads(result.stdout)["baseline_commit"] == graph.base
+
+
+def test_unresolved_threads_block_even_with_approval(graph: ReleaseGraph) -> None:
+    payload = graph.read()
+    repository = obj(obj(payload["graphql"])["data"])
+    threads = obj(obj(obj(repository["repository"])["pullRequest"])["reviewThreads"])
+    threads["nodes"] = [{"isResolved": False}]
+    graph.write(payload)
+    result = run_source(graph)
+    assert result.returncode == 1
+    assert "unresolved review threads" in result.stderr
+
+
+def test_read_only_ruleset_response_does_not_invent_bypass_readback(
+    graph: ReleaseGraph,
+) -> None:
+    payload = graph.read()
+    del obj(payload[PREFIX + "/rulesets/7"])["bypass_actors"]
+    graph.write(payload)
+    result = run_source(graph)
+    assert result.returncode == 0, result.stderr
+
+
+def test_duplicate_policy_keys_fail_closed(graph: ReleaseGraph) -> None:
+    raw = json.dumps(policy_document()).replace(
+        '"revoked_commits": []', '"revoked_commits": [], "revoked_commits": []'
     )
-    command = lines[start].strip().removeprefix('source="$(')
-    end = start
-    while command.endswith("\\"):
-        end += 1
-        command = command[:-1] + lines[end].strip()
-    command = command.removesuffix(')"')
-    resolver = shlex.quote(str(ROOT / "scripts/release_source_policy.py"))
-    command = command.replace(
-        "python3 scripts/release_source_policy.py",
-        f"{shlex.quote(sys.executable)} {resolver}",
-    )
-    tag_object = git_output(graph.repo, "rev-parse", f"refs/tags/{TAG}")
-    environment = os.environ | {
-        "GITHUB_REF_NAME": TAG,
-        "RELEASE_TAG": TAG,
-        "target_sha": graph.target,
-        "commit_sha": graph.target,
-        "PINNED_TARGET_COMMIT_SHA": graph.target,
-        "tag_object_sha": tag_object,
-        "PINNED_TAG_OBJECT_SHA": tag_object,
-    }
-    completed = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", command],
-        cwd=graph.repo,
-        env=environment,
+    graph = publish_policy(graph, raw)
+    result = run_source(graph)
+    assert result.returncode == 1
+    assert "duplicate trusted policy field" in result.stderr
+
+
+@pytest.mark.parametrize("mutation", ["ios-source", "ios-version", "batch"])
+def test_receiver_only_transition_preserves_component_baseline(
+    graph: ReleaseGraph, mutation: str
+) -> None:
+    index = graph.repo / "component-versions.json"
+    payload = TypeAdapter(dict[str, JsonValue]).validate_json(index.read_bytes())
+    if mutation == "ios-source":
+        _ = (graph.repo / "ios/changed.swift").write_text(
+            "// synthetic changed source\n"
+        )
+    elif mutation == "ios-version":
+        obj(payload["ios_companion"])["build"] = "51"
+    else:
+        obj(payload["batch_protocol"])["version"] = "1.1.0"
+    _ = index.write_text(json.dumps(payload))
+    graph = replace_target(graph, (graph.target,))
+    result = run_source(graph)
+    assert result.returncode == 0, result.stderr
+    receipt = graph.transport.parent / "receipt.json"
+    _ = receipt.write_text(result.stdout)
+    validation = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/release_tools.py"),
+            "validate",
+            "--repo",
+            str(graph.repo),
+            "--tag",
+            graph.tag,
+            "--tag-target-commit",
+            graph.target,
+            "--default-main-commit",
+            graph.main,
+            "--baseline-commit",
+            graph.base,
+            "--source-receipt",
+            str(receipt),
+        ],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert completed.returncode == (0 if authorized else 1), completed.stderr
+    assert validation.returncode == 1

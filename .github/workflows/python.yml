@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - fix/receiver-1.1.4
+      - release
     tags:
       - "ios-v*"
   pull_request:
@@ -12,10 +12,12 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  pull-requests: read
 
 concurrency:
-  group: python-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: python-${{ github.workflow }}-${{ github.ref == 'refs/heads/release' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
 
 jobs:
   checks:
@@ -106,22 +108,15 @@ jobs:
             "/repos/${GITHUB_REPOSITORY}/commits/${target_sha}" \
             --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
           test "$commit_identity" = "true"
-          default_branch="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}" \
-            --jq '.default_branch')"
-          default_main_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/branches/${default_branch}" \
-            --jq '.commit.sha')"
-          [[ "$default_main_sha" =~ ^[0-9a-f]{40}$ ]]
-          test "$target_sha" = "$default_main_sha"
-          baseline_sha="$(git rev-parse "${target_sha}^1")"
-          [[ "$baseline_sha" =~ ^[0-9a-f]{40}$ ]]
+          uv run python scripts/release_source_policy.py \
+            --repo . --tag "$GITHUB_REF_NAME" --commit "$target_sha" \
+            --tag-object "$tag_object_sha" > "$RUNNER_TEMP/ios-source.json"
+          default_main_sha="$(jq -r .default_main_commit "$RUNNER_TEMP/ios-source.json")"
+          baseline_sha="$(jq -r .baseline_commit "$RUNNER_TEMP/ios-source.json")"
           uv run python scripts/release_tools.py validate \
-            --repo . \
-            --tag "$GITHUB_REF_NAME" \
-            --tag-target-commit "$target_sha" \
-            --default-main-commit "$default_main_sha" \
-            --baseline-commit "$baseline_sha"
+            --repo . --tag "$GITHUB_REF_NAME" \
+            --tag-target-commit "$target_sha" --default-main-commit "$default_main_sha" \
+            --baseline-commit "$baseline_sha" --source-receipt "$RUNNER_TEMP/ios-source.json"
 
       - name: Run public release audit
         run: uv run python scripts/public-release-audit.py --strict
