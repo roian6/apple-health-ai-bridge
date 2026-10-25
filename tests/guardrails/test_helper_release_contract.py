@@ -343,16 +343,16 @@ def test_owner_staging_script_is_exact_source_and_public_safe() -> None:
     assert "curl" not in body
 
 
-def test_tagged_release_stages_attested_draft_without_publishing() -> None:
+def test_candidate_release_emits_immutable_proof_without_release_permissions() -> None:
     workflow = TAGGED_WORKFLOW.read_text(encoding="utf-8")
 
-    assert "Create and verify helper-pending draft release" in workflow
     assert "actions/attest-build-provenance@" in workflow
-    assert "--draft" in workflow
-    assert "--draft=false" not in workflow
-    assert "HealthBridgeMailboxAckPublisher" in workflow
-    assert "helper-pending" in workflow
-    assert "Existing published release" in workflow
+    assert "scripts/release_candidate.py --phase seal" in workflow
+    assert "candidate-${{ github.run_id }}-${{ github.run_attempt }}" in workflow
+    assert "contents: write" not in workflow
+    assert "environment: github-release" not in workflow
+    assert "gh release" not in workflow
+    assert "git push" not in workflow
 
 
 def test_manual_continuation_is_bound_and_never_replaces_published_release() -> None:
@@ -364,19 +364,17 @@ def test_manual_continuation_is_bound_and_never_replaces_published_release() -> 
         "tag:",
         "helper_sha256:",
         "helper_manifest_sha256:",
-        "tag_object_sha",
-        "target_commit_sha",
-        "tree_sha",
-        "scripts/release_source_policy.py",
-        "verification.verified == true",
-        "draft == true",
-        "published_at == null",
-        "verify-helper",
-        "final-checksums",
-        "sha256sum --check --strict SHA256SUMS",
+        "candidate_run_id:",
+        "candidate_attempt:",
+        "candidate_artifact_id:",
+        "scripts/release_candidate.py --phase download",
+        "scripts/release_recovery.py --phase fetch",
+        "scripts/release_recovery.py --phase prepare-final",
+        "scripts/release_recovery.py --phase publish",
+        '--release-id "$DRAFT_RELEASE_ID"',
         "actions/attest-build-provenance@",
-        "--draft=false",
-        "verify-final-published",
+        "if: steps.final.outputs.attest == 'true'",
+        "release-publication-${{ github.repository }}",
     ):
         assert marker in workflow
     assert "gh release create" not in workflow
@@ -394,9 +392,9 @@ def test_manual_continuation_is_bound_and_never_replaces_published_release() -> 
             run_lines.append(line)
     assert "${{ steps.bind.outputs." not in "\n".join(run_lines)
     for variable in (
-        "PINNED_TAG_OBJECT_SHA",
-        "PINNED_TARGET_COMMIT_SHA",
-        "PINNED_TREE_SHA",
+        "CANDIDATE_RUN_ID",
+        "CANDIDATE_ATTEMPT",
+        "CANDIDATE_ARTIFACT_ID",
         "EXPECTED_HELPER_MANIFEST_SHA256",
     ):
         assert variable in workflow
