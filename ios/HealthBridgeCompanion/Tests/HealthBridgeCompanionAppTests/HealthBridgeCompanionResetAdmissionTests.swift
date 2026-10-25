@@ -5209,7 +5209,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             var conflicts: [[String: Any]] = []
             for (key, value) in [
                 ("invitation_secret", "hbi_different_synthetic_invitation"),
-                ("expires_at", "2031-01-01T00:00:00Z"),
+                ("expires_at", "2098-01-01T00:00:00Z"),
             ] {
                 var changed = originalObject
                 changed[key] = value
@@ -7132,7 +7132,7 @@ private final class ExchangePeer {
     func invitation() throws -> ReceiverPairingInvitation {
         let object: [String: Any] = [
             "schema_id": "health_bridge.receiver_pairing_invitation.v2", "schema_version": "2.0.0",
-            "label": "synthetic-native-iphone", "expires_at": "2030-01-01T00:00:00Z",
+            "label": "synthetic-native-iphone", "expires_at": "2099-01-01T00:00:00Z",
             "invitation_secret": "hbi_synthetic_native_invitation", "transport": "mailbox",
             "mailbox_protocol_version": 1,
             "mailbox_bootstrap": ["version": 1, "invitation_id": Self.invitationID,
