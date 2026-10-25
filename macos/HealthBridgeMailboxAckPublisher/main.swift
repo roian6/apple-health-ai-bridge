@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+
+#if !HEALTH_BRIDGE_ISOLATED_HELPER_TEST_HOST
 import Security
 
 private func requiredInfoValue(_ key: String) -> String {
@@ -38,6 +40,9 @@ private func requiredStringArrayEntitlement(_ key: String) -> [String] {
     }
     return values
 }
+
+#endif
+
 private let protocolVersion = 1
 private let maximumRequestBytes = 8_192
 private let maximumAckBytes = 1_048_576
@@ -174,6 +179,7 @@ private func writeOwnerOnly<T: Encodable>(_ value: T, to url: URL) throws {
     )
 }
 
+#if !HEALTH_BRIDGE_ISOLATED_HELPER_TEST_HOST
 private func applicationRoot() throws -> URL {
     guard let support = FileManager.default.urls(
         for: .applicationSupportDirectory,
@@ -190,6 +196,8 @@ private func applicationRoot() throws -> URL {
     )
     return root
 }
+
+#endif
 
 private func receiptURL(root: URL, requestID: String) -> URL {
     root.appendingPathComponent("receipts", isDirectory: true)
@@ -220,10 +228,210 @@ private func destination(
     return (receiver, final)
 }
 
-private func publish(requestID: String) throws -> PublishReceipt {
+// Explicit operations keep the filesystem body shared with the isolated host.
+struct HelperPublicationIO {
+    let providerRoot: () throws -> URL
+    let publish: (URL, URL) throws -> Void
+    let observe: (URL) throws -> (isUbiquitous: Bool, uploadError: String?)
+    let wait: () -> Void
+}
+
+#if !HEALTH_BRIDGE_ISOLATED_HELPER_TEST_HOST
+private func productionPublicationIO() -> HelperPublicationIO {
+    HelperPublicationIO(
+        providerRoot: {
+            guard let root = FileManager.default.url(forUbiquityContainerIdentifier: containerIdentifier)
+            else { throw HelperError.containerUnavailable }
+            return root
+        },
+        publish: { source, final in
+            try FileManager.default.setUbiquitous(true, itemAt: source, destinationURL: final)
+        },
+        observe: { final in
+            let values = try final.resourceValues(
+                forKeys: [.isUbiquitousItemKey, .ubiquitousItemUploadingErrorKey]
+            )
+            let error = (values.ubiquitousItemUploadingError as NSError?).map { "\($0.domain):\($0.code)" }
+            return (values.isUbiquitousItem == true, error)
+        },
+        wait: { RunLoop.current.run(until: Date().addingTimeInterval(0.5)) }
+    )
+}
+#endif
+
+private func publishAndObserve(
+    source: URL,
+    final: URL,
+    payload: Data,
+    maximumBytes: Int,
+    io: HelperPublicationIO,
+    validatePaths: () throws -> Void = {}
+) throws {
+    try validatePaths()
+    if try entryExists(final) {
+        guard try readRegularOwnerOnly(final, maximumBytes: maximumBytes) == payload
+        else { throw HelperError.destinationConflict }
+    } else {
+        try validatePaths()
+        try io.publish(source, final)
+        try validatePaths()
+    }
+    let finalData = try readRegularOwnerOnly(final, maximumBytes: maximumBytes)
+    let exactBytes = finalData == payload
+    var isUbiquitous = false
+    var uploadErrorAbsent = false
+    var uploadErrorSummary = "none"
+    let deadline = Date().addingTimeInterval(60)
+    repeat {
+        try validatePaths()
+        let observation = try io.observe(final)
+        isUbiquitous = observation.isUbiquitous
+        uploadErrorAbsent = observation.uploadError == nil
+        uploadErrorSummary = observation.uploadError ?? "none"
+        if exactBytes && isUbiquitous && uploadErrorAbsent { break }
+        io.wait()
+    } while Date() < deadline
+    guard exactBytes && isUbiquitous && uploadErrorAbsent
+    else { throw HelperError.publicationIncomplete }
+    try validatePaths()
+    guard try readRegularOwnerOnly(final, maximumBytes: maximumBytes) == payload else {
+        throw HelperError.publicationIncomplete
+    }
+}
+
+private let maximumPairingBytes = 65_536
+
+private struct PairingPublishRequest: Decodable {
+    let version: Int
+    let requestID: String
+    let invitationID: String
+    let finalName: String
+    let byteCount: Int
+    let sha256: String
+}
+
+private struct PairingPublishReceipt: Encodable {
+    let version: Int
+    let requestID: String
+    let invitationID: String
+    let finalName: String
+    let byteCount: Int
+    let sha256: String
+    let published: Bool
+    let bootstrapVersion: Int
+}
+
+private struct DirectoryIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+}
+
+// Roots come from the existing application/provider owners. Every relative
+// component is opened without following links; native publication creates none.
+private func checkedDirectoryChain(
+    root: URL,
+    components: [String],
+    ownerOnly: Bool
+) throws -> [DirectoryIdentity] {
+    guard root.isFileURL else { throw HelperError.unsafeFile }
+    var descriptor = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw HelperError.unsafeFile }
+    defer { _ = Darwin.close(descriptor) }
+    var identities: [DirectoryIdentity] = []
+    for index in 0...components.count {
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFDIR,
+              metadata.st_uid == geteuid(),
+              (metadata.st_mode & (ownerOnly ? 0o077 : 0o022)) == 0 else {
+            throw HelperError.unsafeFile
+        }
+        identities.append(DirectoryIdentity(device: metadata.st_dev, inode: metadata.st_ino))
+        if index < components.count {
+            let component = components[index]
+            guard !component.isEmpty, component != ".", component != "..",
+                  !component.contains("/") else { throw HelperError.unsafeFile }
+            let next = openat(descriptor, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard next >= 0 else { throw HelperError.unsafeFile }
+            _ = Darwin.close(descriptor)
+            descriptor = next
+        }
+    }
+    return identities
+}
+
+private func entryExists(_ url: URL) throws -> Bool {
+    var metadata = stat()
+    if lstat(url.path, &metadata) == 0 { return true }
+    guard errno == ENOENT else { throw HelperError.unsafeFile }
+    return false
+}
+
+private func publishPairing(requestID: String, appRoot: URL, io: HelperPublicationIO) throws {
+    guard isHex(requestID, count: 32) else { throw HelperError.invalidArguments }
+    let protocolLanes = ["requests", "staging", "receipts"]
+    let protocolIdentities = try protocolLanes.map {
+        try checkedDirectoryChain(root: appRoot, components: [$0], ownerOnly: true)
+    }
+    let requestData = try readRegularOwnerOnly(
+        appRoot.appendingPathComponent("requests/\(requestID).json"),
+        maximumBytes: maximumRequestBytes
+    )
+    guard let fields = try JSONSerialization.jsonObject(with: requestData) as? [String: Any],
+          Set(fields.keys) == Set(["version", "requestID", "invitationID", "finalName", "byteCount", "sha256"]) else {
+        throw HelperError.invalidRequest
+    }
+    let request = try JSONDecoder().decode(PairingPublishRequest.self, from: requestData)
+    guard request.version == protocolVersion,
+          request.requestID == requestID,
+          isHex(request.invitationID, count: 32),
+          ["completion.hbp", "cancelled.hbp"].contains(request.finalName),
+          request.byteCount > 0, request.byteCount <= maximumPairingBytes,
+          isHex(request.sha256, count: 64) else { throw HelperError.invalidRequest }
+    let source = appRoot.appendingPathComponent("staging/\(requestID).hbp")
+    let payload = try readRegularOwnerOnly(source, maximumBytes: maximumPairingBytes)
+    guard payload.count == request.byteCount else { throw HelperError.sizeMismatch }
+    guard digestHex(payload) == request.sha256 else { throw HelperError.digestMismatch }
+    let providerRoot = try io.providerRoot()
+    let providerPath = providerRoot.resolvingSymlinksInPath().standardizedFileURL.path
+    let sourcePath = source.resolvingSymlinksInPath().standardizedFileURL.path
+    guard sourcePath != providerPath, !sourcePath.hasPrefix(providerPath + "/") else {
+        throw HelperError.unsafeFile
+    }
+    let components = ["Documents", "HealthBridgeMailbox", "v1", "pairing", request.invitationID]
+    let providerIdentities = try checkedDirectoryChain(
+        root: providerRoot, components: components, ownerOnly: false
+    )
+    let directory = components.reduce(providerRoot) { $0.appendingPathComponent($1, isDirectory: true) }
+    let final = directory.appendingPathComponent(request.finalName)
+    let receiptPath = receiptURL(root: appRoot, requestID: requestID)
+    func requireAttachedPaths() throws {
+        guard try protocolLanes.map({
+            try checkedDirectoryChain(root: appRoot, components: [$0], ownerOnly: true)
+        }) == protocolIdentities,
+        try checkedDirectoryChain(root: providerRoot, components: components, ownerOnly: false) == providerIdentities else {
+            throw HelperError.unsafeFile
+        }
+    }
+    try requireAttachedPaths()
+    if try entryExists(receiptPath) {
+        _ = try readRegularOwnerOnly(receiptPath, maximumBytes: maximumRequestBytes)
+    }
+    try publishAndObserve(
+        source: source, final: final, payload: payload, maximumBytes: maximumPairingBytes,
+        io: io, validatePaths: requireAttachedPaths
+    )
+    try requireAttachedPaths()
+    try writeOwnerOnly(PairingPublishReceipt(
+        version: protocolVersion, requestID: requestID, invitationID: request.invitationID,
+        finalName: request.finalName, byteCount: request.byteCount, sha256: request.sha256,
+        published: true, bootstrapVersion: protocolVersion
+    ), to: receiptPath)
+}
+
+private func publish(requestID: String, appRoot: URL, io: HelperPublicationIO) throws -> PublishReceipt {
     guard isHex(requestID, count: 32) else { throw HelperError.invalidArguments }
     let manager = FileManager.default
-    let appRoot = try applicationRoot()
     try ensureProtocolDirectories(root: appRoot)
     let requestData = try readRegularOwnerOnly(
         appRoot.appendingPathComponent("requests/\(requestID).json"),
@@ -235,9 +443,7 @@ private func publish(requestID: String) throws -> PublishReceipt {
     let payload = try readRegularOwnerOnly(source, maximumBytes: maximumAckBytes)
     guard payload.count == request.byteCount else { throw HelperError.sizeMismatch }
     guard digestHex(payload) == request.sha256 else { throw HelperError.digestMismatch }
-    guard let providerRoot = manager.url(
-        forUbiquityContainerIdentifier: containerIdentifier
-    ) else { throw HelperError.containerUnavailable }
+    let providerRoot = try io.providerRoot()
     let sourceOutsideProvider = !source.path.hasPrefix(providerRoot.path + "/")
     guard sourceOutsideProvider else { throw HelperError.unsafeFile }
     let urls = destination(root: providerRoot, request: request)
@@ -249,35 +455,9 @@ private func publish(requestID: String) throws -> PublishReceipt {
             attributes: [.posixPermissions: 0o700]
         )
     }
-    if manager.fileExists(atPath: urls.final.path) {
-        guard try readRegularOwnerOnly(urls.final, maximumBytes: maximumAckBytes) == payload
-        else { throw HelperError.destinationConflict }
-    } else {
-        try manager.setUbiquitous(true, itemAt: source, destinationURL: urls.final)
-    }
-    let finalData = try readRegularOwnerOnly(urls.final, maximumBytes: maximumAckBytes)
-    let exactBytes = finalData == payload
-    var isUbiquitous = false
-    var uploadErrorAbsent = false
-    var uploadErrorSummary = "none"
-    let deadline = Date().addingTimeInterval(60)
-    repeat {
-        let values = try urls.final.resourceValues(
-            forKeys: [.isUbiquitousItemKey, .ubiquitousItemUploadingErrorKey]
-        )
-        isUbiquitous = values.isUbiquitousItem == true
-        if let uploadError = values.ubiquitousItemUploadingError as NSError? {
-            uploadErrorAbsent = false
-            uploadErrorSummary = "\(uploadError.domain):\(uploadError.code)"
-        } else {
-            uploadErrorAbsent = true
-            uploadErrorSummary = "none"
-        }
-        if exactBytes && isUbiquitous && uploadErrorAbsent { break }
-        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-    } while Date() < deadline
-    guard exactBytes && isUbiquitous && uploadErrorAbsent
-    else { throw HelperError.publicationIncomplete }
+    try publishAndObserve(
+        source: source, final: urls.final, payload: payload, maximumBytes: maximumAckBytes, io: io
+    )
     return PublishReceipt(
         version: protocolVersion,
         requestID: request.requestID,
@@ -296,6 +476,27 @@ private func publish(requestID: String) throws -> PublishReceipt {
     )
 }
 
+func runHelper(arguments: [String], applicationRoot: () throws -> URL, io: HelperPublicationIO) throws -> String {
+    guard arguments.count == 1, let requestID = arguments.first else { throw HelperError.invalidArguments }
+    if requestID == "--native-pairing-cancellation-v1" {
+        return "native-pairing-cancellation-v1:available"
+    }
+    if requestID.hasPrefix("pairing:") {
+        let nativeID = String(requestID.dropFirst("pairing:".count))
+        guard isHex(nativeID, count: 32) else { throw HelperError.invalidArguments }
+        try publishPairing(requestID: nativeID, appRoot: applicationRoot(), io: io)
+        return ""
+    }
+    let appRoot = try applicationRoot()
+    try ensureProtocolDirectories(root: appRoot)
+    let receipt = try publish(requestID: requestID, appRoot: appRoot, io: io)
+    try writeOwnerOnly(receipt, to: receiptURL(root: appRoot, requestID: requestID))
+    return ""
+}
+
+#if HEALTH_BRIDGE_ISOLATED_HELPER_TEST_HOST
+NativePairingLocalFakeTests.runAll()
+#else
 precondition(Bundle.main.bundleIdentifier == expectedBundleIdentifier)
 precondition(
     requiredStringArrayEntitlement(
@@ -314,20 +515,15 @@ precondition(
 
 let arguments = CommandLine.arguments.dropFirst()
 do {
-    if arguments.count == 1, let requestID = arguments.first {
-        let appRoot = try applicationRoot()
-        try ensureProtocolDirectories(root: appRoot)
-        let receipt = try publish(requestID: String(requestID))
-        try writeOwnerOnly(
-            receipt,
-            to: receiptURL(root: appRoot, requestID: String(requestID))
-        )
-    } else {
-        throw HelperError.invalidArguments
-    }
+    let output = try runHelper(
+        arguments: Array(arguments), applicationRoot: applicationRoot, io: productionPublicationIO()
+    )
+    if !output.isEmpty { print(output) }
     Darwin.exit(0)
 } catch {
     let value = error as NSError
     fputs("helper_error=\(value.domain):\(value.code)\n", stderr)
     Darwin.exit(3)
 }
+
+#endif

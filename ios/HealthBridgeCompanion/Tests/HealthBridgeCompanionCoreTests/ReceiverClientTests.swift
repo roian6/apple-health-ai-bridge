@@ -485,6 +485,26 @@ final class ReceiverClientTests: XCTestCase {
         XCTAssertEqual(try stateStore.loadOrCreateInstallationID(), syntheticInstallationID)
     }
 
+    func testPairingStateStorePrivateResetClearsUnreadablePending() throws {
+        let pendingStore = MemoryReceiverTokenStore()
+        let installationStore = MemoryReceiverTokenStore()
+        let stateStore = ReceiverPairingStateStore(
+            pendingStore: pendingStore,
+            installationIDStore: installationStore,
+            cancellationStore: MemoryReceiverTokenStore(),
+            installationIDGenerator: { syntheticInstallationID }
+        )
+        let installationID = try stateStore.loadOrCreateInstallationID()
+        try pendingStore.saveToken("synthetic-invalid-pending-json")
+        try stateStore.beginPendingCancellation(expectedGeneration: "g1")
+
+        try stateStore.resetPrivatePairingState()
+
+        XCTAssertNil(try stateStore.loadPending())
+        XCTAssertFalse(try stateStore.hasPendingCancellation())
+        XCTAssertEqual(try stateStore.loadOrCreateInstallationID(), installationID)
+    }
+
     func testPendingPairingDecoderRequiresExplicitMailboxIntent() throws {
         let base = """
         {

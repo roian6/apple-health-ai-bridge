@@ -167,27 +167,119 @@ health-bridge mailbox helper install \
 health-bridge mailbox helper status --json
 ```
 
-## Create mailbox pairing material
+The `receiver-v1.1.5` artifact and proof instructions above preserve the
+supported URL-based flow. They do not establish that those released assets
+support native URL-free pairing. Native pairing requires a specifically
+qualified matching receiver, helper, and companion build set. The helper must
+be owned and ready, and it must implement the native cancellation capability
+described below. Do not infer native support from the helper version or a
+`ready` status alone.
 
-Set the exact values for the user-selected iCloud container and the already
-configured private receiver route. Then run the existing public setup command:
+## Native URL-free pairing with matched builds
 
 ```bash
-: "${HEALTH_BRIDGE_RECEIVER_URL:?Set the exact private /v1/batches URL}"
+: "${HEALTH_BRIDGE_DB:?Set the private local receiver database path}"
+: "${HEALTH_BRIDGE_SETUP_PAGE:?Set the private local setup page path}"
 : "${HEALTH_BRIDGE_MAILBOX_ROOT:?Set the existing HealthBridgeMailbox/v1 path}"
-: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the selected container identifier}"
+: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the matched builds' authorized container identifier}"
+health-bridge mailbox helper status --json
+health-bridge init --db "$HEALTH_BRIDGE_DB"
+health-bridge receiver create-pairing \
+  --db "$HEALTH_BRIDGE_DB" \
+  --label iPhone \
+  --transport icloud-mailbox \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
+  --format setup-page \
+  --setup-page "$HEALTH_BRIDGE_SETUP_PAGE"
+```
+
+Use an existing iCloud container authorized by the matched Mac receiver/helper
+and iPhone companion builds. The Mac's existing container `Documents` directory
+must be available, and both devices must use the same Apple account for iCloud
+Documents. Set `HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER` to the exact shared
+container identifier from those builds. Set `HEALTH_BRIDGE_MAILBOX_ROOT` to
+`$HOME/Library/Mobile Documents/<container identifier with dots replaced by
+tilde>/Documents/HealthBridgeMailbox/v1`. The receiver creates the final
+`HealthBridgeMailbox/v1` directories under that existing `Documents`
+directory. Do not substitute an arbitrary or default container. The private
+database and HTML setup page belong in owner-only local directories, not in the
+iCloud mailbox.
+
+The helper status command must report `{"code": "ready"}`. Readiness verifies
+the installed helper generation and platform checks, but does not prove native
+pairing support. The URL-free `receiver create-pairing` command itself checks
+that the helper returns exit status 0 and the exact
+`native-pairing-cancellation-v1:available` capability response. If that check
+fails, the command does not create a native invitation. Use only a matched,
+qualified receiver/helper/companion build set that shares the authorized
+container; no released native-compatible set is identified by this guide.
+
+This command initializes the local database and writes a private, temporary
+single-use setup page. Open that page locally in a browser on a trusted screen,
+then scan its QR code with the iPhone Camera, or use its setup link with the
+matched companion. Native setup pages do not offer the HTTP server/manual-code
+fallback. Treat the page, QR code, and setup link as private invitation
+material. Don't place them in chat, logs, Git, or a web server, and delete the
+local page after pairing.
+
+Before scanning the page, run one receiver worker and leave it running, or use
+an already running mailbox service. For a foreground worker, use the same DB,
+mailbox root, and container:
+
+```bash
+health-bridge receiver start \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER"
+```
+
+The foreground command stays active while the receiver serves locally and
+checks the mailbox. Do not start a second foreground receiver if the existing
+service is running. After pairing, the read-only query for imported metrics is:
+
+```bash
+health-bridge query synced-metrics --db "$HEALTH_BRIDGE_DB"
+```
+
+A new invitation expires after 20 minutes. If the receiver has already
+committed that exact request but the companion missed its completion, use the
+companion's Retry Pairing flow. The receiver can return the identical committed
+completion for that exact request after invitation expiry. Expiry does not let
+an uncommitted request enroll later.
+
+Cancellation is signed and confirmation-dependent. If request publication may
+have started, the companion keeps its pending authority until it receives and
+verifies the receiver's signed cancellation confirmation. If the Mac or iCloud
+is unavailable, cancellation can remain pending. The app's local pending-state
+cleanup does not remove the provider's pairing files; this flow has no automatic
+bootstrap-file cleanup. iCloud mailbox delivery and confirmation are
+best-effort and may be delayed by iCloud and iOS scheduling.
+
+## URL-based setup alternative
+
+Use this existing setup flow when the companion/build combination uses a
+receiver URL. `health-bridge setup` still requires `--receiver-url`; this
+alternative is not native URL-free pairing:
+
+```bash
+: "${HEALTH_BRIDGE_RECEIVER_URL:?Set the exact phone-reachable /v1/batches URL}"
+: "${HEALTH_BRIDGE_DB:?Set the private local receiver database path}"
+: "${HEALTH_BRIDGE_SETUP_PAGE:?Set the private local setup page path}"
+: "${HEALTH_BRIDGE_MAILBOX_ROOT:?Set the existing HealthBridgeMailbox/v1 path}"
+: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the authorized container identifier}"
 health-bridge setup \
   --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --db "$HEALTH_BRIDGE_DB" \
+  --setup-page "$HEALTH_BRIDGE_SETUP_PAGE" \
   --transport icloud-mailbox \
   --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
   --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER"
 ```
 
-This creates the private database, temporary single-use pairing page, and
-mailbox-aware receiver command. Keep the setup page and its pairing link out of
-chat, logs, Git, and web servers. Pair only after the private redemption route
-and local receiver health check work. iCloud mailbox delivery remains
-best-effort and may be delayed by iCloud and iOS scheduling.
+The URL must be the configured private route for `/v1/batches` and reachable
+from the phone. Direct remains the default transport, and a Direct failure
+does not select mailbox delivery automatically.
 
 ## Before installing the service
 
@@ -207,9 +299,9 @@ Validate the inputs without installing or starting anything:
 ```bash
 health-bridge mailbox service validate \
   --executable /absolute/path/to/health-bridge \
-  --db /absolute/private/path/health.sqlite \
-  --mailbox-root "$HOME/Library/Mobile Documents/CONTAINER/Documents/HealthBridgeMailbox/v1" \
-  --icloud-container-identifier iCloud.example.HealthBridgeCompanion \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
   --json
 ```
 
@@ -224,9 +316,9 @@ data, run the same arguments with `install`:
 ```bash
 health-bridge mailbox service install \
   --executable /absolute/path/to/health-bridge \
-  --db /absolute/private/path/health.sqlite \
-  --mailbox-root "$HOME/Library/Mobile Documents/CONTAINER/Documents/HealthBridgeMailbox/v1" \
-  --icloud-container-identifier iCloud.example.HealthBridgeCompanion \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
   --json
 ```
 
@@ -250,9 +342,9 @@ receiver path, mailbox selection, or generated service-artifact version:
 ```bash
 health-bridge mailbox service upgrade \
   --executable /absolute/path/to/new/health-bridge \
-  --db /absolute/private/path/health.sqlite \
-  --mailbox-root "$HOME/Library/Mobile Documents/CONTAINER/Documents/HealthBridgeMailbox/v1" \
-  --icloud-container-identifier iCloud.example.HealthBridgeCompanion \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
   --json
 ```
 

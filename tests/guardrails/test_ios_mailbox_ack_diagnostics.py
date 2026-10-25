@@ -318,18 +318,40 @@ def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:
 
 def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
+    target_start = source.index("private func capturePayloadDeliveryTarget()")
+    target_end = source.index("private struct PayloadDelivery {", target_start)
+    target_helpers = source[target_start:target_end]
+    capture = target_helpers[
+        : target_helpers.index("private func requireCurrentPayloadDeliveryTarget(")
+    ]
+    validation = target_helpers[
+        target_helpers.index("private func requireCurrentPayloadDeliveryTarget(") :
+    ]
+    assert "let generation = settingsStore.receiverSettingsGenerationToken" in capture
+    assert "try requireCurrentConnectionGeneration(generation)" in capture
+    assert (
+        "record.localScope.generation == settingsStore.receiverSettingsGeneration"
+        in capture
+    )
+    assert "record.localScope.bindingID == bindingID" in capture
+    assert "identity.opaqueBinding == bindingID" in capture
+    assert "try requireCurrentConnectionGeneration(target.generation)" in validation
+    assert "try capturePayloadDeliveryTarget() == target" in validation
+
     helper_start = source.index("private func uploadPendingOutbox(")
     helper_end = source.index(
         "private func makeProductionMailboxDelivery()", helper_start
     )
     helper = source[helper_start:helper_end]
-    mailbox_start = helper.index("if settingsStore.activeTransport == .mailbox")
-    mailbox_end = helper.index("guard let receiverIdentity", mailbox_start)
+    mailbox_start = helper.index("if target.route == .mailbox")
+    mailbox_end = helper.index(
+        "guard case .directHTTP(let url) = target.route", mailbox_start
+    )
     mailbox = helper[mailbox_start:mailbox_end]
 
     delivery = mailbox.index("deliverPending()")
-    post_await_generation_check = mailbox.index(
-        "try requireCurrentConnectionGeneration(expectedGeneration)", delivery
+    post_await_target_check = mailbox.index(
+        "try requireCurrentPayloadDeliveryTarget(target)", delivery
     )
     summary_mapping = mailbox.index(
         "mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine"
@@ -338,10 +360,22 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
         "mailboxDeliveryDiagnosticLine = flushSummary.mailboxDeliveryDiagnosticLine"
     )
 
-    assert delivery < post_await_generation_check < summary_mapping < publication
+    assert delivery < post_await_target_check < summary_mapping < publication
     assert mailbox.index("catch let cancellation as CancellationError") < mailbox.index(
         "catch {"
     )
+    failure_catch = mailbox.index("catch {")
+    failure_target_check = mailbox.index(
+        "try requireCurrentPayloadDeliveryTarget(target)", failure_catch
+    )
+    failure_publication = mailbox.index(
+        (
+            "mailboxDeliveryDiagnosticLine = "
+            "MailboxDeliveryDiagnosticLine.failure(for: error)"
+        ),
+        failure_catch,
+    )
+    assert failure_catch < failure_target_check < failure_publication
 
 
 def test_background_mailbox_failure_checks_generation_before_publication() -> None:

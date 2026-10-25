@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 from typing_extensions import override
+
+from health_bridge.contract._hbjcs1 import hbjcs1_encode
 
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -51,6 +54,30 @@ class DeliveryTrustedConnection:
     receiver_signing_private_key: Ed25519PrivateKey
     source_principal: ReceiverTokenPrincipal
     sender_key_revoked: bool = False
+
+    def enrollment_digest(self) -> str:
+        """Bind persisted consent to the exact peer, independent of cached trust."""
+        keys = {
+            "sender_signing": self.sender_signing_public_key,
+            "device_agreement": self.device_agreement_public_key,
+            "receiver_signing": self.receiver_signing_private_key.public_key(),
+            "receiver_agreement": self.receiver_agreement_private_key.public_key(),
+        }
+        return hashlib.sha256(
+            hbjcs1_encode(
+                {
+                    "receiver_id": self.receiver_id.hex(),
+                    "device_id": self.device_id.hex(),
+                    "generation": self.connection_generation,
+                    "principal": self.device_principal.value,
+                    "installation": self.source_principal.installation_id_hash,
+                    "binding": self.opaque_binding.value.hex(),
+                    **{
+                        name: key.public_bytes_raw().hex() for name, key in keys.items()
+                    },
+                }
+            )
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

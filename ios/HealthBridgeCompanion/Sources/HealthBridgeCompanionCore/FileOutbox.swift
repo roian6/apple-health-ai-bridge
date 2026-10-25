@@ -3323,6 +3323,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     public let deviceCredential: String
     public let platform: String
     public let transport: ReceiverPairingTransport
+    public let mailboxBootstrap: MailboxBootstrapDescriptor?
+    public let expiresAt: String?
+    public let sealedRequest: Data?
+    public let nativeExpectedGeneration: String?
+    public let publicationMayHaveOccurred: Bool
+    public let nativeCancellationConfirmed: Bool
 
     public init(
         label: String,
@@ -3333,7 +3339,13 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         installationID: String,
         deviceCredential: String,
         platform: String,
-        transport: ReceiverPairingTransport = .direct
+        transport: ReceiverPairingTransport = .direct,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil,
+        sealedRequest: Data? = nil,
+        nativeExpectedGeneration: String? = nil,
+        publicationMayHaveOccurred: Bool = false,
+        nativeCancellationConfirmed: Bool = false
     ) {
         self.label = label
         self.receiverURLString = receiverURLString
@@ -3344,6 +3356,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         self.deviceCredential = deviceCredential
         self.platform = platform
         self.transport = transport
+        self.mailboxBootstrap = mailboxBootstrap
+        self.expiresAt = expiresAt
+        self.sealedRequest = sealedRequest
+        self.nativeExpectedGeneration = nativeExpectedGeneration
+        self.publicationMayHaveOccurred = publicationMayHaveOccurred
+        self.nativeCancellationConfirmed = nativeCancellationConfirmed
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -3357,6 +3375,8 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         case platform
         case transport
         case mailboxProtocolVersion
+        case mailboxBootstrap, expiresAt, sealedRequest, nativeExpectedGeneration
+        case publicationMayHaveOccurred, nativeCancellationConfirmed
     }
 
     public init(from decoder: Decoder) throws {
@@ -3377,6 +3397,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
             Int.self,
             forKey: .mailboxProtocolVersion
         )
+        mailboxBootstrap = try container.decodeIfPresent(MailboxBootstrapDescriptor.self, forKey: .mailboxBootstrap)
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+        sealedRequest = try container.decodeIfPresent(Data.self, forKey: .sealedRequest)
+        nativeExpectedGeneration = try container.decodeIfPresent(String.self, forKey: .nativeExpectedGeneration)
+        publicationMayHaveOccurred = try container.decodeIfPresent(Bool.self, forKey: .publicationMayHaveOccurred) ?? false
+        nativeCancellationConfirmed = try container.decodeIfPresent(Bool.self, forKey: .nativeCancellationConfirmed) ?? false
         switch (decodedTransport, legacyMailboxProtocolVersion) {
         case (.some(.direct), nil), (nil, nil):
             transport = .direct
@@ -3389,6 +3415,7 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
                 debugDescription: "Pending pairing transport is inconsistent."
             )
         }
+        try validateNativeState()
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -3402,6 +3429,14 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         try container.encode(deviceCredential, forKey: .deviceCredential)
         try container.encode(platform, forKey: .platform)
         try container.encode(transport, forKey: .transport)
+        if mailboxBootstrap != nil {
+            try container.encodeIfPresent(mailboxBootstrap, forKey: .mailboxBootstrap)
+            try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
+            try container.encodeIfPresent(sealedRequest, forKey: .sealedRequest)
+            try container.encodeIfPresent(nativeExpectedGeneration, forKey: .nativeExpectedGeneration)
+            try container.encode(publicationMayHaveOccurred, forKey: .publicationMayHaveOccurred)
+            try container.encode(nativeCancellationConfirmed, forKey: .nativeCancellationConfirmed)
+        }
         if transport == .mailbox {
             try container.encode(1, forKey: .mailboxProtocolVersion)
         }
@@ -3412,20 +3447,67 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         redeemURLString: String,
         invitationSecret: String?,
         invitationCode: String?,
-        transport: ReceiverPairingTransport = .direct
+        transport: ReceiverPairingTransport = .direct,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil
     ) -> Bool {
         self.receiverURLString == receiverURLString
             && self.redeemURLString == redeemURLString
             && self.invitationSecret == invitationSecret
             && self.invitationCode == invitationCode
             && self.transport == transport
+            && self.mailboxBootstrap == mailboxBootstrap
+            && self.expiresAt == expiresAt
             && platform == "ios"
+    }
+
+    func validateNativeState() throws {
+        guard mailboxBootstrap != nil else {
+            guard expiresAt == nil, sealedRequest == nil, nativeExpectedGeneration == nil,
+                  !publicationMayHaveOccurred, !nativeCancellationConfirmed else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+            return
+        }
+        guard transport == .mailbox, receiverURLString.isEmpty, redeemURLString.isEmpty,
+              invitationCode == nil, let secret = invitationSecret, !secret.isEmpty,
+              platform == "ios", secret.utf8.count <= 65_536,
+              let installation = UUID(uuidString: installationID), installation.uuidString.lowercased() == installationID,
+              (installation.uuid.6 >> 4) == 4, (installation.uuid.8 & 0xc0) == 0x80,
+              deviceCredential.hasPrefix("hb_"), deviceCredential.utf8.count >= 46, deviceCredential.utf8.count <= 256,
+              deviceCredential.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
+                || (48...57).contains($0) || $0 == 45 || $0 == 95 }),
+              let expiresAt, ISO8601DateFormatter().date(from: expiresAt) != nil,
+              (sealedRequest == nil) == (nativeExpectedGeneration == nil),
+              !publicationMayHaveOccurred || sealedRequest != nil else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        if let sealedRequest {
+            guard let generation = nativeExpectedGeneration, generation.hasPrefix("g"),
+                  let number = UInt64(generation.dropFirst()), "g\(number)" == generation, number <= UInt64(Int.max),
+                  !sealedRequest.isEmpty, sealedRequest.count <= 65_536 else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+        }
+    }
+
+    func nativeState(
+        request: Data?, generation: String?, published: Bool, cancelled: Bool
+    ) -> ReceiverPendingPairing {
+        ReceiverPendingPairing(label: label, receiverURLString: receiverURLString,
+            redeemURLString: redeemURLString, invitationSecret: invitationSecret,
+            invitationCode: invitationCode, installationID: installationID,
+            deviceCredential: deviceCredential, platform: platform, transport: transport,
+            mailboxBootstrap: mailboxBootstrap, expiresAt: expiresAt, sealedRequest: request,
+            nativeExpectedGeneration: generation, publicationMayHaveOccurred: published,
+            nativeCancellationConfirmed: cancelled)
     }
 }
 
 public enum ReceiverPairingStateError: LocalizedError, Equatable {
     case pendingPairingConflict
     case legacyCancellationRequiresRetry
+    case nativeCancellationRequiresReceipt
 
     public var errorDescription: String? {
         switch self {
@@ -3433,6 +3515,8 @@ public enum ReceiverPairingStateError: LocalizedError, Equatable {
             "A different pairing is already pending. Resume or cancel it before starting another pairing."
         case .legacyCancellationRequiresRetry:
             "A cancellation from an older app version has unknown connection scope. Confirm Cancel Pending Pairing again to clear it safely."
+        case .nativeCancellationRequiresReceipt:
+            "Mailbox cancellation is pending receiver confirmation. Resume it before clearing pending pairing."
         }
     }
 }
@@ -3467,13 +3551,15 @@ public final class ReceiverPairingStateStore {
     }
 
     public func stage(invitation: ReceiverPairingInvitation) throws -> ReceiverPendingPairing {
-        try stage(
+        return try stage(
             label: invitation.label,
             receiverURLString: invitation.receiverURLString,
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
             invitationCode: nil,
-            transport: invitation.transport
+            transport: invitation.transport,
+            mailboxBootstrap: invitation.mailboxBootstrap,
+            expiresAt: invitation.mailboxBootstrap == nil ? nil : invitation.expiresAt
         )
     }
 
@@ -3495,11 +3581,23 @@ public final class ReceiverPairingStateStore {
     }
 
     public func clearPending() throws {
+        if let pending = try loadPending(), pending.mailboxBootstrap != nil,
+           pending.publicationMayHaveOccurred, !pending.nativeCancellationConfirmed {
+            throw ReceiverPairingStateError.nativeCancellationRequiresReceipt
+        }
+        try pendingStore.saveToken("")
+    }
+
+    func clearCommittedNativePending(_ pending: ReceiverPendingPairing) throws {
+        guard pending.mailboxBootstrap != nil, pending.publicationMayHaveOccurred,
+              try loadPending() == pending, try !hasPendingCancellation() else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
         try pendingStore.saveToken("")
     }
 
     public func resetPrivatePairingState() throws {
-        try clearPending()
+        try pendingStore.saveToken("")
         try finishPendingCancellation()
     }
 
@@ -3544,7 +3642,9 @@ public final class ReceiverPairingStateStore {
         redeemURLString: String,
         invitationSecret: String?,
         invitationCode: String?,
-        transport: ReceiverPairingTransport
+        transport: ReceiverPairingTransport,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil
     ) throws -> ReceiverPendingPairing {
         guard try !hasPendingCancellation() else {
             throw ReceiverPairingStateError.pendingPairingConflict
@@ -3555,11 +3655,26 @@ public final class ReceiverPairingStateStore {
                 redeemURLString: redeemURLString,
                 invitationSecret: invitationSecret,
                 invitationCode: invitationCode,
-                transport: transport
+                transport: transport,
+                mailboxBootstrap: mailboxBootstrap,
+                expiresAt: expiresAt
             ) else {
                 throw ReceiverPairingStateError.pendingPairingConflict
             }
             return existing
+        }
+        if let mailboxBootstrap {
+            guard transport == .mailbox, receiverURLString.isEmpty, redeemURLString.isEmpty,
+                  let secret = invitationSecret, !secret.isEmpty, secret.utf8.count <= 65_536, invitationCode == nil,
+                  let expiresAt, let expiry = ISO8601DateFormatter().date(from: expiresAt), expiry > Date(),
+                  let publicKey = Data(strictBase64URL: mailboxBootstrap.receiverAgreementPublicKey, count: 32) else {
+                throw ReceiverPairingRedeemError.invitationInvalid
+            }
+            // Reject low-order peer keys without touching the local key store.
+            do {
+                _ = try Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(
+                    with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey))
+            } catch { throw ReceiverPairingRedeemError.invalidResponse }
         }
         let installationID = try loadOrCreateInstallationID()
         let pending = ReceiverPendingPairing(
@@ -3571,14 +3686,53 @@ public final class ReceiverPairingStateStore {
             installationID: installationID,
             deviceCredential: deviceCredentialGenerator(),
             platform: "ios",
-            transport: transport
+            transport: transport,
+            mailboxBootstrap: mailboxBootstrap,
+            expiresAt: expiresAt
         )
+        try persistPending(pending)
+        return pending
+    }
+
+    func saveNativeRequest(_ bytes: Data, for pending: ReceiverPendingPairing, generation: String) throws -> ReceiverPendingPairing {
+        guard pending.mailboxBootstrap != nil, pending.sealedRequest == nil,
+              try loadPending() == pending, try !hasPendingCancellation() else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        let updated = pending.nativeState(request: bytes, generation: generation, published: false, cancelled: false)
+        try persistPending(updated)
+        return updated
+    }
+
+    func markNativePublication(_ pending: ReceiverPendingPairing) throws -> ReceiverPendingPairing {
+        guard pending.mailboxBootstrap != nil, pending.sealedRequest != nil,
+              try loadPending() == pending, try !hasPendingCancellation(), !pending.nativeCancellationConfirmed else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        if pending.publicationMayHaveOccurred { return pending }
+        let updated = pending.nativeState(request: pending.sealedRequest, generation: pending.nativeExpectedGeneration,
+            published: true, cancelled: false)
+        try persistPending(updated)
+        return updated
+    }
+
+    func confirmNativeCancellation(_ pending: ReceiverPendingPairing) throws -> ReceiverPendingPairing {
+        guard pending.mailboxBootstrap != nil, try loadPending() == pending else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        let updated = pending.nativeState(request: pending.sealedRequest, generation: pending.nativeExpectedGeneration,
+            published: pending.publicationMayHaveOccurred, cancelled: true)
+        try persistPending(updated)
+        return updated
+    }
+
+    private func persistPending(_ pending: ReceiverPendingPairing) throws {
+        try pending.validateNativeState()
         let encoded = try JSONEncoder().encode(pending)
         guard let string = String(data: encoded, encoding: .utf8) else {
             throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
         try pendingStore.saveToken(string)
-        return pending
     }
 }
 
@@ -3607,12 +3761,14 @@ public enum ReceiverOutboxAdmissionPolicy {
     public static func isReady(
         pendingReceiverIdentities: [String?],
         currentBindingID: String?,
-        hasBearerToken: Bool
+        hasBearerToken: Bool,
+        committedMailboxBindingID: String? = nil
     ) -> Bool {
-        if let currentBindingID, hasBearerToken {
+        if let currentBindingID,
+           hasBearerToken || (!currentBindingID.isEmpty && committedMailboxBindingID == currentBindingID) {
             return pendingReceiverIdentities.allSatisfy { $0 == currentBindingID }
         }
-        guard currentBindingID == nil, !hasBearerToken else {
+        guard currentBindingID == nil, !hasBearerToken, committedMailboxBindingID == nil else {
             return false
         }
         return pendingReceiverIdentities.isEmpty
@@ -4082,8 +4238,13 @@ public final class ReceiverSettingsStore {
 
     public var receiverURLString: String {
         if let stored = try? loadStoredConnectionRecord() {
-            return directHTTPConfiguration(in: stored)?.receiverURLString
-                ?? Self.defaultReceiverURLString
+            if let direct = directHTTPConfiguration(in: stored) {
+                return direct.receiverURLString
+            }
+            if case .v2(let record) = stored, isPairedMailbox(record) {
+                return ""
+            }
+            return Self.defaultReceiverURLString
         }
         return userDefaults.string(forKey: receiverURLKey) ?? Self.defaultReceiverURLString
     }
@@ -4101,9 +4262,13 @@ public final class ReceiverSettingsStore {
 
     public var receiverBindingID: String? {
         guard let stored = try? loadStoredConnectionRecord(),
-              let direct = directHTTPConfiguration(in: stored),
-              !direct.bearerToken.isEmpty,
               !localScope(in: stored).bindingID.isEmpty else {
+            return nil
+        }
+        if case .v2(let record) = stored, isPairedMailbox(record) {
+            return record.localScope.bindingID
+        }
+        guard directHTTPConfiguration(in: stored)?.bearerToken.isEmpty == false else {
             return nil
         }
         return localScope(in: stored).bindingID
@@ -4126,7 +4291,8 @@ public final class ReceiverSettingsStore {
                 try restorePreCutoverV1IfExactMatch(current)
                 record = current
             }
-            return directHTTPConfiguration(in: record)?.bearerToken.isEmpty == false
+            return (isPairedMailbox(record)
+                || directHTTPConfiguration(in: record)?.bearerToken.isEmpty == false)
                 ? record.localScope.bindingID
                 : nil
         }
@@ -4235,6 +4401,64 @@ public final class ReceiverSettingsStore {
             ]
         )
         try persist(record)
+    }
+
+    func requireNativePairingAdmission(expectedGeneration: String) throws {
+        let record = try authoritativeRecordForMutation()
+        guard terminalCancellationExpectedGeneration == nil else { throw CancellationError() }
+        guard "g\(record.localScope.generation)" == expectedGeneration else { throw ReceiverSettingsGenerationError.staleGeneration }
+        guard record.activation != .paired(activeTransport: .mailbox) else {
+            throw ReceiverSettingsRecordError.transportSwitchRequiresCommittedEmptyOutbox
+        }
+    }
+
+    func requireNativePairingAuthority(_ identity: MailboxConnectionIdentityV1, generation: String) throws {
+        let record = try authoritativeRecordForMutation()
+        if "g\(record.localScope.generation)" == generation, record.activation != .paired(activeTransport: .mailbox) { return }
+        guard try nativePairingWasCommitted(identity, generation: generation) else { throw ReceiverSettingsGenerationError.staleGeneration }
+    }
+
+    func nativePairingWasCommitted(_ identity: MailboxConnectionIdentityV1, generation: String) throws -> Bool {
+        let record = try authoritativeRecordForMutation()
+        guard let prior = Self.nativePairingGeneration(generation), prior < UInt64(Int.max) else { return false }
+        return record.activation == .paired(activeTransport: .mailbox)
+            && record.mailboxIdentity == .available(identity)
+            && record.localScope.bindingID == identity.opaqueBinding
+            && record.localScope.generation == prior + 1
+    }
+
+    func saveNativeMailboxPairing(_ identity: MailboxConnectionIdentityV1, expectedGeneration: String) throws {
+        guard terminalCancellationExpectedGeneration == nil else { throw CancellationError() }
+        if try nativePairingWasCommitted(identity, generation: expectedGeneration) { return }
+        let previous = try authoritativeRecordForMutation()
+        guard "g\(previous.localScope.generation)" == expectedGeneration else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
+        guard previous.activation != .paired(activeTransport: .mailbox) else {
+            throw ReceiverSettingsRecordError.transportSwitchRequiresCommittedEmptyOutbox
+        }
+        var configurations: [ReceiverTransportConfigurationV1] = []
+        if let direct = directHTTPConfiguration(in: previous) {
+            configurations.append(.directHTTP(activation: .inactive, configuration: direct))
+        }
+        configurations.append(.mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1()))
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: try Self.nextGeneration(after: previous.localScope.generation), bindingID: identity.opaqueBinding),
+            mailboxIdentity: .available(identity), activation: .paired(activeTransport: .mailbox),
+            transportConfigurations: configurations)
+        try persist(record)
+    }
+
+    func clearCancelledNativePairing(_ identity: MailboxConnectionIdentityV1, generation: String) throws {
+        // Never clear a pre-existing or later connection on behalf of an old request.
+        guard try nativePairingWasCommitted(identity, generation: generation) else { return }
+        try clearReceiverSettingsForTerminalCancellation(expectedGeneration: receiverSettingsGenerationToken)
+    }
+
+    private static func nativePairingGeneration(_ token: String) -> UInt64? {
+        guard token.hasPrefix("g"), let value = UInt64(token.dropFirst()), "g\(value)" == token else { return nil }
+        return value
     }
 
     public func saveMailboxPairing(
@@ -4806,6 +5030,16 @@ public final class ReceiverSettingsStore {
                 throw ReceiverSettingsRecordError.invalidRecord
             }
         }
+    }
+
+    // Call only after stored-record validation, which checks identity keys,
+    // a nonempty binding and exactly one matching active configuration.
+    private func isPairedMailbox(_ record: ReceiverConnectionRecordV2) -> Bool {
+        guard record.activation == .paired(activeTransport: .mailbox),
+              case .available = record.mailboxIdentity else {
+            return false
+        }
+        return true
     }
 
     private func localScope(in stored: StoredConnectionRecord) -> ReceiverLocalConnectionScopeV1 {

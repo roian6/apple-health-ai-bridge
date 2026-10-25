@@ -28,6 +28,11 @@ public struct MailboxResolvedLocatorV1: Sendable {
     fileprivate let laneIdentities: [MailboxLaneV1: MailboxDirectoryIdentityV1]
 }
 
+struct MailboxPairingLocatorV1: Sendable {
+    let directory: URL
+    fileprivate let chain: [(URL, MailboxDirectoryIdentityV1)]
+}
+
 private struct MailboxLocatorRecordV1: Codable {
     let v: Int
     let kind: String
@@ -157,6 +162,77 @@ public enum MailboxLocatorV1 {
             deviceRootIdentity: deviceIdentity,
             laneIdentities: laneIdentities
         )
+    }
+
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    static func resolvePairing(invitationID: String) throws -> MailboxPairingLocatorV1 {
+        let invitation = try MailboxLayoutV1.opaqueComponent(invitationID)
+        guard let provider = FileManager.default.url(
+            forUbiquityContainerIdentifier: HealthBridgeAppIdentity.ubiquityContainerIdentifier
+        )?.standardizedFileURL, provider.isFileURL else {
+            throw MailboxLocatorError.containerUnavailable
+        }
+        var current = provider
+        var chain = [(provider, try directoryIdentity(at: provider))]
+        // The app, not the receiver helper, owns first creation of this topology.
+        for part in ["Documents", MailboxLayoutV1.rootDirectoryName,
+                     MailboxLayoutV1.versionDirectoryName, "pairing", invitation] {
+            let parent = open(current.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            guard parent >= 0 else { throw MailboxLocatorError.storageFailure }
+            defer { _ = close(parent) }
+            try revalidatePairing(MailboxPairingLocatorV1(directory: current, chain: chain))
+            var parentMetadata = stat()
+            guard fstat(parent, &parentMetadata) == 0, let expected = chain.last?.1,
+                  UInt64(parentMetadata.st_dev) == expected.device, UInt64(parentMetadata.st_ino) == expected.inode else {
+                throw MailboxLocatorError.pathReplaced
+            }
+            let created = part.withCString { mkdirat(parent, $0, 0o700) }
+            guard created == 0 || errno == EEXIST else { throw MailboxLocatorError.storageFailure }
+            let child = part.withCString { openat(parent, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) }
+            guard child >= 0 else { throw MailboxLocatorError.pathNotDirectory }
+            defer { _ = close(child) }
+            var metadata = stat()
+            guard fstat(child, &metadata) == 0, metadata.st_uid == geteuid(),
+                  fchmod(child, 0o700) == 0 else { throw MailboxLocatorError.storageFailure }
+            current.appendPathComponent(part, isDirectory: true)
+            let identity = try directoryIdentity(at: current)
+            guard identity.device == UInt64(metadata.st_dev), identity.inode == UInt64(metadata.st_ino) else {
+                throw MailboxLocatorError.pathReplaced
+            }
+            chain.append((current, identity))
+        }
+        let locator = MailboxPairingLocatorV1(directory: current, chain: chain)
+        try revalidatePairing(locator)
+        return locator
+    }
+    #endif
+
+    static func revalidatePairing(_ locator: MailboxPairingLocatorV1) throws {
+        for (url, identity) in locator.chain {
+            guard try directoryIdentity(at: url) == identity else { throw MailboxLocatorError.pathReplaced }
+        }
+    }
+
+    static func requirePairingFile(_ url: URL, locator: MailboxPairingLocatorV1) throws {
+        guard ["request.hbp", "completion.hbp", "cancel.hbp", "cancelled.hbp"].contains(url.lastPathComponent),
+              url == locator.directory.appendingPathComponent(url.lastPathComponent) else {
+            throw MailboxLocatorError.invalidProviderRoot
+        }
+        try revalidatePairing(locator)
+    }
+
+    static func pairingFileExists(_ url: URL, locator: MailboxPairingLocatorV1) throws -> Bool {
+        try requirePairingFile(url, locator: locator)
+        var metadata = stat()
+        if lstat(url.path, &metadata) != 0 {
+            guard errno == ENOENT else { throw MailboxLocatorError.storageFailure }
+            return false
+        }
+        guard (metadata.st_mode & S_IFMT) == S_IFREG, metadata.st_nlink == 1,
+              metadata.st_uid == geteuid(), metadata.st_size >= 0, metadata.st_size <= 65_536 else {
+            throw MailboxLocatorError.storageFailure
+        }
+        return true
     }
 
     public static func revalidate(_ locator: MailboxResolvedLocatorV1) throws {

@@ -23,12 +23,32 @@ before following this checklist:
 
 If pairing reports invalid/unavailable, generate a new invitation. That generic result intentionally does not reveal whether the old invitation was mistyped, expired, revoked, locked, used, or unknown.
 
-For Encrypted iCloud Mailbox, first run the explicit mailbox setup command and
-signed-helper lifecycle in
-[`icloud-mailbox-service.md`](icloud-mailbox-service.md). The public pairing
-command remains `health-bridge setup --transport icloud-mailbox`; there is no
-separate hidden mailbox pairing command. Direct remains the default and never
-falls back to mailbox delivery.
+For Encrypted iCloud Mailbox, follow the signed-helper lifecycle and choose the
+matching enrollment path in [the Mailbox setup guide](icloud-mailbox-service.md).
+The existing URL-based path uses `health-bridge setup --transport icloud-mailbox`.
+Compatible native builds instead use the documented URL-free
+`health-bridge receiver create-pairing --transport icloud-mailbox` flow. Direct
+remains the default and never falls back to mailbox delivery.
+
+## Native iCloud Mailbox pairing
+
+Direct remains the default. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta, and a Direct failure never switches transports automatically. Native Mailbox pairing is a separate enrollment path for compatible iPhone and Mac components using the same user-authorized iCloud container and a cancellation-capable receiver helper. It does not replace existing Direct or legacy URL-based pairing.
+
+The private invitation carries the receiver's signing and key-agreement public keys and an invitation ID. This is the initial trust channel: whoever obtains the authentic, unexpired invitation can attempt the first enrollment. The receiver does not preauthorize a particular physical phone, and the app does not use Apple-account identity or device attestation to choose the first holder. The phone creates its installation ID, device keys, and connection credential locally.
+
+The phone publishes a signed, encrypted request. It binds the invitation ID and device signing key, and encrypts the invitation secret, installation ID, credential, and device keys to the pinned receiver key. The receiver validates its own invitation keys, verifies the request signature, and commits enrollment atomically. Its signed, encrypted completion is bound to the exact sealed request and invitation. The app saves the Mailbox connection only after verifying the receiver signature, request digest, peer identities, and expected connection binding. Neither the completion nor the active Mailbox settings expose an HTTP receiver URL or bearer token.
+
+The default lifetime for a new invitation is 20 minutes, with an accepted internal range of 10 to 30 minutes. Expiry prevents a new enrollment, but does not block recovery of the exact request if the receiver already committed it. During interrupted pairing, the phone retains the sealed request and original keys and retries that same request. A changed request cannot recover the committed enrollment. Do not interpret invitation expiry as expiry or deletion of the resulting connection credential, keys, or stored pairing files.
+
+The receiver credential created by enrollment has no time-based expiry in the current implementation. It remains valid until revoked. Receiver-side device revocation blocks new deliveries for that device. Local disconnect is not server-side revocation and does not delete receiver history.
+
+Cancellation depends on how far publication may have progressed. Before a request could have reached iCloud, cancellation can finish locally. After publication may have occurred, the phone must publish a request-bound cancellation and receive a valid receiver-signed confirmation before retiring the pending authority. If iCloud, the receiver, or required keys are unavailable, cancellation can remain pending. The receiver tombstones the invitation and revokes the credential associated with that request when it processes cancellation; this is not an instant or guaranteed remote action.
+
+**Reset Private Sync State** is a separate, explicitly confirmed local recovery action. It discards pending pairing and unsent local payloads even when normal cancellation cannot obtain confirmation, and it resets local sync progress. It does not revoke an enrollment already accepted by the receiver or delete receiver history. Revoke that device on the receiver if needed, then use a fresh invitation. The dedicated lost-key reset remains available only after pending pairing is cleared and the connection, queue and sync operations are safely idle.
+
+Request and completion bodies are encrypted and authenticated. The iCloud container can still expose envelope metadata, including message kind, invitation ID, sender public key, and message size. Cancellation and cancellation-confirmation envelopes are signed, not application-encrypted. The current implementation does not automatically delete pairing files after invitation expiry, redemption, or cancellation, and it does not establish a remote retention or erasure deadline. Treat the container and its metadata as private.
+
+Native Mailbox pairing is an enrollment and transport choice only. It does not add HealthKit permissions or data types, HealthKit writes, a developer-operated relay, telemetry, or automatic third-party AI upload. Health data remains subject to the user's existing HealthKit permissions and selected receiver.
 
 ## Pairing v2 lifecycle
 
