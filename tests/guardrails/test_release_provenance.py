@@ -26,6 +26,7 @@ BUILD = "receiver-build-provenance.intoto.jsonl"
 FINAL = "receiver-final-provenance.intoto.jsonl"
 REPOSITORY = "roian6/apple-health-ai-bridge"
 TAG = "receiver-v1.1.3"
+DOCUMENTED_TAG = "receiver-v1.1.5"
 
 
 def run_documented_proof(
@@ -44,6 +45,7 @@ def run_documented_proof(
     controls.mkdir()
     calls = tmp_path / "shell-calls.txt"
     stub = f"""#!{sys.executable}
+import json
 import os
 import pathlib
 import sys
@@ -53,6 +55,9 @@ calls = pathlib.Path(os.environ['DOC_PROOF_CALLS'])
 previous = calls.read_text().splitlines() if calls.exists() else []
 with calls.open('a') as stream:
     stream.write(command + '\\n')
+if command == 'gh':
+    with calls.with_name('shell-attestation-argv.jsonl').open('a') as stream:
+        stream.write(json.dumps(sys.argv[1:]) + '\\n')
 if command == 'gh' and previous.count('gh') + 1 == int(os.environ['DOC_PROOF_FAIL_GH']):
     sys.exit(17)
 if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
@@ -76,7 +81,7 @@ if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
         [
             "set +e +u",
             "set +o pipefail",
-            f"tag={TAG}",
+            f"tag={DOCUMENTED_TAG}",
             "commit=" + "1" * 40,
             input_control,
             'verification_flags_before="$-"',
@@ -131,6 +136,29 @@ def test_documented_proof_preserves_parent_shell(
         if line.startswith("VERIFICATION_PARENT ")
     )
     assert marker.endswith(" yes"), marker
+
+
+def test_documented_proof_selects_build_and_publication_source_refs(
+    tmp_path: Path,
+) -> None:
+    completed, _ = run_documented_proof(tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFICATION_PARENT 0 yes" in completed.stdout
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "shell-attestation-argv.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 6
+    assert [call[call.index("--bundle") + 1] for call in calls] == [BUILD] * 3 + [
+        FINAL
+    ] * 3
+    for index, call in enumerate(calls):
+        expected_ref = (
+            "refs/heads/release" if index < 3 else f"refs/tags/{DOCUMENTED_TAG}"
+        )
+        assert call[call.index("--source-ref") + 1] == expected_ref
+        assert call[call.index("--source-digest") + 1] == "1" * 40
+        assert call[call.index("--signer-digest") + 1] == "1" * 40
 
 
 def test_documented_proof_reports_success(tmp_path: Path) -> None:

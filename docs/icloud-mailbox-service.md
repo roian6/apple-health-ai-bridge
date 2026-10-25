@@ -79,6 +79,12 @@ immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
+For this `1.1.5` release, metadata schema `health_bridge.release.v4` binds the
+build proof to `release.yml@refs/heads/release` and the final proof to
+`publish-release.yml@refs/tags/receiver-v1.1.5`. Both source and signer digests
+must equal the independently verified signed tag's exact commit, not a later
+branch HEAD.
+
 Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
@@ -110,7 +116,7 @@ metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
     gh attestation verify "$1" --repo "$repository" \
       --bundle "$2" \
       --signer-workflow "$repository/.github/workflows/$3" \
-      --source-ref "refs/tags/$tag" --source-digest "$commit" \
+      --source-ref "$4" --source-digest "$commit" \
       --signer-digest "$commit" --deny-self-hosted-runners \
       --predicate-type https://slsa.dev/provenance/v1
   }
@@ -118,13 +124,15 @@ metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
     "apple_health_ai_bridge-${version}-py3-none-any.whl" \
     "apple_health_ai_bridge-${version}.tar.gz" \
     release-metadata.json; do
-    verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml
+    verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml \
+      refs/heads/release
   done
   for subject in \
     "HealthBridgeMailboxAckPublisher-${version}.zip" \
     "HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
     SHA256SUMS; do
-    verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml
+    verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml \
+      "refs/tags/$tag"
   done
   shasum -a 256 -c SHA256SUMS
 )
