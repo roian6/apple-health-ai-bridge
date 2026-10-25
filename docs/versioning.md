@@ -6,11 +6,13 @@ Apple Health AI Bridge contains independently released components. Always includ
 
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.3` | Release tag `receiver-v1.1.3` |
+| Receiver/CLI | `1.1.5` | Release tag `receiver-v1.1.5` |
 | iOS Companion | `1.1.1` | Source candidate build `50` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
 The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture.
+
+The published `receiver-v1.1.5` is a bounded maintenance release based on `receiver-v1.1.3`. Main carries the matching source version after forward-porting release metadata and workflow fixes, while its additional runtime features and migrations remain unreleased. Use the immutable release tag and its tagged installation guides for the published behavior.
 
 ### One stable release branch
 
@@ -105,7 +107,7 @@ checksums or provenance verification.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.1.3
+Receiver/CLI 1.1.5
 Compatible iOS Companion 1.1.1 (build 50)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```

@@ -104,7 +104,7 @@ Use short fix branches from release, squash reviewed fixes when appropriate, and
 
 Source eligibility is an exact PR merge plus successful checks, signed tag binding and trusted-main policy. No per-patch main JSON grant is required. Policy can revoke a commit or tag object explicitly. A candidate cannot authorize itself by editing its own policy copy.
 
-The old `receiver-v1.1.4` tag is retained as a retired unpublished candidate. Its unconsumed grant is empty; its immutable identity is recorded in the static policy. Bootstrap release from the reviewed stable history and backport the control plane through a normal protected PR. Do not bring unrelated main runtime features or migrations into that bootstrap.
+The old `receiver-v1.1.4` tag is retained as a retired unpublished, unsupported candidate. Its unconsumed grant is empty; its immutable identity is recorded in the static policy. Published `receiver-v1.1.5` completes the stable maintenance bootstrap from `receiver-v1.1.3`. Forward-port its workflow fixes, component metadata, and published installation references through a normal main PR. Preserve main's unreleased runtime features and migrations; advancing its source version does not publish those features.
 
 ## Response targets
 

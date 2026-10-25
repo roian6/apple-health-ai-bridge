@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/release' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
 
 jobs:
   analyze:
