@@ -22,21 +22,21 @@ project developer does not have access to either endpoint or the transmitted
 HealthKit records. App Store Connect may remain “Data Not Collected” only while
 that developer-no-access boundary remains true.
 
-## Install and verify Receiver/CLI 1.1.3
+## Install and verify Receiver/CLI 1.1.5
 
 These install and verification instructions apply to the published Receiver/CLI
-`1.1.3` release. Download its complete asset set and verify the release identity,
+`1.1.5` release. Download its complete asset set and verify the release identity,
 provenance, and checksums below before installing anything. Do not substitute
-`main` or an older helper; the receiver and helper must both be version `1.1.3`.
+`main` or an older helper; the receiver and helper must both be version `1.1.5`.
 
-Use the Receiver/CLI `1.1.3` GitHub Release assets. Download these files with a
+Use the Receiver/CLI `1.1.5` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.3-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.3.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.3.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.3.manifest.json`;
+- `apple_health_ai_bridge-1.1.5-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.1.5.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.1.5.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.5.manifest.json`;
 - `release-metadata.json`;
 - `receiver-build-provenance.intoto.jsonl`;
 - `SHA256SUMS`;
@@ -83,7 +83,7 @@ Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to `receiver-v1.1.3` and
+metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -147,14 +147,14 @@ After every proof and checksum check succeeds, install the wheel, structurally
 validate the helper, and explicitly install it:
 
 ```bash
-uv tool install ./apple_health_ai_bridge-1.1.3-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.1.5-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.3.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.3.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.3.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.3.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```
