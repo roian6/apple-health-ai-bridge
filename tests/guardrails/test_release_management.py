@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import ClassVar, Literal, cast
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+
+from health_bridge import __version__
+from tests.guardrails.test_release_recovery import recovery_transport
 
 ROOT = Path(__file__).parents[2]
 RELEASE_TOOL = ROOT / "scripts/release_tools.py"
@@ -21,6 +24,37 @@ VERSIONING_DOC = ROOT / "docs/versioning.md"
 XCODE_PROJECT = (
     ROOT / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
+
+
+def test_candidate_notes_selection_uses_planned_tag_on_release_branch(
+    tmp_path: Path,
+) -> None:
+    notes = b"# Synthetic Receiver release\n\nExact candidate notes.\n"
+    notes_directory = tmp_path / ".github/release"
+    notes_directory.mkdir(parents=True)
+    _ = (notes_directory / "notes-receiver-v9.0.1.md").write_bytes(notes)
+    (tmp_path / "dist").mkdir()
+    commands = [
+        line.strip()
+        for line in RELEASE_WORKFLOW.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("cp ")
+        and line.strip().endswith("dist/release-notes.md")
+    ]
+    assert len(commands) == 1
+    result = subprocess.run(
+        ["bash", "-euc", commands[0]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_REF_NAME": "release",
+            "RELEASE_TAG": "receiver-v9.0.1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "dist/release-notes.md").read_bytes() == notes
 
 
 def _current_ios_build() -> str:
@@ -258,7 +292,7 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "--repo",
         str(ROOT),
         "--tag",
-        "receiver-v1.1.4",
+        f"receiver-v{__version__}",
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -266,9 +300,9 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     assert output.model_dump() == {
         "ios_build": _current_ios_build(),
         "ios_marketing_version": "1.1.1",
-        "project_version": "1.1.4",
+        "project_version": __version__,
         "release_scope": "receiver",
-        "tag": "receiver-v1.1.4",
+        "tag": f"receiver-v{__version__}",
     }
 
 
@@ -309,53 +343,35 @@ def test_tag_info_derives_exact_release_title(
 def test_release_workflow_passes_derived_title_to_create(
     tmp_path: Path, tag: str, title: str
 ) -> None:
-    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-    step = workflow.split(
-        "      - name: Create and verify helper-pending draft release\n", 1
-    )[1]
-    # Run the real title extraction and flag assembly, not GitHub transport.
-    start = min(
-        step.index("          tag_info="), step.index("          release_flags=(")
-    )
-    snippet = step[start:].split('          draft_release_id=""', 1)[0]
-    captured = tmp_path / "create-args"
-    environment = {
-        **os.environ,
-        "TITLE_QA_PYTHON": sys.executable,
-        "TITLE_QA_TOOL": str(RELEASE_TOOL),
-        "TITLE_QA_ARGS": str(captured),
-        "GITHUB_REF_NAME": tag,
-        "GITHUB_REPOSITORY": "synthetic/release",
-        "PINNED_TARGET_COMMIT_SHA": "1" * 40,
-        "PINNED_TAG_OBJECT_SHA": "2" * 40,
-    }
-    completed = subprocess.run(
-        [
-            "bash",
-            "--noprofile",
-            "--norc",
-            "-c",
-            f"""set -euo pipefail
-uv() {{ "$TITLE_QA_PYTHON" "$TITLE_QA_TOOL" "${{@:4}}"; }}
-python3() {{ test "$1" = scripts/release_source_policy.py; }}
-gh() {{ printf "%s\\0" "$@" > "$TITLE_QA_ARGS"; }}
-{snippet}
-""",
-        ],
+    environment, state = recovery_transport(tmp_path, "none")
+    runner = tmp_path / "title.py"
+    _ = runner.write_text(f"""import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+from release_tools import release_title
+from release_reconciliation import ExpectedRelease, synchronize
+expected = ExpectedRelease(
+    tag=sys.argv[1], commit="1"*40, title=release_title(sys.argv[1]),
+    notes="synthetic notes", assets=[],
+)
+synchronize(Path(sys.argv[2]), expected, Path(sys.argv[2]))
+""")
+    result = subprocess.run(
+        [sys.executable, str(runner), tag, str(tmp_path)],
         env=environment,
         capture_output=True,
         text=True,
         check=False,
-        timeout=30,
     )
-
-    assert completed.returncode == 0, completed.stderr
-    arguments = captured.read_bytes().decode().split("\0")[:-1]
-    assert arguments[:3] == ["release", "create", tag]
-    assert arguments[arguments.index("--title") + 1] == title
-    assert arguments[arguments.index("--notes-file") + 1] == (
-        f".github/release/notes-{tag}.md"
-    )
+    assert result.returncode == 0, result.stderr
+    payload = TypeAdapter(dict[str, JsonValue]).validate_json(state.read_bytes())
+    releases = payload["releases"]
+    assert isinstance(releases, list)
+    release = releases[0]
+    assert isinstance(release, dict)
+    assert release["tag_name"] == tag
+    assert release["name"] == title
+    assert release["draft"] is True
 
 
 def test_component_version_index_matches_current_release_surfaces() -> None:
@@ -370,7 +386,10 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "version": "1.0.0",
         },
         "ios_companion": {"build": "50", "marketing_version": "1.1.1"},
-        "receiver_cli": {"release_tag": "receiver-v1.1.4", "version": "1.1.4"},
+        "receiver_cli": {
+            "release_tag": f"receiver-v{__version__}",
+            "version": __version__,
+        },
         "release_scope": "receiver",
         "schema_id": "health_bridge.component_versions.v1",
     }
@@ -433,7 +452,7 @@ def test_release_validate_rejects_noncanonical_or_mismatched_tag(tag: str) -> No
 
     assert completed.returncode == 1
     assert completed.stdout == ""
-    assert "receiver-v1.1.4" in completed.stderr
+    assert f"receiver-v{__version__}" in completed.stderr
 
 
 def test_receiver_and_ios_semver_order_does_not_define_compatibility(
@@ -960,116 +979,50 @@ def test_draft_and_published_verifiers_reject_nonexact_release_metadata(
     assert "metadata" in completed.stderr.lower()
 
 
-def test_release_workflow_requires_verified_tag_and_attested_draft() -> None:  # noqa: PLR0915
+def test_release_workflow_separates_candidate_and_publication_permissions() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-
-    assert 'tags: ["receiver-v*"]' in workflow
-    assert "  verify:\n" in workflow
-    assert "tag_object_sha:" in workflow
-    assert "target_commit_sha:" in workflow
-    assert workflow.count("needs: verify") == 2
+    publish = (ROOT / ".github/workflows/publish-release.yml").read_text()
+    assert "workflow_dispatch:" in workflow
+    assert "source_commit:" in workflow
+    assert "signed_tag_object:" in workflow
+    assert "contents: write" not in workflow
+    assert "environment: github-release" not in workflow
+    assert "gh release" not in workflow
     assert "needs: [verify, python, ios]" in workflow
-    assert "environment: github-release" in workflow
-    assert "ref: ${{ needs.verify.outputs.target_commit_sha }}" in workflow
-    assert (
-        "PINNED_TAG_OBJECT_SHA: ${{ needs.verify.outputs.tag_object_sha }}" in workflow
-    )
-    assert (
-        "PINNED_TARGET_COMMIT_SHA: ${{ needs.verify.outputs.target_commit_sha }}"
-        in workflow
-    )
-    assert '"${{ needs.verify.outputs.tag_object_sha }}"' not in workflow
-    assert '"${{ needs.verify.outputs.target_commit_sha }}"' not in workflow
-    assert "permissions:\n  contents: read" in workflow
-    assert workflow.count("contents: write") == 1
     assert "id-token: write" in workflow
     assert "attestations: write" in workflow
-    assert "release_tools.py validate" in workflow
-    assert "release_tools.py manifest" in workflow
-    assert "release_tools.py checksums" in workflow
-    checksum_command = workflow.split("release_tools.py checksums", 1)[1].split(
-        "(cd dist",
-        1,
-    )[0]
-    assert "--repo ." in checksum_command
-    assert '--tag "$GITHUB_REF_NAME"' in checksum_command
-    assert '--tag-object "$tag_object_sha"' in checksum_command
-    assert '--commit "$commit_sha"' in checksum_command
-    assert '--tree "$tree_sha"' in checksum_command
-    assert workflow.count('--tag-object "$PINNED_TAG_OBJECT_SHA"') >= 2
-    assert workflow.count('--commit "$PINNED_TARGET_COMMIT_SHA"') >= 1
-    assert workflow.count('--tree "$(git rev-parse') >= 1
-    assert "rm -f dist/.gitignore" in workflow
-    assert "check-jsonschema --builtin-schema vendor.github-workflows" in workflow
-    assert "enable-cache: false" in workflow
-    assert "enable-cache: true" not in workflow
-    assert "refs/tags/${GITHUB_REF_NAME}^{tag}" in workflow
-    assert "${{ github.event.after }}" in workflow
-    assert 'test "$target_sha" = "$event_target_commit_sha"' not in workflow
-    assert 'test "$tag_ref_sha" = "$event_tag_object_sha"' in workflow
-    assert 'test "$signed_tag_name" = "$GITHUB_REF_NAME"' in workflow
-    assert 'test "$target_sha" = "$(git rev-parse HEAD)"' in workflow
-    assert 'commit_sha="$(git rev-parse HEAD)"' in workflow
-    assert '--commit "$commit_sha"' in workflow
-    assert '--tag-object "$tag_object_sha"' in workflow
-    assert "verification.verified == true" in workflow
-    assert '.author.login == "roian6"' in workflow
-    assert '.commit.author.name == "Chanhyo Jung"' in workflow
-    assert '.committer.login == "web-flow"' in workflow
-    assert '.commit.committer.name == "GitHub"' in workflow
-    assert '.commit.committer.email == ("noreply" + "@" + "github.com")' in workflow
-    assert ".commit.author.email | endswith" not in workflow
-    assert (
-        'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"' in workflow
-    )
-    assert 'test "$tagger_email" = "$expected_tagger_email"' in workflow
-    assert 'endswith("@users.noreply.github.com")' not in workflow
-    assert (
-        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
-        in workflow
-    )
-    assert "gh release create" in workflow
-    assert "--draft" in workflow
-    assert "DRAFT_RELEASE_ID" in workflow
-    assert "for _ in {1..10}" in workflow
-    assert "releases/${draft_release_id}" in workflow
-    assert "releases/${DRAFT_RELEASE_ID}" in workflow
-    assert "gh release edit" not in workflow
-    assert "--draft=false" not in workflow
-    assert 'test "$asset_names" = "$expected_assets"' in workflow
-    assert workflow.count("git/ref/tags/${GITHUB_REF_NAME}") >= 2
-    assert (
-        workflow.index("Attest release artifacts")
-        < workflow.index("Export and verify original build attestation")
-        < workflow.index("Create and verify helper-pending draft release")
-    )
-    assert "verify-core-draft" in workflow
-    assert "helper-pending" in workflow
-    assert "published_at == null" in workflow
-    release_tool = RELEASE_TOOL.read_text(encoding="utf-8")
-    assert "remote asset digest mismatch" in release_tool
-    assert "release body does not match exact notes" in release_tool
-    assert "(cd dist && sha256sum --check --strict SHA256SUMS)" in workflow
-    assert "--verify-tag" in workflow
-    assert workflow.count("release_tools.py tag-info") == 2
-    assert 'prerelease="$(jq -r \'.prerelease\' <<< "$tag_info")"' in workflow
-    assert 'version="$(jq -r \'.version\' <<< "$tag_info")"' in workflow
-    assert 'if [[ "$prerelease" = "true" ]]' in workflow
-    assert 'version="${GITHUB_REF_NAME#receiver-v}"' not in workflow
-    assert "release_flags+=(--prerelease)" in workflow
-    assert '--notes-file ".github/release/notes-${GITHUB_REF_NAME}.md"' in workflow
-    assert "--generate-notes" not in workflow
-    assert '"dist/apple_health_ai_bridge-${version}-py3-none-any.whl"' in workflow
-    assert '"dist/apple_health_ai_bridge-${version}.tar.gz"' in workflow
+    assert "ref: ${{ github.sha }}" in workflow
+    assert 'test "$GITHUB_SHA" = "$REQUESTED_SOURCE"' in workflow
+    assert 'test "$GITHUB_WORKFLOW_SHA" = "$REQUESTED_SOURCE"' in workflow
+    assert 'test "$GITHUB_REF" = refs/heads/release' in workflow
+    assert "release.yml@refs/heads/release" in workflow
+    assert "release_candidate.py --repo ." in workflow
+    assert "release_candidate.py --phase seal" in workflow
+    assert "name: candidate-${{ github.run_id }}-${{ github.run_attempt }}" in workflow
+    assert "release_tools.py manifest --candidate" in workflow
+    assert '--source-receipt "$RUNNER_TEMP/source.json"' in workflow
+    assert "release_tools.py verify-packet" in workflow
+    assert "uv run pytest -q" in workflow
+    assert "uv run basedpyright" in workflow
+    assert "package-smoke.py --dist-dir dist" in workflow
+    assert "swift test" in workflow
+    assert "CODE_SIGNING_ALLOWED=NO" in workflow
+    assert "subject-path: |" in workflow
     assert "subject-path: dist/*" not in workflow
-    create_block = workflow.split("gh release create", 1)[1].split(
-        "release_flags[@]",
-        1,
-    )[0]
-    assert "dist/SHA256SUMS" not in create_block
-    assert "dist/receiver-build-provenance.intoto.jsonl" in create_block
-    assert "dist/release-metadata.json" in workflow
-    assert "(cd dist && sha256sum --check --strict SHA256SUMS)" in workflow
+    assert "receiver-build-provenance.intoto.jsonl" in workflow
+    assert "environment: github-release" in publish
+    assert 'test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"' in publish
+    assert "publish-release.yml@refs/tags/" in publish
+    assert "needs: verify_helper_on_macos" in publish
+    assert "group: release-publication-${{ github.repository }}" in publish
+    assert "cancel-in-progress: false" in publish
+    assert "release_candidate.py --phase download" in publish
+    assert "release_recovery.py --phase prepare-final" in publish
+    assert "release_recovery.py --phase publish" in publish
+    assert "if: steps.final.outputs.attest == 'true'" in publish
+    assert "verify_helper_distribution.py" in publish
+    assert "--clobber" not in workflow + publish
+    assert "--generate-notes" not in workflow + publish
     assert "pypi" not in workflow.lower()
 
 
@@ -1102,12 +1055,9 @@ def test_release_criteria_requires_live_app_store_build_readback() -> None:
     assert "Restrict updates" in criteria
     assert "Restrict creations" in criteria
     assert "Enable release immutability" in criteria
-    assert 'git verify-tag "$tag"' in criteria
+    operations = (ROOT / "docs/release-operations.md").read_text()
+    assert 'git verify-tag "$tag"' in operations
     assert "git verify-commit HEAD" not in criteria
-    assert '.author.login == "roian6"' in criteria
-    assert '.committer.login == "web-flow"' in criteria
-    assert "/commits/$commit_sha" in criteria
-    assert "lightweight tag" in criteria
     assert "build 3" not in criteria
     assert "receiver-only patch" in criteria
     assert "must not upload a new TestFlight build" in criteria
@@ -1118,8 +1068,8 @@ def test_public_docs_name_each_version_surface_and_transition() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     versioning = VERSIONING_DOC.read_text(encoding="utf-8")
 
+    assert "(docs/versioning.md)" in readme
     for label in ("Receiver/CLI", "iOS Companion", "Batch Protocol"):
-        assert label in readme
         assert label in versioning
     assert "receiver-v1.0.2" in versioning
     assert "ios-v1.1.1-build.50" in versioning
@@ -1173,14 +1123,16 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
 
+    pin_pattern = (
+        r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)'
+    )
+    repository_url = "https://github.com/roian6/apple-health-ai-bridge"
+    assert f"({repository_url}/blob/receiver-v1.1.3/docs/setup.md)" in readme
     for content, name, expected_tag in (
-        (readme, "README.md", "receiver-v1.1.4"),
-        (setup, "docs/setup.md", "receiver-v1.1.4"),
+        (readme, "README.md", "receiver-v1.1.3"),
+        (setup, "docs/setup.md", f"receiver-v{__version__}"),
     ):
-        pins = re.findall(
-            r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)',
-            content,
-        )
+        pins = re.findall(pin_pattern, content)
         assert pins, f"No versioned install pin found in {name}"
         assert set(pins) == {expected_tag}, (
             f"Found stale install pins in {name}: {pins}"
@@ -1190,6 +1142,17 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     assert unpinned not in setup
 
 
+def test_roadmap_matches_readme_current_receiver_release() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    roadmap = (ROOT / "docs/roadmap.md").read_text(encoding="utf-8")
+    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
+    current_receiver = re.search(rf'{install_source}@receiver-v([^\s"]+)', readme)
+
+    assert current_receiver is not None
+    expected_prefix = "The current public release set is Receiver/CLI "
+    assert f"{expected_prefix}`{current_receiver.group(1)}`" in roadmap
+
+
 def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
     self_build = (ROOT / "docs/self-build.md").read_text(encoding="utf-8")
@@ -1197,7 +1160,7 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
 
     assert re.search(r"\]\(setup\.md(?:#[^)]+)?\)", self_build)
     assert "(icloud-mailbox-service.md)" in setup
-    release_notes_path = ROOT / ".github/release/notes-receiver-v1.1.4.md"
+    release_notes_path = ROOT / f".github/release/notes-receiver-v{__version__}.md"
     assert release_notes_path.is_file()
     release_notes = release_notes_path.read_text(encoding="utf-8")
     expected_assets = set(re.findall(r"^- `([^`]+)`[.;]?", release_notes, re.MULTILINE))
@@ -1211,12 +1174,30 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     assert downloaded_assets == expected_assets
     assert set(
         re.findall(r"apple_health_ai_bridge-[\w.]+-py3-none-any\.whl", mailbox)
-    ) == {"apple_health_ai_bridge-1.1.4-py3-none-any.whl"}
+    ) == {f"apple_health_ai_bridge-{__version__}-py3-none-any.whl"}
     assert set(
         re.findall(
             r"HealthBridgeMailboxAckPublisher-[\d.]+(?:zip|manifest\.json)", mailbox
         )
     ) == {
-        "HealthBridgeMailboxAckPublisher-1.1.4.zip",
-        "HealthBridgeMailboxAckPublisher-1.1.4.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
     }
+
+
+@pytest.mark.parametrize("guide", ["setup.md", "icloud-mailbox-service.md"])
+def test_versioned_guide_requires_publication_before_commands(guide: str) -> None:
+    document = (ROOT / "docs" / guide).read_text(encoding="utf-8")
+    condition = document.split("## Release availability\n", 1)[1].split("\n## ", 1)[0]
+    repository = "https://github.com/roian6/apple-health-ai-bridge"
+    assert f"({repository}/releases/tag/receiver-v{__version__})" in condition
+    assert f"({repository}/blob/receiver-v1.1.3/docs/setup.md)" in condition
+    assert "published" in condition
+    assert "all eight" in condition
+    assert "verified" in condition
+    assert "Until that check succeeds" in condition
+    assert document.index("## Release availability\n") < document.index("```bash\n")
+    if guide == "icloud-mailbox-service.md":
+        assert document.index("## Release availability\n") < document.index(
+            "download them:\n"
+        )

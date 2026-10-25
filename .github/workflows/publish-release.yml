@@ -1,22 +1,34 @@
-name: Continue helper-bound release
+name: Publish qualified release
 
 on:
   workflow_dispatch:
     inputs:
       draft_release_id:
-        description: Existing helper-pending draft release database ID
+        description: Release ID returned by staging, including published readback
         required: true
         type: string
       tag:
-        description: Exact signed receiver release tag
+        description: Genuine public signed Receiver tag
+        required: true
+        type: string
+      candidate_run_id:
+        description: Original successful candidate run ID
+        required: true
+        type: string
+      candidate_attempt:
+        description: Exact original candidate execution attempt
+        required: true
+        type: string
+      candidate_artifact_id:
+        description: Immutable candidate artifact ID
         required: true
         type: string
       helper_sha256:
-        description: Helper archive SHA-256 printed by the owner staging command
+        description: Qualified native helper archive SHA-256
         required: true
         type: string
       helper_manifest_sha256:
-        description: Helper manifest SHA-256 printed by the owner staging command
+        description: Qualified native helper manifest SHA-256
         required: true
         type: string
 
@@ -24,73 +36,42 @@ permissions:
   contents: read
 
 concurrency:
-  group: continue-release-${{ inputs.tag }}
+  group: release-publication-${{ github.repository }}
   cancel-in-progress: false
+
+env:
+  DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
+  RELEASE_TAG: ${{ inputs.tag }}
+  CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+  CANDIDATE_ATTEMPT: ${{ inputs.candidate_attempt }}
+  CANDIDATE_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
+  EXPECTED_HELPER_SHA256: ${{ inputs.helper_sha256 }}
+  EXPECTED_HELPER_MANIFEST_SHA256: ${{ inputs.helper_manifest_sha256 }}
 
 jobs:
   verify_helper_on_macos:
-    name: Verify exact draft helper on clean macOS
+    name: Verify exact staged helper on clean macOS
     runs-on: macos-15
     timeout-minutes: 20
-    # GitHub's API requires contents:write to read unpublished draft assets.
-    # This job never uploads, edits, or publishes release content.
+    environment: github-release
     permissions:
       contents: write
-    env:
-      DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
-      RELEASE_TAG: ${{ inputs.tag }}
-      EXPECTED_HELPER_SHA256: ${{ inputs.helper_sha256 }}
-      EXPECTED_HELPER_MANIFEST_SHA256: ${{ inputs.helper_manifest_sha256 }}
+      actions: read
+      pull-requests: read
     steps:
-      - name: Bind exact unpublished draft and immutable source
-        id: bind
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Reject wrong tag execution
         run: |
           set -euo pipefail
-          [[ "$DRAFT_RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$DRAFT_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$RELEASE_TAG" =~ ^receiver-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
-          [[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$EXPECTED_HELPER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          gh api "$release_api" > "$RUNNER_TEMP/helper-release-binding.json"
-          test "$(jq -r \
-            --arg tag "$RELEASE_TAG" \
-            '.id == ($ENV.DRAFT_RELEASE_ID | tonumber) and .tag_name == $tag and .draft == true and .published_at == null' \
-            "$RUNNER_TEMP/helper-release-binding.json")" = "true"
-          matching_release_ids="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
-          test "$matching_release_ids" = "$DRAFT_RELEASE_ID"
-          tag_object_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-            --jq '.object.sha')"
-          [[ "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
-          test "$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.verification.verified == true and .verification.reason == "valid"')" = "true"
-          target_commit_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.object.sha')"
-          [[ "$target_commit_sha" =~ ^[0-9a-f]{40}$ ]]
-          test "$GITHUB_SHA" = "$target_commit_sha"
-          test "$GITHUB_WORKFLOW_SHA" = "$target_commit_sha"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
           test "$GITHUB_WORKFLOW_REF" = "${GITHUB_REPOSITORY}/.github/workflows/publish-release.yml@refs/tags/${RELEASE_TAG}"
-          tree_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/commits/${target_commit_sha}" \
-            --jq '.tree.sha')"
-          [[ "$tree_sha" =~ ^[0-9a-f]{40}$ ]]
-          {
-            echo "tag_object_sha=$tag_object_sha"
-            echo "target_commit_sha=$target_commit_sha"
-            echo "tree_sha=$tree_sha"
-          } >> "$GITHUB_OUTPUT"
 
-      - name: Check out exact helper-bound commit
+      - name: Check out original public tag source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ steps.bind.outputs.target_commit_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -105,332 +86,143 @@ jobs:
           version: "0.11.14"
           enable-cache: false
 
-      - name: Download exact bound draft helper assets
+      - name: Install locked tooling
+        run: uv sync --all-extras --dev --locked
+
+      - name: Download and verify original candidate execution
         env:
           GH_TOKEN: ${{ github.token }}
-          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
-          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
-          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
-          python3 scripts/release_source_policy.py \
-            --repo . --tag "$RELEASE_TAG" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
-          uv sync --all-extras --dev --locked
-          uv run python scripts/release_tools.py verify-execution \
-            --repo . --tag "$RELEASE_TAG" --commit "$PINNED_TARGET_COMMIT_SHA" \
-            --tree "$PINNED_TREE_SHA" --workflow publish-release.yml
-          version="${RELEASE_TAG#receiver-v}"
-          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,receiver-build-provenance.intoto.jsonl,release-metadata.json"
-          test "$(gh api "$release_api" \
-            --jq '[.assets[].name] | sort | join(",")')" = "$expected_assets"
-          mkdir dist
-          IFS=',' read -r -a expected_names <<< "$expected_assets"
-          for asset_name in "${expected_names[@]}"; do
-            asset_id="$(gh api "$release_api" \
-              --jq ".assets[] | select(.name == \"${asset_name}\") | .id")"
-            [[ "$asset_id" =~ ^[0-9]+$ ]]
-            gh api "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-              -H "Accept: application/octet-stream" > "dist/${asset_name}"
-          done
-          archive="dist/HealthBridgeMailboxAckPublisher-${version}.zip"
-          manifest="dist/HealthBridgeMailboxAckPublisher-${version}.manifest.json"
-          test "$(shasum -a 256 "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_HELPER_SHA256"
-          actual_manifest_sha256="$(shasum -a 256 "$manifest" | cut -d ' ' -f 1)"
-          test "$actual_manifest_sha256" = "$EXPECTED_HELPER_MANIFEST_SHA256"
-          common=(
-            --repo .
-            --dist-dir dist
-            --tag "$RELEASE_TAG"
-            --tag-object "$PINNED_TAG_OBJECT_SHA"
-            --commit "$PINNED_TARGET_COMMIT_SHA"
-            --tree "$PINNED_TREE_SHA"
-            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+          uv run python scripts/release_candidate.py --phase download --repo . \
+            --run-id "$CANDIDATE_RUN_ID" --attempt "$CANDIDATE_ATTEMPT" \
+            --artifact-id "$CANDIDATE_ARTIFACT_ID" --dist-dir dist \
+            --output "$RUNNER_TEMP/candidate.json"
+
+      - name: Read back exact staged helper and existing proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run python scripts/release_recovery.py --phase fetch --repo . \
+            --dist-dir dist --candidate-record "$RUNNER_TEMP/candidate.json" \
+            --candidate-artifact "$CANDIDATE_ARTIFACT_ID" \
+            --release-id "$DRAFT_RELEASE_ID" \
+            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
             --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
-          )
-          gh api "$release_api" > "$RUNNER_TEMP/helper-inputs.json"
-          uv run python scripts/release_tools.py verify-helper-draft "${common[@]}" \
-            --release-json "$RUNNER_TEMP/helper-inputs.json" \
-            --notes-file ".github/release/notes-${RELEASE_TAG}.md"
+
+      - name: Verify native helper distribution and isolated installation
+        run: |
+          version="${RELEASE_TAG#receiver-v}"
           uv run python scripts/verify_helper_distribution.py \
-            --archive "$archive" \
-            --manifest "$manifest"
+            --archive "dist/HealthBridgeMailboxAckPublisher-${version}.zip" \
+            --manifest "dist/HealthBridgeMailboxAckPublisher-${version}.manifest.json"
 
   publish:
-    name: Verify helper and publish existing draft
+    name: Reconcile and publish immutable release
     needs: verify_helper_on_macos
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: github-release
     permissions:
-      contents: write # zizmor: ignore[undocumented-permissions]
-      id-token: write # zizmor: ignore[undocumented-permissions]
-      attestations: write # zizmor: ignore[undocumented-permissions]
-    env:
-      DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
-      RELEASE_TAG: ${{ inputs.tag }}
-      EXPECTED_HELPER_SHA256: ${{ inputs.helper_sha256 }}
-      EXPECTED_HELPER_MANIFEST_SHA256: ${{ inputs.helper_manifest_sha256 }}
+      contents: write
+      actions: read
+      pull-requests: read
+      id-token: write
+      attestations: write
     steps:
-      - name: Bind existing unpublished draft and immutable source
-        id: bind
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Reject wrong tag execution
         run: |
           set -euo pipefail
-          [[ "$DRAFT_RELEASE_ID" =~ ^[0-9]+$ ]]
-          [[ "$RELEASE_TAG" =~ ^receiver-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$DRAFT_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_TAG" =~ ^receiver-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
-          [[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$EXPECTED_HELPER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          gh api "$release_api" > "$RUNNER_TEMP/release-binding.json"
-          bound_draft="$(jq -r \
-            --arg tag "$RELEASE_TAG" \
-            '.id == ($ENV.DRAFT_RELEASE_ID | tonumber) and .tag_name == $tag and .draft == true and .published_at == null' \
-            "$RUNNER_TEMP/release-binding.json")"
-          test "$bound_draft" = "true"
-          matching_release_ids="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
-          test "$matching_release_ids" = "$DRAFT_RELEASE_ID"
-          tag_object_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-            --jq '.object.sha')"
-          [[ "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
-          signed_tag_name="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.tag')"
-          test "$signed_tag_name" = "$RELEASE_TAG"
-          tag_verified="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.verification.verified == true and .verification.reason == "valid"')"
-          test "$tag_verified" = "true"
-          expected_tagger_email="23256775+roian6"@"users.noreply.github.com"
-          tagger_name="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.tagger.name')"
-          tagger_email="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.tagger.email')"
-          test "$tagger_name" = "Chanhyo Jung"
-          test "$tagger_email" = "$expected_tagger_email"
-          target_commit_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.object.sha')"
-          target_type="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
-            --jq '.object.type')"
-          test "$target_type" = "commit"
-          [[ "$target_commit_sha" =~ ^[0-9a-f]{40}$ ]]
-          test "$GITHUB_SHA" = "$target_commit_sha"
-          test "$GITHUB_WORKFLOW_SHA" = "$target_commit_sha"
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
           test "$GITHUB_WORKFLOW_REF" = "${GITHUB_REPOSITORY}/.github/workflows/publish-release.yml@refs/tags/${RELEASE_TAG}"
-          commit_verified="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/commits/${target_commit_sha}" \
-            --jq '.commit.verification.verified == true and .commit.verification.reason == "valid"')"
-          test "$commit_verified" = "true"
-          commit_identity="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/commits/${target_commit_sha}" \
-            --jq '.author.login == "roian6" and .committer.login == "web-flow" and .commit.author.name == "Chanhyo Jung" and .commit.committer.name == "GitHub" and .commit.committer.email == ("noreply" + "@" + "github.com")')"
-          test "$commit_identity" = "true"
-          tree_sha="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/commits/${target_commit_sha}" \
-            --jq '.tree.sha')"
-          [[ "$tree_sha" =~ ^[0-9a-f]{40}$ ]]
-          {
-            echo "tag_object_sha=$tag_object_sha"
-            echo "target_commit_sha=$target_commit_sha"
-            echo "tree_sha=$tree_sha"
-          } >> "$GITHUB_OUTPUT"
 
-      - name: Check out exact bound commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out original public tag source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ steps.bind.outputs.target_commit_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           version: "0.11.14"
           enable-cache: false
 
-      - name: Download exact remote helper-pending asset set
-        id: packet
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
-          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
-          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$PINNED_TARGET_COMMIT_SHA"
-          python3 scripts/release_source_policy.py \
-            --repo . --tag "$RELEASE_TAG" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
-          uv sync --all-extras --dev --locked
-          uv run python scripts/release_tools.py verify-execution \
-            --repo . --tag "$RELEASE_TAG" --commit "$PINNED_TARGET_COMMIT_SHA" \
-            --tree "$PINNED_TREE_SHA" --workflow publish-release.yml
-          version="$(uv run python scripts/release_tools.py tag-info \
-            --tag "$RELEASE_TAG" | jq -r '.version')"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          asset_names="$(gh api "$release_api" --jq '[.assets[].name] | sort | join(",")')"
-          expected_assets="HealthBridgeMailboxAckPublisher-${version}.manifest.json,HealthBridgeMailboxAckPublisher-${version}.zip,apple_health_ai_bridge-${version}-py3-none-any.whl,apple_health_ai_bridge-${version}.tar.gz,receiver-build-provenance.intoto.jsonl,release-metadata.json"
-          test "$asset_names" = "$expected_assets"
-          mkdir dist
-          IFS=',' read -r -a expected_names <<< "$expected_assets"
-          for asset_name in "${expected_names[@]}"; do
-            asset_id="$(gh api "$release_api" \
-              --jq ".assets[] | select(.name == \"${asset_name}\") | .id")"
-            [[ "$asset_id" =~ ^[0-9]+$ ]]
-            gh api \
-              "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-              -H "Accept: application/octet-stream" > "dist/${asset_name}"
-          done
-          actual_helper_sha256="$(sha256sum \
-            "dist/HealthBridgeMailboxAckPublisher-${version}.zip" | cut -d ' ' -f 1)"
-          test "$actual_helper_sha256" = "$EXPECTED_HELPER_SHA256"
-          actual_manifest_sha256="$(sha256sum \
-            "dist/HealthBridgeMailboxAckPublisher-${version}.manifest.json" | cut -d ' ' -f 1)"
-          test "$actual_manifest_sha256" = "$EXPECTED_HELPER_MANIFEST_SHA256"
+      - name: Install locked tooling
+        run: uv sync --all-extras --dev --locked
 
-      - name: Verify helper source binding and create final checksums
+      - name: Download and verify original candidate execution
         env:
           GH_TOKEN: ${{ github.token }}
-          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
-          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
-          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
         run: |
-          set -euo pipefail
-          common=(
-            --repo .
-            --dist-dir dist
-            --tag "$RELEASE_TAG"
-            --tag-object "$PINNED_TAG_OBJECT_SHA"
-            --commit "$PINNED_TARGET_COMMIT_SHA"
-            --tree "$PINNED_TREE_SHA"
-            --helper-sha256 "$EXPECTED_HELPER_SHA256"
+          uv run python scripts/release_candidate.py --phase download --repo . \
+            --run-id "$CANDIDATE_RUN_ID" --attempt "$CANDIDATE_ATTEMPT" \
+            --artifact-id "$CANDIDATE_ARTIFACT_ID" --dist-dir dist \
+            --output "$RUNNER_TEMP/candidate.json"
+
+      - name: Read back exact staged helper and existing proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run python scripts/release_recovery.py --phase fetch --repo . \
+            --dist-dir dist --candidate-record "$RUNNER_TEMP/candidate.json" \
+            --candidate-artifact "$CANDIDATE_ARTIFACT_ID" \
+            --release-id "$DRAFT_RELEASE_ID" \
+            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
             --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
-          )
-          gh api "/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}" \
-            > "$RUNNER_TEMP/helper-inputs.json"
-          uv run python scripts/release_tools.py verify-helper-draft "${common[@]}" \
-            --release-json "$RUNNER_TEMP/helper-inputs.json" \
-            --notes-file ".github/release/notes-${RELEASE_TAG}.md"
-          uv run python scripts/release_tools.py final-checksums \
-            "${common[@]}" --output dist/SHA256SUMS
-          (cd dist && sha256sum --check --strict SHA256SUMS)
 
-      - name: Attest owner-produced helper and final checksums
+      - name: Reconcile partial or published state before signing
+        id: final
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          uv run python scripts/release_recovery.py --phase prepare-final --repo . \
+            --dist-dir dist --candidate-record "$RUNNER_TEMP/candidate.json" \
+            --candidate-artifact "$CANDIDATE_ARTIFACT_ID" \
+            --release-id "$DRAFT_RELEASE_ID" \
+            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
+            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
+          echo "version=${RELEASE_TAG#receiver-v}" >> "$GITHUB_OUTPUT"
+          if test -f dist/receiver-final-provenance.intoto.jsonl; then
+            echo "attest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "attest=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attest final subjects only when no valid proof exists
+        if: steps.final.outputs.attest == 'true'
         id: final_attestation
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: |
-            dist/HealthBridgeMailboxAckPublisher-${{ steps.packet.outputs.version }}.zip
-            dist/HealthBridgeMailboxAckPublisher-${{ steps.packet.outputs.version }}.manifest.json
+            dist/HealthBridgeMailboxAckPublisher-${{ steps.final.outputs.version }}.zip
+            dist/HealthBridgeMailboxAckPublisher-${{ steps.final.outputs.version }}.manifest.json
             dist/SHA256SUMS
 
-      - name: Export original final attestation and upload without replacement
+      - name: Preserve new original final proof
+        if: steps.final.outputs.attest == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           ATTESTATION_BUNDLE: ${{ steps.final_attestation.outputs.bundle-path }}
-          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
-          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
-          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
         run: |
-          set -euo pipefail
-          jq -ce 'select(type == "object")' "$ATTESTATION_BUNDLE" \
-            > dist/receiver-final-provenance.intoto.jsonl
-          uv run python scripts/release_tools.py verify-final \
-            --repo . --dist-dir dist --tag "$RELEASE_TAG" \
-            --tag-object "$PINNED_TAG_OBJECT_SHA" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" --tree "$PINNED_TREE_SHA" \
-            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
-            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
-          gh release upload "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            dist/SHA256SUMS dist/receiver-final-provenance.intoto.jsonl
-          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          gh api "$release_api" > "$RUNNER_TEMP/release-final-draft.json"
-          uv run python scripts/release_tools.py verify-final-draft \
-            --repo . \
-            --dist-dir dist \
-            --release-json "$RUNNER_TEMP/release-final-draft.json" \
-            --notes-file ".github/release/notes-${RELEASE_TAG}.md" \
-            --tag "$RELEASE_TAG" \
-            --tag-object "$PINNED_TAG_OBJECT_SHA" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" \
-            --tree "$PINNED_TREE_SHA" \
-            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
-            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
+          test ! -e dist/receiver-final-provenance.intoto.jsonl
+          jq -ce 'select(type == "object")' "$ATTESTATION_BUNDLE" > dist/receiver-final-provenance.intoto.jsonl
 
-      - name: Reverify exact draft and publish once
+      - name: Upload missing bytes and publish or verify existing publication
         env:
           GH_TOKEN: ${{ github.token }}
-          PINNED_TAG_OBJECT_SHA: ${{ steps.bind.outputs.tag_object_sha }}
-          PINNED_TARGET_COMMIT_SHA: ${{ steps.bind.outputs.target_commit_sha }}
-          PINNED_TREE_SHA: ${{ steps.bind.outputs.tree_sha }}
         run: |
-          set -euo pipefail
-          release_api="/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_RELEASE_ID}"
-          current_tag_object="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-            --jq '.object.sha')"
-          test "$current_tag_object" = "$PINNED_TAG_OBJECT_SHA"
-          current_target="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/git/tags/${current_tag_object}" \
-            --jq '.object.sha')"
-          test "$current_target" = "$PINNED_TARGET_COMMIT_SHA"
-          matching_release_ids="$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .id] | join(\",\")")"
-          test "$matching_release_ids" = "$DRAFT_RELEASE_ID"
-          gh api "$release_api" > "$RUNNER_TEMP/release-before-publish.json"
-          remote_dir="$(mktemp -d "$RUNNER_TEMP/final-draft-proof.XXXXXX")"
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" --dir "$remote_dir"
-          diff --recursive dist "$remote_dir"
-          uv run python scripts/release_tools.py verify-final-draft \
-            --repo . \
-            --dist-dir "$remote_dir" \
-            --release-json "$RUNNER_TEMP/release-before-publish.json" \
-            --notes-file ".github/release/notes-${RELEASE_TAG}.md" \
-            --tag "$RELEASE_TAG" \
-            --tag-object "$PINNED_TAG_OBJECT_SHA" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" \
-            --tree "$PINNED_TREE_SHA" \
-            --helper-sha256 "$EXPECTED_HELPER_SHA256" \
-            --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"
-          python3 scripts/release_source_policy.py \
-            --repo . --tag "$RELEASE_TAG" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" --tag-object "$PINNED_TAG_OBJECT_SHA"
-          gh release edit "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft=false
-          gh api "$release_api" > "$RUNNER_TEMP/release-after-publish.json"
-          published_dir="$(mktemp -d "$RUNNER_TEMP/published-proof.XXXXXX")"
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" --dir "$published_dir"
-          diff --recursive dist "$published_dir"
-          uv run python scripts/release_tools.py verify-final-published \
-            --repo . \
-            --dist-dir "$published_dir" \
-            --release-json "$RUNNER_TEMP/release-after-publish.json" \
-            --notes-file ".github/release/notes-${RELEASE_TAG}.md" \
-            --tag "$RELEASE_TAG" \
-            --tag-object "$PINNED_TAG_OBJECT_SHA" \
-            --commit "$PINNED_TARGET_COMMIT_SHA" \
-            --tree "$PINNED_TREE_SHA" \
+          uv run python scripts/release_recovery.py --phase publish --repo . \
+            --dist-dir dist --candidate-record "$RUNNER_TEMP/candidate.json" \
+            --candidate-artifact "$CANDIDATE_ARTIFACT_ID" \
+            --release-id "$DRAFT_RELEASE_ID" \
             --helper-sha256 "$EXPECTED_HELPER_SHA256" \
             --helper-manifest-sha256 "$EXPECTED_HELPER_MANIFEST_SHA256"

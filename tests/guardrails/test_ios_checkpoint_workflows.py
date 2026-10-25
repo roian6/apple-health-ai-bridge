@@ -27,8 +27,8 @@ def test_ios_checkpoint_tags_run_pinned_transition_and_source_gates() -> None:
         '.verification.verified == true and .verification.reason == "valid"',
         'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"',
         'test "$tagger_email" = "$expected_tagger_email"',
-        'test "$target_sha" = "$default_main_sha"',
-        'baseline_sha="$(git rev-parse "${target_sha}^1")"',
+        "scripts/release_source_policy.py",
+        '--source-receipt "$RUNNER_TEMP/ios-source.json"',
         "uv run python scripts/release_tools.py validate",
         '--tag "$GITHUB_REF_NAME"',
         '--tag-target-commit "$target_sha"',
@@ -49,12 +49,12 @@ def test_ios_checkpoint_tags_run_pinned_transition_and_source_gates() -> None:
 def test_ios_checkpoint_tags_do_not_enter_receiver_release_publication() -> None:
     receiver = RECEIVER_RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
-    assert 'tags: ["receiver-v*"]' in receiver
+    assert "workflow_dispatch:" in receiver
+    assert "source_commit:" in receiver
+    assert "contents: write" not in receiver
     assert '"ios-v*"' not in receiver
-    assert (
-        'expected_tagger_email="23256775+roian6"@"users.noreply.github.com"' in receiver
-    )
-    assert 'test "$tagger_email" = "$expected_tagger_email"' in receiver
+    assert "scripts/release_candidate.py" in receiver
+    assert "SIGNED_TAG_OBJECT: ${{ inputs.signed_tag_object }}" in receiver
     assert 'endswith("@users.noreply.github.com")' not in receiver
 
 

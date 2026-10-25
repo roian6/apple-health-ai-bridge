@@ -22,18 +22,20 @@ project developer does not have access to either endpoint or the transmitted
 HealthKit records. App Store Connect may remain “Data Not Collected” only while
 that developer-no-access boundary remains true.
 
+## Release availability
+
+This versioned guide targets Receiver/CLI and helper `1.1.5`. Before downloading or installing them, confirm that [receiver-v1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5) is published and all eight matching release assets are present and verified. Until that check succeeds, use the [published 1.1.3 setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md). Do not substitute `main`, the retired unpublished `receiver-v1.1.4` tag, or an older helper.
+
 ## Install and verify the signed helper
 
-Download assets and run the commands below only after the immutable `receiver-v1.1.4` release and **all** of its assets have been published and verified. Until then, keep your existing installation or wait. Do not substitute `main` or an older helper; the receiver and helper must both be version `1.1.4`.
-
-Use the Receiver/CLI `1.1.4` GitHub Release assets. Download these files with a
+After the availability check succeeds, use the Receiver/CLI `1.1.5` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.4-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.4.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.4.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.4.manifest.json`;
+- `apple_health_ai_bridge-1.1.5-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.1.5.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.1.5.zip`;
+- `HealthBridgeMailboxAckPublisher-1.1.5.manifest.json`;
 - `release-metadata.json`;
 - `receiver-build-provenance.intoto.jsonl`;
 - `SHA256SUMS`;
@@ -67,7 +69,7 @@ Helper status uses fixed, path-free codes:
 | `helper_drift` | Owned metadata, app bytes, identity, permissions, or signature changed. |
 | `unsupported_host` | Installed-helper inspection is unavailable on this host. |
 
-## Downloadable proof for future releases
+## Verify published release provenance
 
 Receiver/CLI `1.1.3` and later require two additional assets:
 `receiver-build-provenance.intoto.jsonl` and
@@ -76,11 +78,26 @@ immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
+This release uses metadata schema `health_bridge.release.v4`. Its core proof
+comes from `release.yml@refs/heads/release`; its final proof comes from
+`publish-release.yml@refs/tags/receiver-v1.1.5`. Both must bind the same exact
+source commit as the independently verified signed tag, never a newer branch
+HEAD. The publisher's candidate source receipt binds `source_commit`,
+`source_tree`, `source_tag`, and `tag_object` to that identity; the candidate
+artifact verification also pins its original run and attempt. See the
+[release operations](release-operations.md) for those publisher checks.
+
+Before running the commands below, confirm that `release-metadata.json` declares
+schema v4 and that its `git` tag, tag object, commit, and tree match the verified
+signed tag and helper manifest. Stop on any mismatch. These commands verify the
+published artifact proofs; they do not replace source eligibility, native helper
+qualification, or the publisher's candidate receipt checks.
+
 Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to `receiver-v1.1.4` and
+metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -101,7 +118,7 @@ metadata. From the asset directory, set `tag` to `receiver-v1.1.4` and
     gh attestation verify "$1" --repo "$repository" \
       --bundle "$2" \
       --signer-workflow "$repository/.github/workflows/$3" \
-      --source-ref "refs/tags/$tag" --source-digest "$commit" \
+      --source-ref "$4" --source-digest "$commit" \
       --signer-digest "$commit" --deny-self-hosted-runners \
       --predicate-type https://slsa.dev/provenance/v1
   }
@@ -109,13 +126,15 @@ metadata. From the asset directory, set `tag` to `receiver-v1.1.4` and
     "apple_health_ai_bridge-${version}-py3-none-any.whl" \
     "apple_health_ai_bridge-${version}.tar.gz" \
     release-metadata.json; do
-    verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml
+    verify_subject "$subject" receiver-build-provenance.intoto.jsonl release.yml \
+      refs/heads/release
   done
   for subject in \
     "HealthBridgeMailboxAckPublisher-${version}.zip" \
     "HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
     SHA256SUMS; do
-    verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml
+    verify_subject "$subject" receiver-final-provenance.intoto.jsonl publish-release.yml \
+      "refs/tags/$tag"
   done
   shasum -a 256 -c SHA256SUMS
 )
@@ -138,14 +157,14 @@ After every proof and checksum check succeeds, install the wheel, structurally
 validate the helper, and explicitly install it:
 
 ```bash
-uv tool install ./apple_health_ai_bridge-1.1.4-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.1.5-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.4.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.4.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.4.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.4.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```

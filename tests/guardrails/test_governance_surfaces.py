@@ -41,7 +41,7 @@ def test_security_support_and_ownership_routes_are_current() -> None:
     codeowners = Path(".github/CODEOWNERS").read_text(encoding="utf-8")
 
     assert "developer-preview" not in security
-    assert "stable source release is `receiver-v1.1.2`" in security
+    assert "stable source release is `receiver-v1.1.3`" in security
     assert "public TestFlight" in security
     assert "security/advisories/new" in security
     assert "healthbridge@chanhyo.dev" in security
@@ -87,8 +87,9 @@ def test_contribution_and_maintainer_workflow_is_versioned() -> None:
         assert marker in pull_request
 
     for marker in (
-        "Solo-maintainer phase",
-        "required approval count is `0`",
+        "one approving review and approval of the latest push",
+        "dismisses stale reviews",
+        "review threads to be resolved",
         "second trusted maintainer",
         "Python quality and package checks",
         "Swift tests and unsigned app builds",
@@ -98,6 +99,13 @@ def test_contribution_and_maintainer_workflow_is_versioned() -> None:
         "ios-v<marketing-version>-build.<build>",
         "exact compatible Batch Protocol",
         "Do not routinely disable the main ruleset",
+    ):
+        assert marker in maintainer
+    for marker in (
+        "one protected `release` branch",
+        "same reviews, latest-push approval, resolved conversations",
+        "deletion/force-push protection, without bypass actors",
+        "immutable historical Receiver/CLI releases",
     ):
         assert marker in maintainer
     assert "`v1.1.0` for the next" not in maintainer

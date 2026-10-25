@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Literal, assert_never
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 from typing_extensions import TypedDict
 
+from health_bridge import __version__
 from tests.guardrails.release_version_fixtures import (
     ReleaseTree,
     commit_release_tree,
@@ -34,15 +35,17 @@ def run_documented_proof(
     failed_gh: int = 0,
     failed_checksum: bool = False,
     missing: Literal["tag", "commit"] | None = None,
+    empty: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Exercise the actual docs in Bash; stubs test control flow, not signatures."""
     document = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
-    section = document.split("## Downloadable proof for future releases\n", 1)[1]
+    section = document.split("## Verify published release provenance\n", 1)[1]
     snippet = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
     controls = tmp_path / "shell-controls"
     controls.mkdir()
     calls = tmp_path / "shell-calls.txt"
     stub = f"""#!{sys.executable}
+import json
 import os
 import pathlib
 import sys
@@ -52,6 +55,8 @@ calls = pathlib.Path(os.environ['DOC_PROOF_CALLS'])
 previous = calls.read_text().splitlines() if calls.exists() else []
 with calls.open('a') as stream:
     stream.write(command + '\\n')
+with calls.with_suffix('.jsonl').open('a') as stream:
+    stream.write(json.dumps([command, *sys.argv[1:]]) + '\\n')
 if command == 'gh' and previous.count('gh') + 1 == int(os.environ['DOC_PROOF_FAIL_GH']):
     sys.exit(17)
 if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
@@ -68,13 +73,16 @@ if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
         DOC_PROOF_FAIL_GH=str(failed_gh),
         DOC_PROOF_FAIL_CHECKSUM="1" if failed_checksum else "0",
     )
+    input_control = ":"
+    if missing is not None:
+        input_control = f"{missing}=''" if empty else f"unset {missing}"
     script = "\n".join(
         [
             "set +e +u",
             "set +o pipefail",
-            f"tag={TAG}",
+            f"tag=receiver-v{__version__}",
             "commit=" + "1" * 40,
-            f"unset {missing}" if missing else ":",
+            input_control,
             'verification_flags_before="$-"',
             'verification_options_before="$(set +o)"',
             snippet,
@@ -136,6 +144,48 @@ def test_documented_proof_reports_success(tmp_path: Path) -> None:
     assert "Release proof verified." in completed.stdout
     assert "Release proof FAILED." not in completed.stdout + completed.stderr
     assert calls == ["gh"] * 6 + ["shasum"]
+    arguments = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "shell-calls.jsonl").read_text().splitlines()
+    ]
+    core = [
+        f"apple_health_ai_bridge-{__version__}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{__version__}.tar.gz",
+        "release-metadata.json",
+    ]
+    final = [
+        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
+        "SHA256SUMS",
+    ]
+    for actual, subject in zip(arguments[:6], core + final, strict=True):
+        is_core = subject in core
+        workflow = "release.yml" if is_core else "publish-release.yml"
+        source_ref = (
+            "refs/heads/release" if is_core else f"refs/tags/receiver-v{__version__}"
+        )
+        assert actual == [
+            "gh",
+            "attestation",
+            "verify",
+            subject,
+            "--repo",
+            REPOSITORY,
+            "--bundle",
+            BUILD if is_core else FINAL,
+            "--signer-workflow",
+            f"{REPOSITORY}/.github/workflows/{workflow}",
+            "--source-ref",
+            source_ref,
+            "--source-digest",
+            "1" * 40,
+            "--signer-digest",
+            "1" * 40,
+            "--deny-self-hosted-runners",
+            "--predicate-type",
+            "https://slsa.dev/provenance/v1",
+        ]
+    assert arguments[6] == ["shasum", "-a", "256", "-c", "SHA256SUMS"]
 
 
 @pytest.mark.parametrize("failed_gh", [1, 3, 4, 6])
@@ -159,11 +209,12 @@ def test_documented_proof_reports_checksum_failure(tmp_path: Path) -> None:
     assert calls == ["gh"] * 6 + ["shasum"]
 
 
+@pytest.mark.parametrize("empty", [False, True], ids=["unset", "empty"])
 @pytest.mark.parametrize("missing", ["tag", "commit"])
 def test_documented_proof_reports_missing_input(
-    tmp_path: Path, missing: Literal["tag", "commit"]
+    tmp_path: Path, missing: Literal["tag", "commit"], empty: bool
 ) -> None:
-    completed, calls = run_documented_proof(tmp_path, missing=missing)
+    completed, calls = run_documented_proof(tmp_path, missing=missing, empty=empty)
     assert completed.returncode == 0, completed.stderr
     assert "VERIFICATION_PARENT 1 yes" in completed.stdout
     assert "Release proof FAILED." in completed.stderr
@@ -242,6 +293,14 @@ if args[0] == 'api':
     elif '/git/tags/' in endpoint: print('1' * 40)
     elif '/branches/' in endpoint: print('1' * 40)
     elif endpoint.endswith('?per_page=100'): print('17')
+    elif '/releases/assets/' in endpoint:
+        record_path = pathlib.Path(os.environ['PROVENANCE_RELEASE_JSON'])
+        release = json.loads(record_path.read_text())
+        asset = next(item for item in release['assets']
+                     if item['id'] == int(endpoint.rsplit('/', 1)[1]))
+        root_dist = pathlib.Path(os.environ['PROVENANCE_DIST'])
+        sys.stdout.buffer.write((root_dist / asset['name']).read_bytes())
+        sys.exit(0)
     elif endpoint.endswith('/releases/17'):
         print(pathlib.Path(os.environ['PROVENANCE_RELEASE_JSON']).read_text())
     else: print('main')
@@ -305,15 +364,22 @@ def helper_packet(
     return args
 
 
-def remote_release(dist: Path, repo: Path, output: Path) -> None:
+def remote_release(
+    dist: Path,
+    repo: Path,
+    output: Path,
+    *,
+    tag: str = TAG,
+    title: str | None = None,
+) -> None:
     _ = output.write_text(
         json.dumps(
             {
-                "tag_name": TAG,
-                "name": TAG,
+                "tag_name": tag,
+                "name": title if title is not None else tag,
                 "draft": True,
                 "prerelease": False,
-                "body": (repo / f".github/release/notes-{TAG}.md").read_text(),
+                "body": (repo / f".github/release/notes-{tag}.md").read_text(),
                 "assets": [
                     {
                         "name": path.name,
@@ -327,6 +393,105 @@ def remote_release(dist: Path, repo: Path, output: Path) -> None:
             }
         )
     )
+
+
+@pytest.mark.parametrize(
+    "title_case",
+    [
+        ("1.1.3", "receiver-v1.1.3", "Receiver/CLI 1.1.3"),
+        ("1.1.4", "Receiver/CLI 1.1.4", "receiver-v1.1.4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        (command, mutation)
+        for command in (
+            "verify-core-draft",
+            "verify-helper-draft",
+            "verify-final-draft",
+            "verify-final-published",
+        )
+        for mutation in ("none", "other-title", "arbitrary-title", "body")
+    ],
+)
+def test_release_stages_require_exact_title_and_source_body(
+    tmp_path: Path,
+    receiver_release_repo: Path,
+    native_transport_mock: Path,
+    title_case: tuple[str, str, str],
+    scenario: tuple[str, Literal["none", "other-title", "arbitrary-title", "body"]],
+) -> None:
+    version, title, other_title = title_case
+    command, mutation = scenario
+    tag = f"receiver-v{version}"
+    write_release_tree(
+        receiver_release_repo,
+        ReleaseTree(version, tag, "receiver", "1.1.0", "39", "1.0.0"),
+    )
+    _ = commit_release_tree(receiver_release_repo, "synthetic release title boundary")
+    args = build_helper_packet(tmp_path, receiver_release_repo, version)
+    dist = tmp_path / "dist"
+    mock_bundle(
+        dist,
+        native_transport_mock,
+        BUILD,
+        {
+            f"apple_health_ai_bridge-{version}-py3-none-any.whl",
+            f"apple_health_ai_bridge-{version}.tar.gz",
+            "release-metadata.json",
+        },
+    )
+    if command == "verify-core-draft":
+        for path in dist.glob("HealthBridgeMailboxAckPublisher-*"):
+            path.unlink()
+        args = args[: args.index("--helper-sha256")]
+    elif command in {"verify-final-draft", "verify-final-published"}:
+        checksum = run_tool(
+            "final-checksums", *args, "--output", str(dist / "SHA256SUMS")
+        )
+        assert checksum.returncode == 0, checksum.stderr
+        mock_bundle(
+            dist,
+            native_transport_mock,
+            FINAL,
+            {
+                f"HealthBridgeMailboxAckPublisher-{version}.zip",
+                f"HealthBridgeMailboxAckPublisher-{version}.manifest.json",
+                "SHA256SUMS",
+            },
+        )
+    remote = tmp_path / "release.json"
+    remote_release(dist, receiver_release_repo, remote, tag=tag, title=title)
+    payload = TypeAdapter(ReleaseRecord).validate_json(remote.read_text())
+    payload["draft"] = command != "verify-final-published"
+    match mutation:
+        case "none":
+            pass
+        case "other-title":
+            payload["name"] = other_title
+        case "arbitrary-title":
+            payload["name"] = "Untrusted release title"
+        case "body":
+            payload["body"] += "\n"
+        case _:
+            assert_never(mutation)
+    _ = remote.write_text(json.dumps(payload))
+
+    result = run_tool(
+        command,
+        *args,
+        "--release-json",
+        str(remote),
+        "--notes-file",
+        str(receiver_release_repo / f".github/release/notes-{tag}.md"),
+    )
+
+    assert (result.returncode == 0) is (mutation == "none"), result.stderr
+    if mutation == "body":
+        assert "release body does not match exact notes" in result.stderr
+    elif mutation != "none":
+        assert "release metadata is not exact" in result.stderr
 
 
 def test_helper_stage_verifies_three_native_subjects(
@@ -518,6 +683,59 @@ def final_packet(
     return helper_packet
 
 
+def publication_runner(tmp_path: Path) -> Path:
+    runner = tmp_path / "synthetic-publication.py"
+    _ = runner.write_text(f"""import sys
+from pathlib import Path
+import os
+from pydantic import TypeAdapter
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+import release_publication as publication
+import release_publication_inputs as qualification
+from release_authority import Baseline, SourceReceipt
+from release_reconciliation import RemoteRelease
+from release_candidate_model import CandidateIdentity, CandidateRecord, artifact_record
+repo, dist = Path(sys.argv[1]), Path(sys.argv[2])
+identity = CandidateIdentity(
+    tag={TAG!r}, tag_object="3"*40, commit="1"*40, tree="2"*40, helper_tree="4"*40,
+)
+baseline = Baseline(
+    tag="receiver-v1.1.2", tag_object="5"*40, commit="6"*40, release_id=2,
+)
+source = SourceReceipt(
+    default_main_commit="7"*40, baseline_commit=baseline.commit,
+    source_commit=identity.commit, source_tree=identity.tree,
+    source_tag=identity.tag, tag_object=identity.tag_object,
+    baseline=baseline, pull_request=1, reviewed_head="8"*40, check_runs=dict(check=1),
+)
+artifacts = [
+    artifact_record(path) for path in dist.iterdir()
+    if path.name.endswith((".whl", ".tar.gz"))
+    or path.name in ("release-metadata.json", {BUILD!r})
+]
+record = CandidateRecord(
+    identity=identity, source=source, run_id=1, run_attempt=1, artifacts=artifacts,
+)
+record_path = dist.parent / "candidate.json"
+record_path.write_text(record.model_dump_json())
+qualification.verify_candidate = lambda *args, **kwargs: None
+qualification.verify_candidate_artifact_receipt = lambda *args: None
+qualification.verify_execution = lambda *args: None
+snapshot = os.environ.get("SYNTHETIC_PUBLICATION_SNAPSHOT")
+releases = (
+    [RemoteRelease.model_validate_json(Path(snapshot).read_bytes())]
+    if snapshot else []
+)
+publication.snapshot = lambda *args: releases
+request = publication.PublicationRequest(
+    repo, dist, record_path, 1, sys.argv[3], sys.argv[4],
+    sys.argv[5] if len(sys.argv) > 5 else "publish",
+)
+print(publication.continue_publication(request).model_dump_json())
+""")
+    return runner
+
+
 @pytest.mark.parametrize("bundle", [BUILD, FINAL])
 def test_native_failure_rejects_final_packet(
     final_packet: tuple[str, ...], monkeypatch: pytest.MonkeyPatch, bundle: str
@@ -611,45 +829,21 @@ def test_workflow_proof_failure_prevents_publish(
     monkeypatch: pytest.MonkeyPatch,
     bundle: str,
 ) -> None:
-    remote = tmp_path / "release.json"
-    (future_repo / "dist").symlink_to(tmp_path / "dist", target_is_directory=True)
-    remote_release(tmp_path / "dist", future_repo, remote)
-    uv = tmp_path / "uv"
-    _ = uv.write_text(
-        f"""#!{sys.executable}
-import subprocess, sys
-sys.exit(subprocess.call([sys.executable, {str(TOOL)!r}, *sys.argv[4:]]))
-"""
-    )
-    uv.chmod(0o700)
-    values = {
-        "PROVENANCE_REJECT": bundle,
-        "PROVENANCE_RELEASE_JSON": str(remote),
-        "PROVENANCE_DIST": str(tmp_path / "dist"),
-        "RUNNER_TEMP": str(tmp_path),
-        "GITHUB_REPOSITORY": REPOSITORY,
-        "DRAFT_RELEASE_ID": "17",
-        "RELEASE_TAG": TAG,
-        "PINNED_TAG_OBJECT_SHA": "3" * 40,
-        "PINNED_TARGET_COMMIT_SHA": "1" * 40,
-        "PINNED_TREE_SHA": "2" * 40,
-        "EXPECTED_HELPER_SHA256": final_packet[
-            final_packet.index("--helper-sha256") + 1
-        ],
-        "EXPECTED_HELPER_MANIFEST_SHA256": final_packet[-1],
-    }
-    for key, value in values.items():
-        monkeypatch.setenv(key, value)
-    (tmp_path / "calls.jsonl").unlink()
-
+    monkeypatch.setenv("PROVENANCE_REJECT", bundle)
+    runner = publication_runner(tmp_path)
     result = subprocess.run(
-        ["bash", "-c", workflow_run("Reverify exact draft and publish once")],
-        cwd=future_repo,
+        [
+            sys.executable,
+            str(runner),
+            str(future_repo),
+            str(tmp_path / "dist"),
+            final_packet[final_packet.index("--helper-sha256") + 1],
+            final_packet[final_packet.index("--helper-manifest-sha256") + 1],
+        ],
         capture_output=True,
         text=True,
         check=False,
     )
-
     assert result.returncode != 0
     assert "native provenance verification failed" in result.stderr
     calls = [
@@ -657,6 +851,71 @@ sys.exit(subprocess.call([sys.executable, {str(TOOL)!r}, *sys.argv[4:]]))
         for line in (tmp_path / "calls.jsonl").read_text().splitlines()
     ]
     assert all(call[:2] != ["release", "edit"] for call in calls)
+    assert all(call[:2] != ["release", "upload"] for call in calls)
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_valid_existing_final_proof_is_reused_without_signing_or_mutation(
+    tmp_path: Path,
+    future_repo: Path,
+    final_packet: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    published: bool,
+) -> None:
+    dist = tmp_path / "dist"
+    remote_dist = tmp_path / "remote-bytes"
+    remote_dist.mkdir()
+    for path in dist.iterdir():
+        _ = (remote_dist / path.name).write_bytes(path.read_bytes())
+    original_proof = (dist / FINAL).read_bytes()
+    remote = tmp_path / "release.json"
+    remote_release(dist, future_repo, remote)
+    payload = TypeAdapter(dict[str, JsonValue]).validate_json(remote.read_bytes())
+    payload.update(
+        {
+            "id": 17,
+            "target_commitish": "1" * 40,
+            "draft": not published,
+            "published_at": "2026-01-01T00:00:00Z" if published else None,
+        }
+    )
+    assets = payload["assets"]
+    assert isinstance(assets, list)
+    for identity, asset in enumerate(assets, 1):
+        assert isinstance(asset, dict)
+        asset["id"] = identity
+    _ = remote.write_text(json.dumps(payload))
+    (dist / FINAL).unlink()
+    monkeypatch.setenv("SYNTHETIC_PUBLICATION_SNAPSHOT", str(remote))
+    monkeypatch.setenv("PROVENANCE_RELEASE_JSON", str(remote))
+    monkeypatch.setenv("PROVENANCE_DIST", str(remote_dist))
+    _ = (tmp_path / "calls.jsonl").write_text("")
+    runner = publication_runner(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            str(future_repo),
+            str(dist),
+            final_packet[final_packet.index("--helper-sha256") + 1],
+            final_packet[final_packet.index("--helper-manifest-sha256") + 1],
+            "publish" if published else "prepare-final",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["action"] == (
+        "verify-only" if published else "ready"
+    )
+    assert (dist / FINAL).read_bytes() == original_proof
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "calls.jsonl").read_text().splitlines()
+    ]
+    assert all(call[0] in {"api", "attestation"} for call in calls)
+    assert all(call[1] == "verify" for call in calls if call[0] == "attestation")
 
 
 @pytest.mark.parametrize("version", ["1.1.1", "1.1.2"])
@@ -763,3 +1022,94 @@ def test_checksum_output_cannot_overwrite_an_input(
 
     assert result.returncode == 1
     assert bundle.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected_ref"),
+    [
+        ("health_bridge.release.v3", f"refs/tags/{TAG}"),
+        ("health_bridge.release.v4", "refs/heads/release"),
+    ],
+)
+def test_metadata_version_selects_strict_core_provenance_role(
+    tmp_path: Path,
+    helper_packet: tuple[str, ...],
+    native_transport_mock: Path,
+    schema: str,
+    expected_ref: str,
+) -> None:
+    metadata = tmp_path / "dist/release-metadata.json"
+    payload = TypeAdapter(dict[str, JsonValue]).validate_json(metadata.read_bytes())
+    payload["schema_id"] = schema
+    _ = metadata.write_text(json.dumps(payload))
+    names = {
+        "apple_health_ai_bridge-1.1.3-py3-none-any.whl",
+        "apple_health_ai_bridge-1.1.3.tar.gz",
+        "release-metadata.json",
+    }
+    mock_bundle(tmp_path / "dist", native_transport_mock, BUILD, names)
+    calls_file = tmp_path / "calls.jsonl"
+    _ = calls_file.write_text("")
+    result = run_tool("verify-helper", *helper_packet)
+    assert result.returncode == 0, result.stderr
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in calls_file.read_text().splitlines()
+    ]
+    assert len(calls) == 3
+    for call in calls:
+        assert call[call.index("--source-ref") + 1] == expected_ref
+        assert call[call.index("--source-digest") + 1] == "1" * 40
+        assert call[call.index("--signer-digest") + 1] == "1" * 40
+        assert (
+            call[call.index("--signer-workflow") + 1]
+            == f"{REPOSITORY}/.github/workflows/release.yml"
+        )
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_candidate_native_proof_binds_original_execution_attempt(
+    tmp_path: Path,
+    helper_packet: tuple[str, ...],
+    attempt: int,
+) -> None:
+    _ = helper_packet
+    result_file = tmp_path / f"{BUILD}.result"
+    records = TypeAdapter(list[dict[str, JsonValue]]).validate_json(
+        result_file.read_bytes()
+    )
+    verification = records[0]["verificationResult"]
+    assert isinstance(verification, dict)
+    statement = verification["statement"]
+    assert isinstance(statement, dict)
+    statement["predicate"] = {
+        "runDetails": {
+            "metadata": {
+                "invocationId": f"https://github.com/{REPOSITORY}/actions/runs/123/attempts/{attempt}"
+            }
+        }
+    }
+    _ = result_file.write_text(json.dumps(records))
+    runner = tmp_path / "invocation.py"
+    _ = runner.write_text(f"""import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+from release_provenance import ProvenanceRequest, verify_provenance
+names = frozenset([
+    "apple_health_ai_bridge-1.1.3-py3-none-any.whl",
+    "apple_health_ai_bridge-1.1.3.tar.gz", "release-metadata.json",
+])
+request = ProvenanceRequest(
+    Path(sys.argv[1]), {TAG!r}, "1"*40, "release.yml", {BUILD!r}, names,
+    candidate=True,
+    invocation="https://github.com/{REPOSITORY}/actions/runs/123/attempts/2",
+)
+verify_provenance(request)
+""")
+    result = subprocess.run(
+        [sys.executable, str(runner), str(tmp_path / "dist")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is (attempt == 2), result.stderr

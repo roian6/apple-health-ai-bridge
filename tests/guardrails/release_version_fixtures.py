@@ -152,7 +152,10 @@ def write_release_tree(
 def init_release_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
-    _ = git_output(repo, "init", "-b", "main")
+    _ = git_output(repo, "init", "--template=", "-b", "main")
+    _ = git_output(repo, "config", "commit.gpgsign", "false")
+    _ = git_output(repo, "config", "tag.gpgsign", "false")
+    _ = git_output(repo, "config", "core.hooksPath", str(repo / ".git/hooks"))
     return repo
 
 

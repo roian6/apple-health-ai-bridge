@@ -8,6 +8,8 @@ from typing import cast
 
 from pydantic import BaseModel
 
+from health_bridge import __version__
+
 ROOT = Path(__file__).parents[2]
 
 
@@ -42,12 +44,15 @@ def test_current_receiver_preserves_ios_1_1_1_build_50() -> None:
         / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
     ).read_text()
 
-    assert project["version"] == "1.1.4"
-    assert '__version__: Final = "1.1.4"' in package_init
-    assert server["version"] == "1.1.4"
-    assert receiver == {"release_tag": "receiver-v1.1.4", "version": "1.1.4"}
+    assert project["version"] == __version__
+    assert f'__version__: Final = "{__version__}"' in package_init
+    assert server["version"] == __version__
+    assert receiver == {
+        "release_tag": f"receiver-v{__version__}",
+        "version": __version__,
+    }
     assert component_versions["release_scope"] == "receiver"
-    assert helper_info["CFBundleShortVersionString"] == "1.1.4"
+    assert helper_info["CFBundleShortVersionString"] == __version__
     assert helper_info["CFBundleVersion"] == "1"
     assert ios == {"build": "50", "marketing_version": "1.1.1"}
     assert ios_project.count("MARKETING_VERSION = 1.1.1;") == 2
@@ -63,7 +68,7 @@ def test_current_receiver_lock_matches_project_version() -> None:
     packages = [package for package in lock.package if package.name == project.name]
 
     assert len(packages) == 1
-    assert packages[0].version == project.version == "1.1.4"
+    assert packages[0].version == project.version == __version__
 
 
 def test_receiver_1_1_1_release_notes_are_receiver_only_and_helper_bound() -> None:
