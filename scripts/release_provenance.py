@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from release_authority import GitSha
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,6 +32,8 @@ class ProvenanceRequest:
     workflow: Workflow
     bundle: str
     subjects: frozenset[str]
+    candidate: bool = False
+    invocation: str | None = None
 
 
 class NativeModel(BaseModel):
@@ -42,12 +45,25 @@ class Subject(NativeModel):
     digest: dict[str, str]
 
 
+class RunMetadata(NativeModel):
+    invocation_id: str = Field(alias="invocationId")
+
+
+class RunDetails(NativeModel):
+    metadata: RunMetadata
+
+
+class Predicate(NativeModel):
+    run_details: RunDetails = Field(alias="runDetails")
+
+
 class Statement(NativeModel):
     statement_type: Literal["https://in-toto.io/Statement/v1"] = Field(alias="_type")
     predicate_type: Literal["https://slsa.dev/provenance/v1"] = Field(
         alias="predicateType"
     )
     subject: list[Subject]
+    predicate: Predicate | None = None
 
 
 class VerificationResult(NativeModel):
@@ -76,6 +92,12 @@ def verify_provenance(request: ProvenanceRequest) -> None:
                 "sha256": hashlib.file_digest(handle, "sha256").hexdigest()
             }
     workflow = f"{REPOSITORY}/.github/workflows/{request.workflow}"
+    if request.candidate and request.workflow != "release.yml":
+        msg = "only candidate build provenance may use the release branch"
+        raise ProvenanceError(msg)
+    source_ref = (
+        "refs/heads/release" if request.candidate else f"refs/tags/{request.tag}"
+    )
     for name in sorted(request.subjects):
         result = subprocess.run(  # noqa: S603
             [
@@ -90,7 +112,7 @@ def verify_provenance(request: ProvenanceRequest) -> None:
                 "--signer-workflow",
                 workflow,
                 "--source-ref",
-                f"refs/tags/{request.tag}",
+                source_ref,
                 "--source-digest",
                 request.commit,
                 "--signer-digest",
@@ -109,24 +131,54 @@ def verify_provenance(request: ProvenanceRequest) -> None:
         if result.returncode != 0:
             message = f"native provenance verification failed: {name}\n{result.stderr}"
             raise ProvenanceError(message)
-        try:
-            verified = TypeAdapter(list[NativeVerification]).validate_json(
-                result.stdout
-            )
-        except ValidationError as exc:
-            message = "native provenance verification returned invalid statements"
-            raise ProvenanceError(message) from exc
-        if not verified:
-            message = "native provenance verification returned no statements"
-            raise ProvenanceError(message)
-        for record in verified:
-            subjects = record.verification_result.statement.subject
+        verify_statements(result.stdout, expected, request.invocation)
+
+
+def verify_statements(
+    raw: str, expected: dict[str, dict[str, str]], invocation: str | None
+) -> None:
+    try:
+        verified = TypeAdapter(list[NativeVerification]).validate_json(raw)
+    except ValidationError as exc:
+        message = "native provenance verification returned invalid statements"
+        raise ProvenanceError(message) from exc
+    if not verified:
+        message = "native provenance verification returned no statements"
+        raise ProvenanceError(message)
+    for record in verified:
+        if invocation is not None:
+            predicate = record.verification_result.statement.predicate
             if (
-                len(subjects) != len(expected)
-                or {subject.name: subject.digest for subject in subjects} != expected
+                predicate is None
+                or predicate.run_details.metadata.invocation_id != invocation
             ):
-                message = "verified provenance subject names or digests are not exact"
-                raise ProvenanceError(message)
+                msg = "verified provenance execution snapshot mismatch"
+                raise ProvenanceError(msg)
+        subjects = record.verification_result.statement.subject
+        if (
+            len(subjects) != len(expected)
+            or {subject.name: subject.digest for subject in subjects} != expected
+        ):
+            message = "verified provenance subject names or digests are not exact"
+            raise ProvenanceError(message)
+
+
+def verify_dispatch(commit: str) -> None:
+    expected = {
+        "GITHUB_REPOSITORY": REPOSITORY,
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": "refs/heads/release",
+        "GITHUB_SHA": commit,
+        "GITHUB_WORKFLOW_SHA": commit,
+        "GITHUB_WORKFLOW_REF": (
+            f"{REPOSITORY}/.github/workflows/release.yml@refs/heads/release"
+        ),
+    }
+    _ = TypeAdapter(GitSha).validate_python(commit)
+    for key, value in expected.items():
+        if os.environ.get(key) != value:
+            msg = f"candidate dispatch source mismatch: {key}"
+            raise ProvenanceError(msg)
 
 
 def verify_execution(tag: str, commit: str, workflow: Workflow) -> None:

@@ -2,7 +2,7 @@ name: Python CodeQL
 
 on:
   push:
-    branches: [main, fix/receiver-1.1.4]
+    branches: [main, release]
   pull_request: {}
 
 permissions:
