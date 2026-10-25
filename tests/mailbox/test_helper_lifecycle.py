@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         DistributionVerificationRequest,
     )
 
+from health_bridge import __version__
 from health_bridge.cli import app
 from health_bridge.mailbox import helper_lifecycle
 from health_bridge.mailbox.helper_lifecycle import (
@@ -65,7 +66,7 @@ def allow_synthetic_distribution_policy(
 
 BUNDLE_ID = "com.example.HealthBridgeMailboxAckPublisher"
 CONTAINER_ID = "iCloud.com.example.HealthBridgeMailboxAckPublisher"
-VERSION = "1.1.3"
+VERSION = __version__
 TAG = f"receiver-v{VERSION}"
 TAG_OBJECT = "1" * 40
 COMMIT = "2" * 40
@@ -355,6 +356,46 @@ def test_structural_validation_rejects_links_duplicates_and_limits(
         _ = validate_helper_release(archive, manifest)
 
     assert raised.value.code is HelperErrorCode.UNSAFE_ARCHIVE
+
+
+@pytest.mark.parametrize(
+    "metadata_path",
+    [
+        "Contents/._Info.plist",
+        "Contents/MacOS/._HealthBridgeMailboxAckPublisher",
+        "Contents/._Resources/child",
+        "Contents/__MACOSX/child",
+        "Contents/Resources/__MACOSX/child",
+    ],
+)
+def test_install_rejects_metadata_before_filesystem_or_platform_verification(
+    tmp_path: Path,
+    metadata_path: str,
+) -> None:
+    # Given: an otherwise valid release containing AppleDouble metadata.
+    archive, manifest = _release(tmp_path)
+    _write_archive(
+        archive,
+        extra_members={f"{HELPER_APP_NAME}/{metadata_path}": b"AppleDouble"},
+    )
+    _write_manifest(manifest, archive)
+    home = tmp_path / "synthetic-home"
+    calls: list[Path] = []
+
+    # When: the production installer validates the supplied archive.
+    with pytest.raises(HelperError) as raised:
+        _ = install_helper(
+            archive,
+            manifest,
+            home=home,
+            platform="darwin",
+            verifier=_verifier(calls),
+        )
+
+    # Then: no filesystem generation or platform verification was attempted.
+    assert raised.value.code is HelperErrorCode.UNSAFE_ARCHIVE
+    assert not home.exists()
+    assert calls == []
 
 
 def test_validation_binds_archive_digest_bundle_and_release_source(

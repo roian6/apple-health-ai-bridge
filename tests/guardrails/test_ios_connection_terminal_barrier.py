@@ -179,7 +179,7 @@ def test_terminal_request_reservation_precancels_pairing() -> None:
         "try self.requireTrustedEmptyOutboxForConnectionTransition("
     ) < commit.index("let result = try await commit(expectedGeneration)")
     assert body.index("connectionTerminalBarrier.perform(") < body.index(
-        "try preparePrivateStorageForUploadAdmission()"
+        "try await preparePrivateStorageForUploadAdmission()"
     )
     assert "postCommitRecoveryRequired: true" in body
     assert "postCommitRecoveryRequired: false" in body
@@ -395,7 +395,7 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
     )
     assert transition.rindex(
         "endTerminalTaskUIPublicationSuppression()"
-    ) < transition.index("try preparePrivateStorageForUploadAdmission()")
+    ) < transition.index("try await preparePrivateStorageForUploadAdmission()")
 
     clear_start = source.index("func clearPendingOutbox() async")
     clear_end = source.index(
@@ -754,7 +754,7 @@ def test_terminal_request_prevents_post_opt_out_enqueue() -> None:
         "guard terminalPayloadActionAdmissionIsOpen, !Task.isCancelled else"
     )
     sleep_journal_write = sleep_sync_body.index(
-        "sleepManifestStore.savePendingTransition("
+        "sleepManifestStore.savePendingForSync("
     )
     assert sleep_journal_guard < sleep_journal_write
 
@@ -766,8 +766,42 @@ def test_terminal_request_prevents_post_opt_out_enqueue() -> None:
     sleep_outbox_guard = sleep_delivery_body.index(
         "guard terminalPayloadActionAdmissionIsOpen, !Task.isCancelled else"
     )
+    snapshot = sleep_delivery_body.index("var snapshot = try sleepOperationSnapshot(")
+    validation_start = sleep_delivery_body.index("let validate = { @MainActor in")
+    decode = sleep_delivery_body.index(
+        "let (uploadedRecords, hasRecordChanges) = try await SleepSyncValueWork.run"
+    )
+    validation = sleep_delivery_body[validation_start:decode]
+    assert "try self.requireCurrentPayloadDeliveryTarget(target)" in validation
+    assert (
+        "try self.validateSleepOperation(snapshot, store: store, outbox: outbox)"
+        in validation
+    )
+    revalidate = sleep_delivery_body.index("try validate()", decode)
     sleep_outbox_write = sleep_delivery_body.index("outbox.enqueueIfAbsent(")
-    assert sleep_outbox_guard < sleep_outbox_write
+    assert sleep_outbox_guard < snapshot < validation_start < decode
+    assert decode < revalidate < sleep_outbox_write
+
+    context_start = source.index("private func validateSleepOperationContext(")
+    operation_start = source.index(
+        "private func validateSleepOperation(", context_start
+    )
+    validation_end = source.index(
+        "private static func sleepStorageMayNeedRecovery(", operation_start
+    )
+    context = source[context_start:operation_start]
+    for guard in (
+        "try Task.checkCancellation()",
+        "backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration",
+        "terminalTransitionRequestIsActive == snapshot.terminalRequest",
+        "connectionTerminalBarrier.admissionIsOpen == snapshot.admissionOpen",
+        "try outbox.requireUploadAdmission()",
+    ):
+        assert guard in context
+    assert (
+        "try validateSleepOperationContext(snapshot, store: store, outbox: outbox)"
+        in source[operation_start:validation_end]
+    )
 
 
 def test_background_upload_cancellation_is_bounded() -> None:

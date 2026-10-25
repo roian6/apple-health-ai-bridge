@@ -495,6 +495,7 @@ public final class FileOutbox {
         var receiverIdentity: String?
         var mailboxBinding: FileOutboxMailboxBindingV1?
         var deliveryState: FileOutboxDeliveryStateV1?
+        var nutritionProjectionPrepared: Bool? = nil
     }
 
     private struct SequenceManifest: Codable, Equatable {
@@ -620,6 +621,8 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    var observeNutritionCodec: @Sendable () -> Void = {}
+    var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
 
     #if !HEALTH_BRIDGE_MAILBOX_QA
     public weak var automaticSyncDiagnosticDraft: AutomaticSyncDiagnosticDraft?
@@ -1119,7 +1122,20 @@ public final class FileOutbox {
     }
 
     public func pendingItems() throws -> [FileOutboxItem] {
-        let manifest = try reconciledManifest()
+        try pendingItems(in: reconciledManifest())
+    }
+
+    func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
+        try requireUploadAdmission()
+        guard let manifest = try loadManifest() else { throw CancellationError() }
+        let known = Set(manifest.entries.map(\.id))
+        guard try payloadFileURLs().allSatisfy({ known.contains(payloadID(for: $0)) }) else {
+            throw CancellationError()
+        }
+        return try pendingItems(in: manifest)
+    }
+
+    private func pendingItems(in manifest: SequenceManifest) throws -> [FileOutboxItem] {
         let payloadIDs = Set(try payloadFileURLs().map { payloadID(for: $0) })
         return manifest.entries
             .sorted { $0.sequence < $1.sequence }
@@ -1214,7 +1230,7 @@ public final class FileOutbox {
         }) else {
             throw FileOutboxCursorCheckpointError.checkpointMismatch
         }
-        guard transactionIndex == 0 else {
+        guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
@@ -1291,7 +1307,7 @@ public final class FileOutbox {
                 try persistEnqueueTransactions(transactions)
             }
             _ = try reconciledManifest()
-            guard transactionIndex == 0,
+            guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
                   updated.directAcknowledgedIDs == Set(updated.entries.map(\.id)) else {
                 return nil
             }
@@ -1313,17 +1329,45 @@ public final class FileOutbox {
     ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         _ = try reconciledManifest()
-        guard let transaction = try loadEnqueueTransactions().first,
-              let finalizationRecord = transaction.finalizationRecord,
-              transaction.entries.allSatisfy({
-                  $0.receiverIdentity == receiverIdentity
-              }),
-              finalizationRecord.cursorCheckpoint?.receiverIdentity
-                == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
-              transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)) else {
-            return nil
+        let transactions = try loadEnqueueTransactions()
+        for (index, transaction) in transactions.enumerated() {
+            guard let finalizationRecord = transaction.finalizationRecord,
+                  transaction.entries.allSatisfy({ $0.receiverIdentity == receiverIdentity }),
+                  finalizationRecord.cursorCheckpoint?.receiverIdentity
+                    == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
+                  transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)),
+                  try canFinalizeNutritionIndependentTransaction(index, in: transactions) else {
+                continue
+            }
+            return finalizationRecord
         }
-        return finalizationRecord
+        return nil
+    }
+
+    private func canFinalizeNutritionIndependentTransaction(
+        _ index: Int, in transactions: [EnqueueTransaction]
+    ) throws -> Bool {
+        guard index > 0 else { return true }
+        let target = transactions[index]
+        for previous in transactions.prefix(index) {
+            guard previous.entries.allSatisfy({
+                $0.receiverIdentity == target.entries.first?.receiverIdentity
+            }) else { return false }
+            if let left = previous.cursorCheckpoint, let right = target.cursorCheckpoint,
+               left.receiverIdentity == right.receiverIdentity,
+               left.sourceKey == right.sourceKey, left.cursorKind == right.cursorKind { return false }
+            if !Set(previous.pendingGenerationRetirements?.keys.map { $0 } ?? [])
+                .isDisjoint(with: target.pendingGenerationRetirements?.keys.map { $0 } ?? []) {
+                return false
+            }
+            // Only held nutrition can be bypassed, never another ordinary FIFO lane.
+            for entry in previous.entries where !previous.directAcknowledgedIDs.contains(entry.id) {
+                guard let item = try pendingItem(id: entry.id) else { return false }
+                guard let prepared = try preparedNutritionPayload(for: item),
+                      prepared.containsNutrition else { return false }
+            }
+        }
+        return true
     }
 
     public func uploadablePendingItems(for receiverIdentity: String) throws -> [FileOutboxItem] {
@@ -1344,6 +1388,28 @@ public final class FileOutbox {
             try requireDirectRetirementAllowed(itemID: item.id)
         }
         return uploadable
+    }
+
+    func prepareNutritionProjection(for item: FileOutboxItem, payload: Data) throws {
+        let manifest = try reconciledManifest()
+        guard let entry = manifest.entries.first(where: { $0.id == item.id }),
+              let identity = entry.receiverIdentity else {
+            throw ReceiverOutboxIdentityError.missingReceiverIdentity
+        }
+        guard entry.nutritionProjectionPrepared != true else { return }
+        // Persist the child before the marker. A crash between these writes can
+        // replay stable record identities, but cannot lose supported records.
+        let projection = try enqueueIfAbsent(payload, receiverIdentity: identity).item
+        preparedNutritionPayloads[projection.id] = PreparedNutritionPayload(
+            revision: try NutritionPayloadRevision(projection.fileURL),
+            containsNutrition: false, permitsSupported: true, projection: nil
+        )
+        var updated = try reconciledManifest()
+        guard let index = updated.entries.firstIndex(where: { $0.id == item.id }) else {
+            throw SequenceError.invalidManifest
+        }
+        updated.entries[index].nutritionProjectionPrepared = true
+        try persistManifest(updated)
     }
 
     public func pendingItem(id: String) throws -> FileOutboxItem? {
@@ -1556,7 +1622,7 @@ public final class FileOutbox {
         }) else {
             return nil
         }
-        guard transactionIndex == 0 else {
+        guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
@@ -2718,19 +2784,187 @@ public struct SleepSyncPendingTransition: Codable, Equatable, Sendable {
     }
 }
 
-public protocol SleepSyncManifestStoring {
+fileprivate struct SleepSyncFileRevision: Equatable, Sendable {
+    let number: UInt64?
+    let size: UInt64?
+    let modified: Date?
+    static let missing = SleepSyncFileRevision(number: nil, size: nil, modified: nil)
+}
+
+public struct SleepSyncStorageRevision: Equatable, Sendable {
+    fileprivate let files: [SleepSyncFileRevision]
+}
+
+public protocol SleepSyncManifestStoring: AnyObject {
     func loadManifest() throws -> SleepSyncManifest?
     func saveManifest(_ manifest: SleepSyncManifest) throws
     func loadPendingTransition() throws -> SleepSyncPendingTransition?
     func savePendingTransition(_ transition: SleepSyncPendingTransition) throws
     func clearPendingTransition(id: String) throws
     func resetSynchronizationState() throws
+    var recoveryMayBeNeeded: Bool { get }
+    func revisionForSync() throws -> SleepSyncStorageRevision
+    @MainActor func loadManifestForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncManifest?
+    @MainActor func loadPendingForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncPendingTransition?
+    @MainActor func saveManifestForSync(_ manifest: SleepSyncManifest, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
+    @MainActor func savePendingForSync(_ transition: SleepSyncPendingTransition, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
+    @MainActor func clearPendingForSync(id: String, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
+}
+#endif
+
+public enum SleepSyncValueWork {
+    public static func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let work = Task.detached(priority: Task.currentPriority) {
+            try Task.checkCancellation()
+            let value = try operation()
+            try Task.checkCancellation()
+            return value
+        }
+        return try await withTaskCancellationHandler {
+            let value = try await work.value
+            try Task.checkCancellation()
+            return value
+        } onCancel: { work.cancel() }
+    }
 }
 
+#if !HEALTH_BRIDGE_MAILBOX_QA
 public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
+    enum CodecOperation: Hashable, Sendable {
+        case decodeManifest
+        case decodePending
+        case encodeManifest
+        case encodePending(tracked: Bool)
+    }
+
     private let fileURL: URL
     private let pendingTransitionFileURL: URL
     private let fileManager: FileManager
+    private var observeCodec: @Sendable (CodecOperation) -> Void = { _ in }
+    private typealias FileRevision = SleepSyncFileRevision
+    private var validatedManifest: FileRevision?
+    private var validatedPending: FileRevision?
+
+    private func revision(_ url: URL) throws -> FileRevision {
+        guard fileManager.fileExists(atPath: url.path) else { return .missing }
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        guard let number = attributes[.systemFileNumber] as? NSNumber,
+              let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return FileRevision(number: number.uint64Value, size: size.uint64Value, modified: modified)
+    }
+
+    private func revisions() throws -> [FileRevision] {
+        try [revision(fileURL), revision(pendingTransitionFileURL)]
+    }
+
+    public func revisionForSync() throws -> SleepSyncStorageRevision {
+        try SleepSyncStorageRevision(files: revisions())
+    }
+
+    public var recoveryMayBeNeeded: Bool {
+        guard let current = try? revisions(),
+              current[0] == validatedManifest, current[1] == validatedPending else { return true }
+        return current[1] != .missing
+    }
+
+    @MainActor
+    private func validateSnapshot(_ snapshot: [FileRevision], validate: @MainActor () throws -> Void) throws {
+        try Task.checkCancellation()
+        try validate()
+        guard try revisions() == snapshot else { throw CancellationError() }
+    }
+
+    @MainActor
+    public func loadManifestForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncManifest? {
+        let snapshot = try revisions()
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            try validateSnapshot(snapshot, validate: validate)
+            validatedManifest = .missing
+            return nil
+        }
+        let bytes = try Data(contentsOf: fileURL)
+        let observer = observeCodec
+        let value = try await SleepSyncValueWork.run {
+            observer(.decodeManifest)
+            return Result { try JSONDecoder().decode(SleepSyncManifest.self, from: bytes) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let decoded = try value.get()
+        validatedManifest = snapshot[0]
+        return decoded
+    }
+
+    @MainActor
+    public func loadPendingForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncPendingTransition? {
+        let snapshot = try revisions()
+        guard fileManager.fileExists(atPath: pendingTransitionFileURL.path) else {
+            try validateSnapshot(snapshot, validate: validate)
+            validatedPending = .missing
+            return nil
+        }
+        let bytes = try Data(contentsOf: pendingTransitionFileURL)
+        let observer = observeCodec
+        let value = try await SleepSyncValueWork.run {
+            observer(.decodePending)
+            return Result { try JSONDecoder().decode(SleepSyncPendingTransition.self, from: bytes) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let decoded = try value.get()
+        validatedPending = snapshot[1]
+        return decoded
+    }
+
+    @MainActor
+    public func saveManifestForSync(_ manifest: SleepSyncManifest, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision {
+        let snapshot = try revisions()
+        let observer = observeCodec
+        let encoded = try await SleepSyncValueWork.run {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            observer(.encodeManifest)
+            return Result { try encoder.encode(manifest) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let bytes = try encoded.get()
+        try bytes.write(to: fileURL, options: [.atomic])
+        try Self.applySensitiveFileAttributes(to: fileURL, permissions: 0o600, fileManager: fileManager)
+        validatedManifest = try revision(fileURL)
+        return try revisionForSync()
+    }
+
+    @MainActor
+    public func savePendingForSync(_ transition: SleepSyncPendingTransition, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision {
+        let snapshot = try revisions()
+        let observer = observeCodec
+        let encoded = try await SleepSyncValueWork.run {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            observer(.encodePending(tracked: transition.outboxItemID != nil))
+            return Result { try encoder.encode(transition) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let bytes = try encoded.get()
+        try bytes.write(to: pendingTransitionFileURL, options: [.atomic])
+        try Self.applySensitiveFileAttributes(to: pendingTransitionFileURL, permissions: 0o600, fileManager: fileManager)
+        validatedPending = try revision(pendingTransitionFileURL)
+        return try revisionForSync()
+    }
+
+    @MainActor
+    public func clearPendingForSync(id: String, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision {
+        guard let pending = try await loadPendingForSync(validate: validate) else { return try revisionForSync() }
+        guard pending.id == id else { throw CocoaError(.fileWriteFileExists) }
+        try validate()
+        try fileManager.removeItem(at: pendingTransitionFileURL)
+        validatedPending = .missing
+        return try revisionForSync()
+    }
 
     public init(fileURL: URL, fileManager: FileManager = .default) throws {
         self.fileURL = fileURL
@@ -2759,15 +2993,26 @@ public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
         }
     }
 
+    convenience init(
+        fileURL: URL,
+        fileManager: FileManager = .default,
+        observeCodec: @escaping @Sendable (CodecOperation) -> Void
+    ) throws {
+        try self.init(fileURL: fileURL, fileManager: fileManager)
+        self.observeCodec = observeCodec
+    }
+
     public func loadManifest() throws -> SleepSyncManifest? {
         guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
         let data = try Data(contentsOf: fileURL)
+        observeCodec(.decodeManifest)
         return try JSONDecoder().decode(SleepSyncManifest.self, from: data)
     }
 
     public func saveManifest(_ manifest: SleepSyncManifest) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        observeCodec(.encodeManifest)
         let data = try encoder.encode(manifest)
         try data.write(to: fileURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(
@@ -2780,12 +3025,14 @@ public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
     public func loadPendingTransition() throws -> SleepSyncPendingTransition? {
         guard fileManager.fileExists(atPath: pendingTransitionFileURL.path) else { return nil }
         let data = try Data(contentsOf: pendingTransitionFileURL)
+        observeCodec(.decodePending)
         return try JSONDecoder().decode(SleepSyncPendingTransition.self, from: data)
     }
 
     public func savePendingTransition(_ transition: SleepSyncPendingTransition) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        observeCodec(.encodePending(tracked: transition.outboxItemID != nil))
         let data = try encoder.encode(transition)
         try data.write(to: pendingTransitionFileURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(
@@ -2804,6 +3051,7 @@ public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
     }
 
     public func resetSynchronizationState() throws {
+        defer { validatedManifest = nil; validatedPending = nil }
         if fileManager.fileExists(atPath: fileURL.path) {
             try fileManager.removeItem(at: fileURL)
         }
@@ -2888,41 +3136,41 @@ public enum SleepBaselineRejectionRecoveryError: Error, Equatable {
 }
 
 public enum SleepBaselineRejectionRecovery {
+    @MainActor
     public static func recover(
         itemID: String,
         minimumResetEpoch: UInt64,
         outbox: FileOutbox,
         manifestStore: SleepSyncManifestStoring,
-        epochStore: SleepResetEpochStore
-    ) throws {
-        guard var pendingTransition = try manifestStore.loadPendingTransition() else {
+        epochStore: SleepResetEpochStore,
+        validate: @escaping @MainActor () throws -> Void = {}
+    ) async throws {
+        var revision = try manifestStore.revisionForSync()
+        let items = try outbox.pendingItems()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try validate()
+            try outbox.requireUploadAdmission()
+            guard try manifestStore.revisionForSync() == revision,
+                  try outbox.pendingItems() == items else { throw CancellationError() }
+        }
+        guard var pending = try await manifestStore.loadPendingForSync(validate: check) else {
             throw SleepBaselineRejectionRecoveryError.missingPendingTransition
         }
-        var matchingItems = try matchingOutboxItems(
-            pendingTransition,
-            in: outbox
-        )
-        guard itemID.isEmpty
-            || pendingTransition.outboxItemID == itemID
-            || matchingItems.contains(where: { $0.id == itemID }) else {
+        var matching = try await matchingOutboxItems(pending, in: outbox, validate: check)
+        guard itemID.isEmpty || pending.outboxItemID == itemID
+                || matching.contains(where: { $0.id == itemID }) else {
             throw SleepBaselineRejectionRecoveryError.mismatchedOutboxItem
         }
-        if pendingTransition.outboxItemID == nil,
-           let rejectedItem = matchingItems.first(where: { $0.id == itemID }) {
-            pendingTransition = pendingTransition.assigningOutboxItemID(rejectedItem.id)
+        if pending.outboxItemID == nil, let rejected = matching.first(where: { $0.id == itemID }) {
+            pending = pending.assigningOutboxItemID(rejected.id)
         }
-        let rejectedTransition = pendingTransition.markingRejected(
-            minimumResetEpoch: max(
-                minimumResetEpoch,
-                pendingTransition.rejectedMinimumResetEpoch ?? 0
-            )
-        )
-        try manifestStore.savePendingTransition(rejectedTransition)
-        _ = try epochStore.reserveEpoch(
-            after: rejectedTransition.rejectedMinimumResetEpoch ?? 0
-        )
-        matchingItems = try matchingOutboxItems(rejectedTransition, in: outbox)
-        for item in matchingItems {
+        let rejected = pending.markingRejected(minimumResetEpoch: max(minimumResetEpoch, pending.rejectedMinimumResetEpoch ?? 0))
+        revision = try await manifestStore.savePendingForSync(rejected, validate: check)
+        try check()
+        _ = try epochStore.reserveEpoch(after: rejected.rejectedMinimumResetEpoch ?? 0)
+        matching = try await matchingOutboxItems(rejected, in: outbox, validate: check)
+        for item in matching {
             try outbox.markUploaded(item)
             #if !HEALTH_BRIDGE_MAILBOX_QA
             outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .rejected)
@@ -2931,19 +3179,25 @@ public enum SleepBaselineRejectionRecovery {
         try manifestStore.resetSynchronizationState()
     }
 
+    @MainActor
     private static func matchingOutboxItems(
-        _ pendingTransition: SleepSyncPendingTransition,
-        in outbox: FileOutbox
-    ) throws -> [FileOutboxItem] {
-        try outbox.pendingItems().filter { item in
-            if item.id == pendingTransition.outboxItemID {
-                return true
-            }
-            guard item.receiverIdentity == pendingTransition.receiverBindingID else {
-                return false
-            }
-            return try Data(contentsOf: item.fileURL) == pendingTransition.payload
+        _ pending: SleepSyncPendingTransition,
+        in outbox: FileOutbox,
+        validate: @MainActor () throws -> Void
+    ) async throws -> [FileOutboxItem] {
+        let items = try outbox.pendingItems()
+        let bytes = try items.map { item -> Data? in
+            guard item.id != pending.outboxItemID,
+                  item.receiverIdentity == pending.receiverBindingID else { return nil }
+            return try Data(contentsOf: item.fileURL)
         }
+        let matching = try await SleepSyncValueWork.run {
+            items.enumerated().compactMap { index, item in
+                item.id == pending.outboxItemID || bytes[index] == pending.payload ? item : nil
+            }
+        }
+        try validate()
+        return matching
     }
 }
 
@@ -3048,9 +3302,10 @@ struct SleepStorageOperationFailure: Error {
     let underlyingError: Error
 }
 
-func withSleepStorageOrigin<T>(_ operation: () throws -> T) throws -> T {
+@MainActor
+func withSleepStorageOrigin<T>(_ operation: @MainActor () async throws -> T) async throws -> T {
     do {
-        return try operation()
+        return try await operation()
     } catch let cancellation as CancellationError {
         throw cancellation
     } catch {

@@ -34,14 +34,20 @@ def test_codeql_runs_on_main_push_and_pull_requests_with_bounded_resources(
     job = required_object(jobs["analyze"])
     # Then: only native push/PR events reach a bounded Ubuntu analysis job.
     assert set(workflow) == {"name", "on", "permissions", "concurrency", "jobs"}
-    assert workflow["on"] == {"push": {"branches": ["main"]}, "pull_request": {}}
+    assert workflow["on"] == {
+        "push": {"branches": ["main", "release"]},
+        "pull_request": {},
+    }
     assert set(jobs) == {"analyze"}
     assert set(job) == {"name", "runs-on", "timeout-minutes", "permissions", "steps"}
     assert job["runs-on"] == "ubuntu-latest"
     assert job["timeout-minutes"] == 15
     assert workflow["concurrency"] == {
-        "group": "${{ github.workflow }}-${{ github.ref }}",
-        "cancel-in-progress": True,
+        "group": (
+            "${{ github.workflow }}-"
+            "${{ github.ref == 'refs/heads/release' && github.sha || github.ref }}"
+        ),
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/release' }}",
     }
 
 

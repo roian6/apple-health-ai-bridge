@@ -419,10 +419,7 @@ struct ContentView: View {
     }
 
     private var userFacingStatusMessage: String {
-        CompanionPrimaryStatusMessage.sanitized(
-            from: viewModel.statusMessage,
-            isError: viewModel.statusIsError
-        )
+        viewModel.displayStatusMessage
     }
 }
 

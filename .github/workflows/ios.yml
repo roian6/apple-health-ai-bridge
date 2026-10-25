@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - release
     tags:
       - "ios-v*"
   pull_request:
@@ -13,8 +14,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ios-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ios-${{ github.workflow }}-${{ github.ref == 'refs/heads/release' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
 
 jobs:
   build-and-test:

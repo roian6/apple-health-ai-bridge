@@ -1,0 +1,20 @@
+{
+  "schema_id": "health_bridge.release_policy.v1",
+  "source_ref": "refs/heads/release",
+  "signer_login": "roian6",
+  "required_checks": {
+    "Python quality and package checks": "python.yml",
+    "Swift tests and unsigned app builds": "ios.yml",
+    "Analyze Python": "codeql.yml"
+  },
+  "revoked_commits": [],
+  "revoked_tag_objects": [],
+  "retired_tags": [
+    {
+      "tag": "receiver-v1.1.4",
+      "tag_object": "e7ef4b19ce32ee6e3d11327ca035606d9ad5d0a3",
+      "commit": "a8249ec9bdc27b911df4d67904aad31c06f965e1",
+      "reason": "Unpublished candidate retired during release lifecycle migration; retain the immutable public tag."
+    }
+  ]
+}

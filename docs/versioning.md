@@ -6,11 +6,33 @@ Apple Health AI Bridge contains independently released components. Always includ
 
 | Surface | Current version | Public identifier |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.3` | Release tag `receiver-v1.1.3` |
+| Receiver/CLI | `1.1.5` | Release tag `receiver-v1.1.5` |
 | iOS Companion | `1.1.1` | Source candidate build `50` |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). The index declares `release_scope` explicitly rather than deriving scope from equal version numbers. Release validation compares the index with `pyproject.toml`, the Xcode project settings, and the canonical batch fixture. For a tagged release, it also requires the tag target to equal the trusted default-main commit and compares the candidate with that commit’s first-parent baseline. A stale branch or regressing Receiver/CLI, iOS Companion, or Batch Protocol value therefore fails before publication.
+The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture.
+
+The published `receiver-v1.1.5` is a bounded maintenance release based on `receiver-v1.1.3`. Main carries the matching source version after forward-porting release metadata and workflow fixes, while its additional runtime features and migrations remain unreleased. Use the immutable release tag and its tagged installation guides for the published behavior.
+
+### One stable release branch
+
+`main` integrates development; `release` is the single protected stable source branch. Promote reviewed main changes through a two-parent merge into release so repeated promotions preserve ancestry. Short fixes may squash into release and are forward-ported to main when needed. Do not reset, rebase or reverse-merge the stable branch to synchronize it. Main retains its squash and linear-history rules.
+
+A candidate identifies an exact source commit/tree, component baseline, genuine signed annotated tag object and workflow run/attempt/artifact. Neither branch tip is the release identity. Subsequent main or release commits do not invalidate a frozen candidate.
+
+[`release-policy.json`](../.github/release/release-policy.json), fetched from current protected default main, supplies the authority. Qualification verifies visible active release protection, an exact GitHub-verified squash or two-parent PR merge, approval of the reviewed head, and passing release-push checks on the final source SHA. Administrators must separately confirm that protection has no bypass actors: GitHub hides that list from read-only tokens. Required contexts remain **Python quality and package checks**, **Swift tests and unsigned app builds**, and **Analyze Python**. A skipped CodeRabbit review is not approval. Candidate-local policy and caller claims cannot grant authority. Trusted-main revocations stop continuation.
+
+Receiver transitions use the last actually published stable Receiver release. Drafts and existing tags do not establish a published baseline. Same-line patch gaps require exact retired unpublished tag records; the records preserve the original tag object and explain the skipped number. The unconsumed `receiver-v1.1.4` maintenance grant is retired; its existing tag remains immutable. The retirement does not prohibit descendants of its source.
+
+A preparation commit and later reviewed fixes may retain the candidate version. The final source is compared with the published baseline, not its immediate parent. Receiver-only patches preserve compatible iOS source/version/build and Batch Protocol. iOS checkpoints use their own previous signed checkpoint with successful exact-tag verification, independently of the Receiver published baseline. Source checkpoints do not assert App Store or TestFlight distribution.
+
+### Candidate and publication provenance
+
+Candidate preparation runs `release.yml@refs/heads/release` at the dispatched source SHA. It imports and verifies the genuine local signed tag against registered maintainer signing keys, runs source/package gates and emits an immutable Actions artifact. It creates neither a public tag ref nor a GitHub Release. Remote tag verification remains pending.
+
+Publication runs `publish-release.yml@refs/tags/<tag>` at that same source SHA behind the existing tag-only `github-release` environment. Release metadata v4 selects strict branch-based core provenance; v3 retains historical tag-based verification. Both roles require exact source and signer digests and exact subject sets. The helper manifest and final eight-asset contract retain their existing formats.
+
+See [release operations](release-operations.md) for local tag transport, native qualification, publication and recovery. Matching published releases are verify-only. Partial drafts retain matching bytes and receive only missing assets; conflicts, expired evidence or changed baselines HOLD before mutation.
 
 ## Version surfaces
 
@@ -72,7 +94,7 @@ be exactly `Receiver/CLI <version>`; for example, `Receiver/CLI 1.1.4` for
 releases.
 
 The release tool's `tag-info` JSON derives `title` from the canonical tag. The
-tagged-release workflow passes that value to `gh release create --title`, and
+release reconciler uses that value when creating a draft, and
 the shared identity verifier requires it at the core, helper, final-draft and
 published stages. Publication preserves the verified draft title; it does not
 patch the title afterward. At every stage, the release body must still exactly
@@ -85,7 +107,7 @@ checksums or provenance verification.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.1.3
+Receiver/CLI 1.1.5
 Compatible iOS Companion 1.1.1 (build 50)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```

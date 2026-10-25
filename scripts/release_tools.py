@@ -11,19 +11,23 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Literal, assert_never, cast
 
+from pydantic import ValidationError
+from release_authority import SourceReceipt
 from release_provenance import (
     BUILD_PROVENANCE,
     FINAL_PROVENANCE,
     ProvenanceError,
     ProvenanceRequest,
     Workflow,
+    verify_dispatch,
     verify_execution,
     verify_provenance,
 )
+from release_source_policy import SourceRequest, resolve_release_source
 from release_versions import (
     ReleaseError,
     canonical_receiver_tag,
@@ -79,6 +83,7 @@ class TransitionRequest:
     tag_target_commit: str
     default_main_commit: str
     baseline_commit: str
+    source_receipt: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +95,7 @@ class ManifestRequest:
     commit: str
     tree: str
     output: Path
+    candidate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +117,7 @@ class PacketVerificationRequest:
     tag_object: str
     commit: str
     tree: str
+    invocation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +375,7 @@ def _helper_source_tree(repo: Path) -> str:
     completed = subprocess.run(  # noqa: S603 - fixed git executable, no shell.
         [
             GIT_EXECUTABLE,
+            "--no-replace-objects",
             "-C",
             str(repo),
             "rev-parse",
@@ -525,7 +533,7 @@ def _git_output(repo: Path, *args: str) -> str:
         message = "Git executable is required for trusted transition validation"
         raise ReleaseError(message)
     completed = subprocess.run(  # noqa: S603
-        [GIT_EXECUTABLE, *args],
+        [GIT_EXECUTABLE, "--no-replace-objects", *args],
         cwd=repo,
         capture_output=True,
         check=False,
@@ -550,17 +558,69 @@ def _transition_baseline(request: TransitionRequest) -> ComponentSnapshot:
     if checked_out != request.tag_target_commit:
         message = "tag target must equal the checked-out commit"
         raise ReleaseError(message)
-    if request.tag_target_commit != request.default_main_commit:
-        message = "tag target must equal the trusted default-main commit"
-        raise ReleaseError(message)
+    if request.source_receipt is not None:
+        receipt = SourceReceipt.model_validate_json(request.source_receipt.read_bytes())
+        if (
+            receipt.source_commit != checked_out
+            or receipt.source_tree
+            != _git_output(request.repo, "rev-parse", "HEAD^{tree}")
+            or receipt.baseline_commit != request.baseline_commit
+            or receipt.default_main_commit != request.default_main_commit
+        ):
+            msg = "frozen source receipt does not bind this transition"
+            raise ReleaseError(msg)
+        fresh = resolve_release_source(
+            SourceRequest(
+                request.repo,
+                receipt.source_tag,
+                receipt.source_commit,
+                receipt.tag_object,
+                local=receipt.remote_tag_verification == "pending",
+            )
+        )
+        if (
+            fresh.baseline != receipt.baseline
+            or fresh.pull_request != receipt.pull_request
+            or fresh.reviewed_head != receipt.reviewed_head
+        ):
+            message = "frozen transition source receipt is stale"
+            raise ReleaseError(message)
+        baseline = _read_component_snapshot(
+            _git_output(
+                request.repo,
+                "show",
+                f"{receipt.baseline_commit}:{COMPONENT_VERSION_INDEX}",
+            ),
+            surface="verified component baseline",
+        )
+        if fresh.compatibility_baseline is not None:
+            compatible = _read_component_snapshot(
+                _git_output(
+                    request.repo,
+                    "show",
+                    f"{fresh.compatibility_baseline.commit}:{COMPONENT_VERSION_INDEX}",
+                ),
+                surface="published Receiver compatibility",
+            )
+            baseline = replace(
+                baseline,
+                receiver_version=compatible.receiver_version,
+                receiver_tag=compatible.receiver_tag,
+                batch_version=compatible.batch_version,
+                batch_schema_id=compatible.batch_schema_id,
+            )
+        return baseline
     expected_baseline = _git_output(
         request.repo,
         "rev-parse",
         f"{request.tag_target_commit}^1",
     )
-    if request.baseline_commit != expected_baseline:
-        message = "baseline must equal the tag target's first parent"
+    baseline_error = "baseline must equal the tag target's first parent"
+    if request.tag_target_commit != request.default_main_commit:
+        message = "tag target must equal the trusted default-main commit"
         raise ReleaseError(message)
+    if request.baseline_commit != expected_baseline:
+        raise ReleaseError(baseline_error)
     return _read_component_snapshot(
         _git_output(
             request.repo,
@@ -683,6 +743,14 @@ def validate_component_transition(
     versions: ReleaseVersions,
 ) -> None:
     baseline = _transition_baseline(request)
+    if (
+        request.source_receipt is not None
+        and versions.components.release_scope == "receiver"
+        and _git_output(request.repo, "rev-parse", f"{request.baseline_commit}:ios")
+        != _git_output(request.repo, "rev-parse", "HEAD:ios")
+    ):
+        message = "receiver scope must preserve baseline iOS source tree"
+        raise ReleaseError(message)
     receiver_advanced, ios_changed, batch_changed = _component_change_flags(
         versions.components,
         baseline,
@@ -697,6 +765,11 @@ def validate_component_transition(
 
 
 def create_manifest(request: ManifestRequest) -> None:
+    if request.candidate:
+        verify_dispatch(request.commit)
+        if _git_output(request.repo, "status", "--porcelain", "--untracked-files=all"):
+            message = "candidate build changed its frozen source checkout"
+            raise ReleaseError(message)
     versions = validate_tag(request.repo, request.tag)
     if any(
         HEX_SHA_PATTERN.fullmatch(value) is None
@@ -741,7 +814,9 @@ def create_manifest(request: ManifestRequest) -> None:
         },
         "release_scope": _release_scope(versions),
         "release_version": versions.project_version,
-        "schema_id": "health_bridge.release.v3",
+        "schema_id": "health_bridge.release.v4"
+        if request.candidate
+        else "health_bridge.release.v3",
     }
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
     _atomic_write(request.output, encoded)
@@ -838,7 +913,8 @@ def _validate_release_metadata(
         message = "release metadata top-level schema is not exact"
         raise ReleaseError(message)
     if (
-        payload.get("schema_id") != "health_bridge.release.v3"
+        payload.get("schema_id")
+        not in {"health_bridge.release.v3", "health_bridge.release.v4"}
         or payload.get("release_scope") != _release_scope(versions)
         or payload.get("release_version") != versions.project_version
         or payload.get("batch_contract") != _batch_contract(repo)
@@ -1092,6 +1168,7 @@ def _validate_helper_packet(
                 "release.yml",
                 BUILD_PROVENANCE,
                 frozenset(records) | {"release-metadata.json"},
+                candidate=payload["schema_id"] == "health_bridge.release.v4",
             )
         )
     return names, records
@@ -1224,6 +1301,8 @@ def verify_core_packet(request: PacketVerificationRequest) -> set[str]:
                 "release.yml",
                 BUILD_PROVENANCE,
                 frozenset(records) | {"release-metadata.json"},
+                candidate=metadata_payload["schema_id"] == "health_bridge.release.v4",
+                invocation=request.invocation,
             )
         )
     return expected_names
@@ -1403,8 +1482,10 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     validate.add_argument("--tag-target-commit")
     validate.add_argument("--default-main-commit")
     validate.add_argument("--baseline-commit")
+    validate.add_argument("--source-receipt", type=Path)
 
     manifest = subparsers.add_parser("manifest")
+    manifest.add_argument("--candidate", action="store_true")
     manifest.add_argument("--repo", type=Path, required=True)
     manifest.add_argument("--dist-dir", type=Path, required=True)
     manifest.add_argument("--tag", required=True)
@@ -1500,6 +1581,20 @@ def _transition_request(
             raise ReleaseError(message)
 
 
+def receipt_transition(repo: Path, tag: str, path: Path) -> TransitionRequest:
+    receipt = SourceReceipt.model_validate_json(path.read_bytes())
+    if receipt.source_tag != tag:
+        message = "source receipt tag differs from requested checkpoint"
+        raise ReleaseError(message)
+    return TransitionRequest(
+        repo,
+        receipt.source_commit,
+        receipt.default_main_commit,
+        receipt.baseline_commit,
+        path,
+    )
+
+
 def main() -> int:  # noqa: C901, PLR0912
     args = _parser().parse_args()
     try:
@@ -1529,6 +1624,14 @@ def main() -> int:  # noqa: C901, PLR0912
                 args.baseline_commit,
             )
             transition = _transition_request(args.repo, transition_commits)
+            if args.source_receipt is not None:
+                verified_transition = receipt_transition(
+                    args.repo, args.tag, args.source_receipt
+                )
+                if transition is None:
+                    transition = verified_transition
+                else:
+                    transition = replace(transition, source_receipt=args.source_receipt)
             if transition is not None:
                 validate_component_transition(transition, versions)
             sys.stdout.write(
@@ -1554,6 +1657,7 @@ def main() -> int:  # noqa: C901, PLR0912
                     commit=args.commit,
                     tree=args.tree,
                     output=args.output,
+                    candidate=args.candidate,
                 )
             )
         elif args.command == "checksums":
@@ -1654,6 +1758,7 @@ def main() -> int:  # noqa: C901, PLR0912
         OSError,
         ReleaseError,
         ProvenanceError,
+        ValidationError,
         json.JSONDecodeError,
         tomllib.TOMLDecodeError,
         subprocess.TimeoutExpired,

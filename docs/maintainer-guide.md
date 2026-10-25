@@ -8,7 +8,7 @@ The main ruleset requires one approving review and approval of the latest push. 
 
 Keep the approval requirement aligned with an eligible reviewer. A second trusted maintainer can provide human review; an automated reviewer counts only after it has been demonstrated as eligible on a real pull request. For an automated reviewer, read back the App's identity, review state, reviewed commit, and GitHub's actual approval and last-push eligibility before changing the rules. A summary comment or successful check alone is not an eligible review. Do not enable required code-owner review before an eligible code owner exists.
 
-The repository's `.coderabbit.yaml` configures English reviews, walkthrough summaries, incremental review, and the request-changes workflow, with author approval overrides disabled and drafts excluded. Installing the hosted CodeRabbit App and confirming its effective configuration are separate maintainer actions. This configuration does not establish that the App is installed, that its reviews satisfy a rule, or that an approval requirement has been activated.
+The repository's `.coderabbit.yaml` configures English reviews, walkthrough summaries, incremental review, and the request-changes workflow, with author approval overrides disabled and drafts excluded. The anchored `reviews.auto_review.base_branches` entry includes `release` in addition to the default branch, following the [supported configuration schema](https://docs.coderabbit.ai/reference/configuration#auto-review). Installing the hosted CodeRabbit App and confirming its effective configuration are separate maintainer actions. This configuration does not establish that the App is installed, that its reviews satisfy a rule, or that an approval requirement has been activated.
 
 Do not routinely disable the main ruleset or push directly to `main`. Emergency changes still use a narrowly scoped pull request and the same required checks.
 
@@ -90,11 +90,21 @@ analyses ran for historical immutable releases.
 2. update each changed authoritative version source, `component-versions.json`, and release notes drafted from the [release notes template](../.github/release/release-notes-template.md) in one reviewed pull request;
 3. state the exact compatible iOS Companion version/build and exact compatible Batch Protocol schema identifier/version in the release notes;
 4. run the full public, Python, and iOS gates;
-5. create a signed annotated component-scoped tag for the exact approved default-branch commit;
-6. let the protected exact-tag workflow compare the tag with default main and its predecessor baseline, then build, verify, attest, and publish an immutable release;
-7. verify the remote tag, release assets, checksums, attestations, and linked site state.
+5. freeze the reviewed release source and create a genuine signed annotated tag locally;
+6. run the release-branch candidate workflow and qualify the same package/helper on the owner Mac before pushing the exact tag object;
+7. use the protected tag-based publication workflow, then verify downloaded public bytes and isolated installation before moving install pins.
 
-Treat source-release status and TestFlight/App Store distribution status as separate facts.
+Follow [release operations](release-operations.md) for exact candidate IDs, artifact transport, native staging and recovery commands. Source-release status and TestFlight/App Store distribution status are separate facts.
+
+### Protected stable source
+
+Maintain one protected `release` branch. Enable repository merge commits for reviewed main-to-release promotions while preserving main's existing squash-only and linear-history requirements. Release requires the same reviews, latest-push approval, resolved conversations, strict required checks and deletion/force-push protection, without bypass actors. The source policy verifies effective hosted rules; checked-in configuration alone does not provision them.
+
+Use short fix branches from release, squash reviewed fixes when appropriate, and forward-port needed runtime fixes to main. Prepare candidate versions only on the stable line. Release-control changes on main do not require changing main's runtime version or moving published install pins.
+
+Source eligibility is an exact PR merge plus successful checks, signed tag binding and trusted-main policy. No per-patch main JSON grant is required. Policy can revoke a commit or tag object explicitly. A candidate cannot authorize itself by editing its own policy copy.
+
+The old `receiver-v1.1.4` tag is retained as a retired unpublished, unsupported candidate. Its unconsumed grant is empty; its immutable identity is recorded in the static policy. Published `receiver-v1.1.5` completes the stable maintenance bootstrap from `receiver-v1.1.3`. Forward-port its workflow fixes, component metadata, and published installation references through a normal main PR. Preserve main's unreleased runtime features and migrations; advancing its source version does not publish those features.
 
 ## Response targets
 

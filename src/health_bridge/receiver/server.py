@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 from typing_extensions import override
 
+from health_bridge.contract.receiver_capabilities import RECEIVER_CAPABILITIES
 from health_bridge.mailbox.connections import (
     MailboxConnectionError,
     MailboxConnectionErrorCode,
@@ -172,6 +173,15 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/v1/capabilities":
+            if self._authorize_batch_request() is None:
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                RECEIVER_CAPABILITIES.model_dump(mode="json"),
+                extra_headers={"Cache-Control": "no-store"},
+            )
+            return
         if path != "/health":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return

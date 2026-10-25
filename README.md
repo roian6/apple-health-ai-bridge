@@ -32,9 +32,11 @@ Automatic sync brings new records into the same local history, without another e
 You'll need an **iPhone running iOS 18 or later**, a **macOS or Linux computer** that can stay awake to receive records, and an AI assistant.
 
 1. **Install the app.** Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806).
-2. **Set up the receiver.** Follow the [setup guide](docs/setup.md), including a private HTTPS route for sync away from home.
+2. **Set up the receiver.** Install the published [Receiver/CLI 1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5) using its [tagged setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/setup.md), including a private HTTPS route for sync away from home.
 3. **Pair your iPhone.** [Scan the pairing QR](docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
 4. **Connect your AI.** [Choose your client](#choose-your-ai), then [ask your first question](docs/setup.md#ask-your-first-question).
+
+For the Mac-only iCloud Mailbox Beta, use the same release's [helper verification and installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md). The maintenance release preserves 1.1.3 query behavior; newer features in main remain unreleased.
 
 ## Choose your AI
 

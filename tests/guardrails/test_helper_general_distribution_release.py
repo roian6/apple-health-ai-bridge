@@ -234,6 +234,8 @@ def test_owner_staging_notarizes_and_staples_before_final_archive() -> None:
     assert body.index("xcodebuild") < body.index(architecture_check)
     final_archive = '--keepParent "$app" "$archive"'
     assert body.index("stapler staple") < body.index(final_archive)
+    assert body.count("/usr/bin/ditto -c -k --norsrc --keepParent") == 2
+    assert '--app "$app"' not in body
     assert body.count("require_secure_timestamp") == 3
     assert body.count("require_hardened_runtime") == 3
     assert '"$profile_icloud_services" != "*"' in body
@@ -300,38 +302,26 @@ def test_publish_requires_clean_macos_distribution_gate() -> None:
     assert "verify_helper_on_macos:" in workflow
     assert "runs-on: macos-" in workflow
     assert "needs: verify_helper_on_macos" in workflow
-    assert "Download exact bound draft helper assets" in workflow
+    assert "scripts/release_recovery.py --phase fetch" in workflow
     assert "scripts/verify_helper_distribution.py" in workflow
-    assert "scripts/release_tools.py verify-helper" in workflow
+    inputs = (ROOT / "scripts/release_publication_inputs.py").read_text(
+        encoding="utf-8"
+    )
+    assert "verify_helper_packet(" in inputs
     assert "helper_manifest_sha256:" in workflow
     assert (
         workflow.count(
             "EXPECTED_HELPER_MANIFEST_SHA256: ${{ inputs.helper_manifest_sha256 }}"
         )
-        == 2
+        == 1
     )
-    assert (
-        workflow.count('[[ "$EXPECTED_HELPER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]')
-        == 2
-    )
-    assert workflow.count("--helper-manifest-sha256") == 6
-    assert workflow.count('test "$actual_manifest_sha256" =') == 2
-    assert "ditto -x -k" in workflow
-    extracted_executable = (
-        'helper_executable="$RUNNER_TEMP/helper-app/'
-        "HealthBridgeMailboxAckPublisher.app/Contents/MacOS/"
-        'HealthBridgeMailboxAckPublisher"'
-    )
-    architecture_check = '/usr/bin/lipo -archs "$helper_executable"'
-    assert extracted_executable in workflow
-    assert architecture_check in workflow
-    assert '"$helper_architectures" != "arm64 x86_64"' in workflow
-    assert '"$helper_architectures" != "x86_64 arm64"' in workflow
-    assert workflow.index("ditto -x -k") < workflow.index(extracted_executable)
-    assert workflow.index(extracted_executable) < workflow.index(architecture_check)
-    assert workflow.index(architecture_check) < workflow.index(
-        "scripts/verify_helper_distribution.py"
-    )
+    assert workflow.count("--helper-manifest-sha256") == 4
+    assert workflow.count('--release-id "$DRAFT_RELEASE_ID"') == 4
+    assert "request.helper_manifest_sha256" in inputs
+    assert "request.helper_sha256" in inputs
+    assert "ditto -x -k" not in workflow
+    assert "--app" not in workflow
+    assert "install_helper(archive, manifest_path, home=home)" in verifier
     assert "verify_macos_release_distribution(" in verifier
     assert "gh release create" not in workflow
     assert "--clobber" not in workflow

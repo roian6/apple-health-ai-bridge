@@ -7,3 +7,5 @@ reviews:
     enabled: true
     auto_incremental_review: true
     drafts: false
+    base_branches:
+      - "^release$"
