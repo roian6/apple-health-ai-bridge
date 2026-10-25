@@ -167,7 +167,7 @@ health-bridge mailbox helper install \
 health-bridge mailbox helper status --json
 ```
 
-The `receiver-v1.1.3` artifact and proof instructions above preserve the
+The `receiver-v1.1.5` artifact and proof instructions above preserve the
 supported URL-based flow. They do not establish that those released assets
 support native URL-free pairing. Native pairing requires a specifically
 qualified matching receiver, helper, and companion build set. The helper must
