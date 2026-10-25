@@ -16,8 +16,8 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: python-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: python-${{ github.workflow }}-${{ github.ref == 'refs/heads/release' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
 
 jobs:
   checks:
