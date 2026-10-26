@@ -20,8 +20,31 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
 
 jobs:
-  checks:
-    name: Python quality and package checks
+  scope:
+    name: Select Python checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed files
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mode="$(bash scripts/ci-scope.sh classify "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")"
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+
+  python-checks:
+    name: Run Python quality and package checks
+    needs: scope
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -137,10 +160,23 @@ jobs:
         run: uv run pip-audit --local --skip-editable
 
       - name: Test
+        if: needs.scope.outputs.mode == 'full'
         run: >-
           uv run pytest -q --cov --cov-config=pyproject.toml
           --cov-report=term --cov-report=xml:coverage/coverage.xml
           --cov-report=json:coverage/coverage.json
+          --durations=30 --durations-min=1.0
+          --junitxml=coverage/pytest.xml
+
+      - name: Test metadata contracts
+        if: needs.scope.outputs.mode == 'metadata'
+        run: >-
+          uv run pytest -q
+          tests/guardrails/test_governance_surfaces.py
+          tests/guardrails/test_issue_forms.py
+          tests/guardrails/test_public_language.py
+          --durations=30 --durations-min=1.0
+          --junitxml=coverage/pytest-metadata.xml
 
       - name: Build distributions
         run: |
@@ -149,6 +185,24 @@ jobs:
 
       - name: Smoke-test built distributions
         run: uv run python scripts/package-smoke.py --dist-dir dist
+
+  checks:
+    name: Python quality and package checks
+    if: always()
+    needs: [scope, python-checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify required result
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          MODE: ${{ needs.scope.outputs.mode }}
+          WORKER_RESULT: ${{ needs.python-checks.result }}
+        run: bash scripts/ci-scope.sh check python "$SCOPE_RESULT" "$MODE" "$WORKER_RESULT"
 
   fuzz:
     name: Coverage-guided input fuzzing

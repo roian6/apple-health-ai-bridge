@@ -101,8 +101,10 @@ to produce another copy of the same evidence.
 
 For concurrent runs in separate worktrees, use separate synthetic data,
 temporary directories and test HOME directories. A different database filename
-alone does not isolate the HOME-relative database lock. Do not use personal
-health data or share a mutable test database between runs.
+alone does not isolate the HOME-relative database lock. Keep the checkout outside
+`TMPDIR`: storage-policy tests distinguish repository paths from explicitly
+allowed temporary state directories. Do not use personal health data or share a
+mutable test database between runs.
 
 ## Swift static analysis
 
