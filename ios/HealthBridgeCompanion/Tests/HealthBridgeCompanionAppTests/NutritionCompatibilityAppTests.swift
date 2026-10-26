@@ -83,15 +83,28 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         let fixture = try NutritionMailboxFixture()
         defer { fixture.base.cleanup() }
         let original = try fixture.base.enqueueMixed()
+        try fixture.writeCapabilities()
         let delivery = fixture.delivery()
         _ = try await delivery.publishPendingFIFOHead()
+        XCTAssertNil(try fixture.base.cursor("dietary_protein"))
         _ = try fixture.receiveAndAcknowledge(original)
+        XCTAssertNil(try fixture.base.cursor("dietary_protein"))
         try fixture.writeCapabilities(tamperUnknownField: true)
         fixture.base.receiver.capability = .offline
         let result = try await delivery.reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
         XCTAssertEqual(result.finalizedCount, 1)
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
-        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+        XCTAssertNil(try fixture.base.outbox.pendingItem(id: original.id))
+        let remaining = try fixture.base.outbox.pendingItems()
+        XCTAssertEqual(remaining.count, 1, "Unknown support retains the unacknowledged supported projection")
+        let projection = try XCTUnwrap(remaining.first)
+        XCTAssertNotEqual(projection.id, original.id)
+        XCTAssertEqual(projection.receiverIdentity, original.receiverIdentity)
+        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: projection.fileURL))
+        XCTAssertFalse(NutritionCompatibility.containsNutrition(batch))
+        XCTAssertEqual(batch.samples.map(\.typeCode), ["weight"])
+        XCTAssertTrue(batch.sync.cursors.isEmpty)
+        XCTAssertNil(projection.deliveryState, "Unacknowledged projection must not inherit the original receipt")
     }
 
     func testCapabilityTokenFailureDoesNotReportQuantitySyncSuccess() async throws {
