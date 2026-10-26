@@ -21,6 +21,7 @@ enum NativePairingLocalFakeTests {
             ("testCapabilitiesPublicationFailurePreservesOldBytes", testCapabilitiesPublicationFailurePreservesOldBytes),
             ("testCapabilitiesRefuseUnsafeInputs", testCapabilitiesRefuseUnsafeInputs),
             ("testCapabilitiesRejectDirectoryReplacementDuringPublication", testCapabilitiesRejectDirectoryReplacementDuringPublication),
+            ("testCapabilitiesRejectStagingReplacementDuringPublication", testCapabilitiesRejectStagingReplacementDuringPublication),
             ("testNativeCancellationCapability", testNativeCancellationCapability),
             ("testNativeExactPublicationReceiptAndIdempotence", testNativeExactPublicationReceiptAndIdempotence),
             ("testNativeRefusalsAfterCapability", testNativeRefusalsAfterCapability),
@@ -84,6 +85,18 @@ enum NativePairingLocalFakeTests {
         try require(!FileManager.default.fileExists(atPath: f.receipt.path), "Detached namespace cannot issue success")
         let old = f.root.appendingPathComponent("detached-device/receiver-capabilities.json")
         try require(try Data(contentsOf: old) == f.payload, "Old detached bytes must survive")
+    }
+
+    static func testCapabilitiesRejectStagingReplacementDuringPublication() throws {
+        let f = try Fixture(); defer { f.close() }
+        _ = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        _ = try f.stageCapabilities(Data("changed synthetic metadata".utf8))
+        try FileManager.default.removeItem(at: f.receipt)
+        f.replaceStagingOnPublication = true
+        try refuses { _ = try f.run("capabilities:" + f.requestID) }
+        try require(try Data(contentsOf: f.capabilitiesFinal) == f.payload, "Replaced staging must preserve the old declaration")
+        try require(!FileManager.default.fileExists(atPath: f.receipt.path), "Replaced staging cannot issue success")
     }
 
     static func testCapabilitiesRefuseUnsafeInputs() throws {
@@ -240,6 +253,7 @@ enum NativePairingLocalFakeTests {
         var publications = 0, observations = 0
         var failPublication = false
         var detachOnPublication = false
+        var replaceStagingOnPublication = false
         var app: URL { root.appendingPathComponent("protocol") }
         var provider: URL { root.appendingPathComponent("provider") }
         var mailboxRoot: URL { provider.appendingPathComponent("Documents/HealthBridgeMailbox/v1") }
@@ -309,6 +323,9 @@ enum NativePairingLocalFakeTests {
                     return (true, nil)
                 }, wait: { preconditionFailure("Successful fake observation must not wait") },
                 replaceMetadata: { payload, final, validatePaths in
+                    if self.replaceStagingOnPublication {
+                        try self.write(Data(contentsOf: self.capabilitiesSource), to: self.capabilitiesSource)
+                    }
                     if self.detachOnPublication {
                         let directory = final.deletingLastPathComponent()
                         try FileManager.default.moveItem(at: directory, to: self.root.appendingPathComponent("detached-device"))

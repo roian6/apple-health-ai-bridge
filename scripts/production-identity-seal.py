@@ -63,6 +63,7 @@ QA_SOURCE_MEMBERS: Final = frozenset(
         "BatchV1.swift",
         "FileOutbox.swift",
         "HealthTypeRegistry.swift",
+        "ReceiverCapabilities.swift",
         "MailboxAckClassifier.swift",
         "MailboxAckDeletion.swift",
         "MailboxAckFileReader.swift",
