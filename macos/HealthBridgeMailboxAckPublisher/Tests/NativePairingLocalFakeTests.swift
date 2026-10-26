@@ -91,12 +91,15 @@ enum NativePairingLocalFakeTests {
         let probe = try Fixture(); defer { probe.close() }
         _ = try probe.stageCapabilities(probe.payload)
         _ = try probe.run("capabilities:" + probe.requestID)
-        for fault in ["operation", "size", "digest", "requestSymlink", "sourceSymlink", "targetSymlink"] {
+        for fault in ["operation", "size", "digest", "requestID", "receiver", "extra", "requestSymlink", "sourceSymlink", "targetSymlink", "sourceHardlink", "targetHardlink", "oversize"] {
             let f = try Fixture(); defer { f.close() }
             var request = try f.stageCapabilities(f.payload)
             if fault == "operation" { request["operation"] = "ack" }
             if fault == "size" { request["byteCount"] = 8_193 }
             if fault == "digest" { request["sha256"] = String(repeating: "0", count: 64) }
+            if fault == "requestID" { request["requestID"] = String(repeating: "f", count: 32) }
+            if fault == "receiver" { request["receiver"] = "../outside" }
+            if fault == "extra" { request["finalName"] = "arbitrary.json" }
             try f.write(JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), to: f.request)
             if fault == "requestSymlink" { try f.replaceWithSymlink(f.request) }
             if fault == "sourceSymlink" { try f.replaceWithSymlink(f.capabilitiesSource) }
@@ -104,6 +107,14 @@ enum NativePairingLocalFakeTests {
                 try f.write(f.payload, to: f.capabilitiesFinal)
                 try f.replaceWithSymlink(f.capabilitiesFinal)
             }
+            if fault == "sourceHardlink" {
+                try FileManager.default.linkItem(at: f.capabilitiesSource, to: f.root.appendingPathComponent("linked-source"))
+            }
+            if fault == "targetHardlink" {
+                try f.write(f.payload, to: f.capabilitiesFinal)
+                try FileManager.default.linkItem(at: f.capabilitiesFinal, to: f.root.appendingPathComponent("linked-target"))
+            }
+            if fault == "oversize" { try f.write(Data(repeating: 0x61, count: 8_193), to: f.capabilitiesSource) }
             try refuses { _ = try f.run("capabilities:" + f.requestID) }
             try require(f.publications == 0, "Unsafe metadata must not publish")
             try require(!FileManager.default.fileExists(atPath: f.receipt.path), "No success receipt for refusal")
