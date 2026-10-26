@@ -299,6 +299,7 @@ private func deleteSyntheticKeychainItems(service: String) {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
+        kSecMatchLimit as String: kSecMatchLimitAll,
     ]
     let deleted = SecItemDelete(query as CFDictionary)
     XCTAssertTrue(deleted == errSecSuccess || deleted == errSecItemNotFound)
