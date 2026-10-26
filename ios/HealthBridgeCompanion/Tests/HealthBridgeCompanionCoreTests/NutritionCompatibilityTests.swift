@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 #if canImport(HealthBridgeCompanion)
@@ -7,6 +8,37 @@ import XCTest
 #endif
 
 final class NutritionCompatibilityTests: XCTestCase {
+    func testMailboxCapabilitiesGoldenPrimitivesAndUnknownFieldTamper() throws {
+        struct Golden: Decodable { let document_utf8: String; let public_key_hex: String }
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let golden = try JSONDecoder().decode(Golden.self, from: Data(contentsOf:
+            root.appendingPathComponent("tests/fixtures/mailbox_receiver_capabilities_v1.synthetic.json")))
+        let document = Data(golden.document_utf8.utf8)
+        XCTAssertLessThanOrEqual(document.count, 8_192)
+        guard case .object(var fields) = try DeliveryProtocolV1.decodeMetadata(document),
+              case .string(let signatureText)? = fields.removeValue(forKey: "signature"),
+              case .object(var capabilities)? = fields["capabilities"] else {
+            return XCTFail("Invalid synthetic golden")
+        }
+        var keyBytes = Data()
+        var index = golden.public_key_hex.startIndex
+        while index < golden.public_key_hex.endIndex {
+            let end = golden.public_key_hex.index(index, offsetBy: 2)
+            keyBytes.append(try XCTUnwrap(UInt8(golden.public_key_hex[index..<end], radix: 16)))
+            index = end
+        }
+        let key = try Curve25519.Signing.PublicKey(rawRepresentation: keyBytes)
+        let base64 = signatureText.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        let signature = try XCTUnwrap(Data(base64Encoded: base64 + String(repeating: "=", count: (4 - base64.count % 4) % 4)))
+        let domain = Data("health-bridge/mailbox/v1/receiver-capabilities/signature\0".utf8)
+        XCTAssertTrue(key.isValidSignature(signature, for: domain + (try DeliveryProtocolV1.encodeMetadata(.object(fields)))))
+        XCTAssertEqual(NutritionSupport.decode(try DeliveryProtocolV1.encodeMetadata(.object(capabilities))), .supported)
+        capabilities["future_synthetic"] = .object(["enabled": .bool(false)])
+        fields["capabilities"] = .object(capabilities)
+        XCTAssertFalse(key.isValidSignature(signature, for: domain + (try DeliveryProtocolV1.encodeMetadata(.object(fields)))))
+    }
+
     @MainActor
     func testNutritionPayloadCodecDoesNotOccupyMainActor() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

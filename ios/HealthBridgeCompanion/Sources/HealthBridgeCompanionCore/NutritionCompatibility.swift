@@ -8,7 +8,7 @@ public enum NutritionSupport: Equatable, Sendable {
     public var notice: String {
         switch self {
         case .unknown:
-            "Nutrition support is unknown. Nutrition is held; reconnect or update the Receiver."
+            "Nutrition support is unknown. Nutrition is held until the Receiver declares support."
         case .unsupported:
             "Nutrition is held. Update the Receiver to enable nutrition delivery."
         case .supported:
@@ -16,17 +16,15 @@ public enum NutritionSupport: Equatable, Sendable {
         }
     }
 
-    public static func decode(_ data: Data) -> NutritionSupport {
-        struct Declaration: Decodable {
-            let schema_id: String
-            let batch_schema_id: String
-            let nutrition_supported: Bool
-        }
-        guard let declaration = try? JSONDecoder().decode(Declaration.self, from: data),
-              declaration.schema_id == "health_bridge.receiver_capabilities.v1",
-              declaration.batch_schema_id == "health_bridge.batch.v1" else { return .unknown }
-        return declaration.nutrition_supported ? .supported : .unsupported
+    public init(capabilities: ReceiverCapabilities?) {
+        guard let capabilities else { self = .unknown; return }
+        self = capabilities.nutritionSupported ? .supported : .unsupported
     }
+
+    public static func decode(_ data: Data) -> NutritionSupport {
+        NutritionSupport(capabilities: ReceiverCapabilities.decodeHTTP(data))
+    }
+
 }
 
 public enum NutritionCompatibility {

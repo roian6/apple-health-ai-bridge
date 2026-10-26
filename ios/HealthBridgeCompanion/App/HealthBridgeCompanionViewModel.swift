@@ -1110,17 +1110,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func refreshNutritionSupport() async throws -> NutritionSupport {
-        let generation = settingsStore.receiverSettingsGenerationToken
-        let binding = settingsStore.receiverBindingID
-        guard let url = URL(string: settingsStore.receiverURLString) else {
-            return .unknown
-        }
-        let token = try settingsStore.loadBearerToken()
-        let support = await receiverClient.nutritionSupport(forBatchURL: url, bearerToken: token)
-        try requireCurrentConnectionGeneration(generation)
-        guard settingsStore.receiverBindingID == binding,
-              settingsStore.receiverURLString == url.absoluteString,
-              try settingsStore.loadBearerToken() == token else { throw CancellationError() }
+        let capabilities = try await ReceiverCapabilityResolver.resolve(
+            settingsStore: settingsStore, client: receiverClient,
+            readMailbox: { identity in
+                try await self.makeProductionMailboxDelivery().readReceiverCapabilities(identity: identity)
+            },
+            validate: {
+                try Task.checkCancellation()
+                guard self.terminalPayloadActionAdmissionIsOpen else { throw CancellationError() }
+                try self.outbox?.requireUploadAdmission()
+            }
+        )
+        let support = NutritionSupport(capabilities: capabilities)
         nutritionNotice = support.notice
         return support
     }
@@ -3775,17 +3776,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     backgroundSyncPreferenceGeneration
                   ) else { return .blocked }
         case let code where HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(code):
-            await syncBackgroundAutomaticQuantityMetrics(
+            let admission = await syncBackgroundAutomaticQuantityMetrics(
                 typeCodes: retirementGenerations.keys.sorted(),
                 historyDepth: healthHistoryDepthStore.historyDepth,
                 pendingGenerationRetirements: retirementGenerations
             )
+            if admission == .heldForReceiverSupport { return .unknownAvailabilityCovering(retirementGenerations) }
         default:
-            await syncBackgroundAutomaticQuantityMetrics(
+            let admission = await syncBackgroundAutomaticQuantityMetrics(
                 typeCodes: [typeCode],
                 historyDepth: .lastDays(1),
                 pendingGenerationRetirements: retirementGenerations
             )
+            if admission == .heldForReceiverSupport { return .unknownAvailabilityCovering(retirementGenerations) }
         }
         if let failure = backgroundAutomaticSyncFailure {
             if !backgroundAutomaticSyncQuerySucceeded,
@@ -5511,8 +5514,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         typeCodes: [String],
         historyDepth: HealthHistoryDepth,
         pendingGenerationRetirements: [String: Int]
-    ) async {
-        await syncQuantityMetrics(
+    ) async -> QuantityCollectionAdmission {
+        return await syncQuantityMetrics(
             typeCodes: typeCodes,
             mode: .background,
             historyDepth: historyDepth,
@@ -5570,18 +5573,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
+    private enum QuantityCollectionAdmission {
+        case attempted
+        case heldForReceiverSupport
+    }
+
+    @discardableResult
     private func syncQuantityMetrics(
         typeCodes rawTypeCodes: [String],
         mode: QuantitySyncMode,
         historyDepth: HealthHistoryDepth? = nil,
         pendingGenerationRetirements: [String: Int] = [:]
-    ) async {
+    ) async -> QuantityCollectionAdmission {
         guard let target = try? capturePayloadDeliveryTarget() else {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return .attempted }
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: mode.executionMode)
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
-            return
+            return .attempted
         }
 
         #if canImport(HealthKit)
@@ -5594,15 +5603,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 nutritionSupport = availableRawTypeCodes.contains(where: NutritionCompatibility.isNutrition)
                     ? try await refreshNutritionSupport() : .unknown
             } catch is CancellationError {
-                return
+                return .attempted
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else { return .attempted }
                 noteBackgroundAutomaticSyncFailure(
                     stage: .store, error: error, executionMode: mode.executionMode
                 )
                 statusIsError = true
                 statusMessage = "\(mode.failurePrefix): \(describe(error))"
-                return
+                return .attempted
             }
             let selectedTypeCodes = GenericQuantityCoveragePolicy
                 .coveragePlan(availableTypeCodes: availableRawTypeCodes)
@@ -5615,7 +5624,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             guard !selectedTypeCodes.isEmpty else {
                 statusIsError = false
                 statusMessage = mode.emptySelectionMessage
-                return
+                return availableRawTypeCodes.contains(where: NutritionCompatibility.isNutrition)
+                    && nutritionSupport != .supported ? .heldForReceiverSupport : .attempted
             }
 
             let sourceKey = HealthBridgeAppleHealthSource.phone.sourceKey
@@ -5631,7 +5641,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 )
                 statusIsError = true
                 statusMessage = describe(error)
-                return
+                return .attempted
             }
             let (cursorStore, progressScope) = progressStorage
             let receiverBindingID = progressScope.receiverBindingID
@@ -5813,7 +5823,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         to: target,
                         cursorCheckpoint: cursorCheckpoint,
                         executionMode: mode.executionMode,
+                        // Nutrition has no separate daily-activity owner; its receipt retires this generation.
                         pendingGenerationRetirements: selectedEntries.first(where: { $0.typeCode == typeCode })?.aggregation == .sum
+                            && !NutritionCompatibility.typeCodes.contains(typeCode)
                             ? [:] : pendingGenerationRetirements
                     )
                     try requireCurrentReceiverSyncProgressScope(
@@ -5853,7 +5865,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         if mode == .background {
                             statusIsError = true
                         }
-                        return
+                        return .attempted
                     }
                     let name = displayNamesByTypeCode[typeCode] ?? typeCode
                     skippedMetricDescriptions.append(
@@ -5870,7 +5882,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     if mode == .background {
                         statusIsError = true
                     }
-                    return
+                    return .attempted
                 } catch {
                     noteBackgroundAutomaticSyncFailure(
                         stage: failureStage,
@@ -5890,7 +5902,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     statusIsError = false
                     statusMessage = mode.noSamplesMessage
                 }
-                return
+                return .attempted
             }
 
             statusIsError = false
@@ -5922,6 +5934,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         statusIsError = true
         statusMessage = "HealthKit is not available on this platform."
         #endif
+        return .attempted
     }
 
     // An immutable target for one collection/delivery operation, never a stored connection.

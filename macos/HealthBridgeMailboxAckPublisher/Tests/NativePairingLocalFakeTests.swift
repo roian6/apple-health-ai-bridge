@@ -16,6 +16,12 @@ enum NativePairingLocalFakeTests {
 
     static func runAll() {
         let tests: [(String, () throws -> Void)] = [
+            ("testCapabilitiesFirstCreateAndSameBytes", testCapabilitiesFirstCreateAndSameBytes),
+            ("testCapabilitiesChangedBytesReplace", testCapabilitiesChangedBytesReplace),
+            ("testCapabilitiesPublicationFailurePreservesOldBytes", testCapabilitiesPublicationFailurePreservesOldBytes),
+            ("testCapabilitiesRefuseUnsafeInputs", testCapabilitiesRefuseUnsafeInputs),
+            ("testCapabilitiesRejectDirectoryReplacementDuringPublication", testCapabilitiesRejectDirectoryReplacementDuringPublication),
+            ("testCapabilitiesRejectStagingReplacementDuringPublication", testCapabilitiesRejectStagingReplacementDuringPublication),
             ("testNativeCancellationCapability", testNativeCancellationCapability),
             ("testNativeExactPublicationReceiptAndIdempotence", testNativeExactPublicationReceiptAndIdempotence),
             ("testNativeRefusalsAfterCapability", testNativeRefusalsAfterCapability),
@@ -29,6 +35,103 @@ enum NativePairingLocalFakeTests {
         }
         print("CASES=\(tests.count) PASSED=\(tests.count - failed) FAILED=\(failed) SKIPPED=0")
         Darwin.exit(failed == 0 ? 0 : 1)
+    }
+
+    static func testCapabilitiesFirstCreateAndSameBytes() throws {
+        let f = try Fixture(); defer { f.close() }
+        let request = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        var expected = request
+        expected["stored"] = true; expected["exactBytes"] = true; expected["isUbiquitous"] = true
+        let receipt = try JSONSerialization.jsonObject(with: Data(contentsOf: f.receipt)) as? NSDictionary
+        try require(receipt == expected as NSDictionary, "Metadata receipt must bind operation, identity and bytes")
+        try require(try Data(contentsOf: f.capabilitiesFinal) == f.payload, "First-create exact metadata")
+        _ = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        try require(f.publications == 1, "Same bytes must not rewrite metadata")
+    }
+
+    static func testCapabilitiesChangedBytesReplace() throws {
+        let f = try Fixture(); defer { f.close() }
+        _ = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        let changed = Data("changed synthetic signed metadata".utf8)
+        _ = try f.stageCapabilities(changed)
+        _ = try f.run("capabilities:" + f.requestID)
+        try require(try Data(contentsOf: f.capabilitiesFinal) == changed, "Metadata must replace changed bytes")
+        try require(f.publications == 2, "Only changed metadata is republished")
+    }
+
+    static func testCapabilitiesPublicationFailurePreservesOldBytes() throws {
+        let f = try Fixture(); defer { f.close() }
+        _ = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        _ = try f.stageCapabilities(Data("changed synthetic signed metadata".utf8))
+        try FileManager.default.removeItem(at: f.receipt)
+        f.failPublication = true
+        try refuses { _ = try f.run("capabilities:" + f.requestID) }
+        try require(try Data(contentsOf: f.capabilitiesFinal) == f.payload, "Failed replace must preserve old bytes")
+        try require(!FileManager.default.fileExists(atPath: f.receipt.path), "Failure cannot issue a success receipt")
+    }
+
+    static func testCapabilitiesRejectDirectoryReplacementDuringPublication() throws {
+        let f = try Fixture(); defer { f.close() }
+        _ = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        _ = try f.stageCapabilities(Data("changed synthetic metadata".utf8))
+        try FileManager.default.removeItem(at: f.receipt)
+        f.detachOnPublication = true
+        try refuses { _ = try f.run("capabilities:" + f.requestID) }
+        try require(!FileManager.default.fileExists(atPath: f.receipt.path), "Detached namespace cannot issue success")
+        let old = f.root.appendingPathComponent("detached-device/receiver-capabilities.json")
+        try require(try Data(contentsOf: old) == f.payload, "Old detached bytes must survive")
+    }
+
+    static func testCapabilitiesRejectStagingReplacementDuringPublication() throws {
+        let f = try Fixture(); defer { f.close() }
+        _ = try f.stageCapabilities(f.payload)
+        _ = try f.run("capabilities:" + f.requestID)
+        _ = try f.stageCapabilities(Data("changed synthetic metadata".utf8))
+        try FileManager.default.removeItem(at: f.receipt)
+        f.replaceStagingOnPublication = true
+        try refuses { _ = try f.run("capabilities:" + f.requestID) }
+        try require(try Data(contentsOf: f.capabilitiesFinal) == f.payload, "Replaced staging must preserve the old declaration")
+        try require(!FileManager.default.fileExists(atPath: f.receipt.path), "Replaced staging cannot issue success")
+    }
+
+    static func testCapabilitiesRefuseUnsafeInputs() throws {
+        // Reach actual supported dispatch first; unsupported commands cannot satisfy refusal controls.
+        let probe = try Fixture(); defer { probe.close() }
+        _ = try probe.stageCapabilities(probe.payload)
+        _ = try probe.run("capabilities:" + probe.requestID)
+        for fault in ["operation", "size", "digest", "requestID", "receiver", "extra", "requestSymlink", "sourceSymlink", "targetSymlink", "sourceHardlink", "targetHardlink", "oversize"] {
+            let f = try Fixture(); defer { f.close() }
+            var request = try f.stageCapabilities(f.payload)
+            if fault == "operation" { request["operation"] = "ack" }
+            if fault == "size" { request["byteCount"] = 8_193 }
+            if fault == "digest" { request["sha256"] = String(repeating: "0", count: 64) }
+            if fault == "requestID" { request["requestID"] = String(repeating: "f", count: 32) }
+            if fault == "receiver" { request["receiver"] = "../outside" }
+            if fault == "extra" { request["finalName"] = "arbitrary.json" }
+            try f.write(JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), to: f.request)
+            if fault == "requestSymlink" { try f.replaceWithSymlink(f.request) }
+            if fault == "sourceSymlink" { try f.replaceWithSymlink(f.capabilitiesSource) }
+            if fault == "targetSymlink" {
+                try f.write(f.payload, to: f.capabilitiesFinal)
+                try f.replaceWithSymlink(f.capabilitiesFinal)
+            }
+            if fault == "sourceHardlink" {
+                try FileManager.default.linkItem(at: f.capabilitiesSource, to: f.root.appendingPathComponent("linked-source"))
+            }
+            if fault == "targetHardlink" {
+                try f.write(f.payload, to: f.capabilitiesFinal)
+                try FileManager.default.linkItem(at: f.capabilitiesFinal, to: f.root.appendingPathComponent("linked-target"))
+            }
+            if fault == "oversize" { try f.write(Data(repeating: 0x61, count: 8_193), to: f.capabilitiesSource) }
+            try refuses { _ = try f.run("capabilities:" + f.requestID) }
+            try require(f.publications == 0, "Unsafe metadata must not publish")
+            try require(!FileManager.default.fileExists(atPath: f.receipt.path), "No success receipt for refusal")
+        }
     }
 
     private static func capability(_ f: Fixture) throws {
@@ -148,12 +251,28 @@ enum NativePairingLocalFakeTests {
         let ackName = String(repeating: "e", count: 32) + ".hba"
         let payload = Data("synthetic opaque encrypted publication bytes".utf8)
         var publications = 0, observations = 0
+        var failPublication = false
+        var detachOnPublication = false
+        var replaceStagingOnPublication = false
         var app: URL { root.appendingPathComponent("protocol") }
         var provider: URL { root.appendingPathComponent("provider") }
         var mailboxRoot: URL { provider.appendingPathComponent("Documents/HealthBridgeMailbox/v1") }
         var request: URL { app.appendingPathComponent("requests/\(requestID).json") }
         var receipt: URL { app.appendingPathComponent("receipts/\(requestID).json") }
         var ackFinal: URL { mailboxRoot.appendingPathComponent("\(receiver)/\(device)/acks/\(ackName)") }
+        var capabilitiesFinal: URL { mailboxRoot.appendingPathComponent("\(receiver)/\(device)/receiver-capabilities.json") }
+        var capabilitiesSource: URL { app.appendingPathComponent("staging/\(requestID).json") }
+        func stageCapabilities(_ bytes: Data) throws -> [String: Any] {
+            try mkdir(capabilitiesFinal.deletingLastPathComponent())
+            let request: [String: Any] = [
+                "version": 1, "operation": "receiver_capabilities", "requestID": requestID,
+                "receiver": receiver, "device": device, "byteCount": bytes.count,
+                "sha256": SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            ]
+            try write(bytes, to: capabilitiesSource)
+            try write(JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), to: self.request)
+            return request
+        }
         func nativeFinal(_ name: String) -> URL { mailboxRoot.appendingPathComponent("pairing/\(invitationID)/\(name)") }
         func source(native: Bool) -> URL { app.appendingPathComponent("staging/\(requestID).\(native ? "hbp" : "hba")") }
         init() throws {
@@ -189,6 +308,12 @@ enum NativePairingLocalFakeTests {
                 publish: { source, final in
                     try NativePairingLocalFakeTests.require(source.path.hasPrefix(self.app.path + "/"), "Private staging required")
                     try NativePairingLocalFakeTests.require(final.path.hasPrefix(self.provider.path + "/"), "Private fake provider required")
+                    if self.detachOnPublication {
+                        let directory = final.deletingLastPathComponent()
+                        try FileManager.default.moveItem(at: directory, to: self.root.appendingPathComponent("detached-device"))
+                        try self.mkdir(directory)
+                    }
+                    if self.failPublication { throw Failure(message: "synthetic failure before publication") }
                     self.publications += 1
                     try self.write(Data(contentsOf: source), to: final)
                 },
@@ -196,7 +321,20 @@ enum NativePairingLocalFakeTests {
                     try NativePairingLocalFakeTests.require(final.path.hasPrefix(self.provider.path + "/"), "Private observation required")
                     self.observations += 1
                     return (true, nil)
-                }, wait: { preconditionFailure("Successful fake observation must not wait") }
+                }, wait: { preconditionFailure("Successful fake observation must not wait") },
+                replaceMetadata: { payload, final, validatePaths in
+                    if self.replaceStagingOnPublication {
+                        try self.write(Data(contentsOf: self.capabilitiesSource), to: self.capabilitiesSource)
+                    }
+                    if self.detachOnPublication {
+                        let directory = final.deletingLastPathComponent()
+                        try FileManager.default.moveItem(at: directory, to: self.root.appendingPathComponent("detached-device"))
+                        try self.mkdir(directory)
+                    }
+                    if self.failPublication { throw Failure(message: "synthetic failure before replacement") }
+                    self.publications += 1
+                    try coordinatedCapabilityReplacement(payload, final, validatePaths)
+                }
             ))
         }
         func close() { try? FileManager.default.removeItem(at: root) }

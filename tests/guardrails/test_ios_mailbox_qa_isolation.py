@@ -29,6 +29,7 @@ CURATED_CORE = {
     "BatchV1.swift",
     "FileOutbox.swift",
     "HealthTypeRegistry.swift",
+    "ReceiverCapabilities.swift",
     "MailboxAckClassifier.swift",
     "MailboxAckDeletion.swift",
     "MailboxAckFileReader.swift",
