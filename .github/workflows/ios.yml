@@ -18,13 +18,34 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/release' }}
 
 jobs:
-  build-and-test:
-    name: Swift tests and unsigned app builds
+  scope:
+    name: Select native checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed files
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mode="$(bash scripts/ci-scope.sh classify "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")"
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+
+  native-checks:
+    name: Run Swift tests and unsigned app builds
+    needs: scope
+    if: needs.scope.outputs.mode == 'full' || needs.scope.outputs.mode == 'native'
     runs-on: macos-26
     timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: ios/HealthBridgeCompanion
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,45 +61,26 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/swift-analysis.sh
 
-      - name: Run Swift package tests
-        run: swift test
+      - name: Run selected native checks
+        env:
+          MODE: ${{ needs.scope.outputs.mode }}
+          CHECKS_OUTPUT_DIR: ${{ runner.temp }}/health-bridge-checks
+        run: bash scripts/run-checks.sh native-builds "$MODE"
 
-      - name: Build unsigned iPhone simulator app
-        run: |
-          xcodebuild -project HealthBridgeCompanion.xcodeproj \
-            -target HealthBridgeCompanion \
-            -sdk iphonesimulator \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Build unsigned generic iPhone app
-        run: |
-          xcodebuild -project HealthBridgeCompanion.xcodeproj \
-            -target HealthBridgeCompanion \
-            -sdk iphoneos \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Build unsigned Public Documents QA simulator app
-        run: |
-          xcodebuild -project HealthBridgeCompanion.xcodeproj \
-            -target HealthBridgeCompanionPublicDocumentsQA \
-            -sdk iphonesimulator \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Build unsigned Public Documents QA generic iPhone app
-        run: |
-          xcodebuild -project HealthBridgeCompanion.xcodeproj \
-            -target HealthBridgeCompanionPublicDocumentsQA \
-            -sdk iphoneos \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
+  build-and-test:
+    name: Swift tests and unsigned app builds
+    if: always()
+    needs: [scope, native-checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify required result
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          MODE: ${{ needs.scope.outputs.mode }}
+          WORKER_RESULT: ${{ needs.native-checks.result }}
+        run: bash scripts/ci-scope.sh check native "$SCOPE_RESULT" "$MODE" "$WORKER_RESULT"

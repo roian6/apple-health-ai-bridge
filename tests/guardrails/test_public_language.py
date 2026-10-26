@@ -540,10 +540,10 @@ def test_current_component_identities_are_explicit() -> None:
     assert f'version = "{__version__}"' in pyproject
     assert f'__version__: Final = "{__version__}"' in package_init
     assert f'"version": "{__version__}"' in server_manifest
-    assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
-    assert '?? "1.1.1"' in content_view
-    assert '?? "50"' in content_view
+    assert xcode_project.count("MARKETING_VERSION = 1.2.0;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 51;") == 2
+    assert '?? "1.2.0"' in content_view
+    assert '?? "51"' in content_view
     assert "pre-1.0" not in security
 
 

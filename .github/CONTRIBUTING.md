@@ -71,6 +71,41 @@ Keep deterministic fuzz contracts in the normal suite; run the native campaign
 on its supported platform. Explain in the PR when a change has no testable
 behavior, such as a prose-only correction.
 
+### Fast local feedback
+
+While iterating, start with the test file covering the change, then widen to
+related tests when you change a shared fixture or interface. For example, an
+issue-form change can start with:
+
+```bash
+uv run pytest -q tests/guardrails/test_issue_forms.py
+```
+
+To investigate one failing case, use its full node ID:
+
+```bash
+uv run pytest -q tests/guardrails/test_issue_forms.py::test_bug_report_keeps_reproduction_required
+```
+
+A focused run is feedback for that selection, not a replacement for the selected
+[pre-PR checks](#before-opening-a-pr). Keep the existing assertions and fix the
+failure rather than excluding it. Run the impact-aware checks once the changes
+are ready for review, instead of the whole suite after every small edit.
+
+Keep the command, result, source revision and any uncommitted changes with your
+local verification notes. Reuse a passing result only while its inputs and
+environment are unchanged; a commit ID alone does not describe a dirty worktree.
+Changes to code, tests, fixtures, configuration, dependencies or tool versions
+invalidate the affected results. Do not repeat an unchanged passing check just
+to produce another copy of the same evidence.
+
+For concurrent Python runs in separate worktrees, use separate synthetic data,
+temporary directories and test HOME directories. A different database filename
+alone does not isolate the HOME-relative database lock. Keep the checkout outside
+`TMPDIR`: storage-policy tests distinguish repository paths from explicitly
+allowed temporary state directories. Do not use personal health data or share a
+mutable test database between runs.
+
 ## Swift static analysis
 
 From the repository root, run `bash scripts/swift-analysis.sh` on macOS with
@@ -156,7 +191,43 @@ Non-trivial features should link an accepted issue. The public triage, merge, an
 
 ## Before Opening a PR
 
-Run the Python gates for non-iOS changes:
+Run the same impact-aware checks used by CI against your current PR base:
+
+```bash
+bash scripts/run-checks.sh local origin/main
+```
+
+Update the base ref before reviewing a branch. The command includes committed,
+staged and unstaged changes; untracked files, unknown inputs, deletions, renames
+or mixed Python/native work select the full profile rather than silently losing
+coverage. Python checks use an isolated test HOME, while native checks retain
+the macOS keychain context. Temporary directories are removed when the command
+exits. Reports and build outputs go to `.tmp/checks`;
+`CHECKS_OUTPUT_DIR` can select another task-owned output directory.
+
+| Profile | Selected validation |
+| --- | --- |
+| Maintenance | Mapped docs, community, marketing assets and automation contracts, including public links, executable CLI/MCP examples and package smoke. |
+| Python | Runtime tests and relevant guards, with coverage; unrelated release-orchestration tests are omitted only for reviewed internal Python paths. |
+| Native | Swift analysis, package tests, both unsigned SDK builds for both app targets, and relevant Python native/contract/document guards. |
+| Full | The complete Python suite and native gates. Shared protocols, release inputs, dependencies, CI logic and uncertain impact keep this profile. |
+
+All profiles retain formatting, lint, type, source/dependency security, workflow
+schema and public-release checks. The exact path policy is in
+[`scripts/ci-scope.sh`](../scripts/ci-scope.sh), and both local and CI execution
+use [`scripts/run-checks.sh`](../scripts/run-checks.sh). Main/release pushes,
+iOS checkpoint tags and manual CI runs remain full. CodeQL and native fuzzing
+remain separate CI checks; a local pass does not claim those hosted checks ran.
+
+Use the full local profile when impact is uncertain or for release-facing work:
+
+```bash
+bash scripts/run-checks.sh full
+```
+
+Selected native checks require macOS with Xcode and fail visibly when unavailable.
+Report that limitation rather than treating an unrun native check as passed.
+The full Python baseline remains:
 
 ```bash
 uv run ruff format --check .
@@ -164,10 +235,14 @@ uv run ruff check .
 uv run basedpyright
 uv run bandit -r src -q
 uv run pip-audit --local --skip-editable
-uv run pytest -q
+uv run pytest -q --durations=30 --durations-min=1.0
 uv run python scripts/public-release-audit.py --strict
 git diff --check
 ```
+
+The duration report identifies slow tests without reducing the test selection.
+Use it to guide optimization rather than assuming the largest test file is the
+slowest.
 
 For iOS/Swift changes, use Xcode 16 or later and also run Swift package tests and the relevant Xcode build.
 
