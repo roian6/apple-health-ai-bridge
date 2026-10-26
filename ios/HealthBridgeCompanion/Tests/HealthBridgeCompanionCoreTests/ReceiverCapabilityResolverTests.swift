@@ -84,3 +84,39 @@ final class ReceiverCapabilityResolverTests: XCTestCase {
         catch is CancellationError { }
     }
 }
+
+private final class CapabilityMemoryTokenStore: ReceiverTokenStoring {
+    var value: String
+    private(set) var writes = 0
+    init(_ value: String = "") { self.value = value }
+    func loadToken() throws -> String { value }
+    func saveToken(_ token: String) throws { writes += 1; value = token }
+}
+
+extension ReceiverCapabilityResolverTests {
+    func testLegacyHTTPRecordUsesDirectConfigurationWithoutRewritingPairing() async throws {
+        let suite = "CapabilityLegacy.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fields: [String: Any] = ["version": 1, "receiverURLString": "http://127.0.0.1:8765/v1/batches",
+                                   "bearerToken": "synthetic-legacy", "generation": 3, "bindingID": "synthetic-binding"]
+        let original = "health-bridge-connection-v1:" + (try JSONSerialization.data(withJSONObject: fields, options: .sortedKeys)).base64EncodedString()
+        let tokens = CapabilityMemoryTokenStore(original)
+        let backup = CapabilityMemoryTokenStore()
+        let settings = ReceiverSettingsStore(userDefaults: defaults, tokenStore: tokens,
+                                             preCutoverBackupStore: backup, synchronize: { true })
+        let connection = try settings.currentConnectionRecordV2()
+        let result = try await ReceiverCapabilityResolver.resolve(
+            connection: connection, currentConnection: { try settings.currentConnectionRecordV2() },
+            readDirect: { url, token in
+                XCTAssertEqual(url.absoluteString, "http://127.0.0.1:8765/v1/batches")
+                XCTAssertEqual(token, "synthetic-legacy")
+                return ReceiverCapabilities(nutritionSupported: true)
+            }, readMailbox: { _ in XCTFail("Legacy Direct must not inspect iCloud"); return nil }
+        )
+        XCTAssertEqual(result?.nutritionSupported, true)
+        XCTAssertEqual(tokens.value, original)
+        XCTAssertEqual(tokens.writes, 0)
+        XCTAssertEqual(backup.writes, 0)
+    }
+}

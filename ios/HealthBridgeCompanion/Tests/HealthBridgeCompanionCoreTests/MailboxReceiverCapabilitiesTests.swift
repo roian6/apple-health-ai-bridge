@@ -127,12 +127,15 @@ private final class CapabilityReadProbe: @unchecked Sendable {
     private var onMain = false
     private var expired = false
     private var requests = 0
+    private var local = true
     func block() {
         lock.withLock { onMain = Thread.isMainThread }
         entered.fulfill()
         if semaphore.wait(timeout: .now() + 5) != .success { lock.withLock { expired = true } }
     }
     func release() { semaphore.signal() }
+    func markUnavailable() { lock.withLock { local = false } }
+    var localAvailability: Bool { lock.withLock { local } }
     func requested() { lock.withLock { requests += 1 } }
     var downloadRequests: Int { lock.withLock { requests } }
     var occupiedMain: Bool { lock.withLock { onMain } }
@@ -221,5 +224,22 @@ extension MailboxReceiverCapabilitiesTests {
         let preimage = Data("health-bridge/mailbox/v1/receiver-capabilities/signature\0".utf8) + (try DeliveryProtocolV1.encodeMetadata(.object(raw)))
         raw["signature"] = .string(try attacker.signature(for: preimage).base64URLEncodedString())
         XCTAssertThrowsError(try MailboxReceiverCapabilities.decode(DeliveryProtocolV1.encodeMetadata(.object(raw)), identity: f.identity))
+    }
+}
+
+extension MailboxReceiverCapabilitiesTests {
+    @MainActor
+    func testAvailabilityConflictDuringReadCannotBecomeSupport() async throws {
+        let f = try CapabilityLocalFixture(); defer { f.close() }
+        let locator = f.locator
+        let probe = CapabilityReadProbe()
+        let io = MailboxReceiverCapabilities.IO(isLocal: { _ in probe.localAvailability }, requestDownload: { _ in probe.requested() }, readBytes: { url in
+            let data = try MailboxRegularFileReader.read(url, maximumBytes: 8192)
+            probe.markUnavailable()
+            return data
+        })
+        let result = try await MailboxReceiverCapabilities.read(identity: f.golden.identity, locate: { locator }, io: io)
+        XCTAssertNil(result)
+        XCTAssertEqual(probe.downloadRequests, 0)
     }
 }
