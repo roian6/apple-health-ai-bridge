@@ -6,6 +6,7 @@ import sqlite3
 import time
 from contextlib import closing
 from threading import Event, Thread
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Self, cast, final
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -14,6 +15,11 @@ import pytest
 
 import health_bridge.receiver.mailbox_runtime as runtime_module
 import health_bridge.receiver.server as server_module
+from health_bridge.mailbox.connections import (
+    MailboxConnectionError,
+    MailboxConnectionErrorCode,
+    MailboxConnectionStore,
+)
 from health_bridge.mailbox.models import MailboxImportResult
 from tests.mailbox.importer_support import (
     configured_importer,
@@ -22,17 +28,32 @@ from tests.mailbox.importer_support import (
     opened_receipt,
     write_delivery,
 )
+from tests.receiver.delivery_acceptance_support import connection
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     from health_bridge.mailbox.filesystem import MailboxDirectoryHandle
+    from health_bridge.receiver.delivery_acceptance import DeliveryTrustedConnection
 
 
 RECEIVER_ID = "02" * 16
 DEVICE_ID = "03" * 16
 SECOND_DEVICE_ID = "04" * 16
+
+
+@pytest.fixture(autouse=True)
+def synthetic_capability_connection_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Runtime fixtures must never fall through to the user's real connection store.
+    def unavailable(_path: Path) -> DeliveryTrustedConnection:
+        raise MailboxConnectionError(MailboxConnectionErrorCode.UNAVAILABLE)
+
+    monkeypatch.setattr(
+        MailboxConnectionStore,
+        "production",
+        lambda: SimpleNamespace(load=unavailable),
+    )
 
 
 @final
@@ -731,3 +752,89 @@ def test_direct_serve_receiver_never_starts_mailbox_worker(
         connection,
     ):
         assert connection.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_empty_paired_mailbox_publishes_capabilities_after_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+    published: list[bytes] = []
+
+    def publish(directory: MailboxDirectoryHandle, payload: bytes) -> None:
+        assert calls == [mailbox]
+        published.append(payload)
+        _ = (directory.path / "receiver-capabilities.json").write_bytes(payload)
+
+    def load(_path: Path) -> DeliveryTrustedConnection:
+        return connection()
+
+    monkeypatch.setattr(
+        MailboxConnectionStore,
+        "production",
+        lambda: SimpleNamespace(load=load),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "default_native_ack_publisher",
+        lambda: SimpleNamespace(publish_capabilities=publish),
+    )
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+    worker.run_once()
+    assert calls == [mailbox]
+    assert len(published) == 1
+    assert json.loads(published[0])["capabilities"]["nutrition_supported"] is True
+    worker.run_once()
+    assert len(published) == 1
+    restarted = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+    restarted.run_once()
+    assert calls == [mailbox, mailbox]
+    assert len(published) == 1
+
+
+@pytest.mark.parametrize("metadata_failure", [False, True])
+def test_metadata_failure_preserves_real_import_ack_and_maintenance_cadence(
+    tmp_path: Path,
+    metadata_failure: bool,
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    attempts: list[int] = []
+    clock = [0.0]
+
+    def publish(_directory: MailboxDirectoryHandle) -> None:
+        assert database_counts(value) == (1, 1, 1)
+        assert opened_receipt(next(value.acks.glob("*.hba"))).result == "committed"
+        attempts.append(1)
+        if metadata_failure:
+            raise TimeoutError
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=value.db_path,
+        mailbox_root=tmp_path,
+        importer_factory=lambda _db, _path, _directory: configured_importer(value),
+        capability_publisher=publish,
+        monotonic=lambda: clock[0],
+    )
+    worker.run_once()
+    # Import changed the ACK lane; its next settling pass remains eligible.
+    worker.run_once()
+    settled_attempts = len(attempts)
+    worker.run_once()
+    assert len(attempts) == settled_attempts
+    clock[0] += 301
+    worker.run_once()
+    assert len(attempts) == settled_attempts + 1
+    assert worker.health_error() is None
+    assert database_counts(value) == (1, 1, 1)

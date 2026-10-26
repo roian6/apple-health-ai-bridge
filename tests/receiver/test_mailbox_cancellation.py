@@ -70,6 +70,7 @@ def test_native_bootstrap_bounds_helper_work_across_restart(
 
     if restarted:
         previous = MailboxRuntimeWorker(
+            capability_publisher=lambda _directory: None,
             db_path=peer.db,
             mailbox_root=root,
             pairing_keys=peer.receiver,
@@ -81,6 +82,7 @@ def test_native_bootstrap_bounds_helper_work_across_restart(
         assert len(publications) == 2
         publications.clear()
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -114,6 +116,7 @@ def test_cancellation_revokes_exact_request_across_restart(
         publish_response(directory, content)
 
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -151,6 +154,7 @@ def test_cancellation_revokes_exact_request_across_restart(
         PAIRING_DOMAIN + b"cancelled/signature\0" + hbjcs1_encode(decoded),
     )
     restarted = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -200,6 +204,7 @@ def test_older_native_request_recovers_beyond_first_invitation_page(
         publish_response(path, content)
 
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -232,6 +237,7 @@ def test_older_native_request_recovers_beyond_first_invitation_page(
         )
     if restarted:
         worker = MailboxRuntimeWorker(
+            capability_publisher=lambda _directory: None,
             db_path=peer.db,
             mailbox_root=root,
             pairing_keys=peer.receiver,
@@ -282,6 +288,7 @@ def test_wrong_peer_cannot_cancel_committed_request(tmp_path: Path) -> None:
     directory.mkdir(parents=True)
     _ = publish_final(directory, "request.hbp", request)
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -330,6 +337,7 @@ def test_cancel_arriving_after_trust_save_prevents_registration_commit(
 
     monkeypatch.setattr(MailboxConnectionStore, "save", intercept)
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=tmp_path / "provider",
         pairing_keys=peer.receiver,

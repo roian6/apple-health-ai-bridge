@@ -40,6 +40,7 @@ def test_bootstrap_worker_retries_real_sqlite_contention(
     root = tmp_path / "provider"
     root.mkdir()
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -143,6 +144,7 @@ def test_running_bootstrap_and_writer_leave_installed_queries_available(
     root = tmp_path / "provider"
     root.mkdir()
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,

@@ -18,6 +18,10 @@ from typing import Final, cast, final
 
 from health_bridge.contract._delivery_common import MAX_ENVELOPE_BYTES
 from health_bridge.contract._hbjcs1 import hbjcs1_decode
+from health_bridge.contract.mailbox_capabilities import (
+    CAPABILITIES_FILENAME,
+    MAX_CAPABILITIES_BYTES,
+)
 from health_bridge.mailbox.filesystem import (
     MailboxDirectoryHandle,
     read_final,
@@ -176,6 +180,93 @@ class NativeAckPublisher:
             for path in (source, request_path, receipt_path):
                 _unlink_protocol_file(path)
 
+    def publish_capabilities(
+        self, directory: MailboxDirectoryHandle, payload: bytes
+    ) -> None:
+        """Store bounded bytes at the helper's fixed metadata target, then reread it."""
+        directory.validate_attached()
+        receiver, device = directory.receiver_name, directory.device_name
+        _require_opaque_component(receiver)
+        _require_opaque_component(device)
+        if not payload or len(payload) > MAX_CAPABILITIES_BYTES:
+            raise NativeAckPublicationError("invalid capability metadata size")
+        executable = self._config.helper_executable
+        _require_executable(executable)
+        request_id = secrets.token_hex(16)
+        root = self._config.protocol_root
+        for lane in (root, root / "requests", root / "staging", root / "receipts"):
+            ensure_private_directory(lane)
+            _require_owner_private_directory(lane)
+        source = root / "staging" / f"{request_id}.json"
+        request_path = root / "requests" / f"{request_id}.json"
+        receipt_path = root / "receipts" / f"{request_id}.json"
+        request = {
+            "version": PROTOCOL_VERSION,
+            "operation": "receiver_capabilities",
+            "requestID": request_id,
+            "receiver": receiver,
+            "device": device,
+            "byteCount": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        try:
+            _write_private_bytes(source, payload)
+            write_private_text_file(
+                request_path, json.dumps(request, separators=(",", ":"), sort_keys=True)
+            )
+            try:
+                completed = subprocess.run(  # nosec B603
+                    [str(executable), f"capabilities:{request_id}"],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=self._config.timeout_seconds,
+                    close_fds=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise NativeAckPublicationError(
+                    "native capability helper timed out"
+                ) from exc
+            if completed.returncode != 0:
+                raise NativeAckPublicationError("native capability helper failed")
+            metadata = receipt_path.lstat()
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                raise NativeAckPublicationError("native capability receipt unsafe")
+            receipt = read_final(receipt_path, maximum_bytes=MAX_RECEIPT_BYTES).content
+            try:
+                actual = cast(
+                    "object",
+                    json.loads(receipt, object_pairs_hook=_unique_receipt_fields),
+                )
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise NativeAckPublicationError(
+                    "native capability receipt invalid"
+                ) from exc
+            expected = {
+                **request,
+                "stored": True,
+                "exactBytes": True,
+                "isUbiquitous": True,
+            }
+            # JSON comparison keeps bool and int distinct.
+            if json.dumps(actual, sort_keys=True) != json.dumps(
+                expected, sort_keys=True
+            ):
+                raise NativeAckPublicationError("native capability receipt mismatch")
+            directory.validate_attached()
+            final = read_final_at(
+                directory.mailbox_fd,
+                CAPABILITIES_FILENAME,
+                maximum_bytes=MAX_CAPABILITIES_BYTES,
+            )
+            if final.content != payload:
+                raise NativeAckPublicationError("stored capability content mismatch")
+            directory.validate_attached()
+        finally:
+            for path in (receipt_path, request_path, source):
+                _unlink_protocol_file(path)
+
     def __call__(
         self,
         directory: MailboxDirectoryHandle,
@@ -265,6 +356,15 @@ class NativeAckPublisher:
             _unlink_protocol_file(receipt_path)
             _unlink_protocol_file(request_path)
             _unlink_protocol_file(source)
+
+
+def _unique_receipt_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise NativeAckPublicationError("duplicate capability receipt field")
+        result[name] = value
+    return result
 
 
 def default_native_ack_publisher() -> NativeAckPublisher:
