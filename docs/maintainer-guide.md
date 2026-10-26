@@ -16,11 +16,17 @@ Do not routinely disable the main ruleset or push directly to `main`. Emergency 
 
 1. Move sensitive security reports out of public Issues and into GitHub private vulnerability reporting.
 2. Reproduce ordinary defects with synthetic fixtures or redacted aggregate output.
-3. Type and area labels are added automatically from conventional titles, issue selections, and changed PR paths. Assign a human triage status and add a priority only when impact justifies it.
+3. Type and area labels are classified from the issue's requested work or the PR's actual changes. Existing issue-form labels remain useful input. Assign a human triage status and add a priority only when impact justifies it.
 4. Classify the issue as accepted, needs reproduction, needs a design decision, blocked, duplicate, or out of scope.
 5. Add a milestone only after the work is assigned to an actual release.
 
-The [label rules](../.github/labeler.yml) run through the commit-pinned [Multi Labeler](https://github.com/fuxingloh/multi-labeler) action. Updates are append-only: existing labels, human decisions, and release notes are never removed by this workflow. It does not post comments, publish status checks, or add merge requirements. Unknown areas remain unclassified rather than guessed from arbitrary prose. Update the rules through a normal pull request.
+The [CodeRabbit configuration](../.coderabbit.yaml) shares one set of type and area instructions between PR reviews and issue labeling. Automatic application is enabled for these classifications only. Existing valid type labels should be respected, and multiple areas may apply when several components are directly affected. Background mentions and behavior explicitly left unchanged are not reasons to add an area. Genuinely unclear work can remain unclassified for maintainer triage.
+
+PR labels are part of the normal CodeRabbit review rather than a separate review request. Labels may be delayed when a review is skipped or its allowance is exhausted; do not request another full review just to refresh labels. Issue classification is configured separately, with automatic enrichment comments and implementation planning disabled. Configuration validation alone does not establish App permission, service availability, or successful label application.
+
+Priority, acceptance, reproduction status, blocking decisions, privacy review, breaking-change assessment, and release notes remain maintainer decisions and are excluded from the automatic label list. Preserve existing and human-applied labels; do not treat classification as approval to implement or release work. Repository review requirements and billing settings are unchanged.
+
+The existing [label rules](../.github/labeler.yml) and commit-pinned [Multi Labeler](https://github.com/fuxingloh/multi-labeler) action remain an append-only **area-only** fallback during the handover. The fallback's five title-based primary-type rules are removed so they cannot race with CodeRabbit and add a conflicting type. CodeRabbit is the sole automatic primary-type classifier; explicit issue-form and human type labels remain respected. The six existing area rules still use titles, issue selections, and changed PR paths without comments or new merge requirements. Retire the area fallback only after native CodeRabbit area application and preservation have been verified for both PRs and free-form issues; correct labels added by the fallback alone do not prove that CodeRabbit applied them.
 
 Recommended area labels (a PR may span several):
 
