@@ -1,7 +1,7 @@
 [project]
 name = "apple-health-ai-bridge"
 version = "1.1.5"
-description = "Open-source receiver and read-only CLI/MCP package for Health Bridge for AI."
+description = "Open-source receiver and read-only CLI/MCP package for Apple Health AI Bridge."
 keywords = ["ai-agents", "apple-health", "healthkit", "local-first", "mcp"]
 readme = "README.md"
 license = "Apache-2.0"
