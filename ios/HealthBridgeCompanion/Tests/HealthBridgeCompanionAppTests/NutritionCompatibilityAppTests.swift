@@ -571,3 +571,34 @@ extension NutritionCompatibilityAppTests {
         }
     }
 }
+
+extension NutritionCompatibilityAppTests {
+    func testNativeAutomaticOffDuringCapabilityReadRetainsDirtyWork() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let probe = NutritionCodecProbe(blocking: true)
+        defer { probe.release() }
+        fixture.capabilityReadIO.readBytes = { url in
+            probe.record()
+            return try MailboxRegularFileReader.read(url, maximumBytes: 8192)
+        }
+        let runtime = try await nativeAutomaticRuntime(fixture)
+        let store = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try store.markPendingObserverTypeCodes(["dietary_protein"])
+        let dirty = try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"]
+        let sync = Task { @MainActor in
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["dietary_protein"]))
+        }
+        await fulfillment(of: [probe.entered], timeout: 5)
+        runtime.viewModel.requestBackgroundSyncEnabled(false)
+        probe.release()
+        await sync.value
+        await runtime.viewModel.waitForAutomaticSyncDisableCleanup()
+        XCTAssertFalse(runtime.viewModel.backgroundSyncEnabled)
+        XCTAssertTrue(fixture.base.reads.isEmpty)
+        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], dirty)
+        XCTAssertFalse(probe.watchdogExpired)
+    }
+}
