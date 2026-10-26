@@ -104,7 +104,9 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertFalse(NutritionCompatibility.containsNutrition(batch))
         XCTAssertEqual(batch.samples.map(\.typeCode), ["weight"])
         XCTAssertTrue(batch.sync.cursors.isEmpty)
-        XCTAssertNil(projection.deliveryState, "Unacknowledged projection must not inherit the original receipt")
+        XCTAssertEqual(projection.deliveryState?.phase, .collected)
+        XCTAssertNil(projection.deliveryState?.ownership)
+        XCTAssertNil(projection.deliveryState?.committedReceipt, "Unacknowledged projection must not inherit the original receipt")
     }
 
     func testCapabilityTokenFailureDoesNotReportQuantitySyncSuccess() async throws {
