@@ -462,3 +462,26 @@ HOME="$SYNTH_HOME" health-bridge mailbox service validate \
 
 This check proves rendering and filesystem validation only. It is not evidence
 of a real macOS launchd lifecycle or physical iPhone/iCloud delivery.
+
+## Receiver capability declaration
+
+The Receiver uses the same capability body as Direct HTTP, carried in the signed
+`receiver-capabilities.json` file at the existing paired device root. The native
+helper stores only this fixed metadata target; its ACK and pairing publication
+paths remain immutable. The declaration is bounded to 8,192 bytes and uses the
+existing Receiver signing key and connection identity.
+
+Publication runs after ordinary importer/ACK work in an existing eligible
+maintenance pass. Unchanged bytes do not cause a rewrite; changed bytes use a
+coordinated atomic replacement. A metadata failure, including an unsupported
+older helper, does not make the Mailbox worker terminal or invalidate an ACK.
+Retries use the next existing maintenance opportunity.
+
+An updated Receiver and compatible helper can declare support to an existing
+pairing without resetting keys, sending a dummy batch or re-pairing. An active
+Mailbox client reads the file even if inactive HTTP settings remain saved. File
+propagation and app wake are eventual: this is the last authenticated declaration
+available locally, not a heartbeat, live revocation proof or receipt. See the
+[capability contract](receiver-capabilities.md) for the signature, compatibility
+and unknown-support rules. Actual iCloud provider delivery and signed component
+distribution remain separate from isolated source tests.
