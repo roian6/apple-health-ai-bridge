@@ -12,7 +12,8 @@
     <a href="#get-started"><strong>Quickstart</strong></a> ·
     <a href="#documentation">Documentation</a> ·
     <a href="docs/examples/weekly-review.md">Examples</a> ·
-    <a href="https://healthbridge.chanhyo.dev/">Website</a>
+    <a href="https://healthbridge.chanhyo.dev/">Website</a> ·
+    <a href="https://healthbridge.chanhyo.dev/discord/">Discord</a>
   </p>
   <p>
     <a href="https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on the App Store" height="40"></a>
@@ -76,6 +77,12 @@ Health access and MCP queries are **read-only**. The receiver stores your record
 When you use a cloud model, the query results your client sends go to that model provider. Its privacy settings and policies apply.
 
 [Privacy policy](https://healthbridge.chanhyo.dev/privacy) · [Security model](.github/SECURITY.md) · [Remove local data](docs/setup.md#remove-local-bridge-data)
+
+## Join the community
+
+Have a question or an idea you'd like to try? Join us on [Discord](https://healthbridge.chanhyo.dev/discord/) for setup help, useful prompts, and conversations about using Apple Health with your AI.
+
+You can also follow release news and see what we're working on next.
 
 ## Documentation
 
