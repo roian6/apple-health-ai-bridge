@@ -234,6 +234,7 @@ struct HelperPublicationIO {
     let publish: (URL, URL) throws -> Void
     let observe: (URL) throws -> (isUbiquitous: Bool, uploadError: String?)
     let wait: () -> Void
+    var replaceMetadata: (Data, URL, () throws -> Void) throws -> Void = coordinatedCapabilityReplacement
 }
 
 #if !HEALTH_BRIDGE_ISOLATED_HELPER_TEST_HOST
@@ -476,10 +477,147 @@ private func publish(requestID: String, appRoot: URL, io: HelperPublicationIO) t
     )
 }
 
+private let maximumCapabilitiesBytes = 8_192
+private let capabilitiesFilename = "receiver-capabilities.json"
+
+private struct CapabilitiesRequest: Codable {
+    let version: Int
+    let operation: String
+    let requestID: String
+    let receiver: String
+    let device: String
+    let byteCount: Int
+    let sha256: String
+}
+
+private struct CapabilitiesReceipt: Encodable {
+    let version: Int
+    let operation: String
+    let requestID: String
+    let receiver: String
+    let device: String
+    let byteCount: Int
+    let sha256: String
+    let stored = true
+    let exactBytes = true
+    let isUbiquitous = true
+}
+
+private func readCapabilityBytes(_ url: URL, maximumBytes: Int = maximumCapabilitiesBytes) throws -> Data {
+    var before = stat()
+    guard lstat(url.path, &before) == 0,
+          (before.st_mode & S_IFMT) == S_IFREG, before.st_nlink == 1 else { throw HelperError.unsafeFile }
+    let bytes = try readRegularOwnerOnly(url, maximumBytes: maximumBytes)
+    var after = stat()
+    guard lstat(url.path, &after) == 0,
+          before.st_dev == after.st_dev, before.st_ino == after.st_ino,
+          before.st_mode == after.st_mode, before.st_nlink == after.st_nlink,
+          before.st_size == after.st_size,
+          before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
+          before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+          before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
+          before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw HelperError.unsafeFile }
+    return bytes
+}
+
+// Both production and the isolated helper host execute this same atomic replacement.
+func coordinatedCapabilityReplacement(_ payload: Data, _ final: URL, _ validatePaths: () throws -> Void) throws {
+    let manager = FileManager.default
+    try validatePaths()
+    let scratch = try manager.url(for: .itemReplacementDirectory, in: .userDomainMask,
+                                  appropriateFor: final.deletingLastPathComponent(), create: true)
+    defer { try? manager.removeItem(at: scratch) }
+    let staged = scratch.appendingPathComponent("receiver-capabilities.tmp")
+    try payload.write(to: staged, options: .withoutOverwriting)
+    try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: staged.path)
+    let descriptor = Darwin.open(staged.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw HelperError.unsafeFile }
+    defer { _ = Darwin.close(descriptor) }
+    guard fsync(descriptor) == 0 else { throw HelperError.publicationIncomplete }
+    var stagedMetadata = stat(), directoryMetadata = stat()
+    guard fstat(descriptor, &stagedMetadata) == 0,
+          lstat(final.deletingLastPathComponent().path, &directoryMetadata) == 0,
+          stagedMetadata.st_dev == directoryMetadata.st_dev else { throw HelperError.unsafeFile }
+    let coordinator = NSFileCoordinator(filePresenter: nil)
+    var coordinationError: NSError?
+    var result: Result<Void, Error> = .failure(HelperError.publicationIncomplete)
+    coordinator.coordinate(writingItemAt: final, options: .forReplacing, error: &coordinationError) { coordinated in
+        result = Result {
+            guard coordinated.standardizedFileURL == final.standardizedFileURL else { throw HelperError.unsafeFile }
+            try validatePaths()
+            guard try readCapabilityBytes(staged) == payload else { throw HelperError.digestMismatch }
+            if try entryExists(final) {
+                _ = try readCapabilityBytes(final)
+                _ = try manager.replaceItemAt(final, withItemAt: staged, backupItemName: nil, options: .usingNewMetadataOnly)
+            } else {
+                try manager.moveItem(at: staged, to: final)
+            }
+            try validatePaths()
+            guard try readCapabilityBytes(final) == payload else { throw HelperError.publicationIncomplete }
+        }
+    }
+    if let coordinationError { throw coordinationError }
+    try result.get()
+}
+
+private func publishCapabilities(requestID: String, appRoot: URL, io: HelperPublicationIO) throws {
+    guard isHex(requestID, count: 32) else { throw HelperError.invalidArguments }
+    let lanes = ["requests", "staging", "receipts"]
+    let protocolIdentities = try lanes.map { try checkedDirectoryChain(root: appRoot, components: [$0], ownerOnly: true) }
+    let requestURL = appRoot.appendingPathComponent("requests/\(requestID).json")
+    let encoded = try readCapabilityBytes(requestURL)
+    guard let fields = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
+          Set(fields.keys) == Set(["version", "operation", "requestID", "receiver", "device", "byteCount", "sha256"]),
+          try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys, .withoutEscapingSlashes]) == encoded else {
+        throw HelperError.invalidRequest
+    }
+    let request = try JSONDecoder().decode(CapabilitiesRequest.self, from: encoded)
+    guard request.version == protocolVersion, request.operation == "receiver_capabilities",
+          request.requestID == requestID, isHex(request.receiver, count: 32), isHex(request.device, count: 32),
+          request.byteCount > 0, request.byteCount <= maximumCapabilitiesBytes, isHex(request.sha256, count: 64) else {
+        throw HelperError.invalidRequest
+    }
+    let source = appRoot.appendingPathComponent("staging/\(requestID).json")
+    let payload = try readCapabilityBytes(source)
+    guard payload.count == request.byteCount, digestHex(payload) == request.sha256 else { throw HelperError.digestMismatch }
+    let provider = try io.providerRoot()
+    let providerPath = provider.resolvingSymlinksInPath().standardizedFileURL.path
+    let sourcePath = source.resolvingSymlinksInPath().standardizedFileURL.path
+    guard sourcePath != providerPath, !sourcePath.hasPrefix(providerPath + "/") else { throw HelperError.unsafeFile }
+    let components = ["Documents", "HealthBridgeMailbox", "v1", request.receiver, request.device]
+    let identities = try checkedDirectoryChain(root: provider, components: components, ownerOnly: false)
+    let final = components.reduce(provider) { $0.appendingPathComponent($1, isDirectory: true) }.appendingPathComponent(capabilitiesFilename)
+    func validatePaths() throws {
+        guard try lanes.map({ try checkedDirectoryChain(root: appRoot, components: [$0], ownerOnly: true) }) == protocolIdentities,
+              try checkedDirectoryChain(root: provider, components: components, ownerOnly: false) == identities,
+              try readCapabilityBytes(requestURL) == encoded,
+              try readCapabilityBytes(source) == payload else { throw HelperError.unsafeFile }
+    }
+    let receipt = receiptURL(root: appRoot, requestID: requestID)
+    if try entryExists(receipt) { _ = try readCapabilityBytes(receipt) }
+    try validatePaths()
+    let current = try entryExists(final) ? readCapabilityBytes(final) : nil
+    if current != payload { try io.replaceMetadata(payload, final, validatePaths) }
+    try validatePaths()
+    guard try readCapabilityBytes(final) == payload else { throw HelperError.publicationIncomplete }
+    let observation = try io.observe(final)
+    guard observation.isUbiquitous, observation.uploadError == nil else { throw HelperError.publicationIncomplete }
+    try validatePaths()
+    guard try readCapabilityBytes(final) == payload else { throw HelperError.publicationIncomplete }
+    try writeOwnerOnly(CapabilitiesReceipt(version: 1, operation: request.operation, requestID: requestID,
+        receiver: request.receiver, device: request.device, byteCount: request.byteCount, sha256: request.sha256), to: receipt)
+}
+
 func runHelper(arguments: [String], applicationRoot: () throws -> URL, io: HelperPublicationIO) throws -> String {
     guard arguments.count == 1, let requestID = arguments.first else { throw HelperError.invalidArguments }
     if requestID == "--native-pairing-cancellation-v1" {
         return "native-pairing-cancellation-v1:available"
+    }
+    if requestID.hasPrefix("capabilities:") {
+        let identifier = String(requestID.dropFirst("capabilities:".count))
+        guard isHex(identifier, count: 32) else { throw HelperError.invalidArguments }
+        try publishCapabilities(requestID: identifier, appRoot: applicationRoot(), io: io)
+        return ""
     }
     if requestID.hasPrefix("pairing:") {
         let nativeID = String(requestID.dropFirst("pairing:".count))

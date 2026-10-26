@@ -97,7 +97,7 @@ enum NativePairingLocalFakeTests {
             if fault == "operation" { request["operation"] = "ack" }
             if fault == "size" { request["byteCount"] = 8_193 }
             if fault == "digest" { request["sha256"] = String(repeating: "0", count: 64) }
-            try f.write(JSONSerialization.data(withJSONObject: request), to: f.request)
+            try f.write(JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), to: f.request)
             if fault == "requestSymlink" { try f.replaceWithSymlink(f.request) }
             if fault == "sourceSymlink" { try f.replaceWithSymlink(f.capabilitiesSource) }
             if fault == "targetSymlink" {
@@ -245,7 +245,7 @@ enum NativePairingLocalFakeTests {
                 "sha256": SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
             ]
             try write(bytes, to: capabilitiesSource)
-            try write(JSONSerialization.data(withJSONObject: request), to: self.request)
+            try write(JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), to: self.request)
             return request
         }
         func nativeFinal(_ name: String) -> URL { mailboxRoot.appendingPathComponent("pairing/\(invitationID)/\(name)") }
@@ -296,7 +296,17 @@ enum NativePairingLocalFakeTests {
                     try NativePairingLocalFakeTests.require(final.path.hasPrefix(self.provider.path + "/"), "Private observation required")
                     self.observations += 1
                     return (true, nil)
-                }, wait: { preconditionFailure("Successful fake observation must not wait") }
+                }, wait: { preconditionFailure("Successful fake observation must not wait") },
+                replaceMetadata: { payload, final, validatePaths in
+                    if self.detachOnPublication {
+                        let directory = final.deletingLastPathComponent()
+                        try FileManager.default.moveItem(at: directory, to: self.root.appendingPathComponent("detached-device"))
+                        try self.mkdir(directory)
+                    }
+                    if self.failPublication { throw Failure(message: "synthetic failure before replacement") }
+                    self.publications += 1
+                    try coordinatedCapabilityReplacement(payload, final, validatePaths)
+                }
             ))
         }
         func close() { try? FileManager.default.removeItem(at: root) }
