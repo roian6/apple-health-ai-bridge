@@ -16,17 +16,20 @@ Do not routinely disable the main ruleset or push directly to `main`. Emergency 
 
 1. Move sensitive security reports out of public Issues and into GitHub private vulnerability reporting.
 2. Reproduce ordinary defects with synthetic fixtures or redacted aggregate output.
-3. Assign one area label and one status label. Add a priority only when impact justifies it.
+3. Type and area labels are added automatically from conventional titles, issue selections, and changed PR paths. Assign a human triage status and add a priority only when impact justifies it.
 4. Classify the issue as accepted, needs reproduction, needs a design decision, blocked, duplicate, or out of scope.
 5. Add a milestone only after the work is assigned to an actual release.
 
-Recommended area labels:
+The [label rules](../.github/labeler.yml) run through the commit-pinned [Multi Labeler](https://github.com/fuxingloh/multi-labeler) action. Updates are append-only: existing labels, human decisions, and release notes are never removed by this workflow. It does not post comments, publish status checks, or add merge requirements. Unknown areas remain unclassified rather than guessed from arbitrary prose. Update the rules through a normal pull request.
+
+Recommended area labels (a PR may span several):
 
 - `area: ios`
 - `area: python`
 - `area: receiver`
 - `area: mcp`
 - `area: docs`
+- `area: ci`
 
 Recommended workflow labels:
 
