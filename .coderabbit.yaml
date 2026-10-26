@@ -9,6 +9,7 @@ reviews:
     drafts: false
     base_branches:
       - "^release$"
+      - "^(?:fix|feat|docs|chore)/.+$"
   suggested_labels: true
   auto_apply_labels: true
   # Keep one classification policy for PRs and free-form issues.
@@ -49,22 +50,32 @@ reviews:
         changed files on PRs. Do not select from behavior explicitly left unchanged.
     - label: "area: python"
       instructions: >-
-        Apply to directly affected Python package, CLI, storage, fixtures, tests,
-        or packaging. For PRs, actual src/, tests/, fixtures/, fuzz/, typings/,
-        pyproject.toml or uv.lock changes are evidence. For issues, do not assume
-        a Python change solely because a named component can use Python.
+        Apply to Python product package, CLI, storage, packaging, or Python-specific
+        validation and fuzzing infrastructure, including fuzz/ or scripts/fuzz/.
+        Supporting tests or fixtures count only when those responsibilities are
+        directly affected. A .py file, a tests/ path, or a Python-written helper
+        alone is not sufficient. Exclude brand renderers and governance or
+        documentation checks unless Python product or packaging behavior changes.
+        Moving an unchanged packaging file without changing package contents or
+        build requirements is not sufficient. For issues, do not infer this area
+        solely from an implementation language.
     - label: "area: mcp"
       instructions: >-
         Apply to directly affected read-only MCP tools, their query contracts,
         server metadata, or MCP client integration. Mere mentions are insufficient.
     - label: "area: docs"
       instructions: >-
-        Apply when documentation is itself a direct work item or an actual PR
-        change. Quoted documentation in an otherwise unrelated issue is insufficient.
+        Apply when documentation or public-facing brand assets are direct work
+        items or actual PR changes. Supporting document updates can qualify for
+        this area without changing the primary type to documentation. Quoted
+        documentation in an otherwise unrelated issue is insufficient.
     - label: "area: ci"
       instructions: >-
-        Apply to directly affected CI, GitHub Actions, release automation, repository
-        tooling or configuration, including CodeRabbit configuration.
+        Apply to actual CI workflow, GitHub Actions, release/build automation,
+        lint or security-scanning configuration, or review/label automation changes,
+        including CodeRabbit configuration. Merely running tests or changing an
+        arbitrary helper under scripts/ or tools/ is not sufficient. Exclude a
+        brand renderer or its tests when CI or release automation is unchanged.
 issue_enrichment:
   auto_enrich:
     enabled: false
