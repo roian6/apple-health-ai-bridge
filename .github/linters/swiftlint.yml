@@ -1,9 +1,9 @@
 # Production code only: test harnesses, package manifests and generated builds
 # are outside these roots. All authored files within each root are analyzed.
 included:
-  - ios/HealthBridgeCompanion/App
-  - ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore
-  - macos/HealthBridgeMailboxAckPublisher
+  - ../../ios/HealthBridgeCompanion/App
+  - ../../ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore
+  - ../../macos/HealthBridgeMailboxAckPublisher
 
 # Bounded defect policy, independent of formatting and file size.
 only_rules:

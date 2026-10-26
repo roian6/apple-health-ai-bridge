@@ -1,6 +1,6 @@
 # Optional local-only strict audit denylist.
 #
-# Copy this file to .public-release-denylist.local and add private values that
+# Copy this file to the repository root as .public-release-denylist.local and add private values that
 # should never appear in tracked files. The .local file is gitignored.
 #
 # Lines are case-insensitive literal matches by default.

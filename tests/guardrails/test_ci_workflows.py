@@ -24,7 +24,7 @@ def test_python_ci_runs_all_release_facing_python_gates() -> None:
     text = PYTHON_WORKFLOW.read_text()
     build_command = " ".join(  # noqa: FLY002
         (
-            "uv build --build-constraints build-constraints.txt",
+            "uv build --build-constraints .github/release/build-constraints.txt",
             "--require-hashes --out-dir dist",
         )
     )

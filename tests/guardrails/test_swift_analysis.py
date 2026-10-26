@@ -17,7 +17,7 @@ def test_swift_analysis_is_required_in_existing_native_gate() -> None:
 
 def test_swift_analysis_policy_covers_all_production_components() -> None:
     # Given
-    config = Path(".swiftlint.yml").read_text()
+    config = Path(".github/linters/swiftlint.yml").read_text()
     script = Path("scripts/swift-analysis.sh").read_text()
     # When / Then
     for scope in (

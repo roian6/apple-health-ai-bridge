@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = ROOT / "scripts/public-release-audit.py"
 
@@ -92,3 +94,26 @@ def test_strict_audit_still_blocks_other_registry_like_names(
 
     assert result.returncode == 3
     assert "non-neutral-bundle-literal" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "candidate_path",
+    [".github/CONTRIBUTING.md", ".github/SECURITY.md"],
+)
+def test_strict_audit_keeps_relocated_public_documents_in_scope(
+    tmp_path: Path,
+    candidate_path: str,
+) -> None:
+    # Given
+    candidate_text = "dog" + "food"
+
+    # When
+    result = run_strict_audit(
+        tmp_path,
+        candidate_text,
+        candidate_path=candidate_path,
+    )
+
+    # Then
+    assert result.returncode == 3
+    assert "private-dogfood-language" in result.stdout

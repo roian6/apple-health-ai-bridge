@@ -58,12 +58,12 @@ for scope in "${scopes[@]}"; do
 done
 printf 'Total production Swift files: %s\n' "${#files[@]}"
 
-printf 'let control = 1\n' | "$lint" lint --config "$root/.swiftlint.yml" \
+printf 'let control = 1\n' | "$lint" lint --config "$root/.github/linters/swiftlint.yml" \
   --strict --no-cache --use-stdin
 printf 'Positive control: accepted\n'
 set +e
 printf 'let control = (1 as Any) as! String\n' | "$lint" lint \
-  --config "$root/.swiftlint.yml" --strict --no-cache --use-stdin \
+  --config "$root/.github/linters/swiftlint.yml" --strict --no-cache --use-stdin \
   > "$scratch/negative.log" 2>&1
 negative_status=$?
 set -e
@@ -73,4 +73,4 @@ cat "$scratch/negative.log"
   exit 1
 }
 printf 'Negative control: rejected with force_cast (exit %s)\n' "$negative_status"
-"$lint" lint --config "$root/.swiftlint.yml" --strict --no-cache "${files[@]}"
+"$lint" lint --config "$root/.github/linters/swiftlint.yml" --strict --no-cache "${files[@]}"

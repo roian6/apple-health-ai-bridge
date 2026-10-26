@@ -76,7 +76,7 @@ Health access and MCP queries are **read-only**. The receiver stores your record
 
 When you use a cloud model, the query results your client sends go to that model provider. Its privacy settings and policies apply.
 
-[Privacy policy](https://healthbridge.chanhyo.dev/privacy) · [Security model](SECURITY.md) · [Remove local data](docs/setup.md#remove-local-bridge-data)
+[Privacy policy](https://healthbridge.chanhyo.dev/privacy) · [Security model](.github/SECURITY.md) · [Remove local data](docs/setup.md#remove-local-bridge-data)
 
 ## Join the community
 
@@ -88,7 +88,7 @@ You can also follow release news and see what we're working on next.
 
 - **Install and use:** [Setup and troubleshooting](docs/setup.md) · [Supported data](docs/supported-health-data.md) · [Support](https://healthbridge.chanhyo.dev/support)
 - **Understand and build:** [Architecture](docs/architecture.md) · [Compatibility](docs/versioning.md) · [Batch protocol](docs/reference/batch-v1.md) · [SQLite schema](docs/reference/sqlite-v1.md) · [Brand guide](docs/brand.md)
-- **Contribute:** [Development setup](CONTRIBUTING.md) · [Contribution ideas](docs/contribution-ideas.md) · [Build the iPhone app](docs/self-build.md)
+- **Contribute:** [Development setup](.github/CONTRIBUTING.md) · [Contribution ideas](docs/contribution-ideas.md) · [Build the iPhone app](docs/self-build.md)
 
 ## License
 

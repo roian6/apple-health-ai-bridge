@@ -34,7 +34,7 @@ def test_release_criteria_requires_built_artifact_smoke() -> None:
     criteria = Path(".github/release/criteria.md").read_text()
     build_command = " ".join(  # noqa: FLY002
         (
-            "uv build --build-constraints build-constraints.txt",
+            "uv build --build-constraints .github/release/build-constraints.txt",
             "--require-hashes --out-dir dist",
         )
     )
@@ -48,7 +48,7 @@ def test_release_criteria_requires_built_artifact_smoke() -> None:
 def test_isolated_build_constraints_are_complete_exact_hashed_pins() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
     build_requires = cast("list[str]", pyproject["build-system"]["requires"])
-    constraints = Path("build-constraints.txt").read_text()
+    constraints = Path(".github/release/build-constraints.txt").read_text()
     workflow = Path(".github/workflows/python.yml").read_text()
     criteria = Path(".github/release/criteria.md").read_text()
 
