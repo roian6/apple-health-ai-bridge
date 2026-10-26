@@ -76,7 +76,9 @@ public enum MailboxReceiverCapabilities {
                             throw DeliveryProtocolV1Error.authenticationFailed
                         }
                         try validate(locator, chain: chain)
+                        guard try io.isLocal(url) else { throw DeliveryProtocolV1Error.authenticationFailed }
                         let data = try io.readBytes(url)
+                        guard try io.isLocal(url) else { throw DeliveryProtocolV1Error.authenticationFailed }
                         try validate(locator, chain: chain)
                         try Task.checkCancellation()
                         return data
