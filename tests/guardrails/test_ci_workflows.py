@@ -14,6 +14,7 @@ from health_bridge.mcp.types import JsonObject, required_list, required_object
 PYTHON_WORKFLOW = Path(".github/workflows/python.yml")
 IOS_WORKFLOW = Path(".github/workflows/ios.yml")
 DEPENDABOT_CONFIG = Path(".github/dependabot.yml")
+CHECK_RUNNER = Path("scripts/run-checks.sh")
 PINNED_ACTION = re.compile(r"^\s*uses:\s*[^#\s]+@(?P<sha>[0-9a-f]{40})(?:\s+#.*)?$")
 
 
@@ -39,11 +40,15 @@ def test_ci_workflows_use_minimal_permissions_and_immutable_actions() -> None:
 
 
 def test_python_ci_runs_all_release_facing_python_gates() -> None:
-    text = PYTHON_WORKFLOW.read_text()
+    text = " ".join(
+        (PYTHON_WORKFLOW.read_text() + CHECK_RUNNER.read_text())
+        .replace("\\\n", " ")
+        .split()
+    )
     build_command = " ".join(  # noqa: FLY002
         (
             "uv build --build-constraints .github/release/build-constraints.txt",
-            "--require-hashes --out-dir dist",
+            '--require-hashes --out-dir "$output/dist"',
         )
     )
     assert "runs-on: ubuntu-24.04" in text
@@ -57,11 +62,11 @@ def test_python_ci_runs_all_release_facing_python_gates() -> None:
         "uv run pip-audit --local --skip-editable",
         "uv run pytest -q",
         "--cov --cov-config=pyproject.toml",
-        "--cov-report=xml:coverage/coverage.xml",
-        "--cov-report=json:coverage/coverage.json",
-        "rm -rf dist",
+        "--cov-report=xml:$output/coverage.xml",
+        "--cov-report=json:$output/coverage.json",
+        'rm -rf -- "$output/dist"',
         build_command,
-        "uv run python scripts/package-smoke.py --dist-dir dist",
+        'uv run python scripts/package-smoke.py --dist-dir "$output/dist"',
     ):
         assert command in text
 
@@ -79,7 +84,7 @@ def test_python_coverage_measures_all_source_and_child_process_branches() -> Non
 
 
 def test_ios_ci_runs_swift_tests_and_unsigned_simulator_build() -> None:
-    text = IOS_WORKFLOW.read_text()
+    text = IOS_WORKFLOW.read_text() + CHECK_RUNNER.read_text()
     assert "runs-on: macos-26" in text
     assert "swift test" in text
     assert "xcodebuild -project HealthBridgeCompanion.xcodeproj" in text
@@ -124,13 +129,17 @@ def test_dependabot_keeps_security_updates_without_version_prs() -> None:
         ("success", "full", "failure"),
         ("success", "full", "cancelled"),
         ("success", "full", "skipped"),
-        ("success", "metadata", "success"),
-        ("success", "metadata", "failure"),
-        ("success", "metadata", "cancelled"),
-        ("success", "metadata", "skipped"),
-        ("failure", "metadata", "skipped"),
+        ("success", "maintenance", "success"),
+        ("success", "maintenance", "failure"),
+        ("success", "maintenance", "cancelled"),
+        ("success", "maintenance", "skipped"),
+        ("failure", "maintenance", "skipped"),
         ("cancelled", "full", "success"),
-        ("skipped", "metadata", "success"),
+        ("skipped", "maintenance", "success"),
+        ("success", "python", "success"),
+        ("success", "python", "skipped"),
+        ("success", "native", "success"),
+        ("success", "native", "skipped"),
         ("success", "", "success"),
     ],
 )
@@ -170,17 +179,19 @@ def test_required_gate_executes_actual_dependency_result_contract(
     )
     # Then: only the selected successful work, or justified native skip, passes.
     expected_worker = (
-        "skipped" if path == IOS_WORKFLOW and mode == "metadata" else "success"
+        "skipped"
+        if path == IOS_WORKFLOW and mode in {"maintenance", "python"}
+        else "success"
     )
     expected = (
         scope_result == "success"
-        and mode in {"metadata", "full"}
+        and mode in {"maintenance", "python", "native", "full"}
         and worker_result == expected_worker
     )
     assert (result.returncode == 0) is expected, result.stdout + result.stderr
 
 
-def test_metadata_selection_never_removes_workflow_triggers_or_full_coverage() -> None:
+def test_selection_keeps_full_events_and_uses_the_same_local_runner() -> None:
     # Given: both workflows still receive every PR and all original full events.
     python = _workflow(PYTHON_WORKFLOW, YAML(typ="safe"))
     native = _workflow(IOS_WORKFLOW, YAML(typ="safe"))
@@ -195,23 +206,27 @@ def test_metadata_selection_never_removes_workflow_triggers_or_full_coverage() -
     native_jobs = required_object(native["jobs"])
     worker = required_object(native_jobs["native-checks"])
     assert worker["needs"] == "scope"
-    assert worker["if"] == "needs.scope.outputs.mode == 'full'"
+    assert worker["if"] == (
+        "needs.scope.outputs.mode == 'full' || needs.scope.outputs.mode == 'native'"
+    )
     python_jobs = required_object(python["jobs"])
     checks = required_object(python_jobs["python-checks"])
     assert checks["needs"] == "scope"
     steps = [required_object(step) for step in required_list(checks["steps"])]
-    full = next(step for step in steps if step.get("name") == "Test")
-    metadata = next(
-        step for step in steps if step.get("name") == "Test metadata contracts"
+    selected = next(
+        step for step in steps if step.get("name") == "Run selected Python checks"
     )
-    # Then: full and metadata runs are distinct, with no coverage claim for a subset.
-    assert full["if"] == "needs.scope.outputs.mode == 'full'"
-    assert metadata["if"] == "needs.scope.outputs.mode == 'metadata'"
-    full_command = full["run"]
-    metadata_command = metadata["run"]
-    assert isinstance(full_command, str)
-    assert isinstance(metadata_command, str)
-    assert "--cov --cov-config=pyproject.toml" in full_command
-    assert "--junitxml=coverage/pytest.xml" in full_command
-    assert "--cov" not in metadata_command
-    assert "--junitxml=coverage/pytest-metadata.xml" in metadata_command
+    # Then: CI executes the shared runner using the actual classifier output.
+    assert "if" not in selected
+    assert selected["run"] == 'bash scripts/run-checks.sh python "$MODE"'
+    assert required_object(selected["env"])["MODE"] == "${{ needs.scope.outputs.mode }}"
+    native_steps = [required_object(step) for step in required_list(worker["steps"])]
+    selected_native = next(
+        step
+        for step in native_steps
+        if step.get("name") == "Run selected native checks"
+    )
+    assert selected_native["run"] == 'bash scripts/run-checks.sh native-builds "$MODE"'
+    assert required_object(selected_native["env"])["MODE"] == (
+        "${{ needs.scope.outputs.mode }}"
+    )

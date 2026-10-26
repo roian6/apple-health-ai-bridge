@@ -141,50 +141,11 @@ jobs:
             --tag-target-commit "$target_sha" --default-main-commit "$default_main_sha" \
             --baseline-commit "$baseline_sha" --source-receipt "$RUNNER_TEMP/ios-source.json"
 
-      - name: Run public release audit
-        run: uv run python scripts/public-release-audit.py --strict
-
-      - name: Check formatting
-        run: uv run ruff format --check .
-
-      - name: Lint
-        run: uv run ruff check .
-
-      - name: Type check
-        run: uv run basedpyright
-
-      - name: Audit Python source
-        run: uv run bandit -r src -q
-
-      - name: Audit installed dependencies
-        run: uv run pip-audit --local --skip-editable
-
-      - name: Test
-        if: needs.scope.outputs.mode == 'full'
-        run: >-
-          uv run pytest -q --cov --cov-config=pyproject.toml
-          --cov-report=term --cov-report=xml:coverage/coverage.xml
-          --cov-report=json:coverage/coverage.json
-          --durations=30 --durations-min=1.0
-          --junitxml=coverage/pytest.xml
-
-      - name: Test metadata contracts
-        if: needs.scope.outputs.mode == 'metadata'
-        run: >-
-          uv run pytest -q
-          tests/guardrails/test_governance_surfaces.py
-          tests/guardrails/test_issue_forms.py
-          tests/guardrails/test_public_language.py
-          --durations=30 --durations-min=1.0
-          --junitxml=coverage/pytest-metadata.xml
-
-      - name: Build distributions
-        run: |
-          rm -rf dist
-          uv build --build-constraints .github/release/build-constraints.txt --require-hashes --out-dir dist
-
-      - name: Smoke-test built distributions
-        run: uv run python scripts/package-smoke.py --dist-dir dist
+      - name: Run selected Python checks
+        env:
+          MODE: ${{ needs.scope.outputs.mode }}
+          CHECKS_OUTPUT_DIR: ${{ runner.temp }}/health-bridge-checks
+        run: bash scripts/run-checks.sh python "$MODE"
 
   checks:
     name: Python quality and package checks

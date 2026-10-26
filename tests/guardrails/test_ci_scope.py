@@ -16,6 +16,36 @@ METADATA: Final = (
     ".github/ISSUE_TEMPLATE/config.yml",
     ".github/pull_request_template.md",
 )
+SCOPED: Final = (
+    ("README.md", "maintenance"),
+    (".github/SUPPORT.md", "maintenance"),
+    (".coderabbit.yaml", "maintenance"),
+    (".github/labeler.yml", "maintenance"),
+    (".github/workflows/labels.yml", "maintenance"),
+    ("assets/brand/health-bridge-lockup.svg", "maintenance"),
+    ("assets/brand/build.py", "full"),
+    ("docs/examples/demo.py", "full"),
+    ("docs/reference/cli.md", "maintenance"),
+    ("src/health_bridge/queries/daily.py", "python"),
+    ("src/health_bridge/mcp/server.py", "python"),
+    ("tests/queries/test_date_boundaries.py", "python"),
+    ("ios/HealthBridgeCompanion/App/ContentView.swift", "native"),
+    ("scripts/generate_brand_assets.py", "native"),
+    (".github/linters/swiftlint.yml", "native"),
+    ("src/health_bridge/mcp/types.py", "full"),
+    ("ios/HealthBridgeCompanion/Sources/DeliveryProtocolV1.swift", "full"),
+    ("ios/HealthBridgeCompanion/Package.swift", "full"),
+    ("macos/HealthBridgeMailboxAckPublisher/Sources/main.swift", "full"),
+)
+UNCLASSIFIED: Final = (
+    "src/health_bridge/__init__.py",
+    "pyproject.toml",
+    ".github/workflows/python.yml",
+    "docs/reference/batch-v1.md",
+    ".github/release/criteria.md",
+    ".github/ISSUE_TEMPLATE/unlisted.yml",
+    ".github/ISSUE_TEMPLATE/setup_feedback.yml\nextra",
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -60,7 +90,7 @@ def history(tmp_path: Path) -> tuple[Path, str]:
     repo.mkdir()
     _ = _git(repo, "init", "--template=", "-b", "main")
     _ = _git(repo, "config", "core.filemode", "true")
-    for name in METADATA:
+    for name in (*METADATA, *UNCLASSIFIED, *(name for name, _ in SCOPED)):
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("synthetic original\n")
@@ -78,20 +108,12 @@ def test_existing_metadata_modification_selects_light_checks(
     # When: the production classifier reads the complete diff.
     result = _scope(repo, "classify", "pull_request", base, head)
     # Then: this PR may use the metadata lane.
-    assert (result.returncode, result.stdout) == (0, "metadata\n"), result.stderr
+    assert (result.returncode, result.stdout) == (0, "maintenance\n"), result.stderr
 
 
 @pytest.mark.parametrize(
     "name",
-    [
-        "src/health_bridge/__init__.py",
-        "pyproject.toml",
-        ".github/workflows/python.yml",
-        "docs/reference/batch-v1.md",
-        ".github/release/criteria.md",
-        ".github/ISSUE_TEMPLATE/unlisted.yml",
-        ".github/ISSUE_TEMPLATE/setup_feedback.yml\nextra",
-    ],
+    UNCLASSIFIED,
 )
 def test_mixed_or_unknown_change_keeps_full_checks(
     history: tuple[Path, str], name: str
@@ -177,4 +199,69 @@ def test_invalid_pr_ref_fails_closed(history: tuple[Path, str], head: str) -> No
     result = _scope(repo, "classify", "pull_request", base, head)
     # Then: it fails rather than manufacturing a successful light selection.
     assert result.returncode != 0
-    assert result.stdout != "metadata\n"
+    assert result.stdout not in {"maintenance\n", "python\n", "native\n"}
+
+
+@pytest.mark.parametrize(("name", "expected"), SCOPED)
+def test_component_profiles_follow_reviewed_consumers(
+    history: tuple[Path, str], name: str, expected: str
+) -> None:
+    # Given: an existing reviewed component path and ordinary content modification.
+    repo, base = history
+    _ = (repo / name).write_text("synthetic updated\n")
+    head = _commit(repo)
+    # When: the same classifier used in CI processes its committed diff.
+    result = _scope(repo, "classify", "pull_request", base, head)
+    # Then: shared/native-generator inputs are not mistaken for passive docs.
+    assert (result.returncode, result.stdout) == (0, f"{expected}\n"), result.stderr
+
+
+@pytest.mark.parametrize(
+    ("component", "expected"),
+    [
+        ("src/health_bridge/queries/daily.py", "python"),
+        ("ios/HealthBridgeCompanion/App/ContentView.swift", "native"),
+    ],
+)
+def test_local_selection_includes_committed_staged_and_unstaged_changes(
+    history: tuple[Path, str], component: str, expected: str
+) -> None:
+    # Given: committed docs, staged support copy, and an unstaged component change.
+    repo, base = history
+    _ = (repo / "README.md").write_text("synthetic committed\n")
+    _ = _commit(repo)
+    _ = (repo / ".github/SUPPORT.md").write_text("synthetic staged\n")
+    _ = _git(repo, "add", ".github/SUPPORT.md")
+    _ = (repo / component).write_text("synthetic unstaged\n")
+    # When: local validation is selected against the PR base.
+    result = _scope(repo, "local", base)
+    # Then: it includes all three layers rather than inspecting only HEAD.
+    assert (result.returncode, result.stdout) == (0, f"{expected}\n"), result.stderr
+
+
+def test_mixed_python_and_native_changes_require_full_validation(
+    history: tuple[Path, str],
+) -> None:
+    # Given: both components change, with ordinary metadata in the same PR.
+    repo, base = history
+    for name in (
+        "README.md",
+        "src/health_bridge/queries/daily.py",
+        "ios/HealthBridgeCompanion/App/ContentView.swift",
+    ):
+        _ = (repo / name).write_text("synthetic updated\n")
+    head = _commit(repo)
+    # When: the whole committed diff is classified.
+    result = _scope(repo, "classify", "pull_request", base, head)
+    # Then: the shared integration path is retained.
+    assert (result.returncode, result.stdout) == (0, "full\n"), result.stderr
+
+
+def test_untracked_local_inputs_fail_closed_to_full(history: tuple[Path, str]) -> None:
+    # Given: a local file is not represented by the tracked diff.
+    repo, base = history
+    _ = (repo / "untracked.py").write_text("synthetic change\n")
+    # When: the local selector includes untracked inputs.
+    result = _scope(repo, "local", base)
+    # Then: it cannot issue a scoped pass while ignoring that file.
+    assert (result.returncode, result.stdout) == (0, "full\n"), result.stderr
