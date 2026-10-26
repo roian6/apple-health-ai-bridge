@@ -319,7 +319,7 @@ def test_package_metadata_connects_distribution_to_public_surfaces() -> None:
 
     assert project["name"] == "apple-health-ai-bridge"
     assert project["description"] == (
-        "Open-source receiver and read-only CLI/MCP package for Health Bridge for AI."
+        "Open-source receiver and read-only CLI/MCP package for Apple Health AI Bridge."
     )
     assert project["scripts"] == {"health-bridge": "health_bridge.cli:run"}
     assert project["keywords"] == [
