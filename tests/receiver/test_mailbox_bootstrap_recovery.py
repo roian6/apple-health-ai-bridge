@@ -51,6 +51,7 @@ def test_settled_worker_avoids_crypto_until_provider_inputs_change(
             cancellation(request, descriptor.invitation_id, peer.device),
         )
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,

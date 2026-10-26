@@ -63,6 +63,7 @@ def assert_worker_recovers(
         )
 
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -234,6 +235,7 @@ def test_local_key_failure_remains_terminal(
 
     monkeypatch.setattr(MailboxKeyStore, "load_or_create", load_then_damage)
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=tmp_path / "provider",
         pairing_keys=receiver,
@@ -293,6 +295,7 @@ def test_transient_local_key_io_failure_keeps_worker_alive(
 
     monkeypatch.setattr(os, "fchmod", unavailable_once)
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=tmp_path / "provider",
         pairing_keys=peer.receiver,

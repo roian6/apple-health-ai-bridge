@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import time
 from collections.abc import Callable, Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -251,6 +252,22 @@ def _production_importer(
     return production_importer(db_path, mailbox_path, directory=directory)
 
 
+def _publish_capabilities(directory: MailboxDirectoryHandle) -> None:
+    # Keep receiver/package initialization out of the module import path.
+    from health_bridge.mailbox.capabilities import (  # noqa: PLC0415
+        publish_receiver_capabilities,
+    )
+
+    def publish(handle: MailboxDirectoryHandle, payload: bytes) -> None:
+        default_native_ack_publisher().publish_capabilities(handle, payload)
+
+    _ = publish_receiver_capabilities(
+        directory,
+        load_connection=MailboxConnectionStore.production().load,
+        publish=publish,
+    )
+
+
 def _retryable_errors() -> tuple[type[Exception], ...]:
     # These modules eventually import receiver services. Keep them off the module import
     # path so mailbox QA can import the production importer without a receiver cycle.
@@ -351,6 +368,9 @@ class MailboxRuntimeWorker:
         pairing_keys: MailboxKeyStore | None = None,
         pairing_connections: MailboxConnectionStore | None = None,
         pairing_publisher: Callable[[Path, bytes], None] | None = None,
+        capability_publisher: Callable[
+            [MailboxDirectoryHandle], None
+        ] = _publish_capabilities,
     ) -> None:
         if (
             poll_interval_seconds <= 0
@@ -363,6 +383,7 @@ class MailboxRuntimeWorker:
         self._pairing_keys = pairing_keys
         self._pairing_connections = pairing_connections
         self._pairing_publisher = pairing_publisher
+        self._capability_publisher = capability_publisher
         self._mailbox_root = mailbox_root
         self._importer_factory = importer_factory
         self._poll_interval_seconds = poll_interval_seconds
@@ -471,6 +492,10 @@ class MailboxRuntimeWorker:
                         )
                         directory.validate_attached()
                         result = importer.import_once()
+                        directory.validate_attached()
+                        # Optional metadata cannot terminalize the importer/ACK worker.
+                        with suppress(OSError):
+                            self._capability_publisher(directory)
                         directory.validate_attached()
                         after = _lane_signature(directory)
                         if before is not None and before == after:

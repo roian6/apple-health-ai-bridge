@@ -339,15 +339,19 @@ public final class ReceiverClient: @unchecked Sendable {
     }
 
     public func nutritionSupport(forBatchURL batchURL: URL, bearerToken: String) async -> NutritionSupport {
+        NutritionSupport(capabilities: await receiverCapabilities(forBatchURL: batchURL, bearerToken: bearerToken))
+    }
+
+    public func receiverCapabilities(forBatchURL batchURL: URL, bearerToken: String) async -> ReceiverCapabilities? {
         let token = bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty,
               var components = URLComponents(url: batchURL, resolvingAgainstBaseURL: false) else {
-            return .unknown
+            return nil
         }
         components.path = "/v1/capabilities"
         components.query = nil
         components.fragment = nil
-        guard let url = components.url else { return .unknown }
+        guard let url = components.url else { return nil }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.timeoutInterval = Self.healthCheckTimeout
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -356,11 +360,11 @@ public final class ReceiverClient: @unchecked Sendable {
             guard !Task.isCancelled, let http = response as? HTTPURLResponse,
                   http.statusCode == 200, http.url == url,
                   http.value(forHTTPHeaderField: "Content-Type") == "application/json",
-                  http.value(forHTTPHeaderField: "Cache-Control") == "no-store" else { return .unknown }
-            return NutritionSupport.decode(data)
+                  http.value(forHTTPHeaderField: "Cache-Control") == "no-store" else { return nil }
+            return ReceiverCapabilities.decodeHTTP(data)
         } catch {
             // A failed fresh probe must never inherit an earlier success.
-            return .unknown
+            return nil
         }
     }
 

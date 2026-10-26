@@ -78,6 +78,7 @@ def test_native_worker_pairs_then_authenticates_nonempty_health_and_normal_query
             raise OSError(message)
 
     worker = MailboxRuntimeWorker(
+        capability_publisher=lambda _directory: None,
         db_path=peer.db,
         mailbox_root=root,
         pairing_keys=peer.receiver,
@@ -97,6 +98,7 @@ def test_native_worker_pairs_then_authenticates_nonempty_health_and_normal_query
     if response_loss:
         (directory / "completion.hbp").unlink()
         worker = MailboxRuntimeWorker(
+            capability_publisher=lambda _directory: None,
             db_path=peer.db,
             mailbox_root=root,
             pairing_keys=peer.receiver,

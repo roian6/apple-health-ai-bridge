@@ -217,7 +217,7 @@ Pair only after the receiver and phone route are ready:
 
 1. On the receiver computer, open the generated pairing HTML file on a trusted screen. If the receiver is headless, securely copy that one file to a trusted local screen; do not publish it or place it on a web server.
 2. Scan the displayed QR with iPhone Camera and open the setup link. As a fallback, open the securely transferred HTML on the iPhone and tap its pairing button.
-3. Confirm the receiver connection in Health Bridge for AI.
+3. Confirm the receiver connection in the iPhone app.
 4. Tap **Allow Health Access**.
 5. Review Apple’s native HealthKit authorization sheet.
 6. Enable **Automatic Sync**.
