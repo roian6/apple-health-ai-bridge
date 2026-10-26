@@ -105,15 +105,17 @@ final class NutritionFixture {
     var reads: [String] = []
     private var ids: [String: UUID] = [:]
 
-    init() throws {
+    init(directPairing: Bool = true) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         settings = ReceiverSettingsStore(
             userDefaults: defaults, tokenStore: tokenStore,
             preCutoverBackupStore: NutritionTokenStore(), synchronize: { true }
         )
-        try settings.save(receiverURLString: "http://127.0.0.1:8765/v1/batches",
-                          bearerToken: "synthetic-nutrition")
+        if directPairing {
+            try settings.save(receiverURLString: "http://127.0.0.1:8765/v1/batches",
+                              bearerToken: "synthetic-nutrition")
+        }
         outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
         cursors = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
         anchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 42))
@@ -124,7 +126,10 @@ final class NutritionFixture {
         NutritionURLProtocol.receiver = receiver
     }
 
-    func makeViewModel() async throws -> HealthBridgeCompanionViewModel {
+    func makeViewModel(
+        mailbox: NutritionMailboxFixture? = nil,
+        eligibleTypeCodes: [String]? = nil
+    ) async throws -> HealthBridgeCompanionViewModel {
         let vm = HealthBridgeCompanionViewModel(
             receiverClient: client, settingsStore: settings,
             pairingStateStore: ReceiverPairingStateStore(
@@ -143,13 +148,15 @@ final class NutritionFixture {
             sleepManifestStore: try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json")),
             sleepManifestFileURL: root.appendingPathComponent("sleep.json"),
             sleepResetEpochStore: SleepResetEpochStore(tokenStore: NutritionTokenStore(), epochFloorProvider: { 1 }),
-            mailboxKeyStore: MailboxKeyStore(service: suite, keychain: NutritionKeychain()),
+            mailboxKeyStore: mailbox?.keys ?? MailboxKeyStore(service: suite, keychain: NutritionKeychain()),
+            automaticSyncEligibleTypeCodesForTesting: eligibleTypeCodes,
             readDailyActivityAggregates: { _, _, _, _ in [] },
             scheduleDirectBackgroundUploads: { 0 },
             cancelInheritedLegacyUploads: {
                 BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
             },
             platformBackgroundPayloadDrain: { true },
+            productionMailboxDelivery: mailbox.map { fixture in { fixture.delivery() } },
             readAnchoredQuantityChanges: { [self] type, previous, start, now in
                 reads.append(type)
                 if ids[type] == nil { ids[type] = UUID() }

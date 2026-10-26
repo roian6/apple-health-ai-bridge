@@ -48,8 +48,8 @@ final class NutritionMailboxFixture {
     let agreement = Curve25519.KeyAgreement.PrivateKey()
     var envelopeNumber: UInt8 = 0
 
-    init() throws {
-        base = try NutritionFixture()
+    init(nativePairing: Bool = false) throws {
+        base = try NutritionFixture(directPairing: !nativePairing)
         keys = MailboxKeyStore(service: base.suite, keychain: NutritionKeychain())
         let device = try keys.loadOrCreate()
         let receiverID = Data(repeating: 0x71, count: 16)
@@ -67,10 +67,16 @@ final class NutritionMailboxFixture {
             receiverAgreementPublicKey: agreement.publicKey.rawRepresentation.base64URLEncodedString(),
             opaqueBinding: Data(repeating: 0x73, count: 32).base64URLEncodedString(), connectionGeneration: 1
         )
-        try base.settings.saveMailboxPairing(
-            receiverURLString: "http://127.0.0.1:8765/v1/batches", bearerToken: "synthetic-nutrition",
-            mailboxIdentity: identity, expectedGeneration: base.settings.receiverSettingsGenerationToken
-        )
+        if nativePairing {
+            try base.settings.saveNativeMailboxPairing(
+                identity, expectedGeneration: base.settings.receiverSettingsGenerationToken
+            )
+        } else {
+            try base.settings.saveMailboxPairing(
+                receiverURLString: "http://127.0.0.1:8765/v1/batches", bearerToken: "synthetic-nutrition",
+                mailboxIdentity: identity, expectedGeneration: base.settings.receiverSettingsGenerationToken
+            )
+        }
         context = MailboxAckContext(
             receiverID: receiverID, deviceID: deviceID, receiverBindingID: identity.opaqueBinding,
             connectionGeneration: 1, deviceAgreementPrivateKey: try keys.agreementPrivateKey(),
@@ -86,6 +92,31 @@ final class NutritionMailboxFixture {
             providerRoot: provider, containerIdentifier: "synthetic.nutrition",
             receiverComponent: identity.receiverID, deviceComponent: identity.deviceID,
             localRecordURL: base.root.appendingPathComponent("local/locator.json")
+        )
+    }
+
+    func writeCapabilities(supported: Bool = true, tamperUnknownField: Bool = false) throws {
+        var fields: [String: HBJCS1Value] = [
+            "v": .integer(1), "kind": .string("receiver_capabilities"),
+            "receiver_id": .string(identity.receiverID), "device_id": .string(identity.deviceID),
+            "connection_generation": .integer(1),
+            "receiver_signing_key_id": .string(identity.receiverSigningKeyID),
+            "capabilities": .object([
+                "schema_id": .string("health_bridge.receiver_capabilities.v1"),
+                "batch_schema_id": .string("health_bridge.batch.v1"),
+                "nutrition_supported": .bool(supported),
+                "future_synthetic": .object(["enabled": .bool(true)])
+            ])
+        ]
+        let unsigned = try DeliveryProtocolV1.encodeMetadata(.object(fields))
+        let domain = Data("health-bridge/mailbox/v1/receiver-capabilities/signature\0".utf8)
+        fields["signature"] = .string(try signing.signature(for: domain + unsigned).base64URLEncodedString())
+        if tamperUnknownField, case .object(var capabilities)? = fields["capabilities"] {
+            capabilities["future_synthetic"] = .object(["enabled": .bool(false)])
+            fields["capabilities"] = .object(capabilities)
+        }
+        try DeliveryProtocolV1.encodeMetadata(.object(fields)).write(
+            to: locator.deviceRoot.appendingPathComponent("receiver-capabilities.json"), options: .atomic
         )
     }
 
@@ -120,6 +151,7 @@ final class NutritionMailboxFixture {
         let components = components()
         return ProductionMailboxDelivery(
             settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
+            pendingGenerationStore: BackgroundSyncSettingsStore(userDefaults: base.defaults),
             keyStore: keys, componentsFactory: { components }, receiverClient: base.client
         )
     }
@@ -138,7 +170,8 @@ final class NutritionMailboxFixture {
         let payload = try Data(contentsOf: item.fileURL)
         XCTAssertEqual(opened.plaintext, payload)
         let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: payload)
-        var request = URLRequest(url: try XCTUnwrap(URL(string: base.settings.receiverURLString)))
+        // Synthetic receiver invocation is local; native settings retain no HTTP credential.
+        var request = URLRequest(url: try XCTUnwrap(URL(string: "http://127.0.0.1:8765/v1/batches")))
         request.httpMethod = "POST"
         XCTAssertEqual(try base.receiver.respond(request, body: payload).0, 202)
         let ack = try DeliveryProtocolV1.sealAck(
