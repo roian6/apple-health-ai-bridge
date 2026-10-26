@@ -156,7 +156,9 @@ final class NutritionFixture {
                 BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
             },
             platformBackgroundPayloadDrain: { true },
-            productionMailboxDelivery: mailbox.map { fixture in { fixture.delivery() } },
+            productionMailboxDelivery: mailbox.map { fixture in
+                { @MainActor @Sendable in fixture.delivery() }
+            },
             readAnchoredQuantityChanges: { [self] type, previous, start, now in
                 reads.append(type)
                 if ids[type] == nil { ids[type] = UUID() }
