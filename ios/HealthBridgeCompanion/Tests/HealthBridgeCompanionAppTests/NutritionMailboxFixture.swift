@@ -47,6 +47,7 @@ final class NutritionMailboxFixture {
     let signing = Curve25519.Signing.PrivateKey()
     let agreement = Curve25519.KeyAgreement.PrivateKey()
     var envelopeNumber: UInt8 = 0
+    var capabilityReadIO = MailboxReceiverCapabilities.IO()
 
     init(nativePairing: Bool = false) throws {
         base = try NutritionFixture(directPairing: !nativePairing)
@@ -93,6 +94,12 @@ final class NutritionMailboxFixture {
             receiverComponent: identity.receiverID, deviceComponent: identity.deviceID,
             localRecordURL: base.root.appendingPathComponent("local/locator.json")
         )
+        if !nativePairing { try writeCapabilities() }
+    }
+
+    func removeCapabilities() throws {
+        let url = locator.deviceRoot.appendingPathComponent(MailboxReceiverCapabilities.filename)
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
     }
 
     func writeCapabilities(supported: Bool = true, tamperUnknownField: Bool = false) throws {
@@ -152,7 +159,7 @@ final class NutritionMailboxFixture {
         return ProductionMailboxDelivery(
             settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
             pendingGenerationStore: BackgroundSyncSettingsStore(userDefaults: base.defaults),
-            keyStore: keys, componentsFactory: { components }, receiverClient: base.client
+            keyStore: keys, componentsFactory: { components }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
         )
     }
 

@@ -118,6 +118,7 @@ public final class ProductionMailboxDelivery {
     private let componentsFactory: (() throws -> ProductionMailboxComponents)?
     private let receiverClient: ReceiverClient
     private var nutritionSupport = NutritionSupport.unknown
+    private let capabilityReadIO: MailboxReceiverCapabilities.IO
 
     public convenience init(
         settingsStore: ReceiverSettingsStore,
@@ -153,7 +154,8 @@ public final class ProductionMailboxDelivery {
         sleepStore: (any SleepSyncManifestStoring)? = nil,
         keyStore: MailboxKeyStore,
         componentsFactory: (() throws -> ProductionMailboxComponents)?,
-        receiverClient: ReceiverClient = ReceiverClient()
+        receiverClient: ReceiverClient = ReceiverClient(),
+        capabilityReadIO: MailboxReceiverCapabilities.IO = .init()
     ) {
         self.settingsStore = settingsStore
         self.outbox = outbox
@@ -163,6 +165,7 @@ public final class ProductionMailboxDelivery {
         self.sleepStore = sleepStore
         self.keyStore = keyStore
         self.componentsFactory = componentsFactory
+        self.capabilityReadIO = capabilityReadIO
         self.receiverClient = receiverClient
     }
 
@@ -943,35 +946,43 @@ public final class ProductionMailboxDelivery {
     }
 
     @MainActor
+    public func readReceiverCapabilities(identity: MailboxConnectionIdentityV1) async throws -> ReceiverCapabilities? {
+        let locate: @Sendable () throws -> MailboxResolvedLocatorV1
+        if let componentsFactory {
+            let components = try componentsFactory()
+            guard components.identity == identity else { throw CancellationError() }
+            let locator = try components.locate()
+            locate = { locator }
+        } else {
+            // Discovery uses existing public trust only; it never loads or creates device keys.
+            locate = {
+                try MailboxLocatorV1.resolve(receiverComponent: identity.receiverID, deviceComponent: identity.deviceID)
+            }
+        }
+        return try await MailboxReceiverCapabilities.read(identity: identity, locate: locate, io: capabilityReadIO)
+    }
+
+    @MainActor
     private func refreshNutritionSupport() async throws {
         nutritionSupport = .unknown
-        let generation = settingsStore.receiverSettingsGenerationToken
-        let binding = settingsStore.receiverBindingID
-        let receiverURL = settingsStore.receiverURLString
-        let transport = settingsStore.activeTransport
+        let record = try settingsStore.currentConnectionRecordV2()
         let validate = { @MainActor in
             try Task.checkCancellation()
             try self.outbox.requireUploadAdmission()
-            guard self.settingsStore.receiverSettingsGenerationToken == generation,
-                  self.settingsStore.receiverBindingID == binding,
-                  self.settingsStore.receiverURLString == receiverURL,
-                  self.settingsStore.activeTransport == transport else { throw CancellationError() }
+            guard try self.settingsStore.currentConnectionRecordV2() == record else { throw CancellationError() }
         }
         try await outbox.prepareNutritionCompatibility(validate: validate)
         let pending = try outbox.pendingItems()
-        guard try outbox.containsPreparedNutrition(in: pending),
-              let url = URL(string: receiverURL) else { return }
-        guard let token = try? settingsStore.loadBearerToken() else { return }
-        let support = await receiverClient.nutritionSupport(forBatchURL: url, bearerToken: token)
+        guard try outbox.containsPreparedNutrition(in: pending) else { return }
+        let capabilities = try await ReceiverCapabilityResolver.resolve(
+            settingsStore: settingsStore, client: receiverClient,
+            readMailbox: { identity in try await self.readReceiverCapabilities(identity: identity) }, validate: validate
+        )
         try validate()
-        guard settingsStore.receiverSettingsGenerationToken == generation,
-              settingsStore.receiverBindingID == binding,
-              settingsStore.receiverURLString == url.absoluteString,
-              try settingsStore.loadBearerToken() == token,
-              try outbox.pendingItems() == pending else { throw CancellationError() }
-        nutritionSupport = support
-        if let binding {
-            _ = try outbox.nutritionCompatibleItems(for: binding, support: support)
+        guard try outbox.pendingItems() == pending else { throw CancellationError() }
+        nutritionSupport = NutritionSupport(capabilities: capabilities)
+        if let binding = settingsStore.receiverBindingID {
+            _ = try outbox.nutritionCompatibleItems(for: binding, support: nutritionSupport)
         }
     }
 

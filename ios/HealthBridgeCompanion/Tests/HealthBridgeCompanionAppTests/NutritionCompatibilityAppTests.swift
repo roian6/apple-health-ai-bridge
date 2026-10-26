@@ -134,35 +134,27 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertTrue(fixture.reads.isEmpty)
     }
 
-    func testCapabilityTokenFailureDoesNotBlockPublishedMailboxACK() async throws {
+    func testMissingCapabilityFileDoesNotBlockPublishedMailboxACK() async throws {
         let fixture = try NutritionMailboxFixture()
         defer { fixture.base.cleanup() }
         let original = try fixture.base.enqueueMixed()
         let delivery = fixture.delivery()
         _ = try await delivery.publishPendingFIFOHead()
         _ = try fixture.receiveAndAcknowledge(original)
-        // Five metadata reads and two five-read validations precede the token.
-        fixture.base.tokenStore.loadsBeforeFailure = 15
-        do {
-            let phase = try await delivery.pendingFIFOHeadBackgroundPhase()
-            XCTAssertEqual(phase, .reconcileFIFOHeadAcknowledgment)
-        } catch {
-            XCTFail("Capability token failure blocked ACK phase selection: \(error)")
-        }
-        XCTAssertEqual(fixture.base.tokenStore.failedLoads, 1)
-        fixture.base.tokenStore.loadsBeforeFailure = 15
-
-        do {
-            let result = try await delivery.reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
-            XCTAssertEqual(result.finalizedCount, 1)
-        } catch {
-            XCTFail("Capability token failure blocked authenticated ACK finalization: \(error)")
-        }
-
-        XCTAssertEqual(fixture.base.tokenStore.failedLoads, 2)
+        try fixture.removeCapabilities()
+        let phase = try await delivery.pendingFIFOHeadBackgroundPhase()
+        XCTAssertEqual(phase, .reconcileFIFOHeadAcknowledgment)
+        let result = try await delivery.reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+        XCTAssertEqual(result.finalizedCount, 1)
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
-        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+        XCTAssertNil(try fixture.base.outbox.pendingItem(id: original.id))
+        let remaining = try fixture.base.outbox.pendingItems()
+        XCTAssertEqual(remaining.count, 1)
+        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: XCTUnwrap(remaining.first).fileURL))
+        XCTAssertFalse(NutritionCompatibility.containsNutrition(batch))
+        XCTAssertTrue(batch.sync.cursors.isEmpty)
         XCTAssertEqual(fixture.base.receiver.records.count, 2)
+        XCTAssertTrue(fixture.base.receiver.credentials.isEmpty)
     }
 
     func testStoppedSyncDoesNotDuplicateNutritionNotice() async throws {
@@ -236,6 +228,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         defer { fixture.base.cleanup() }
         let original = try fixture.base.enqueueMixed()
         fixture.base.receiver.capability = .legacy
+        try fixture.removeCapabilities()
         let probe = NutritionCodecProbe(blocking: true)
         defer { probe.release() }
         fixture.base.outbox.observeNutritionCodec = { probe.record() }
@@ -450,6 +443,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         let original = try fixture.base.enqueueMixed()
         let bytes = try Data(contentsOf: original.fileURL)
         fixture.base.receiver.capability = .legacy
+        try fixture.removeCapabilities()
         _ = try await fixture.delivery().publishPendingFIFOHead()
         let projection = try XCTUnwrap(fixture.base.outbox.pendingItems().first { $0.id != original.id })
         XCTAssertEqual(projection.deliveryState?.phase, .providerObserved)
@@ -460,6 +454,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertNil(try fixture.base.cursor("dietary_protein"))
         XCTAssertEqual(try Data(contentsOf: original.fileURL), bytes)
         fixture.base.receiver.capability = .supported
+        try fixture.writeCapabilities()
 
         _ = try await fixture.delivery().publishPendingFIFOHead()
         _ = try fixture.receiveAndAcknowledge(original)
@@ -477,6 +472,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         defer { fixture.base.cleanup() }
         let original = try fixture.base.enqueueMixed()
         fixture.base.receiver.capability = .offline
+        try fixture.removeCapabilities()
 
         _ = try await fixture.delivery().publishPendingFIFOHead()
 
