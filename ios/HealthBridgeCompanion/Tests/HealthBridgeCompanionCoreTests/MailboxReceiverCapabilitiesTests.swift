@@ -150,10 +150,8 @@ extension MailboxReceiverCapabilitiesTests {
             let locator = f.locator
             let probe = CapabilityReadProbe()
             let status = URLUbiquitousItemDownloadingStatus.downloaded
-            // The existing Boolean seam collapses readable stale and current bytes.
-            let io = MailboxReceiverCapabilities.IO(isLocal: { _ in
-                status == .current || status == .downloaded
-            }, requestDownload: { url in
+            // Preserve stale status while independently authenticating local bytes.
+            let io = MailboxReceiverCapabilities.IO(availability: { _ in status }, requestDownload: { url in
                 XCTAssertEqual(url, f.file)
                 probe.requested()
                 if refreshFails { throw CocoaError(.fileReadUnknown) }
@@ -173,12 +171,15 @@ extension MailboxReceiverCapabilitiesTests {
     func testLocalReadAndMissingOrPlaceholderRequestsHydrationOnlyOnce() async throws {
         let f = try CapabilityLocalFixture(); defer { f.close() }
         let locator = f.locator
-        let valid = try await MailboxReceiverCapabilities.read(identity: f.golden.identity, locate: { locator })
+        let currentProbe = CapabilityReadProbe()
+        let currentIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in currentProbe.requested() })
+        let valid = try await MailboxReceiverCapabilities.read(identity: f.golden.identity, locate: { locator }, io: currentIO)
         XCTAssertEqual(valid?.nutritionSupported, true)
+        XCTAssertEqual(currentProbe.downloadRequests, 0)
         for missing in [false, true] {
             if missing { try FileManager.default.removeItem(at: f.file) }
             let probe = CapabilityReadProbe()
-            let io = MailboxReceiverCapabilities.IO(isLocal: { _ in false }, requestDownload: { url in
+            let io = MailboxReceiverCapabilities.IO(availability: { _ in .notDownloaded }, requestDownload: { url in
                 XCTAssertEqual(url, f.file); probe.requested()
             }, readBytes: { _ in XCTFail("Remote metadata must not be polled or read"); return Data() })
             let result = try await MailboxReceiverCapabilities.read(identity: f.golden.identity, locate: { locator }, io: io)
@@ -193,7 +194,7 @@ extension MailboxReceiverCapabilitiesTests {
             let f = try CapabilityLocalFixture(); defer { f.close() }
             let locator = f.locator
             let probe = CapabilityReadProbe(); defer { probe.release() }
-            let io = MailboxReceiverCapabilities.IO(readBytes: { url in
+            let io = MailboxReceiverCapabilities.IO(availability: { _ in .downloaded }, requestDownload: { _ in probe.requested() }, readBytes: { url in
                 probe.block()
                 return try MailboxRegularFileReader.read(url, maximumBytes: 8192)
             })
@@ -204,6 +205,7 @@ extension MailboxReceiverCapabilitiesTests {
             XCTAssertTrue(heartbeat)
             XCTAssertFalse(probe.occupiedMain)
             XCTAssertFalse(probe.watchdogExpired)
+            XCTAssertEqual(probe.downloadRequests, 1)
             if cancel { task.cancel() }
             probe.release()
             if cancel {
@@ -259,7 +261,7 @@ extension MailboxReceiverCapabilitiesTests {
         let f = try CapabilityLocalFixture(); defer { f.close() }
         let locator = f.locator
         let probe = CapabilityReadProbe()
-        let io = MailboxReceiverCapabilities.IO(isLocal: { _ in probe.localAvailability }, requestDownload: { _ in probe.requested() }, readBytes: { url in
+        let io = MailboxReceiverCapabilities.IO(availability: { _ in probe.localAvailability ? .current : .notDownloaded }, requestDownload: { _ in probe.requested() }, readBytes: { url in
             let data = try MailboxRegularFileReader.read(url, maximumBytes: 8192)
             probe.markUnavailable()
             return data

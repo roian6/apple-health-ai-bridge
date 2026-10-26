@@ -38,9 +38,14 @@ public enum MailboxReceiverCapabilities {
     }
 
     struct IO: Sendable {
-        var isLocal: @Sendable (URL) throws -> Bool = localAvailability
+        var availability: @Sendable (URL) throws -> URLUbiquitousItemDownloadingStatus = localAvailability
         var requestDownload: @Sendable (URL) throws -> Void = { try FileManager.default.startDownloadingUbiquitousItem(at: $0) }
         var readBytes: @Sendable (URL) throws -> Data = { try MailboxRegularFileReader.read($0, maximumBytes: Int64(maximumBytes)) }
+
+        func isLocal(_ url: URL) throws -> Bool {
+            let status = try availability(url)
+            return status == .current || status == .downloaded
+        }
     }
 
     static func read(
@@ -57,13 +62,14 @@ public enum MailboxReceiverCapabilities {
                 try MailboxLocatorV1.revalidate(locator)
                 let chain = try directoryChain(locator)
                 let target = locator.deviceRoot.appendingPathComponent(filename)
-                if try !io.isLocal(target) {
+                let status = try io.availability(target)
+                if status != .current {
                     try Task.checkCancellation()
                     try validate(locator, chain: chain)
                     try? io.requestDownload(target)
                     try Task.checkCancellation()
-                    return nil
                 }
+                guard status == .current || status == .downloaded else { return nil }
                 let coordinator = NSFileCoordinator(filePresenter: nil)
                 try cancellation.bind(coordinator)
                 defer { cancellation.clear() }
@@ -123,10 +129,10 @@ public enum MailboxReceiverCapabilities {
         return result
     }
 
-    private static func localAvailability(_ url: URL) throws -> Bool {
+    private static func localAvailability(_ url: URL) throws -> URLUbiquitousItemDownloadingStatus {
         var metadata = stat()
         guard lstat(url.path, &metadata) == 0 else {
-            if errno == ENOENT { return false }
+            if errno == ENOENT { return .notDownloaded }
             throw MailboxLocatorError.storageFailure
         }
         guard (metadata.st_mode & S_IFMT) == S_IFREG, metadata.st_nlink == 1,
@@ -135,8 +141,8 @@ public enum MailboxReceiverCapabilities {
             .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .ubiquitousItemHasUnresolvedConflictsKey
         ])
         guard values.ubiquitousItemHasUnresolvedConflicts != true else { throw MailboxLocatorError.storageFailure }
-        guard values.isUbiquitousItem == true else { return true }
-        return values.ubiquitousItemDownloadingStatus == .current || values.ubiquitousItemDownloadingStatus == .downloaded
+        guard values.isUbiquitousItem == true else { return .current }
+        return values.ubiquitousItemDownloadingStatus ?? .notDownloaded
     }
 }
 
