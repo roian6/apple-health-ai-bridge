@@ -47,7 +47,7 @@ final class NutritionMailboxFixture {
     let signing = Curve25519.Signing.PrivateKey()
     let agreement = Curve25519.KeyAgreement.PrivateKey()
     var envelopeNumber: UInt8 = 0
-    var capabilityReadIO = MailboxReceiverCapabilities.IO()
+    var capabilityReadIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in })
 
     init(nativePairing: Bool = false) throws {
         base = try NutritionFixture(directPairing: !nativePairing)

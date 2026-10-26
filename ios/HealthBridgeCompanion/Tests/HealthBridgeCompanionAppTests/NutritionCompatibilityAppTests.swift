@@ -483,3 +483,84 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertTrue(fixture.base.receiver.records.isEmpty)
     }
 }
+
+extension NutritionCompatibilityAppTests {
+    private func nativeAutomaticRuntime(_ fixture: NutritionMailboxFixture) async throws -> HealthBridgeCompanionApplicationRuntime {
+        let store = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try store.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes)
+        )
+        let vm = try await fixture.base.makeViewModel(mailbox: fixture, eligibleTypeCodes: ["dietary_protein"])
+        XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(
+            healthDataAvailable: { false }, executeQuery: { _ in XCTFail("Unexpected observer query") },
+            stopQuery: { _ in }, enableDelivery: { _, completion in completion(false, nil) }, disableDelivery: { _ in }
+        )
+        return HealthBridgeCompanionApplicationRuntime(viewModel: vm, automaticSyncPlatform: AutomaticSyncRuntime.Platform(
+            scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {}, setUploadAdmission: { _ in },
+            beginBackgroundOwner: { _ in {} }, healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+        ))
+    }
+
+    func testNativeNutritionOnlyDirtyGenerationResumesWithoutNewObserverAndClearsAfterACK() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        fixture.base.values = ["dietary_protein": 12]
+        let runtime = try await nativeAutomaticRuntime(fixture)
+        let store = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try store.markPendingObserverTypeCodes(["dietary_protein"])
+        let originalDirty = try XCTUnwrap(store.loadPendingObserverTypeCodeGenerations()["dietary_protein"])
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["dietary_protein"]))
+        XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], originalDirty)
+        XCTAssertTrue(fixture.base.reads.isEmpty)
+        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+        let generation = fixture.base.settings.receiverSettingsGenerationToken
+        try fixture.writeCapabilities()
+        // No new observer event, record, pairing or dirty generation is introduced.
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        XCTAssertEqual(fixture.base.settings.receiverSettingsGenerationToken, generation)
+        XCTAssertTrue(fixture.base.reads.contains("dietary_protein"))
+        XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], originalDirty)
+        let pending = try XCTUnwrap(fixture.base.outbox.pendingItems().first)
+        let checkpoint = try XCTUnwrap(fixture.base.outbox.pendingCursorCheckpoint())
+        XCTAssertNil(try fixture.base.cursors.cursorValue(receiverBindingID: checkpoint.receiverIdentity,
+            sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind))
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let batch = try fixture.receiveAndAcknowledge(pending)
+        XCTAssertTrue(NutritionCompatibility.containsNutrition(batch))
+        let result = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+        XCTAssertEqual(result.finalizedCount, 1)
+        XCTAssertNil(try fixture.base.outbox.pendingItem(id: pending.id))
+        XCTAssertNil(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"])
+        XCTAssertEqual(try fixture.base.cursors.cursorValue(receiverBindingID: checkpoint.receiverIdentity,
+            sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind), fixture.base.anchor)
+    }
+
+    func testNativeCapabilityReadCancellationAndReplacementCannotCollect() async throws {
+        for replace in [false, true] {
+            let fixture = try NutritionMailboxFixture(nativePairing: true)
+            defer { fixture.base.cleanup() }
+            try fixture.writeCapabilities()
+            let probe = NutritionCodecProbe(blocking: true)
+            defer { probe.release() }
+            fixture.capabilityReadIO.readBytes = { url in
+                probe.record()
+                return try MailboxRegularFileReader.read(url, maximumBytes: 8192)
+            }
+            let vm = try await fixture.base.makeViewModel(mailbox: fixture)
+            let sync = Task { @MainActor in await vm.syncSupportedQuantityMetrics() }
+            await fulfillment(of: [probe.entered], timeout: 5)
+            XCTAssertFalse(probe.watchdogExpired)
+            XCTAssertTrue(probe.values.allSatisfy { !$0 })
+            if replace { _ = try fixture.base.settings.invalidateReceiverSettingsGeneration() }
+            else { sync.cancel() }
+            probe.release()
+            await sync.value
+            XCTAssertTrue(fixture.base.reads.isEmpty)
+            XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+            XCTAssertNil(try fixture.base.cursor("dietary_protein"))
+        }
+    }
+}
