@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from xml.etree import ElementTree as ET
 
-from tools import generate_brand_assets
+from scripts import generate_brand_assets
 
 if TYPE_CHECKING:
     import pytest

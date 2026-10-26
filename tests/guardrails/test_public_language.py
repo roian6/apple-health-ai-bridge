@@ -24,7 +24,7 @@ FILES_TO_SCAN = (
     Path("docs/architecture.md"),
     Path(".github/release/criteria.md"),
     Path(".github/release/app-review-notes-template.md"),
-    Path("CONTRIBUTING.md"),
+    Path(".github/CONTRIBUTING.md"),
     Path("fixtures/health_bridge_batch_v1.synthetic.json"),
     Path("fixtures/health_bridge_batch_v1.synthetic.ndjson"),
     Path("src/health_bridge/cli.py"),
@@ -162,7 +162,7 @@ def test_repository_has_no_unpublished_node_wrapper_surface() -> None:
 def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     # Given
     readme = Path("README.md").read_text()
-    security = Path("SECURITY.md").read_text()
+    security = Path(".github/SECURITY.md").read_text()
     setup_template = Path(".github/ISSUE_TEMPLATE/setup_feedback.yml").read_text(
         encoding="utf-8"
     )
@@ -236,7 +236,7 @@ def test_readme_uses_official_app_store_install_artwork() -> None:
 def test_readme_links_status_badges_to_their_public_sources() -> None:
     documents = "\n".join(
         Path(document).read_text(encoding="utf-8")
-        for document in ("README.md", "CONTRIBUTING.md")
+        for document in ("README.md", ".github/CONTRIBUTING.md")
     )
     repository = "roian6/apple-health-ai-bridge"
     expected_links = (
@@ -499,7 +499,7 @@ def test_setup_connects_an_existing_store_before_the_first_ai_question() -> None
 
 def test_contributor_and_release_docs_match_ci_release_gates() -> None:
     agents = Path("AGENTS.md").read_text()
-    contributing = Path("CONTRIBUTING.md").read_text()
+    contributing = Path(".github/CONTRIBUTING.md").read_text()
     release_criteria = Path(".github/release/criteria.md").read_text()
 
     for text in (contributing, release_criteria):
@@ -535,7 +535,7 @@ def test_current_component_identities_are_explicit() -> None:
     ).read_text()
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
     server_manifest = Path("server.json").read_text()
-    security = Path("SECURITY.md").read_text()
+    security = Path(".github/SECURITY.md").read_text()
 
     assert f'version = "{__version__}"' in pyproject
     assert f'__version__: Final = "{__version__}"' in package_init

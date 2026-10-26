@@ -3,7 +3,7 @@
 
 Run from the repository root or any directory with:
 
-    python3 tools/generate_brand_assets.py
+    python3 scripts/generate_brand_assets.py
 
 This script writes the canonical logo direction and regenerates the iOS
 AppIcon catalog from the same
