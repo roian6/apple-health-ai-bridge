@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import time
 from contextlib import closing
 from threading import Event, Thread
@@ -21,6 +22,10 @@ from health_bridge.mailbox.connections import (
     MailboxConnectionStore,
 )
 from health_bridge.mailbox.models import MailboxImportResult
+from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublisher,
+    NativeAckPublisherConfig,
+)
 from tests.mailbox.importer_support import (
     configured_importer,
     database_counts,
@@ -838,3 +843,86 @@ def test_metadata_failure_preserves_real_import_ack_and_maintenance_cadence(
     assert len(attempts) == settled_attempts + 1
     assert worker.health_error() is None
     assert database_counts(value) == (1, 1, 1)
+
+
+def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    executable = tmp_path / "synthetic-helper"
+    _ = executable.write_bytes(b"synthetic")
+    executable.chmod(0o700)
+    protocol = tmp_path / "protocol"
+    publisher = NativeAckPublisher(NativeAckPublisherConfig(executable, protocol, 1))
+    attempts: list[str] = []
+
+    def helper(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        operation, request_id = argv[1].split(":")
+        assert operation == "capabilities"
+        assert (protocol / "staging" / f"{request_id}.json").is_file()
+        receipt = protocol / "receipts" / f"{request_id}.json"
+        _ = receipt.write_text("[" * 1500 + "]" * 1500)
+        receipt.chmod(0o600)
+        attempts.append(request_id)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", helper)
+    monkeypatch.setattr(
+        MailboxConnectionStore,
+        "production",
+        lambda: SimpleNamespace(load=lambda _path: connection()),
+    )
+    monkeypatch.setattr(
+        runtime_module, "default_native_ack_publisher", lambda: publisher
+    )
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=value.db_path,
+        mailbox_root=tmp_path,
+        importer_factory=lambda _db, _path, _directory: configured_importer(value),
+        poll_interval_seconds=0.01,
+    )
+    first_cycle, resume, second_cycle = Event(), Event(), Event()
+    run_once = worker.run_once
+
+    def observe_cycle() -> None:
+        first = not first_cycle.is_set()
+        try:
+            run_once()
+            if not first:
+                second_cycle.set()
+        finally:
+            if first:
+                first_cycle.set()
+                assert resume.wait(5), "test did not release the first real cycle"
+
+    monkeypatch.setattr(worker, "run_once", observe_cycle)
+    try:
+        worker.start()
+        assert first_cycle.wait(5)
+        assert attempts
+        assert database_counts(value) == (1, 1, 1)
+        first_ack = value.acks / f"{'01' * 16}.hba"
+        assert opened_receipt(first_ack).result == "committed"
+        original_ack = first_ack.read_bytes()
+        # A later delivery must be handled by the same live worker after bad metadata.
+        _ = write_delivery(value, envelope_byte=2)
+        resume.set()
+        continued = second_cycle.wait(5)
+        assert not worker.terminal_error(), worker.health_error()
+        assert continued
+        assert worker.is_alive()
+        second_ack = value.acks / f"{'02' * 16}.hba"
+        assert opened_receipt(second_ack, envelope_byte=2).result == "idempotent"
+        assert first_ack.read_bytes() == original_ack
+        assert database_counts(value) == (1, 1, 2)
+    finally:
+        resume.set()
+        stopped = worker.stop()
+    assert stopped
+    assert worker.health_error() is None
+    assert len(attempts) >= 2
+    for lane in ("requests", "staging", "receipts"):
+        assert not list((protocol / lane).iterdir())

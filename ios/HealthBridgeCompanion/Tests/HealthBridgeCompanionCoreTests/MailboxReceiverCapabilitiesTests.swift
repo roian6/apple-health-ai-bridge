@@ -144,6 +144,32 @@ private final class CapabilityReadProbe: @unchecked Sendable {
 
 extension MailboxReceiverCapabilitiesTests {
     @MainActor
+    func testDownloadedSnapshotRequestsOneBestEffortRefreshAndAuthenticatesLocalBytes() async throws {
+        for refreshFails in [false, true] {
+            let f = try CapabilityLocalFixture(); defer { f.close() }
+            let locator = f.locator
+            let probe = CapabilityReadProbe()
+            let status = URLUbiquitousItemDownloadingStatus.downloaded
+            // The existing Boolean seam collapses readable stale and current bytes.
+            let io = MailboxReceiverCapabilities.IO(isLocal: { _ in
+                status == .current || status == .downloaded
+            }, requestDownload: { url in
+                XCTAssertEqual(url, f.file)
+                probe.requested()
+                if refreshFails { throw CocoaError(.fileReadUnknown) }
+            })
+            let result = try await MailboxReceiverCapabilities.read(identity: f.golden.identity, locate: { locator }, io: io)
+            XCTAssertEqual(result?.nutritionSupported, true)
+            XCTAssertEqual(probe.downloadRequests, 1)
+            let wrongGeneration = try f.golden.changed { $0["connection_generation"] = .integer(2) }
+            try wrongGeneration.write(to: f.file)
+            let refused = try await MailboxReceiverCapabilities.read(identity: f.golden.identity, locate: { locator }, io: io)
+            XCTAssertNil(refused)
+            XCTAssertEqual(probe.downloadRequests, 2)
+        }
+    }
+
+    @MainActor
     func testLocalReadAndMissingOrPlaceholderRequestsHydrationOnlyOnce() async throws {
         let f = try CapabilityLocalFixture(); defer { f.close() }
         let locator = f.locator
