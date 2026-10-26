@@ -6,6 +6,9 @@ contact_links:
   - name: Health Bridge support
     url: https://healthbridge.chanhyo.dev/support
     about: Read support options and contact information for setup or product questions.
+  - name: Community questions and setup help
+    url: https://healthbridge.chanhyo.dev/discord/
+    about: Ask setup and usage questions, share workflow ideas, and chat with the community on Discord.
   - name: Privacy policy
     url: https://healthbridge.chanhyo.dev/privacy
     about: Review the public privacy policy for Health Bridge.

@@ -10,7 +10,11 @@ Do not open a public issue containing vulnerabilities, secrets, real HealthKit d
 
 ## Setup and product support
 
-Start with the [public support page](https://healthbridge.chanhyo.dev/support). If the documented steps do not resolve the problem, open a **Setup feedback** issue using redacted environment details and synthetic data.
+Start with the [public support page](https://healthbridge.chanhyo.dev/support) for setup guides and common troubleshooting steps.
+
+If you're still stuck, ask in our [Discord community](https://healthbridge.chanhyo.dev/discord/). It's also a place to share useful prompts and workflow ideas. You don't need to know whether something is a bug before asking.
+
+For an issue that needs tracking, use the **Setup feedback** or **Bug report** form with redacted environment details and synthetic examples. Prefer not to use Discord? Email `healthbridge@chanhyo.dev`.
 
 ## Reproducible bugs
 
