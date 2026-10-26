@@ -95,8 +95,8 @@ def test_native_ci_requires_campaign_and_dependency_audit() -> None:
     assert "persist-credentials: false" in job
     assert "uv sync --locked --dev --group fuzz" in job
     assert "uv run --no-sync pip-audit --local --skip-editable" in job
-    assert 'uv run --no-sync python -m fuzz.campaign "$scratch"' in job
-    assert "uv run --no-sync basedpyright fuzz" in job
+    assert 'uv run --no-sync python -m scripts.fuzz.campaign "$scratch"' in job
+    assert "uv run --no-sync basedpyright scripts/fuzz" in job
     assert "mktemp -d" in job
     assert all(
         token not in job

@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def test_native_entrypoint_imports_and_uses_atheris_directly() -> None:
-    source = Path("fuzz/engine.py").read_text()
+    source = Path("scripts/fuzz/engine.py").read_text()
     module = ast.parse(source)
     main = next(
         node
@@ -52,8 +52,8 @@ def observe_import(event, args):
         raise SystemExit(42)
 
 sys.addaudithook(observe_import)
-sys.argv = ["fuzz.engine", "batch"]
-runpy.run_module("fuzz.engine", run_name="__main__")
+sys.argv = ["scripts.fuzz.engine", "batch"]
+runpy.run_module("scripts.fuzz.engine", run_name="__main__")
 """
 
     result = subprocess.run(
@@ -76,9 +76,9 @@ def reject_native_import(event, args):
         raise AssertionError("native engine loaded outside invocation")
 
 sys.addaudithook(reject_native_import)
-import fuzz.targets
-import fuzz.campaign
-import fuzz.engine
+import scripts.fuzz.targets
+import scripts.fuzz.campaign
+import scripts.fuzz.engine
 assert "atheris" not in sys.modules
 """
 
