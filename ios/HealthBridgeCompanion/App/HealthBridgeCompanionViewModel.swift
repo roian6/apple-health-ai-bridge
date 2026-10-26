@@ -5823,7 +5823,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         to: target,
                         cursorCheckpoint: cursorCheckpoint,
                         executionMode: mode.executionMode,
+                        // Nutrition has no separate daily-activity owner; its receipt retires this generation.
                         pendingGenerationRetirements: selectedEntries.first(where: { $0.typeCode == typeCode })?.aggregation == .sum
+                            && !NutritionCompatibility.typeCodes.contains(typeCode)
                             ? [:] : pendingGenerationRetirements
                     )
                     try requireCurrentReceiverSyncProgressScope(
