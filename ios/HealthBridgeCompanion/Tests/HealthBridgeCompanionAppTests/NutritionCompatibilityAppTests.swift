@@ -75,6 +75,13 @@ final class NutritionCompatibilityAppTests: XCTestCase {
             XCTAssertTrue(fixture.base.reads.contains("weight"), "Held nutrition must not stop the later real query")
             XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], original)
             XCTAssertNil(try fixture.base.cursor("dietary_protein"))
+            let supported = try XCTUnwrap(fixture.base.outbox.pendingItems().first)
+            let received = try fixture.receiveAndAcknowledge(supported)
+            XCTAssertEqual(received.samples.map(\.typeCode), ["weight"])
+            let ack = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+            XCTAssertEqual(ack.finalizedCount, 1)
+            XCTAssertNil(try fixture.base.outbox.pendingItem(id: supported.id))
+            XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], original)
         }
     }
 

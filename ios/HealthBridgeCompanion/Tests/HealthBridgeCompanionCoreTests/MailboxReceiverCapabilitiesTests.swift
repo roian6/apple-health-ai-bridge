@@ -184,6 +184,7 @@ extension MailboxReceiverCapabilitiesTests {
                 let result = try await task.value
                 XCTAssertEqual(result?.nutritionSupported, true)
             }
+            XCTAssertFalse(probe.watchdogExpired)
         }
     }
 
