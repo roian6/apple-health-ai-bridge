@@ -290,12 +290,19 @@ private func mailboxKeyID(algorithm: String, publicKey: Data) -> String {
 }
 
 private func deleteSyntheticKeychainItems(service: String) {
-    for itemClass in [kSecClassGenericPassword, kSecClassKey] {
-        SecItemDelete(
-            [
-                kSecClass as String: itemClass,
-                kSecAttrService as String: service,
-            ] as CFDictionary
-        )
+    let prefix = "com.example.HealthBridgeCompanion.mailbox-tests."
+    guard service.hasPrefix(prefix),
+          UUID(uuidString: String(service.dropFirst(prefix.count))) != nil else {
+        XCTFail("Refusing cleanup outside the exact synthetic test service")
+        return
     }
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+    ]
+    let deleted = SecItemDelete(query as CFDictionary)
+    XCTAssertTrue(deleted == errSecSuccess || deleted == errSecItemNotFound)
+    let observed = SecItemCopyMatching(query as CFDictionary, nil)
+    XCTAssertEqual(observed, errSecItemNotFound)
+    print("SYNTHETIC_KEYCHAIN_CLEANUP service=\(service) delete=\(deleted) verify=\(observed)")
 }
