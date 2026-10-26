@@ -9,3 +9,69 @@ reviews:
     drafts: false
     base_branches:
       - "^release$"
+  suggested_labels: true
+  auto_apply_labels: true
+  # Keep one classification policy for PRs and free-form issues.
+  labeling_instructions: &classification_labels
+    - label: bug
+      instructions: >-
+        Apply to reported incorrect behavior or a regression. If the item already
+        has a valid primary type label, preserve it and do not add a competing type.
+        Background discussion of bugs is not itself a bug report.
+    - label: enhancement
+      instructions: >-
+        Apply when the main purpose is a new capability or user-visible improvement.
+        If the item already has a valid primary type label, preserve it and do not
+        add a competing type.
+    - label: documentation
+      instructions: >-
+        Apply when the principal requested work is documentation. If a feature or
+        fix merely includes supporting documentation, use its primary type instead.
+        Preserve any existing valid primary type label.
+    - label: question
+      instructions: >-
+        Apply to requests for information or usage help without a requested product
+        change. Preserve any existing valid primary type label.
+    - label: maintenance
+      instructions: >-
+        Apply when the main purpose is internal refactoring, tests, dependencies,
+        tooling, CI, or repository upkeep rather than a feature or defect fix.
+        Preserve any existing valid primary type label.
+    - label: "area: ios"
+      instructions: >-
+        Apply to directly affected iOS app or HealthKit work, including connection
+        setup, app-side capability validation, background sync, and iCloud handoff.
+        For PRs, use the actual ios/ changes. Incidental mentions do not qualify.
+    - label: "area: receiver"
+      instructions: >-
+        Apply to directly affected receiver, mailbox, macOS helper, pairing,
+        ingestion, transport, or receiver capability publication work. Use actual
+        changed files on PRs. Do not select from behavior explicitly left unchanged.
+    - label: "area: python"
+      instructions: >-
+        Apply to directly affected Python package, CLI, storage, fixtures, tests,
+        or packaging. For PRs, actual src/, tests/, fixtures/, fuzz/, typings/,
+        pyproject.toml or uv.lock changes are evidence. For issues, do not assume
+        a Python change solely because a named component can use Python.
+    - label: "area: mcp"
+      instructions: >-
+        Apply to directly affected read-only MCP tools, their query contracts,
+        server metadata, or MCP client integration. Mere mentions are insufficient.
+    - label: "area: docs"
+      instructions: >-
+        Apply when documentation is itself a direct work item or an actual PR
+        change. Quoted documentation in an otherwise unrelated issue is insufficient.
+    - label: "area: ci"
+      instructions: >-
+        Apply to directly affected CI, GitHub Actions, release automation, repository
+        tooling or configuration, including CodeRabbit configuration.
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
+  labeling:
+    auto_apply_labels: true
+    labeling_instructions: *classification_labels
