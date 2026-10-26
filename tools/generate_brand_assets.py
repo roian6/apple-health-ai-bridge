@@ -97,10 +97,10 @@ def lockup_svg() -> str:
   <desc id="desc">Bridge mark, product name and Your Apple Health, connected to your AI.</desc>
   <defs>
     <radialGradient id="mint" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="matrix(892.8 0 0 504 0 0)">
-      <stop stop-color="#0f9f82" stop-opacity=".05"/><stop offset=".78" stop-color="#0f9f82" stop-opacity="0"/>
+      <stop stop-color="#0f9f82" stop-opacity=".1"/><stop offset=".78" stop-color="#0f9f82" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="blue" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="matrix(864 0 0 468 1440 0)">
-      <stop stop-color="#2563eb" stop-opacity=".035"/><stop offset=".78" stop-color="#2563eb" stop-opacity="0"/>
+      <stop stop-color="#2563eb" stop-opacity=".07"/><stop offset=".78" stop-color="#2563eb" stop-opacity="0"/>
     </radialGradient>
   </defs>
   <rect width="1440" height="360" fill="{SURFACE}"/>
@@ -147,7 +147,7 @@ def social_card_source(size: tuple[int, int] = (1280, 640)) -> str:
 *{{box-sizing:border-box}}
 html,body{{margin:0;width:{width}px;height:{height}px;background:{CANVAS}}}
 body{{font-family:{FONT};color:{INK}}}
-.card{{width:100%;height:100%;padding:64px;display:flex;flex-direction:column;background:radial-gradient(ellipse 70% 110% at 0% 0%,rgba(15,159,130,.09),rgba(15,159,130,0) 75%),radial-gradient(ellipse 65% 100% at 100% 0%,rgba(37,99,235,.06),rgba(37,99,235,0) 75%),{CANVAS}}}
+.card{{width:100%;height:100%;padding:64px;display:flex;flex-direction:column;background:radial-gradient(ellipse 70% 110% at 0% 0%,rgba(15,159,130,.18),rgba(15,159,130,0) 75%),radial-gradient(ellipse 65% 100% at 100% 0%,rgba(37,99,235,.12),rgba(37,99,235,0) 75%),{CANVAS}}}
 .brand{{display:flex;align-items:center;gap:24px;font-size:28px;font-weight:600;letter-spacing:-.03em}}
 .brand svg{{width:64px;height:64px;flex:none}}
 .copy{{margin:auto 0}}
@@ -181,7 +181,7 @@ def lockup_html_source() -> str:
 *{{box-sizing:border-box}}
 html,body{{margin:0;width:1440px;height:360px;overflow:hidden;background:#fff}}
 body{{font-family:{FONT};color:{INK}}}
-.lockup{{width:1440px;height:360px;display:flex;align-items:center;padding:0 88px;gap:44px;background:radial-gradient(ellipse 62% 140% at 0% 0%,rgba(15,159,130,.05),rgba(15,159,130,0) 78%),radial-gradient(ellipse 60% 130% at 100% 0%,rgba(37,99,235,.035),rgba(37,99,235,0) 78%),#fff}}
+.lockup{{width:1440px;height:360px;display:flex;align-items:center;padding:0 88px;gap:44px;background:radial-gradient(ellipse 62% 140% at 0% 0%,rgba(15,159,130,.1),rgba(15,159,130,0) 78%),radial-gradient(ellipse 60% 130% at 100% 0%,rgba(37,99,235,.07),rgba(37,99,235,0) 78%),#fff}}
 .mark,.mark svg{{display:block;width:176px;height:176px;flex:none}}
 h1{{font-size:64px;line-height:1.08;letter-spacing:-2.5px;font-weight:700;margin:0}}
 p{{font-size:36px;line-height:1.2;letter-spacing:-.7px;color:#475569;margin:20px 0 0}}
@@ -220,9 +220,10 @@ svg{{display:block;width:{size}px;height:{size}px}}
 
 
 def render_html(browser: Browser, html_path: Path, size: tuple[int, int]) -> None:
+    """Export text artwork at twice its CSS size without changing its layout."""
     width, height = size
     page = browser.new_page(
-        viewport={"width": width, "height": height}, device_scale_factor=1
+        viewport={"width": width, "height": height}, device_scale_factor=2
     )
     _ = page.goto(html_path.as_uri(), wait_until="load")
     _ = page.locator("main").screenshot(path=str(html_path.with_suffix(".png")))
