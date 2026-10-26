@@ -58,9 +58,11 @@ def _publisher(root: Path) -> NativeAckPublisher:
         "duplicate",
         "boolean",
         "nested",
+        "nested_field",
+        "float",
     ],
 )
-def test_capability_ipc_binds_receipt_and_rereads_fixed_target(  # noqa: C901 - independent fault cases.
+def test_capability_ipc_binds_receipt_and_rereads_fixed_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str | None,
@@ -92,17 +94,23 @@ def test_capability_ipc_binds_receipt_and_rereads_fixed_target(  # noqa: C901 - 
         if failure == "unsupported":
             return subprocess.CompletedProcess(argv, 1)
         receipt = {**request, "stored": True, "exactBytes": True, "isUbiquitous": True}
-        if failure == "digest":
-            receipt["sha256"] = "00" * 32
-        if failure == "identity":
-            receipt["device"] = "04" * 16
-        if failure == "operation":
-            receipt["operation"] = "ack"
-        if failure == "boolean":
-            receipt["stored"] = 1
+        mutations: dict[str, dict[str, object]] = {
+            "digest": {"sha256": "00" * 32},
+            "identity": {"device": "04" * 16},
+            "operation": {"operation": "ack"},
+            "boolean": {"stored": 1},
+            "float": {"version": 1.0},
+        }
+        receipt.update(mutations.get(failure or "", {}))
         encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
         if failure == "nested":
             encoded = "[" * 1500 + "]" * 1500
+        if failure == "nested_field":
+            # Decoding succeeds; the scalar comparison must reject this value
+            # without traversing or serializing its nested contents.
+            encoded = encoded.replace(
+                '"stored":true', '"stored":' + "[" * 64 + "]" * 64
+            )
         if failure == "duplicate":
             encoded = encoded.replace('"stored":true', '"stored":false,"stored":true')
         path = root / "receipts" / f"{request_id}.json"

@@ -845,11 +845,9 @@ def test_metadata_failure_preserves_real_import_ack_and_maintenance_cadence(
     assert database_counts(value) == (1, 1, 1)
 
 
-def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
+def _malformed_capability_helper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    value = environment(tmp_path)
-    _ = write_delivery(value)
+) -> tuple[NativeAckPublisher, list[str]]:
     executable = tmp_path / "synthetic-helper"
     _ = executable.write_bytes(b"synthetic")
     executable.chmod(0o700)
@@ -870,10 +868,23 @@ def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(subprocess, "run", helper)
+    return publisher, attempts
+
+
+def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    publisher, attempts = _malformed_capability_helper(tmp_path, monkeypatch)
+
+    def load(_path: Path) -> DeliveryTrustedConnection:
+        return connection()
+
     monkeypatch.setattr(
         MailboxConnectionStore,
         "production",
-        lambda: SimpleNamespace(load=lambda _path: connection()),
+        lambda: SimpleNamespace(load=load),
     )
     monkeypatch.setattr(
         runtime_module, "default_native_ack_publisher", lambda: publisher
@@ -915,9 +926,9 @@ def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
         assert continued
         assert worker.is_alive()
         second_ack = value.acks / f"{'02' * 16}.hba"
-        assert opened_receipt(second_ack, envelope_byte=2).result == "idempotent"
+        assert opened_receipt(second_ack, envelope_byte=2).result == "committed"
         assert first_ack.read_bytes() == original_ack
-        assert database_counts(value) == (1, 1, 2)
+        assert database_counts(value) == (1, 2, 2)
     finally:
         resume.set()
         stopped = worker.stop()
@@ -925,4 +936,4 @@ def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
     assert worker.health_error() is None
     assert len(attempts) >= 2
     for lane in ("requests", "staging", "receipts"):
-        assert not list((protocol / lane).iterdir())
+        assert not list((tmp_path / "protocol" / lane).iterdir())

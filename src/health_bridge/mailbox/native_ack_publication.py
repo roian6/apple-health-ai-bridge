@@ -239,7 +239,7 @@ class NativeAckPublisher:
                     "object",
                     json.loads(receipt, object_pairs_hook=_unique_receipt_fields),
                 )
-            except (ValueError, UnicodeDecodeError) as exc:
+            except (ValueError, UnicodeDecodeError, RecursionError) as exc:
                 raise NativeAckPublicationError(
                     "native capability receipt invalid"
                 ) from exc
@@ -249,9 +249,16 @@ class NativeAckPublisher:
                 "exactBytes": True,
                 "isUbiquitous": True,
             }
-            # JSON comparison keeps bool and int distinct.
-            if json.dumps(actual, sort_keys=True) != json.dumps(
-                expected, sort_keys=True
+            # The receipt is flat: compare scalar types before values, keeping
+            # bool/int distinct without recursively serializing untrusted fields.
+            fields = cast("dict[str, object]", actual)
+            if (
+                not isinstance(actual, dict)
+                or fields.keys() != expected.keys()
+                or any(
+                    type(fields[key]) is not type(value) or fields[key] != value
+                    for key, value in expected.items()
+                )
             ):
                 raise NativeAckPublicationError("native capability receipt mismatch")
             directory.validate_attached()
