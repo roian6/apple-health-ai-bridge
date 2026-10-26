@@ -503,21 +503,42 @@ private struct CapabilitiesReceipt: Encodable {
     let isUbiquitous = true
 }
 
-private func readCapabilityBytes(_ url: URL, maximumBytes: Int = maximumCapabilitiesBytes) throws -> Data {
+private struct CapabilityFileSnapshot: Equatable {
+    let bytes: Data
+    let device: dev_t
+    let inode: ino_t
+    let mode: mode_t
+    let owner: uid_t
+    let links: nlink_t
+    let size: off_t
+    let modifiedSeconds: Int
+    let modifiedNanoseconds: Int
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+
+    init(bytes: Data, metadata: stat) {
+        self.bytes = bytes
+        device = metadata.st_dev; inode = metadata.st_ino; mode = metadata.st_mode
+        owner = metadata.st_uid; links = metadata.st_nlink; size = metadata.st_size
+        modifiedSeconds = metadata.st_mtimespec.tv_sec; modifiedNanoseconds = metadata.st_mtimespec.tv_nsec
+        changedSeconds = metadata.st_ctimespec.tv_sec; changedNanoseconds = metadata.st_ctimespec.tv_nsec
+    }
+}
+
+private func readCapabilityFile(_ url: URL) throws -> CapabilityFileSnapshot {
     var before = stat()
     guard lstat(url.path, &before) == 0,
           (before.st_mode & S_IFMT) == S_IFREG, before.st_nlink == 1 else { throw HelperError.unsafeFile }
-    let bytes = try readRegularOwnerOnly(url, maximumBytes: maximumBytes)
+    let bytes = try readRegularOwnerOnly(url, maximumBytes: maximumCapabilitiesBytes)
+    let snapshot = CapabilityFileSnapshot(bytes: bytes, metadata: before)
     var after = stat()
     guard lstat(url.path, &after) == 0,
-          before.st_dev == after.st_dev, before.st_ino == after.st_ino,
-          before.st_mode == after.st_mode, before.st_nlink == after.st_nlink,
-          before.st_size == after.st_size,
-          before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
-          before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
-          before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
-          before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw HelperError.unsafeFile }
-    return bytes
+          CapabilityFileSnapshot(bytes: bytes, metadata: after) == snapshot else { throw HelperError.unsafeFile }
+    return snapshot
+}
+
+private func readCapabilityBytes(_ url: URL) throws -> Data {
+    try readCapabilityFile(url).bytes
 }
 
 // Both production and the isolated helper host execute this same atomic replacement.
@@ -565,7 +586,8 @@ private func publishCapabilities(requestID: String, appRoot: URL, io: HelperPubl
     let lanes = ["requests", "staging", "receipts"]
     let protocolIdentities = try lanes.map { try checkedDirectoryChain(root: appRoot, components: [$0], ownerOnly: true) }
     let requestURL = appRoot.appendingPathComponent("requests/\(requestID).json")
-    let encoded = try readCapabilityBytes(requestURL)
+    let requestSnapshot = try readCapabilityFile(requestURL)
+    let encoded = requestSnapshot.bytes
     guard let fields = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
           Set(fields.keys) == Set(["version", "operation", "requestID", "receiver", "device", "byteCount", "sha256"]),
           try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys, .withoutEscapingSlashes]) == encoded else {
@@ -578,7 +600,8 @@ private func publishCapabilities(requestID: String, appRoot: URL, io: HelperPubl
         throw HelperError.invalidRequest
     }
     let source = appRoot.appendingPathComponent("staging/\(requestID).json")
-    let payload = try readCapabilityBytes(source)
+    let sourceSnapshot = try readCapabilityFile(source)
+    let payload = sourceSnapshot.bytes
     guard payload.count == request.byteCount, digestHex(payload) == request.sha256 else { throw HelperError.digestMismatch }
     let provider = try io.providerRoot()
     let providerPath = provider.resolvingSymlinksInPath().standardizedFileURL.path
@@ -590,8 +613,8 @@ private func publishCapabilities(requestID: String, appRoot: URL, io: HelperPubl
     func validatePaths() throws {
         guard try lanes.map({ try checkedDirectoryChain(root: appRoot, components: [$0], ownerOnly: true) }) == protocolIdentities,
               try checkedDirectoryChain(root: provider, components: components, ownerOnly: false) == identities,
-              try readCapabilityBytes(requestURL) == encoded,
-              try readCapabilityBytes(source) == payload else { throw HelperError.unsafeFile }
+              try readCapabilityFile(requestURL) == requestSnapshot,
+              try readCapabilityFile(source) == sourceSnapshot else { throw HelperError.unsafeFile }
     }
     let receipt = receiptURL(root: appRoot, requestID: requestID)
     if try entryExists(receipt) { _ = try readCapabilityBytes(receipt) }
