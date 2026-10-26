@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from xml.etree import ElementTree as ET
 
-from tools import generate_brand_assets
+from scripts import generate_brand_assets
 
 if TYPE_CHECKING:
     import pytest
@@ -20,8 +20,8 @@ XCODE_PROJECT = Path(
 )
 
 CANONICAL_BRAND_PNGS = {
-    BRAND / "health-bridge-lockup.png": (1440, 360),
-    BRAND / "health-bridge-social-card.png": (1280, 640),
+    BRAND / "health-bridge-lockup.png": (2880, 720),
+    BRAND / "health-bridge-social-card.png": (2560, 1280),
     BRAND / "health-bridge-mark-1024.png": (1024, 1024),
     BRAND / "health-bridge-mark-512.png": (512, 512),
     BRAND / "apple-touch-icon.png": (180, 180),

@@ -36,8 +36,8 @@ def test_issue_intake_uses_required_structured_forms() -> None:
 
 
 def test_security_support_and_ownership_routes_are_current() -> None:
-    security = Path("SECURITY.md").read_text(encoding="utf-8")
-    support = Path("SUPPORT.md").read_text(encoding="utf-8")
+    security = Path(".github/SECURITY.md").read_text(encoding="utf-8")
+    support = Path(".github/SUPPORT.md").read_text(encoding="utf-8")
     codeowners = Path(".github/CODEOWNERS").read_text(encoding="utf-8")
 
     assert "developer-preview" not in security
@@ -67,7 +67,7 @@ def test_security_support_and_ownership_routes_are_current() -> None:
 
 
 def test_contribution_and_maintainer_workflow_is_versioned() -> None:
-    contributing = Path("CONTRIBUTING.md").read_text(encoding="utf-8")
+    contributing = Path(".github/CONTRIBUTING.md").read_text(encoding="utf-8")
     pull_request = Path(".github/pull_request_template.md").read_text(encoding="utf-8")
     maintainer = Path("docs/maintainer-guide.md").read_text(encoding="utf-8")
 

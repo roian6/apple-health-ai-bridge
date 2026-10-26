@@ -1,23 +1,7 @@
 version: v1
 
-# Append-only: classifications never remove existing or maintainer-applied labels.
+# Append-only area fallback: CodeRabbit owns automatic primary-type classification.
 labels:
-  - label: bug
-    matcher:
-      title: '^(fix(\([^\r\n)]+\))?!?:|\[Bug\]:)'
-  - label: enhancement
-    matcher:
-      title: '^(feat(\([^\r\n)]+\))?!?:|\[Feature\]:)'
-  - label: documentation
-    matcher:
-      title: '^docs(\([^\r\n)]+\))?!?:'
-  - label: maintenance
-    matcher:
-      title: '^(chore|refactor|perf|test|build|ci|style)(\([^\r\n)]+\))?!?:'
-  - label: question
-    matcher:
-      title: '^(question(\([^\r\n)]+\))?!?:|\[Setup\]:)'
-
   - label: 'area: ios'
     matcher:
       title: '^[a-z]+\(ios\)!?:'
@@ -42,12 +26,12 @@ labels:
     matcher:
       title: '^[a-z]+\((?:python|cli|storage)\)!?:'
       body: '(?:^|\r?\n)### Affected area\r?\n[\t \r\n]*Python CLI or package(?:\r?\n|$)'
-      files: ['src/**', 'tests/**', 'fixtures/**', 'fuzz/**', 'typings/**', 'pyproject.toml', 'uv.lock', 'build-constraints.txt', '.python-version']
+      files: ['src/**', 'tests/**', 'fixtures/**', 'fuzz/**', 'scripts/fuzz/**', 'typings/**', 'pyproject.toml', 'uv.lock', 'build-constraints.txt', '.github/release/build-constraints.txt', '.python-version']
   - label: 'area: docs'
     matcher:
       title: '^(docs(\([^\r\n)]+\))?!?:|[a-z]+\(docs\)!?:)'
       body: '(?:^|\r?\n)### (?:Affected area|Setup flow)\r?\n[\t \r\n]*(?:Documentation or setup|README synthetic quickstart|Documentation or positioning)(?:\r?\n|$)'
-      files: ['docs/**', 'assets/**', '**/*.md', 'LICENSE']
+      files: ['docs/**', 'assets/**', '**/*.md', '.github/{CONTRIBUTING,SECURITY,SUPPORT}.md', 'LICENSE']
   - label: 'area: ci'
     matcher:
       title: '^[a-z]+\((?:ci|release|github)\)!?:'

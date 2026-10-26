@@ -123,9 +123,9 @@ def test_public_docs_do_not_claim_external_schema_clone() -> None:
     public_paths = [
         Path("README.md"),
         Path("AGENTS.md"),
-        Path("CONTRIBUTING.md"),
-        Path("SECURITY.md"),
-        Path("CONTRIBUTING.md"),
+        Path(".github/CONTRIBUTING.md"),
+        Path(".github/SECURITY.md"),
+        Path(".github/CONTRIBUTING.md"),
         *Path("docs").rglob("*.md"),
     ]
     forbidden_markers = (
@@ -1352,7 +1352,7 @@ def test_ios_minimum_versions_are_documented_consistently() -> None:
     readme = Path("README.md").read_text()
     self_build = Path("docs/self-build.md").read_text()
     testflight = Path(".github/release/testflight-checklist.md").read_text()
-    contributing = Path("CONTRIBUTING.md").read_text()
+    contributing = Path(".github/CONTRIBUTING.md").read_text()
 
     # Then
     assert "iPhone running iOS 18 or later" in readme
