@@ -50,8 +50,8 @@ Real-device HealthKit validation is useful, but any reported evidence must be re
 
 ## Interface references
 
-See the [CLI reference](docs/reference/cli.md) for command options and output
-formats, and the [MCP reference](docs/reference/mcp.md) for all eleven tools,
+See the [CLI reference](../docs/reference/cli.md) for command options and output
+formats, and the [MCP reference](../docs/reference/mcp.md) for all eleven tools,
 parameters, results, date boundaries, and errors.
 
 ## Automated tests
@@ -64,9 +64,9 @@ Use synthetic fixtures; a source-string assertion alone does not demonstrate
 runtime behavior. Documentation examples should also run through the CLI or MCP.
 
 Representative patterns already in the suite include
-[`tests/queries/test_date_boundaries.py`](tests/queries/test_date_boundaries.py),
-[`tests/receiver/test_delivery_acceptance_failures.py`](tests/receiver/test_delivery_acceptance_failures.py),
-and [`DeliveryProtocolV1TamperTests.swift`](ios/HealthBridgeCompanion/Tests/HealthBridgeCompanionCoreTests/DeliveryProtocolV1TamperTests.swift).
+[`tests/queries/test_date_boundaries.py`](../tests/queries/test_date_boundaries.py),
+[`tests/receiver/test_delivery_acceptance_failures.py`](../tests/receiver/test_delivery_acceptance_failures.py),
+and [`DeliveryProtocolV1TamperTests.swift`](../ios/HealthBridgeCompanion/Tests/HealthBridgeCompanionCoreTests/DeliveryProtocolV1TamperTests.swift).
 Keep deterministic fuzz contracts in the normal suite; run the native campaign
 on its supported platform. Explain in the PR when a change has no testable
 behavior, such as a prose-only correction.
@@ -79,7 +79,7 @@ Xcode selected. The wrapper downloads [SwiftLint 0.65.1](https://github.com/real
 tooling. Linux ARM64 is supported when its required runtime, including SourceKit,
 is available; a missing runtime is a failure, not a successful analysis.
 
-The policy in [`.swiftlint.yml`](.swiftlint.yml) checks every Swift file in the
+The policy in [`.github/linters/swiftlint.yml`](linters/swiftlint.yml) checks every Swift file in the
 iOS App, CompanionCore, and macOS ACK helper. Tests, separate QA app harnesses,
 package manifests, and generated builds are outside these production roots;
 QA support authored inside CompanionCore remains included.
@@ -96,7 +96,7 @@ The wrapper prints the version and file coverage, accepts a clean synthetic
 control, and requires a known-bad forced cast to fail with the expected rule.
 Download, checksum, runtime, empty-scope, control, and production violations fail
 the command. The existing **Swift tests and unsigned app builds** job in
-[iOS CI](.github/workflows/ios.yml) runs it before the unchanged tests and builds.
+[iOS CI](workflows/ios.yml) runs it before the unchanged tests and builds.
 Static analysis complements those gates and does not replace them.
 
 ## Input Fuzzing
@@ -152,7 +152,7 @@ Use a short branch name with one of these prefixes:
 
 Get a maintainer decision before implementation when a change affects HealthKit permissions or read/write scope, receiver authentication or pairing, disconnect/reset/deletion behavior, outbox or cursor semantics, public/hosted network paths, telemetry, analytics, advertising, third-party AI calls, privacy copy, entitlements, or App Review disclosures.
 
-Non-trivial features should link an accepted issue. The public triage, merge, and release process is recorded in [`docs/maintainer-guide.md`](docs/maintainer-guide.md).
+Non-trivial features should link an accepted issue. The public triage, merge, and release process is recorded in [`docs/maintainer-guide.md`](../docs/maintainer-guide.md).
 
 ## Before Opening a PR
 
@@ -173,7 +173,7 @@ For iOS/Swift changes, use Xcode 16 or later and also run Swift package tests an
 
 ## PR Shape
 
-Prefer small PRs that do one thing. If you are looking for safe starter work, see [`docs/contribution-ideas.md`](docs/contribution-ideas.md). Good PRs include:
+Prefer small PRs that do one thing. If you are looking for safe starter work, see [`docs/contribution-ideas.md`](../docs/contribution-ideas.md). Good PRs include:
 
 - a short summary;
 - privacy boundary notes;

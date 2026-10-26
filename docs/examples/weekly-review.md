@@ -2,11 +2,11 @@
 
 This two-week comparison uses [synthetic records](../../fixtures/readme-weekly-review.synthetic.json): fourteen sleep sessions and six walking workouts, dated June 1–14, 2026. All timestamps use UTC.
 
-You can try it without an iPhone, a receiver network route, or personal health data. You need a Mac or Linux computer with the [development environment](../../CONTRIBUTING.md#development-setup). The example proves the local query and MCP path; it does not demonstrate phone pairing or background sync.
+You can try it without an iPhone, a receiver network route, or personal health data. You need a Mac or Linux computer with the [development environment](../../.github/CONTRIBUTING.md#development-setup). The example proves the local query and MCP path; it does not demonstrate phone pairing or background sync.
 
 ## Load the sample history
 
-From a source checkout with the [development environment](../../CONTRIBUTING.md#development-setup) installed, create a fresh sample database in your home directory:
+From a source checkout with the [development environment](../../.github/CONTRIBUTING.md#development-setup) installed, create a fresh sample database in your home directory:
 
 ```bash
 EXAMPLE_DIR="$(mktemp -d "$HOME/health-bridge-example.XXXXXX")"

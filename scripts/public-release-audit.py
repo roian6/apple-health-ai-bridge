@@ -71,9 +71,9 @@ MARKERS = (
 PUBLIC_SURFACE_ROOTS = ("docs/",)
 PUBLIC_SURFACE_FILES = {
     "AGENTS.md",
-    "CONTRIBUTING.md",
+    ".github/CONTRIBUTING.md",
     "README.md",
-    "SECURITY.md",
+    ".github/SECURITY.md",
     "scripts/README.md",
 }
 STRICT_DEFINITION_FILES = {

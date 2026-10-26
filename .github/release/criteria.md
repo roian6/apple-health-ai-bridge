@@ -53,11 +53,11 @@ uv run bandit -r src -q
 uv run pip-audit --local --skip-editable
 uv run pytest -q
 rm -rf dist
-uv build --build-constraints build-constraints.txt --require-hashes --out-dir dist
+uv build --build-constraints .github/release/build-constraints.txt --require-hashes --out-dir dist
 uv run python scripts/package-smoke.py --dist-dir dist
 version="$(uv version --short)"
 uv run python scripts/release_tools.py validate --repo . --tag "receiver-v$version"
-gitleaks git --redact --no-banner --log-opts='--all'
+gitleaks git --config .github/linters/gitleaks.toml --redact --no-banner --log-opts='--all'
 ```
 
 Use Gitleaks `v8.30.0` and verify the release-archive checksum against the immutable value in `.github/workflows/python.yml` before running the command. The scan must cover every reachable ref; a working-tree-only scan is not sufficient. Both `checks` and `build-and-test` must pass on the exact source commit before publication or cutover.
@@ -146,7 +146,7 @@ It should not contain:
 - App Store Connect account material, signing certificates, provisioning profiles, or filled reviewer notes;
 - internal planning transcripts, stage diaries, private QA logs, or tool-specific cleanup reports.
 
-Use `.public-release-denylist.local` for private values that should be checked locally but never committed. Start from `.public-release-denylist.local.example`; the `.local` file is gitignored and is read by the strict audit.
+Use `.public-release-denylist.local` for private values that should be checked locally but never committed. Start from `.github/release/public-release-denylist.local.example`; the `.local` file is gitignored and is read by the strict audit.
 
 ## QA evidence
 

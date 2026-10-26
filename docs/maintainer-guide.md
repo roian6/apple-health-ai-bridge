@@ -1,6 +1,6 @@
 # Maintainer guide
 
-This guide records the public triage, merge, and release process for Apple Health AI Bridge. It complements [CONTRIBUTING.md](../CONTRIBUTING.md), [SECURITY.md](../SECURITY.md), and [SUPPORT.md](../SUPPORT.md).
+This guide records the public triage, merge, and release process for Apple Health AI Bridge. It complements [CONTRIBUTING.md](../.github/CONTRIBUTING.md), [SECURITY.md](../.github/SECURITY.md), and [SUPPORT.md](../.github/SUPPORT.md).
 
 ## Current repository ruleset
 
@@ -66,7 +66,7 @@ Require an accepted issue and maintainer decision before implementation when a c
 - Use `fix/`, `feat/`, `docs/`, or `chore/` branch prefixes.
 - Keep each pull request focused on one change.
 - Use synthetic fixtures and redact all public evidence.
-- Run the Python gates in `CONTRIBUTING.md` and the relevant Swift/Xcode gates for iOS changes.
+- Run the Python gates in `.github/CONTRIBUTING.md` and the relevant Swift/Xcode gates for iOS changes.
 - Resolve every review thread.
 - Require these exact status checks on `main`:
   - `Python quality and package checks`
