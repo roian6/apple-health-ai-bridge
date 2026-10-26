@@ -8,6 +8,21 @@ body:
       value: |
         Describe the user need before prescribing an implementation. Proposals that change HealthKit permissions, receiver authentication, pairing, deletion, queue/cursor semantics, networking, hosted behavior, telemetry, or third-party AI paths require a maintainer decision before implementation.
 
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Python CLI or package
+        - Receiver or pairing
+        - MCP queries
+        - iOS app or HealthKit
+        - Documentation or setup
+        - Release or CI
+        - Other
+    validations:
+      required: true
+
   - type: textarea
     id: use-case
     attributes:
