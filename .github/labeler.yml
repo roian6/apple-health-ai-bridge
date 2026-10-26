@@ -42,7 +42,7 @@ labels:
     matcher:
       title: '^[a-z]+\((?:python|cli|storage)\)!?:'
       body: '(?:^|\r?\n)### Affected area\r?\n[\t \r\n]*Python CLI or package(?:\r?\n|$)'
-      files: ['src/**', 'tests/**', 'fixtures/**', 'fuzz/**', 'typings/**', 'pyproject.toml', 'uv.lock', 'build-constraints.txt', '.github/release/build-constraints.txt', '.python-version']
+      files: ['src/**', 'tests/**', 'fixtures/**', 'fuzz/**', 'scripts/fuzz/**', 'typings/**', 'pyproject.toml', 'uv.lock', 'build-constraints.txt', '.github/release/build-constraints.txt', '.python-version']
   - label: 'area: docs'
     matcher:
       title: '^(docs(\([^\r\n)]+\))?!?:|[a-z]+\(docs\)!?:)'

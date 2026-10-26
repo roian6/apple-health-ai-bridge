@@ -86,6 +86,7 @@ typeCheckingMode = "all"
 pythonVersion = "3.11"
 pythonPlatform = "All"
 include = ["src", "tests"]
+stubPath = "tests/typings"
 exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
 reportUnusedCallResult = "warning"
 reportUnnecessaryTypeIgnoreComment = "error"

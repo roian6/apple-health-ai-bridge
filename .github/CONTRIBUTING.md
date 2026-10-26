@@ -108,7 +108,7 @@ setup. From the repository root in that environment:
 ```bash
 uv sync --locked --dev --group fuzz --python 3.12
 scratch="$(mktemp -d)"
-uv run --no-sync python -m fuzz.campaign "$scratch"
+uv run --no-sync python -m scripts.fuzz.campaign "$scratch"
 ```
 
 The campaign copies the committed synthetic seeds into the temporary directory,
@@ -124,7 +124,7 @@ under `$scratch`; inspect them locally and remove that directory when finished.
 Replay a minimized synthetic crash with the same target and resource bounds:
 
 ```bash
-uv run --no-sync python -m fuzz.engine batch \
+uv run --no-sync python -m scripts.fuzz.engine batch \
   "$scratch/batch/artifacts/crash-REPLACE_WITH_HASH" \
   -runs=1 -max_len=4096 -timeout=5 -rss_limit_mb=512 \
   "-artifact_prefix=$scratch/batch/artifacts/"
@@ -138,7 +138,7 @@ environments, run the deterministic validator and harness contracts:
 ```bash
 uv sync --all-extras --dev --locked
 uv run pytest -q tests/fuzzing tests/guardrails/test_fuzzing_workflow.py
-uv run basedpyright fuzz
+uv run basedpyright scripts/fuzz
 ```
 
 ## Branches and Design Decisions
