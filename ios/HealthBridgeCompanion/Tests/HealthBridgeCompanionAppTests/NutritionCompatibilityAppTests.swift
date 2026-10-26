@@ -71,6 +71,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
                 reason: .observerBatch(typeCodes: ["dietary_protein", "weight"])
             )
             await runtime.automaticSyncRuntime.cancelAndWait()
+            await vm.waitForBootstrapAndForegroundWork()
             XCTAssertFalse(fixture.base.reads.contains("dietary_protein"))
             XCTAssertTrue(fixture.base.reads.contains("weight"), "Held nutrition must not stop the later real query")
             XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], original)
@@ -527,6 +528,7 @@ extension NutritionCompatibilityAppTests {
         // No new observer event, record, pairing or dirty generation is introduced.
         await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
         await runtime.automaticSyncRuntime.cancelAndWait()
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
         XCTAssertEqual(fixture.base.settings.receiverSettingsGenerationToken, generation)
         XCTAssertTrue(fixture.base.reads.contains("dietary_protein"))
         XCTAssertEqual(try store.loadPendingObserverTypeCodeGenerations()["dietary_protein"], originalDirty)
