@@ -3,10 +3,10 @@
   <desc id="desc">Bridge mark, product name and Your Apple Health, connected to your AI.</desc>
   <defs>
     <radialGradient id="mint" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="matrix(892.8 0 0 504 0 0)">
-      <stop stop-color="#0f9f82" stop-opacity=".05"/><stop offset=".78" stop-color="#0f9f82" stop-opacity="0"/>
+      <stop stop-color="#0f9f82" stop-opacity=".1"/><stop offset=".78" stop-color="#0f9f82" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="blue" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="matrix(864 0 0 468 1440 0)">
-      <stop stop-color="#2563eb" stop-opacity=".035"/><stop offset=".78" stop-color="#2563eb" stop-opacity="0"/>
+      <stop stop-color="#2563eb" stop-opacity=".07"/><stop offset=".78" stop-color="#2563eb" stop-opacity="0"/>
     </radialGradient>
   </defs>
   <rect width="1440" height="360" fill="#FFFFFF"/>
