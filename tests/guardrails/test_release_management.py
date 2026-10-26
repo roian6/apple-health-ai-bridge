@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import ClassVar, Literal, cast
+from typing import ClassVar, Final, Literal, cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
@@ -14,6 +14,8 @@ from health_bridge import __version__
 from tests.guardrails.test_release_recovery import recovery_transport
 
 ROOT = Path(__file__).parents[2]
+# Reviewed published baseline: receiver-v1.1.5 at 6940fe41, not the source candidate.
+PUBLISHED_RECEIVER_VERSION: Final = "1.1.5"
 RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 RELEASE_NOTES = ROOT / ".github/release/notes-receiver-v1.1.1.md"
@@ -299,9 +301,9 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     output = ValidateOutput.model_validate_json(completed.stdout)
     assert output.model_dump() == {
         "ios_build": _current_ios_build(),
-        "ios_marketing_version": "1.1.1",
+        "ios_marketing_version": "1.2.0",
         "project_version": __version__,
-        "release_scope": "receiver",
+        "release_scope": "coordinated",
         "tag": f"receiver-v{__version__}",
     }
 
@@ -385,12 +387,12 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "schema_id": "health_bridge.batch.v1",
             "version": "1.0.0",
         },
-        "ios_companion": {"build": "50", "marketing_version": "1.1.1"},
+        "ios_companion": {"build": "51", "marketing_version": "1.2.0"},
         "receiver_cli": {
             "release_tag": f"receiver-v{__version__}",
             "version": __version__,
         },
-        "release_scope": "receiver",
+        "release_scope": "coordinated",
         "schema_id": "health_bridge.component_versions.v1",
     }
 
@@ -1126,13 +1128,16 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     pin_pattern = (
         r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)'
     )
-    assert f"/releases/tag/receiver-v{__version__})" in readme
-    assert f"/blob/receiver-v{__version__}/docs/setup.md)" in readme
-    assert f"/blob/receiver-v{__version__}/docs/icloud-mailbox-service.md)" in readme
+    assert f"/releases/tag/receiver-v{PUBLISHED_RECEIVER_VERSION})" in readme
+    assert f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/setup.md)" in readme
+    assert (
+        f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/icloud-mailbox-service.md)"
+        in readme
+    )
     assert re.findall(pin_pattern, readme) == []
     pins = re.findall(pin_pattern, setup)
     assert pins, "No versioned install pin found in docs/setup.md"
-    assert set(pins) == {f"receiver-v{__version__}"}, (
+    assert set(pins) == {f"receiver-v{PUBLISHED_RECEIVER_VERSION}"}, (
         f"Found stale install pins in docs/setup.md: {pins}"
     )
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
@@ -1147,6 +1152,7 @@ def test_roadmap_matches_readme_current_receiver_release() -> None:
     current_receiver = re.search(rf'{install_source}@receiver-v([^\s"]+)', setup)
 
     assert current_receiver is not None
+    assert current_receiver.group(1) == PUBLISHED_RECEIVER_VERSION
     expected_prefix = "The current public release set is Receiver/CLI "
     assert f"{expected_prefix}`{current_receiver.group(1)}`" in roadmap
 
@@ -1157,8 +1163,13 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     mailbox = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
 
     assert re.search(r"\]\(setup\.md(?:#[^)]+)?\)", self_build)
-    assert f"/blob/receiver-v{__version__}/docs/icloud-mailbox-service.md)" in setup
-    release_notes_path = ROOT / f".github/release/notes-receiver-v{__version__}.md"
+    assert (
+        f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/icloud-mailbox-service.md)"
+        in setup
+    )
+    release_notes_path = (
+        ROOT / f".github/release/notes-receiver-v{PUBLISHED_RECEIVER_VERSION}.md"
+    )
     assert release_notes_path.is_file()
     release_notes = release_notes_path.read_text(encoding="utf-8")
     expected_assets = set(re.findall(r"^- `([^`]+)`[.;]?", release_notes, re.MULTILINE))
@@ -1168,16 +1179,25 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     downloaded_assets = set(
         re.findall(r"^- `([^`]+)`[.;]?", download_section, re.MULTILINE)
     )
-    assert len(expected_assets) == 8
+    assert expected_assets == {
+        "apple_health_ai_bridge-1.1.5-py3-none-any.whl",
+        "apple_health_ai_bridge-1.1.5.tar.gz",
+        "release-metadata.json",
+        "receiver-build-provenance.intoto.jsonl",
+        "HealthBridgeMailboxAckPublisher-1.1.5.zip",
+        "HealthBridgeMailboxAckPublisher-1.1.5.manifest.json",
+        "SHA256SUMS",
+        "receiver-final-provenance.intoto.jsonl",
+    }
     assert downloaded_assets == expected_assets
     assert set(
         re.findall(r"apple_health_ai_bridge-[\w.]+-py3-none-any\.whl", mailbox)
-    ) == {f"apple_health_ai_bridge-{__version__}-py3-none-any.whl"}
+    ) == {f"apple_health_ai_bridge-{PUBLISHED_RECEIVER_VERSION}-py3-none-any.whl"}
     assert set(
         re.findall(
             r"HealthBridgeMailboxAckPublisher-[\d.]+(?:zip|manifest\.json)", mailbox
         )
     ) == {
-        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
-        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip",
+        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.manifest.json",
     }

@@ -4,13 +4,13 @@
     "version": "1.0.0"
   },
   "ios_companion": {
-    "build": "50",
-    "marketing_version": "1.1.1"
+    "build": "51",
+    "marketing_version": "1.2.0"
   },
   "receiver_cli": {
-    "release_tag": "receiver-v1.1.5",
-    "version": "1.1.5"
+    "release_tag": "receiver-v1.2.0",
+    "version": "1.2.0"
   },
-  "release_scope": "receiver",
+  "release_scope": "coordinated",
   "schema_id": "health_bridge.component_versions.v1"
 }
