@@ -1,10 +1,8 @@
-name: Label issues and pull requests
+name: Label issue areas
 
 on:
   issues:
     types: [opened, edited, reopened]
-  pull_request_target:
-    types: [opened, edited, reopened, synchronize]
 
 permissions: {}
 
@@ -15,7 +13,6 @@ jobs:
     permissions:
       contents: read
       issues: write
-      pull-requests: write
     steps:
-      # No PR checkout: the pinned action reads configuration from trusted main.
+      # Issue-only fallback: the pinned action reads configuration from main.
       - uses: fuxingloh/multi-labeler@bcd50af464202999e57f556b4aefcf05a34abf85 # v5.0.0
