@@ -17,7 +17,7 @@ def engine_command(target: str, workspace: Path, *, mutation: bool) -> list[str]
     return [
         sys.executable,
         "-m",
-        "fuzz.engine",
+        "scripts.fuzz.engine",
         target,
         str(workspace / "corpus"),
         f"-artifact_prefix={workspace / 'artifacts'}/",
@@ -60,7 +60,7 @@ def run_engine(command: list[str], log: Path) -> None:
 
 def main() -> None:
     if len(sys.argv) != ARGUMENT_COUNT:
-        message = "usage: python -m fuzz.campaign EMPTY_TEMP_DIRECTORY"
+        message = "usage: python -m scripts.fuzz.campaign EMPTY_TEMP_DIRECTORY"
         raise SystemExit(message)
     scratch = Path(sys.argv[1]).resolve()
     scratch.mkdir(parents=True, exist_ok=True)

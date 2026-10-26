@@ -3,12 +3,12 @@ from pathlib import Path
 from typing import Final
 
 import pytest
-from fuzz.targets import MAX_INPUT_BYTES, batch, mcp_dates
+from scripts.fuzz.targets import MAX_INPUT_BYTES, batch, mcp_dates
 
 from health_bridge.contract.batch_v1 import HealthBridgeBatchV1
 from health_bridge.mcp.tools import DateRangeArgs
 
-CORPUS: Final = Path("fuzz/corpus")
+CORPUS: Final = Path("scripts/fuzz/corpus")
 
 
 @pytest.mark.parametrize("target", ["batch", "mcp_dates"])

@@ -185,13 +185,13 @@ jobs:
         run: uv run --no-sync pip-audit --local --skip-editable
 
       - name: Type check fuzz harness
-        run: uv run --no-sync basedpyright fuzz
+        run: uv run --no-sync basedpyright scripts/fuzz
 
       - name: Replay synthetic seeds and run mutation campaigns
         run: |
           set -euo pipefail
           scratch="$(mktemp -d "$RUNNER_TEMP/health-bridge-fuzz.XXXXXX")"
-          uv run --no-sync python -m fuzz.campaign "$scratch" || {
+          uv run --no-sync python -m scripts.fuzz.campaign "$scratch" || {
             status=$?
             find "$scratch" -type f -name '*.log' -print -exec cat {} \;
             exit "$status"

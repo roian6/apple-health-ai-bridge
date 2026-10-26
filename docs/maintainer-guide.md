@@ -66,7 +66,7 @@ Require an accepted issue and maintainer decision before implementation when a c
 - Use `fix/`, `feat/`, `docs/`, or `chore/` branch prefixes.
 - Keep each pull request focused on one change.
 - Use synthetic fixtures and redact all public evidence.
-- Run the Python gates in `.github/CONTRIBUTING.md` and the relevant Swift/Xcode gates for iOS changes.
+- Run the Python gates in [`.github/CONTRIBUTING.md`](../.github/CONTRIBUTING.md) and the relevant Swift/Xcode gates for iOS changes.
 - Resolve every review thread.
 - Require these exact status checks on `main`:
   - `Python quality and package checks`
