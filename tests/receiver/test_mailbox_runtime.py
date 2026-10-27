@@ -26,6 +26,7 @@ from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublisher,
     NativeAckPublisherConfig,
 )
+from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from tests.mailbox.importer_support import (
     configured_importer,
     database_counts,
@@ -806,6 +807,51 @@ def test_empty_paired_mailbox_publishes_capabilities_after_import(
     restarted.run_once()
     assert calls == [mailbox, mailbox]
     assert len(published) == 1
+
+
+def test_default_capability_publication_uses_configured_connection_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    keys = MailboxKeyStore.for_testing(
+        state_dir=tmp_path / "keys", anchor_dir=tmp_path / "anchor"
+    )
+    connections = MailboxConnectionStore.for_testing(tmp_path / "connections", keys)
+    calls: list[Path] = []
+    loaded: list[Path] = []
+    published: list[bytes] = []
+
+    def load(store: MailboxConnectionStore, path: Path) -> DeliveryTrustedConnection:
+        assert store is connections
+        loaded.append(path)
+        return connection()
+
+    def publish(directory: MailboxDirectoryHandle, payload: bytes) -> None:
+        assert calls == [mailbox]
+        published.append(payload)
+        _ = (directory.path / "receiver-capabilities.json").write_bytes(payload)
+
+    monkeypatch.setattr(MailboxConnectionStore, "load", load)
+    monkeypatch.setattr(
+        runtime_module,
+        "default_native_ack_publisher",
+        lambda: SimpleNamespace(publish_capabilities=publish),
+    )
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        pairing_connections=connections,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+
+    worker.run_once()
+
+    assert loaded == [mailbox]
+    assert len(published) == 1
+    assert json.loads(published[0])["capabilities"]["nutrition_supported"] is True
+    assert worker.health_error() is None
 
 
 @pytest.mark.parametrize("metadata_failure", [False, True])
