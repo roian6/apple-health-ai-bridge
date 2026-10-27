@@ -24,18 +24,21 @@ that developer-no-access boundary remains true.
 
 ## Release availability
 
-This versioned guide targets Receiver/CLI and helper `1.1.5`. Before downloading or installing them, confirm that [receiver-v1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5) is published and all eight matching release assets are present and verified. Until that check succeeds, use the [published 1.1.3 setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md). Do not substitute `main`, the retired unpublished `receiver-v1.1.4` tag, or an older helper.
+These instructions target Receiver/CLI and helper `1.2.0`.
+Confirm that [receiver-v1.2.0](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0)
+and its complete asset set are available, then verify the release identity,
+provenance, and checksums below before installing anything. Do not substitute
+`main`, the retired unpublished `receiver-v1.1.4` tag, or an older helper.
 
 ## Install and verify the signed helper
-
-After the availability check succeeds, use the Receiver/CLI `1.1.5` GitHub Release assets. Download these files with a
+Use the Receiver/CLI `1.2.0` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.5-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.5.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.5.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.5.manifest.json`;
+- `apple_health_ai_bridge-1.2.0-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.2.0.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.zip`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.manifest.json`;
 - `release-metadata.json`;
 - `receiver-build-provenance.intoto.jsonl`;
 - `SHA256SUMS`;
@@ -71,33 +74,33 @@ Helper status uses fixed, path-free codes:
 
 ## Verify published release provenance
 
-Receiver/CLI `1.1.3` and later require two additional assets:
+For Receiver/CLI `1.1.3` and later, verify the two required provenance assets:
 `receiver-build-provenance.intoto.jsonl` and
 `receiver-final-provenance.intoto.jsonl`. This policy does not change the six
 immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
-This release uses metadata schema `health_bridge.release.v4`. Its core proof
-comes from `release.yml@refs/heads/release`; its final proof comes from
-`publish-release.yml@refs/tags/receiver-v1.1.5`. Both must bind the same exact
-source commit as the independently verified signed tag, never a newer branch
-HEAD. The publisher's candidate source receipt binds `source_commit`,
-`source_tree`, `source_tag`, and `tag_object` to that identity; the candidate
-artifact verification also pins its original run and attempt. See the
-[release operations](release-operations.md) for those publisher checks.
+For this `1.2.0` release, metadata schema `health_bridge.release.v4` binds the
+build proof to `release.yml@refs/heads/release` and the final proof to
+`publish-release.yml@refs/tags/receiver-v1.2.0`. Both source and signer digests
+must equal the independently verified signed tag's exact commit, not a later
+branch HEAD.
 
-Before running the commands below, confirm that `release-metadata.json` declares
-schema v4 and that its `git` tag, tag object, commit, and tree match the verified
-signed tag and helper manifest. Stop on any mismatch. These commands verify the
-published artifact proofs; they do not replace source eligibility, native helper
-qualification, or the publisher's candidate receipt checks.
+The publisher's candidate source receipt binds `source_commit`, `source_tree`,
+`source_tag`, and `tag_object` to that identity; candidate artifact verification
+also pins its original run and attempt. Before running the commands below,
+confirm that `release-metadata.json` declares schema v4 and that its `git` tag,
+tag object, commit, and tree match the verified signed tag and helper manifest.
+Stop on any mismatch. These commands verify published artifact proofs; they do
+not replace source eligibility, native helper qualification, or candidate
+receipt checks. See [release operations](release-operations.md).
 
 Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
+metadata. From the asset directory, set `tag` to `receiver-v1.2.0` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -110,8 +113,14 @@ metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
       printf "%s\n" "Release proof FAILED." >&2
     fi
     exit "$verification_status"' EXIT
-  : "${tag:?Set the verified receiver tag}"
-  : "${commit:?Set the independently verified tag target commit}"
+  if [ -z "${tag:-}" ]; then
+    printf "%s\n" "Set the verified receiver tag." >&2
+    exit 1
+  fi
+  if [ -z "${commit:-}" ]; then
+    printf "%s\n" "Set the independently verified tag target commit." >&2
+    exit 1
+  fi
   version="${tag#receiver-v}"
   repository="roian6/apple-health-ai-bridge"
   verify_subject() {
@@ -157,39 +166,130 @@ After every proof and checksum check succeeds, install the wheel, structurally
 validate the helper, and explicitly install it:
 
 ```bash
-uv tool install ./apple_health_ai_bridge-1.1.5-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.2.0-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```
 
-## Create mailbox pairing material
+Native URL-free pairing requires a specifically qualified matching Receiver/CLI
+`1.2.0`, helper `1.2.0`, and iOS Companion `1.2.0 (51)` build set. Check the
+release's compatibility and native qualification before using that path. The helper must
+be owned and ready, and it must implement the native cancellation capability
+described below. Do not infer native support from the helper version or a
+`ready` status alone.
 
-Set the exact values for the user-selected iCloud container and the already
-configured private receiver route. Then run the existing public setup command:
+## Native URL-free pairing with matched builds
 
 ```bash
-: "${HEALTH_BRIDGE_RECEIVER_URL:?Set the exact private /v1/batches URL}"
+: "${HEALTH_BRIDGE_DB:?Set the private local receiver database path}"
+: "${HEALTH_BRIDGE_SETUP_PAGE:?Set the private local setup page path}"
 : "${HEALTH_BRIDGE_MAILBOX_ROOT:?Set the existing HealthBridgeMailbox/v1 path}"
-: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the selected container identifier}"
+: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the matched builds' authorized container identifier}"
+health-bridge mailbox helper status --json
+health-bridge init --db "$HEALTH_BRIDGE_DB"
+health-bridge receiver create-pairing \
+  --db "$HEALTH_BRIDGE_DB" \
+  --label iPhone \
+  --transport icloud-mailbox \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
+  --format setup-page \
+  --setup-page "$HEALTH_BRIDGE_SETUP_PAGE"
+```
+
+Use an existing iCloud container authorized by the matched Mac receiver/helper
+and iPhone companion builds. The Mac's existing container `Documents` directory
+must be available, and both devices must use the same Apple account for iCloud
+Documents. Set `HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER` to the exact shared
+container identifier from those builds. Set `HEALTH_BRIDGE_MAILBOX_ROOT` to
+`$HOME/Library/Mobile Documents/<container identifier with dots replaced by
+tilde>/Documents/HealthBridgeMailbox/v1`. The receiver creates the final
+`HealthBridgeMailbox/v1` directories under that existing `Documents`
+directory. Do not substitute an arbitrary or default container. The private
+database and HTML setup page belong in owner-only local directories, not in the
+iCloud mailbox.
+
+The helper status command must report `{"code": "ready"}`. Readiness verifies
+the installed helper generation and platform checks, but does not prove native
+pairing support. The URL-free `receiver create-pairing` command itself checks
+that the helper returns exit status 0 and the exact
+`native-pairing-cancellation-v1:available` capability response. If that check
+fails, the command does not create a native invitation. Use only a matched,
+qualified receiver/helper/companion build set that shares the authorized
+container; no released native-compatible set is identified by this guide.
+
+This command initializes the local database and writes a private, temporary
+single-use setup page. Open that page locally in a browser on a trusted screen,
+then scan its QR code with the iPhone Camera, or use its setup link with the
+matched companion. Native setup pages do not offer the HTTP server/manual-code
+fallback. Treat the page, QR code, and setup link as private invitation
+material. Don't place them in chat, logs, Git, or a web server, and delete the
+local page after pairing.
+
+Before scanning the page, run one receiver worker and leave it running, or use
+an already running mailbox service. For a foreground worker, use the same DB,
+mailbox root, and container:
+
+```bash
+health-bridge receiver start \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER"
+```
+
+The foreground command stays active while the receiver serves locally and
+checks the mailbox. Do not start a second foreground receiver if the existing
+service is running. After pairing, the read-only query for imported metrics is:
+
+```bash
+health-bridge query synced-metrics --db "$HEALTH_BRIDGE_DB"
+```
+
+A new invitation expires after 20 minutes. If the receiver has already
+committed that exact request but the companion missed its completion, use the
+companion's Retry Pairing flow. The receiver can return the identical committed
+completion for that exact request after invitation expiry. Expiry does not let
+an uncommitted request enroll later.
+
+Cancellation is signed and confirmation-dependent. If request publication may
+have started, the companion keeps its pending authority until it receives and
+verifies the receiver's signed cancellation confirmation. If the Mac or iCloud
+is unavailable, cancellation can remain pending. The app's local pending-state
+cleanup does not remove the provider's pairing files; this flow has no automatic
+bootstrap-file cleanup. iCloud mailbox delivery and confirmation are
+best-effort and may be delayed by iCloud and iOS scheduling.
+
+## URL-based setup alternative
+
+Use this existing setup flow when the companion/build combination uses a
+receiver URL. `health-bridge setup` still requires `--receiver-url`; this
+alternative is not native URL-free pairing:
+
+```bash
+: "${HEALTH_BRIDGE_RECEIVER_URL:?Set the exact phone-reachable /v1/batches URL}"
+: "${HEALTH_BRIDGE_DB:?Set the private local receiver database path}"
+: "${HEALTH_BRIDGE_SETUP_PAGE:?Set the private local setup page path}"
+: "${HEALTH_BRIDGE_MAILBOX_ROOT:?Set the existing HealthBridgeMailbox/v1 path}"
+: "${HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER:?Set the authorized container identifier}"
 health-bridge setup \
   --receiver-url "$HEALTH_BRIDGE_RECEIVER_URL" \
+  --db "$HEALTH_BRIDGE_DB" \
+  --setup-page "$HEALTH_BRIDGE_SETUP_PAGE" \
   --transport icloud-mailbox \
   --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
   --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER"
 ```
 
-This creates the private database, temporary single-use pairing page, and
-mailbox-aware receiver command. Keep the setup page and its pairing link out of
-chat, logs, Git, and web servers. Pair only after the private redemption route
-and local receiver health check work. iCloud mailbox delivery remains
-best-effort and may be delayed by iCloud and iOS scheduling.
+The URL must be the configured private route for `/v1/batches` and reachable
+from the phone. Direct remains the default transport, and a Direct failure
+does not select mailbox delivery automatically.
 
 ## Before installing the service
 
@@ -209,9 +309,9 @@ Validate the inputs without installing or starting anything:
 ```bash
 health-bridge mailbox service validate \
   --executable /absolute/path/to/health-bridge \
-  --db /absolute/private/path/health.sqlite \
-  --mailbox-root "$HOME/Library/Mobile Documents/CONTAINER/Documents/HealthBridgeMailbox/v1" \
-  --icloud-container-identifier iCloud.example.HealthBridgeCompanion \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
   --json
 ```
 
@@ -226,9 +326,9 @@ data, run the same arguments with `install`:
 ```bash
 health-bridge mailbox service install \
   --executable /absolute/path/to/health-bridge \
-  --db /absolute/private/path/health.sqlite \
-  --mailbox-root "$HOME/Library/Mobile Documents/CONTAINER/Documents/HealthBridgeMailbox/v1" \
-  --icloud-container-identifier iCloud.example.HealthBridgeCompanion \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
   --json
 ```
 
@@ -252,9 +352,9 @@ receiver path, mailbox selection, or generated service-artifact version:
 ```bash
 health-bridge mailbox service upgrade \
   --executable /absolute/path/to/new/health-bridge \
-  --db /absolute/private/path/health.sqlite \
-  --mailbox-root "$HOME/Library/Mobile Documents/CONTAINER/Documents/HealthBridgeMailbox/v1" \
-  --icloud-container-identifier iCloud.example.HealthBridgeCompanion \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
   --json
 ```
 
@@ -372,3 +472,26 @@ HOME="$SYNTH_HOME" health-bridge mailbox service validate \
 
 This check proves rendering and filesystem validation only. It is not evidence
 of a real macOS launchd lifecycle or physical iPhone/iCloud delivery.
+
+## Receiver capability declaration
+
+The Receiver uses the same capability body as Direct HTTP, carried in the signed
+`receiver-capabilities.json` file at the existing paired device root. The native
+helper stores only this fixed metadata target; its ACK and pairing publication
+paths remain immutable. The declaration is bounded to 8,192 bytes and uses the
+existing Receiver signing key and connection identity.
+
+Publication runs after ordinary importer/ACK work in an existing eligible
+maintenance pass. Unchanged bytes do not cause a rewrite; changed bytes use a
+coordinated atomic replacement. A metadata failure, including an unsupported
+older helper, does not make the Mailbox worker terminal or invalidate an ACK.
+Retries use the next existing maintenance opportunity.
+
+An updated Receiver and compatible helper can declare support to an existing
+pairing without resetting keys, sending a dummy batch or re-pairing. An active
+Mailbox client reads the file even if inactive HTTP settings remain saved. File
+propagation and app wake are eventual: this is the last authenticated declaration
+available locally, not a heartbeat, live revocation proof or receipt. See the
+[capability contract](receiver-capabilities.md) for the signature, compatibility
+and unknown-support rules. Actual iCloud provider delivery and signed component
+distribution remain separate from isolated source tests.

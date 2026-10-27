@@ -3,7 +3,8 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 extension OutboxDeliveryCoordinatorTests {
-    func testMailboxFinalizationCannotAdvanceLaterTransactionBeforeFIFOHead() throws {
+    @MainActor
+    func testMailboxFinalizationCannotAdvanceLaterTransactionBeforeFIFOHead() async throws {
         let harness = try OutboxDeliveryHarness()
         _ = try advanceToProviderObserved(
             harness,
@@ -117,7 +118,8 @@ extension OutboxDeliveryCoordinatorTests {
         )
     }
 
-    func testCursorAndSleepFinalizationAreExactlyOnce() throws {
+    @MainActor
+    func testCursorAndSleepFinalizationAreExactlyOnce() async throws {
         let harness = try OutboxDeliveryHarness()
         let deliveryFinalizer = CountingOutboxDeliveryFinalizer()
         _ = try advanceToProviderObserved(
@@ -225,15 +227,18 @@ extension OutboxDeliveryCoordinatorTests {
             itemID: harness.fixture.item.id,
             ownership: harness.ownership
         )
-        XCTAssertFalse(try sleepFinalizer.isFinalized(sleepContext))
-        try sleepFinalizer.finalize(sleepContext)
-        XCTAssertTrue(try sleepFinalizer.isFinalized(sleepContext))
-        try sleepFinalizer.finalize(sleepContext)
+        let initiallyFinalized = try await sleepFinalizer.isFinalized(sleepContext)
+        XCTAssertFalse(initiallyFinalized)
+        try await sleepFinalizer.finalize(sleepContext)
+        let finalized = try await sleepFinalizer.isFinalized(sleepContext)
+        XCTAssertTrue(finalized)
+        try await sleepFinalizer.finalize(sleepContext)
         XCTAssertEqual(try store.loadManifest(), manifest)
         XCTAssertNil(try store.loadPendingTransition())
     }
 
-    func testCommittedFinalizationRetiresOnlyExactArtifacts() throws {
+    @MainActor
+    func testCommittedFinalizationRetiresOnlyExactArtifacts() async throws {
         let harness = try OutboxDeliveryHarness()
         let unrelated = try harness.fixture.outbox.enqueue(
             Data("synthetic-unrelated".utf8),
@@ -249,14 +254,15 @@ extension OutboxDeliveryCoordinatorTests {
             harness.publishCommittedAck(),
             itemID: harness.fixture.item.id
         )
-        _ = try coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+        _ = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
 
         XCTAssertNil(try harness.fixture.outbox.pendingItem(id: harness.fixture.item.id))
         XCTAssertNotNil(try harness.fixture.outbox.pendingItem(id: unrelated.id))
         XCTAssertEqual(try Data(contentsOf: unrelated.fileURL), Data("synthetic-unrelated".utf8))
     }
 
-    func testAckDeletionFailureKeepsCommittedFinalization() throws {
+    @MainActor
+    func testAckDeletionFailureKeepsCommittedFinalization() async throws {
         let harness = try OutboxDeliveryHarness()
         let finalizer = CountingOutboxDeliveryFinalizer()
         let coordinator = try advanceToProviderObserved(
@@ -266,7 +272,7 @@ extension OutboxDeliveryCoordinatorTests {
         )
         let event = try harness.publishCommittedAck()
         _ = try coordinator.consume(event, itemID: harness.fixture.item.id)
-        _ = try coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+        _ = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
 
         let failingScanner = MailboxAckScanner(
             context: harness.ackContext,

@@ -1,0 +1,18 @@
+# Production code only: test harnesses, package manifests and generated builds
+# are outside these roots. All authored files within each root are analyzed.
+included:
+  - ../../ios/HealthBridgeCompanion/App
+  - ../../ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore
+  - ../../macos/HealthBridgeMailboxAckPublisher
+
+# Bounded defect policy, independent of formatting and file size.
+only_rules:
+  - force_cast
+  - force_try
+  - duplicate_conditions
+  - duplicate_enum_cases
+  - identical_operands
+  - discarded_notification_center_observer
+  - notification_center_detachment
+  - weak_delegate
+  - valid_ibinspectable

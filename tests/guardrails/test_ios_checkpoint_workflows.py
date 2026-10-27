@@ -39,11 +39,12 @@ def test_ios_checkpoint_tags_run_pinned_transition_and_source_gates() -> None:
 
     assert "fetch-depth: 0" in python
     assert 'endswith("@users.noreply.github.com")' not in python
-    assert "Run Swift package tests" in ios
-    assert "Build unsigned iPhone simulator app" in ios
-    assert "Build unsigned generic iPhone app" in ios
-    assert "Build unsigned Public Documents QA simulator app" in ios
-    assert "Build unsigned Public Documents QA generic iPhone app" in ios
+    assert 'bash scripts/run-checks.sh native-builds "$MODE"' in ios
+    runner = Path("scripts/run-checks.sh").read_text()
+    assert "swift test" in runner
+    for target in ("HealthBridgeCompanion", "HealthBridgeCompanionPublicDocumentsQA"):
+        for sdk in ("iphonesimulator", "iphoneos"):
+            assert f"-target {target} -sdk {sdk}" in runner
 
 
 def test_ios_checkpoint_tags_do_not_enter_receiver_release_publication() -> None:

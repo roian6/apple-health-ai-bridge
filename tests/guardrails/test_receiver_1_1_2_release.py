@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import re
 import tomllib
 from pathlib import Path
 from typing import cast
@@ -22,7 +23,7 @@ class ProjectLock(BaseModel):
     package: list[LockedPackage]
 
 
-def test_current_receiver_preserves_ios_1_1_1_build_50() -> None:
+def test_current_coordinated_receiver_matches_ios_1_2_0_build_51() -> None:
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = cast("dict[str, object]", tomllib.load(handle)["project"])
     component_versions = cast(
@@ -44,19 +45,36 @@ def test_current_receiver_preserves_ios_1_1_1_build_50() -> None:
         / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
     ).read_text()
 
-    assert project["version"] == __version__
+    assert project["version"] == __version__ == "1.2.0"
     assert f'__version__: Final = "{__version__}"' in package_init
     assert server["version"] == __version__
     assert receiver == {
         "release_tag": f"receiver-v{__version__}",
         "version": __version__,
     }
-    assert component_versions["release_scope"] == "receiver"
+    assert component_versions["release_scope"] == "coordinated"
     assert helper_info["CFBundleShortVersionString"] == __version__
     assert helper_info["CFBundleVersion"] == "1"
-    assert ios == {"build": "50", "marketing_version": "1.1.1"}
-    assert ios_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert ios_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
+    assert ios == {"build": "51", "marketing_version": "1.2.0"}
+    assert ios_project.count("MARKETING_VERSION = 1.2.0;") == 2
+    assert ios_project.count("CURRENT_PROJECT_VERSION = 51;") == 2
+    notes = (ROOT / f".github/release/notes-receiver-v{__version__}.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Coordinated release" in notes
+    assert "Compatible iOS Companion: `1.2.0 (51)`" in notes
+    assert "Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`" in notes
+    assert f"@receiver-v{__version__}" in notes
+    assert set(re.findall(r"^- `([^`]+)`[.;]?", notes, re.MULTILINE)) == {
+        f"apple_health_ai_bridge-{__version__}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{__version__}.tar.gz",
+        "release-metadata.json",
+        "receiver-build-provenance.intoto.jsonl",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
+        "SHA256SUMS",
+        "receiver-final-provenance.intoto.jsonl",
+    }
 
 
 def test_current_receiver_lock_matches_project_version() -> None:

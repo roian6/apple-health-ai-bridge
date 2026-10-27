@@ -150,7 +150,9 @@ EXPECTED_TOOL_NAMES = (
     "get_timeseries",
     "get_workouts",
     "get_sleep_summary",
+    "get_latest_sleep_period",
     "get_daily_summary",
+    "get_sleep_report",
     "explain_sources",
 )
 
@@ -281,7 +283,7 @@ def test_mcp_dispatch_calls_supported_timeseries_catalog(tmp_path: Path) -> None
     types_by_code = {entry.type_code: entry for entry in payload.types}
 
     # Then
-    assert payload.total_type_count == 80
+    assert payload.total_type_count == 85
     assert set(types_by_code) == {
         "body_fat_mass",
         "body_fat_percentage",

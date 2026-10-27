@@ -4,13 +4,17 @@ Apple Health AI Bridge contains independently released components. Always includ
 
 ## Source compatibility
 
-| Surface | Current version | Public identifier |
+| Surface | Published baseline | Source candidate |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.3` | Release tag `receiver-v1.1.3` |
-| iOS Companion | `1.1.1` | Source candidate build `50` |
-| Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
+| Receiver/CLI | `1.1.5`, tag `receiver-v1.1.5` | `1.2.0`, proposed tag `receiver-v1.2.0` |
+| iOS Companion | `1.1.1` (build `50`) | `1.2.0` (build `51`) |
+| Batch Protocol | `health_bridge.batch.v1` (`1.0.0`) | `health_bridge.batch.v1` (`1.0.0`) |
 
-The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture.
+The authoritative machine-readable source mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture. The current source candidate declares a coordinated Receiver/CLI 1.2.0 and iOS Companion 1.2.0 build 51, compatible with Batch Protocol `health_bridge.batch.v1` version `1.0.0`. These source values don't make the candidate a published release or change installation pins. Until the candidate is approved and published, the published Receiver/CLI baseline remains `receiver-v1.1.5` at `6940fe4130bfe210e0659b4c53855bbf7682ba38`.
+
+The published `receiver-v1.1.5` is a bounded maintenance release based on `receiver-v1.1.3`. Use its immutable tag and tagged installation guides for published behavior. The source candidate's proposed compatibility mapping is recorded in the [Receiver/CLI 1.2.0 candidate notes](../.github/release/notes-receiver-v1.2.0.md); it remains separate from the published baseline until release approval and publication.
+
+The 1.2.0 source candidate adds migration `012_catalogue_coverage_index`, which builds a catalogue coverage index, and migration `013_mailbox_enrollment`, which adds enrollment digest fields. Back up the database before upgrading. The project doesn't support running an older Receiver/CLI against a database after these migrations; restore the pre-upgrade backup before returning to an older version.
 
 ### One stable release branch
 
@@ -105,7 +109,7 @@ checksums or provenance verification.
 Use labels such as:
 
 ```text
-Receiver/CLI 1.1.3
+Receiver/CLI 1.1.5
 Compatible iOS Companion 1.1.1 (build 50)
 Batch Protocol health_bridge.batch.v1 (1.0.0)
 ```

@@ -89,28 +89,29 @@ left join (
     from sleep_sessions
 ) sleep_counts
 left join (
-    select canonical_cursor_kind as cursor_kind,
-           count(*) as cursor_count,
-           max(latest_cursor_updated_at) as latest_cursor_updated_at
-    from (
-        select sync_cursors.source_id,
-               case sync_cursors.cursor_kind
-                   when 'foreground_quantity_sync:active_energy'
-                   then 'foreground_quantity_sync:energy'
-                   when 'foreground_quantity_sync:body_mass'
-                   then 'foreground_quantity_sync:weight'
-                   else sync_cursors.cursor_kind
-               end as canonical_cursor_kind,
-               max(sync_cursors.updated_at) as latest_cursor_updated_at
-        from sync_cursors
-        group by sync_cursors.source_id, canonical_cursor_kind
-    ) canonical_cursors
-    group by canonical_cursor_kind
-) cursor_counts on cursor_counts.cursor_kind = case
-    when ht.type_code = 'workout' then 'foreground_workout_sync'
-    when ht.type_code = 'sleep_analysis' then 'foreground_sleep_sync'
-    else 'foreground_quantity_sync:' || ht.type_code
-end
+    select metric_catalog.type_code,
+           count(distinct sync_cursors.source_id) as cursor_count,
+           max(sync_cursors.updated_at) as latest_cursor_updated_at
+    from metric_catalog
+    join sync_cursors on (
+        metric_catalog.type_code not in ('workout', 'sleep_analysis')
+        and sync_cursors.cursor_kind in (
+            'foreground_quantity_sync:' || metric_catalog.type_code,
+            'healthkit_anchored_quantity:' || metric_catalog.type_code,
+            'automatic_healthkit_anchored_quantity:' || metric_catalog.type_code
+        )
+    ) or sync_cursors.cursor_kind = case metric_catalog.type_code
+        when 'steps' then 'anchored_step_sync'
+        when 'workout' then 'anchored_workout_sync'
+        when 'sleep_analysis' then 'anchored_sleep_sync'
+    end or sync_cursors.cursor_kind = case metric_catalog.type_code
+        when 'workout' then 'foreground_workout_sync'
+        when 'sleep_analysis' then 'foreground_sleep_sync'
+        when 'energy' then 'foreground_quantity_sync:active_energy'
+        when 'weight' then 'foreground_quantity_sync:body_mass'
+    end
+    group by metric_catalog.type_code
+) cursor_counts on cursor_counts.type_code = ht.type_code
 order by ht.type_code
 """
 SYNC_CURSOR_STATUS_SQL: Final = """

@@ -129,6 +129,8 @@ public enum HealthKitQuantitySampleMapper {
             return HKUnit.meterUnit(with: .centi)
         case "kg":
             return HKUnit.gramUnit(with: .kilo)
+        case "g":
+            return .gram()
         case "kg/m²":
             return .count()
         case "kcal":

@@ -5,19 +5,21 @@ from subprocess import run
 def test_swift_analysis_is_required_in_existing_native_gate() -> None:
     # Given
     workflow = Path(".github/workflows/ios.yml").read_text()
+    runner = Path("scripts/run-checks.sh").read_text()
     # When / Then
     assert "name: Swift tests and unsigned app builds" in workflow
     assert "bash scripts/swift-analysis.sh" in workflow
     assert "working-directory: ${{ github.workspace }}" in workflow
     assert "timeout-minutes: 10" in workflow
     assert "continue-on-error" not in workflow
-    assert "swift test" in workflow
-    assert workflow.count("CODE_SIGNING_REQUIRED=NO") == 4
+    assert 'bash scripts/run-checks.sh native-builds "$MODE"' in workflow
+    assert "swift test" in runner
+    assert runner.count("CODE_SIGNING_REQUIRED=NO") == 4
 
 
 def test_swift_analysis_policy_covers_all_production_components() -> None:
     # Given
-    config = Path(".swiftlint.yml").read_text()
+    config = Path(".github/linters/swiftlint.yml").read_text()
     script = Path("scripts/swift-analysis.sh").read_text()
     # When / Then
     for scope in (

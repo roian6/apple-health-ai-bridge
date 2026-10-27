@@ -147,8 +147,8 @@ class ReceiverDeviceSummary:
 class IssuedPairingInvitation:
     invitation_id: str
     label: str
-    receiver_url: str
-    redeem_url: str
+    receiver_url: str | None
+    redeem_url: str | None
     invitation_secret: str
     invitation_code: str
     created_at: str
@@ -159,7 +159,7 @@ class IssuedPairingInvitation:
 @dataclass(frozen=True, slots=True)
 class PairingRedemptionCompletion:
     label: str
-    receiver_url: str
+    receiver_url: str | None
     installation_id_hash: str
     transport: ReceiverTransport
 
@@ -168,7 +168,7 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
     db_path: Path,
     *,
     label: str,
-    receiver_url: str,
+    receiver_url: str | None,
     transport: ReceiverTransport | Literal["direct", "mailbox"] = (
         ReceiverTransport.DIRECT
     ),
@@ -177,8 +177,12 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
 ) -> IssuedPairingInvitation:
-    normalized_url = _validate_receiver_url(receiver_url)
     selected_transport = ReceiverTransport(transport)
+    normalized_url = (
+        ""
+        if receiver_url is None and selected_transport is ReceiverTransport.MAILBOX
+        else _validate_receiver_url(receiver_url or "")
+    )
     issued_at = _normalized_now(now)
     if not INVITATION_MIN_TTL <= expires_in <= INVITATION_MAX_TTL:
         message = "Pairing invitation expiry must be between 10 and 30 minutes."
@@ -246,8 +250,8 @@ def create_pairing_invitation(  # noqa: PLR0913 - test hooks allow deterministic
         return IssuedPairingInvitation(
             invitation_id=invitation_id,
             label=label,
-            receiver_url=normalized_url,
-            redeem_url=_redeem_url(normalized_url),
+            receiver_url=normalized_url or None,
+            redeem_url=_redeem_url(normalized_url) if normalized_url else None,
             invitation_secret=secret,
             invitation_code=code,
             created_at=issued_at_text,
@@ -268,15 +272,18 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
     invitation_secret: str | None = None,
     invitation_code: str | None = None,
     now: datetime | None = None,
-    before_commit: Callable[[PairingRedemptionCompletion], None] | None = None,
+    before_commit: Callable[[PairingRedemptionCompletion], str | None] | None = None,
+    native_invitation_id: str | None = None,
+    native_request_sha256: str | None = None,
 ) -> PairingRedemptionCompletion:
     if (invitation_secret is None) == (invitation_code is None):
         message = "Provide exactly one pairing invitation credential."
         raise PairingInvitationError(message)
-    normalized_installation_id = _normalize_installation_id(installation_id)
-    normalized_device_credential = _normalize_device_credential(device_credential)
     normalized_platform = _normalize_platform(platform)
-    installation_id_hash = _hash_installation_id(normalized_installation_id)
+    normalized_device_credential = _normalize_device_credential(device_credential)
+    installation_id_hash = _hash_installation_id(
+        _normalize_installation_id(installation_id)
+    )
     device_credential_hash = hash_receiver_token(normalized_device_credential)
     timestamp = _format_utc(_normalized_now(now))
 
@@ -333,6 +340,9 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
             revoked_at,
             _transport,
         ) = lookup
+        _validate_native_redemption(
+            connection, lookup, native_invitation_id, native_request_sha256
+        )
         if redeemed_at is not None:
             completion = INVITATION_RESULT_ROW_ADAPTER.validate_python(
                 connection.execute(
@@ -347,6 +357,8 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
                 completion,
                 installation_id_hash,
                 before_commit,
+                connection,
+                invitation_id,
             )
             connection.commit()
             return result
@@ -397,32 +409,52 @@ def redeem_pairing_invitation(  # noqa: PLR0913 - explicit wire fields are secur
                 pairing_invitation_id,
                 receiver_device_id,
                 receiver_token_id,
-                redeemed_at
+                redeemed_at, native_request_sha256
             )
-            values (?, ?, ?, ?)
+            values (?, ?, ?, ?, ?)
             """,
-            (invitation_id, device_id, issued.token_id, timestamp),
+            (
+                invitation_id,
+                device_id,
+                issued.token_id,
+                timestamp,
+                native_request_sha256,
+            ),
         )
         return _finish_redemption(
             completion,
             installation_id_hash,
             before_commit,
+            connection,
+            invitation_id,
         )
 
 
 def _finish_redemption(
     completion: InvitationResultRow,
     installation_id_hash: str,
-    before_commit: Callable[[PairingRedemptionCompletion], None] | None,
+    before_commit: Callable[[PairingRedemptionCompletion], str | None] | None,
+    connection: sqlite3.Connection,
+    invitation_id: str,
 ) -> PairingRedemptionCompletion:
     result = PairingRedemptionCompletion(
         label=completion[0],
-        receiver_url=completion[1],
+        receiver_url=completion[1] or None,
         installation_id_hash=installation_id_hash,
         transport=ReceiverTransport(completion[2]),
     )
     if before_commit is not None:
-        before_commit(result)
+        enrollment = before_commit(result)
+        if result.transport is ReceiverTransport.MAILBOX and enrollment is not None:
+            updated = connection.execute(
+                """update pairing_invitation_redemptions
+                set mailbox_enrollment_sha256 = ?
+                where pairing_invitation_id = ? and
+                (mailbox_enrollment_sha256 is null or mailbox_enrollment_sha256 = ?)""",
+                (enrollment, invitation_id, enrollment),
+            )
+            if updated.rowcount != 1:
+                raise PairingInvitationError(GENERIC_INVITATION_ERROR)
     return result
 
 
@@ -703,3 +735,111 @@ def _normalized_now(value: datetime | None) -> datetime:
 
 def _format_utc(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _require_native_invitation(
+    lookup: InvitationLookupRow, expected_id: str | None
+) -> None:
+    if expected_id is not None and (
+        lookup[0] != expected_id
+        or lookup[2] != ""
+        or lookup[10] != "mailbox"
+        or lookup[9] is not None
+    ):
+        raise PairingInvitationError(GENERIC_INVITATION_ERROR)
+
+
+def _validate_native_redemption(
+    connection: sqlite3.Connection,
+    lookup: InvitationLookupRow,
+    native_invitation_id: str | None,
+    native_request_sha256: str | None,
+) -> None:
+    _require_native_invitation(lookup, native_invitation_id)
+    if lookup[2] == "" and (
+        native_invitation_id is None or native_request_sha256 is None
+    ):
+        raise PairingInvitationError(GENERIC_INVITATION_ERROR)
+    if lookup[8] is not None and native_request_sha256 is not None:
+        row = TypeAdapter[tuple[str | None] | None](
+            tuple[str | None] | None
+        ).validate_python(
+            connection.execute(
+                """select native_request_sha256 from pairing_invitation_redemptions
+            where pairing_invitation_id = ?""",
+                (lookup[0],),
+            ).fetchone()
+        )
+        if row != (native_request_sha256,):
+            raise PairingInvitationError(GENERIC_INVITATION_ERROR)
+
+
+def cancel_native_invitation(  # noqa: PLR0913 - exact authenticated request binding.
+    db_path: Path,
+    *,
+    invitation_id: str,
+    invitation_secret: str,
+    installation_id: str,
+    device_credential: str,
+    request_sha256: str,
+    before_commit: Callable[[], None] | None = None,
+) -> None:
+    """Tombstone one authenticated request; revoke only its committed credential."""
+    initialize_database(db_path)
+    timestamp = _format_utc(_normalized_now(None))
+    with connect_database(db_path) as connection:
+        _ = connection.execute("begin immediate")
+        row = TypeAdapter[tuple[str | None, str | None] | None](
+            tuple[str | None, str | None] | None
+        ).validate_python(
+            connection.execute(
+                """select redeemed_at, native_cancel_sha256 from pairing_invitations
+                where pairing_invitation_id = ? and invitation_secret_hash = ?
+                  and transport = 'mailbox' and receiver_url = ''""",
+                (
+                    invitation_id,
+                    _hash_invitation_secret(_normalize_secret(invitation_secret)),
+                ),
+            ).fetchone()
+        )
+        if row is None or (row[1] is not None and row[1] != request_sha256):
+            raise PairingInvitationError(GENERIC_INVITATION_ERROR)
+        if row[0] is not None:
+            token = TypeAdapter[tuple[int] | None](tuple[int] | None).validate_python(
+                connection.execute(
+                    """select redemption.receiver_token_id
+                from pairing_invitation_redemptions redemption
+                join receiver_devices device using (receiver_device_id)
+                join receiver_tokens token using (receiver_token_id)
+                join receiver_token_devices mapping
+                  on mapping.receiver_token_id = redemption.receiver_token_id
+                 and mapping.receiver_device_id = redemption.receiver_device_id
+                where pairing_invitation_id = ? and native_request_sha256 = ?
+                  and device.installation_id_hash = ? and token.token_hash = ?
+                  and mailbox_enrollment_sha256 is not null""",
+                    (
+                        invitation_id,
+                        request_sha256,
+                        _hash_installation_id(
+                            _normalize_installation_id(installation_id)
+                        ),
+                        hash_receiver_token(
+                            _normalize_device_credential(device_credential)
+                        ),
+                    ),
+                ).fetchone()
+            )
+            if token is None:
+                raise PairingInvitationError(GENERIC_INVITATION_ERROR)
+            _ = connection.execute(
+                """update receiver_tokens set revoked_at = coalesce(revoked_at, ?)
+                where receiver_token_id = ?""",
+                (timestamp, token[0]),
+            )
+        _ = connection.execute(
+            """update pairing_invitations set revoked_at = coalesce(revoked_at, ?),
+            native_cancel_sha256 = ? where pairing_invitation_id = ?""",
+            (timestamp, request_sha256, invitation_id),
+        )
+        if before_commit is not None:
+            before_commit()

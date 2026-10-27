@@ -1,0 +1,5 @@
+{
+  "synthetic": true,
+  "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "document_utf8": "{\"capabilities\":{\"batch_schema_id\":\"health_bridge.batch.v1\",\"future_synthetic\":{\"enabled\":true},\"nutrition_supported\":true,\"schema_id\":\"health_bridge.receiver_capabilities.v1\"},\"connection_generation\":1,\"device_id\":\"03030303030303030303030303030303\",\"kind\":\"receiver_capabilities\",\"receiver_id\":\"02020202020202020202020202020202\",\"receiver_signing_key_id\":\"7ee0725d6d44b65fd2ff83fc988cc196\",\"signature\":\"awS5Unaz2wBFJYJqSnYkoEQFj-yDRSvHLVgNPvFukKT536SPomucXhW-5GLhlXsjs-p8zgLgdisMl7hd57eQDQ\",\"v\":1}"
+}

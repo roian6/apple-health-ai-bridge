@@ -3,8 +3,12 @@ import sys
 from pathlib import Path
 
 import pytest
-from fuzz.campaign import engine_command, require_mutation_evidence, run_engine
-from fuzz.engine import require_fresh_imports
+from scripts.fuzz.campaign import (
+    engine_command,
+    require_mutation_evidence,
+    run_engine,
+)
+from scripts.fuzz.engine import require_fresh_imports
 
 
 def test_engine_commands_bound_resources_and_use_explicit_artifacts(
@@ -13,7 +17,12 @@ def test_engine_commands_bound_resources_and_use_explicit_artifacts(
     # When
     command = engine_command("batch", tmp_path, mutation=True)
     # Then
-    assert command[:4] == [sys.executable, "-m", "fuzz.engine", "batch"]
+    assert command[:4] == [
+        sys.executable,
+        "-m",
+        "scripts.fuzz.engine",
+        "batch",
+    ]
     assert str(tmp_path / "corpus") in command
     assert f"-artifact_prefix={tmp_path / 'artifacts'}/" in command
     assert {

@@ -1,6 +1,6 @@
 # Supported Apple Health data
 
-Health Bridge for AI requests **read-only** access to every runtime-available supported type in the list below. The same unified type set drives permission requests, foreground sync, observer registration, and background refresh. Apple Health's system permission sheet still lets the user allow or deny each type individually, and only allowed records can sync. The app does not request HealthKit write access.
+Apple Health AI Bridge requests **read-only** access to every runtime-available supported type in the list below. The same unified type set drives permission requests, foreground sync, observer registration, and background refresh. Apple Health's system permission sheet still lets the user allow or deny each type individually, and only allowed records can sync. The app does not request HealthKit write access.
 
 The app uses permitted records only to prepare sync batches for the receiver URL configured by the user, show sync status, and retry pending user-directed transfers. It does not use these records for advertising, tracking, data brokerage, or clinical decisions.
 
@@ -17,6 +17,11 @@ This list is the complete requested scope and the public disclosure source for A
 - `body_fat_percentage` — Body Fat Percentage
 - `body_mass_index` — Body Mass Index
 - `body_temperature` — Body Temperature
+- `dietary_carbohydrates` — Dietary Carbohydrates
+- `dietary_energy_consumed` — Dietary Energy Consumed
+- `dietary_fat_total` — Dietary Fat Total
+- `dietary_fiber` — Dietary Fiber
+- `dietary_protein` — Dietary Protein
 - `distance_cycling` — Cycling Distance
 - `distance_downhill_snow_sports` — Downhill Snow Sports Distance
 - `distance_swimming` — Swimming Distance

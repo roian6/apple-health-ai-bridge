@@ -4,6 +4,52 @@ Pairing connects the iOS companion to a receiver that you run. The default flow 
 
 Setup pages, QR codes, copied links, and invitation codes are still private. Anyone who obtains an unexpired invitation may redeem it first.
 
+## User handoff checklist
+
+For Direct, finish [receiver setup and reachability checks](#create-a-setup-page)
+before following this checklist:
+
+1. Keep the receiver running.
+2. Verify `/health` using the exact base URL the iPhone will reach.
+3. Generate a fresh invitation setup page.
+4. Open it on a trusted screen.
+5. Scan the QR with iPhone Camera.
+6. If QR cannot be used, tap the setup-page button or paste its link inside Health Bridge.
+7. If link handoff is unavailable, enter the displayed server address and invitation code.
+8. Confirm that Health Bridge reports the connection as saved.
+9. Grant only the Apple Health read permissions the user wants.
+10. Tap the primary app action and verify receiver-side aggregate sync evidence.
+11. Delete the setup page after pairing or expiry.
+
+If pairing reports invalid/unavailable, generate a new invitation. That generic result intentionally does not reveal whether the old invitation was mistyped, expired, revoked, locked, used, or unknown.
+
+For Encrypted iCloud Mailbox, follow the signed-helper lifecycle and choose the
+matching enrollment path in [the Mailbox setup guide](icloud-mailbox-service.md).
+The existing URL-based path uses `health-bridge setup --transport icloud-mailbox`.
+Compatible native builds instead use the documented URL-free
+`health-bridge receiver create-pairing --transport icloud-mailbox` flow. Direct
+remains the default and never falls back to mailbox delivery.
+
+## Native iCloud Mailbox pairing
+
+Direct remains the default. Encrypted iCloud Mailbox is an explicit opt-in, Mac-only Beta, and a Direct failure never switches transports automatically. Native Mailbox pairing is a separate enrollment path for compatible iPhone and Mac components using the same user-authorized iCloud container and a cancellation-capable receiver helper. It does not replace existing Direct or legacy URL-based pairing.
+
+The private invitation carries the receiver's signing and key-agreement public keys and an invitation ID. This is the initial trust channel: whoever obtains the authentic, unexpired invitation can attempt the first enrollment. The receiver does not preauthorize a particular physical phone, and the app does not use Apple-account identity or device attestation to choose the first holder. The phone creates its installation ID, device keys, and connection credential locally.
+
+The phone publishes a signed, encrypted request. It binds the invitation ID and device signing key, and encrypts the invitation secret, installation ID, credential, and device keys to the pinned receiver key. The receiver validates its own invitation keys, verifies the request signature, and commits enrollment atomically. Its signed, encrypted completion is bound to the exact sealed request and invitation. The app saves the Mailbox connection only after verifying the receiver signature, request digest, peer identities, and expected connection binding. Neither the completion nor the active Mailbox settings expose an HTTP receiver URL or bearer token.
+
+The default lifetime for a new invitation is 20 minutes, with an accepted internal range of 10 to 30 minutes. Expiry prevents a new enrollment, but does not block recovery of the exact request if the receiver already committed it. During interrupted pairing, the phone retains the sealed request and original keys and retries that same request. A changed request cannot recover the committed enrollment. Do not interpret invitation expiry as expiry or deletion of the resulting connection credential, keys, or stored pairing files.
+
+The receiver credential created by enrollment has no time-based expiry in the current implementation. It remains valid until revoked. Receiver-side device revocation blocks new deliveries for that device. Local disconnect is not server-side revocation and does not delete receiver history.
+
+Cancellation depends on how far publication may have progressed. Before a request could have reached iCloud, cancellation can finish locally. After publication may have occurred, the phone must publish a request-bound cancellation and receive a valid receiver-signed confirmation before retiring the pending authority. If iCloud, the receiver, or required keys are unavailable, cancellation can remain pending. The receiver tombstones the invitation and revokes the credential associated with that request when it processes cancellation; this is not an instant or guaranteed remote action.
+
+**Reset Private Sync State** is a separate, explicitly confirmed local recovery action. It discards pending pairing and unsent local payloads even when normal cancellation cannot obtain confirmation, and it resets local sync progress. It does not revoke an enrollment already accepted by the receiver or delete receiver history. Revoke that device on the receiver if needed, then use a fresh invitation. The dedicated lost-key reset remains available only after pending pairing is cleared and the connection, queue and sync operations are safely idle.
+
+Request and completion bodies are encrypted and authenticated. The iCloud container can still expose envelope metadata, including message kind, invitation ID, sender public key, and message size. Cancellation and cancellation-confirmation envelopes are signed, not application-encrypted. The current implementation does not automatically delete pairing files after invitation expiry, redemption, or cancellation, and it does not establish a remote retention or erasure deadline. Treat the container and its metadata as private.
+
+Native Mailbox pairing is an enrollment and transport choice only. It does not add HealthKit permissions or data types, HealthKit writes, a developer-operated relay, telemetry, or automatic third-party AI upload. Health data remains subject to the user's existing HealthKit permissions and selected receiver.
+
 ## Pairing v2 lifecycle
 
 ```text
@@ -41,16 +87,9 @@ The manual code uses an unambiguous `5-5-5` shape. Its public selector allows th
 
 First prepare the real receiver route by following [the receiver route guide](setup.md#what-the-receiver-url-means). Existing Tailscale users can use Route A; Route B is the agent-assisted private-ingress path; Route C is the explicit local-only fallback.
 
-For normal onboarding, run the route-specific `health-bridge setup` command in that guide. Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
+For normal onboarding, run the route-specific `health-bridge setup` command in [Install and run core setup](setup.md#install-and-run-core-setup). Setup creates the first private pairing page and prints the exact receiver command, but it proves only the same-host MCP process. Put the printed receiver command under the approved service manager, start it, and require `{"status":"ok"}` from the printed local health URL.
 
-Then derive the phone-facing health endpoint:
-
-```bash
-: "${HEALTH_BRIDGE_RECEIVER_URL:?follow docs/setup.md and set the real URL first}"
-PHONE_REACHABLE_BASE_URL="${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}"
-```
-
-Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page.
+Then derive the phone-facing `/health` URL from `HEALTH_BRIDGE_RECEIVER_URL`. Open that exact phone-facing `/health` URL on the physical iPhone and require the same response. Routes A and B use HTTPS; Route C deliberately uses HTTP only on the same trusted LAN. Only after the supervised receiver, local health check, and physical-iPhone health check all pass should the user open the setup-generated pairing page. The canonical route guide also explains that local MCP smoke does not prove receiver readiness or phone reachability.
 
 If that setup invitation expired during verification, create a fresh QR-first page from the already verified batch URL. The new same-label invitation rotates the previous active one:
 
@@ -245,29 +284,6 @@ A production Universal Link still requires:
 - an `applinks:` Associated Domains entitlement.
 
 Arbitrary self-hosted receiver domains cannot all become app Universal Link domains. Until an official pairing domain is selected, the custom scheme plus manual code fallback remains the supported path.
-
-## User handoff checklist
-
-For Encrypted iCloud Mailbox, first run the explicit mailbox setup command and
-signed-helper lifecycle in
-[`icloud-mailbox-service.md`](icloud-mailbox-service.md). The public pairing
-command remains `health-bridge setup --transport icloud-mailbox`; there is no
-separate hidden mailbox pairing command. Direct remains the default and never
-falls back to mailbox delivery.
-
-1. Keep the receiver running.
-2. Verify `/health` using the exact base URL the iPhone will reach.
-3. Generate a fresh invitation setup page.
-4. Open it on a trusted screen.
-5. Scan the QR with iPhone Camera.
-6. If QR cannot be used, tap the setup-page button or paste its link inside Health Bridge.
-7. If link handoff is unavailable, enter the displayed server address and invitation code.
-8. Confirm that Health Bridge reports the connection as saved.
-9. Grant only the Apple Health read permissions the user wants.
-10. Tap the primary app action and verify receiver-side aggregate sync evidence.
-11. Delete the setup page after pairing or expiry.
-
-If pairing reports invalid/unavailable, generate a new invitation. That generic result intentionally does not reveal whether the old invitation was mistyped, expired, revoked, locked, used, or unknown.
 
 ## Security rules
 

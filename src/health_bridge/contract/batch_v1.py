@@ -129,6 +129,7 @@ class HealthType(StrictModel):
         "environmental",
         "fitness",
         "heart",
+        "nutrition",
         "other",
         "provider_specific",
         "sleep",

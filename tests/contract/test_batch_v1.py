@@ -167,6 +167,7 @@ def test_batch_accepts_timeseries_catalog_representative_categories() -> None:
         "distance_cycling",
         "environmental_audio_exposure",
         "hydration",
+        "dietary_protein",
     )
     health_types: list[dict[str, object]] = []
     samples: list[dict[str, object]] = []

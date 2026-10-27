@@ -7,6 +7,7 @@ public struct CompanionSetupSnapshot: Equatable, Sendable {
     public let isSyncing: Bool
     public let statusIsError: Bool
     public let pendingOutboxCount: Int
+    public let hasCommittedMailboxConnection: Bool
 
     public init(
         receiverURLString: String,
@@ -14,7 +15,8 @@ public struct CompanionSetupSnapshot: Equatable, Sendable {
         healthPermissionsRequested: Bool,
         isSyncing: Bool,
         statusIsError: Bool,
-        pendingOutboxCount: Int
+        pendingOutboxCount: Int,
+        hasCommittedMailboxConnection: Bool = false
     ) {
         self.receiverURLString = receiverURLString
         self.hasBearerToken = hasBearerToken
@@ -22,10 +24,12 @@ public struct CompanionSetupSnapshot: Equatable, Sendable {
         self.isSyncing = isSyncing
         self.statusIsError = statusIsError
         self.pendingOutboxCount = pendingOutboxCount
+        self.hasCommittedMailboxConnection = hasCommittedMailboxConnection
     }
 
     public var hasCompleteReceiverSettings: Bool {
-        URL(string: receiverURLString) != nil && hasBearerToken
+        hasCommittedMailboxConnection
+            || (URL(string: receiverURLString) != nil && hasBearerToken)
     }
 }
 

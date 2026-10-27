@@ -105,6 +105,35 @@ final class HealthKitGenericQuantityReaderTests: XCTestCase {
         }
     }
 
+    func testMapperConvertsDietarySamplesToCanonicalUnits() throws {
+        let start = try date("2026-06-15T12:00:00Z")
+        let examples: [(String, HKQuantityTypeIdentifier, HKUnit, Double, Double)] = [
+            ("dietary_energy_consumed", .dietaryEnergyConsumed, .kilocalorie(), 420.0, 420.0),
+            ("dietary_protein", .dietaryProtein, .gram(), 21.5, 21.5),
+            ("dietary_carbohydrates", .dietaryCarbohydrates, HKUnit.gramUnit(with: .milli), 48_000.0, 48.0),
+            ("dietary_fat_total", .dietaryFatTotal, .gram(), 9.25, 9.25),
+            ("dietary_fiber", .dietaryFiber, .gram(), 3.5, 3.5),
+        ]
+
+        for (typeCode, identifier, unit, value, expectedValue) in examples {
+            let entry = try catalogEntry(typeCode)
+            XCTAssertNotNil(HealthKitQuantitySampleMapper.unit(for: entry), typeCode)
+            let sample = quantitySample(
+                typeIdentifier: identifier,
+                unit: unit,
+                value: value,
+                start: start,
+                end: start
+            )
+            let summary = try XCTUnwrap(
+                HealthKitQuantitySampleMapper.summary(for: sample, entry: entry)
+            )
+
+            XCTAssertEqual(summary.typeCode, typeCode)
+            XCTAssertEqual(summary.value, expectedValue, accuracy: 0.000_001)
+        }
+    }
+
     func testMapperScalesFractionalHealthKitPercentQuantitiesToCanonicalPercentUnit() throws {
         let start = try date("2026-06-15T07:00:00Z")
         let oxygen = quantitySample(

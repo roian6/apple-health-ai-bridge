@@ -287,6 +287,7 @@ public final class ReceiverClient: @unchecked Sendable {
     private static let uploadStallTimeout: TimeInterval = 120
     private static let uploadResourceTimeout: TimeInterval = 3_600
     private let session: URLSession
+    private let ownsSession: Bool
 
     public static func foregroundSessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.default
@@ -297,11 +298,18 @@ public final class ReceiverClient: @unchecked Sendable {
     }
 
     public init(session: URLSession? = nil) {
+        ownsSession = session == nil
         self.session = session ?? URLSession(
             configuration: Self.foregroundSessionConfiguration(),
             delegate: ReceiverURLSessionRedirectDelegate(),
             delegateQueue: nil
         )
+    }
+
+    deinit {
+        if ownsSession {
+            session.invalidateAndCancel()
+        }
     }
 
     public static func healthURL(forBatchURL batchURL: URL) -> URL {
@@ -328,6 +336,36 @@ public final class ReceiverClient: @unchecked Sendable {
             throw ReceiverClientError.unsuccessfulStatusCode(statusCode: httpResponse.statusCode, responseBody: data)
         }
         return ReceiverUploadResult(statusCode: httpResponse.statusCode, responseBody: data)
+    }
+
+    public func nutritionSupport(forBatchURL batchURL: URL, bearerToken: String) async -> NutritionSupport {
+        NutritionSupport(capabilities: await receiverCapabilities(forBatchURL: batchURL, bearerToken: bearerToken))
+    }
+
+    public func receiverCapabilities(forBatchURL batchURL: URL, bearerToken: String) async -> ReceiverCapabilities? {
+        let token = bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty,
+              var components = URLComponents(url: batchURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.path = "/v1/capabilities"
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { return nil }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = Self.healthCheckTimeout
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard !Task.isCancelled, let http = response as? HTTPURLResponse,
+                  http.statusCode == 200, http.url == url,
+                  http.value(forHTTPHeaderField: "Content-Type") == "application/json",
+                  http.value(forHTTPHeaderField: "Cache-Control") == "no-store" else { return nil }
+            return ReceiverCapabilities.decodeHTTP(data)
+        } catch {
+            // A failed fresh probe must never inherit an earlier success.
+            return nil
+        }
     }
 
     public func redeem(
@@ -540,12 +578,38 @@ public enum ReceiverPairingCancellationOutcome: Equatable, Sendable {
     case committedCleanupPending
 }
 
+// Operations only; pending state, authentication and commit remain coordinator-owned.
+// Merely constructing this dependency performs no provider or filesystem access.
+@MainActor
+public struct NativeMailboxPairingIO {
+    public let resolve: (MailboxBootstrapDescriptor) throws -> URL
+    public let publish: (URL, Data) throws -> Void
+    public let read: (URL) throws -> Data?
+    public let hydrate: (URL) throws -> Void
+    public let wait: () async throws -> Void
+
+    public init(
+        resolve: @escaping (MailboxBootstrapDescriptor) throws -> URL,
+        publish: @escaping (URL, Data) throws -> Void,
+        read: @escaping (URL) throws -> Data?,
+        hydrate: @escaping (URL) throws -> Void,
+        wait: @escaping () async throws -> Void
+    ) {
+        self.resolve = resolve
+        self.publish = publish
+        self.read = read
+        self.hydrate = hydrate
+        self.wait = wait
+    }
+}
+
 @MainActor
 public final class ReceiverPairingCoordinator {
     private let client: ReceiverClient
     private let stateStore: ReceiverPairingStateStore
     private let settingsStore: ReceiverSettingsStore
     private let mailboxKeyStore: MailboxKeyStore
+    private let nativeMailboxIO: NativeMailboxPairingIO?
 
     public init(
         client: ReceiverClient,
@@ -553,12 +617,14 @@ public final class ReceiverPairingCoordinator {
         settingsStore: ReceiverSettingsStore,
         mailboxKeyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
-        )
+        ),
+        nativeMailboxIO: NativeMailboxPairingIO? = nil
     ) {
         self.client = client
         self.stateStore = stateStore
         self.settingsStore = settingsStore
         self.mailboxKeyStore = mailboxKeyStore
+        self.nativeMailboxIO = nativeMailboxIO
     }
 
     public func pair(
@@ -587,6 +653,13 @@ public final class ReceiverPairingCoordinator {
         expectedGeneration: String? = nil
     ) async throws -> ReceiverPairingCredential? {
         let expectedGeneration = expectedGeneration ?? settingsStore.receiverSettingsGenerationToken
+        if let pending = try stateStore.loadPending(), pending.mailboxBootstrap != nil {
+            let cancelling = try stateStore.hasPendingCancellation()
+            if pending.nativeCancellationConfirmed || cancelling || settingsStore.terminalCancellationExpectedGeneration != nil {
+                try await resumeNativeCancellation(pending)
+                return nil
+            }
+        }
         if try finishPendingCancellationIfNeeded(expectedGeneration: expectedGeneration) {
             return nil
         }
@@ -615,7 +688,9 @@ public final class ReceiverPairingCoordinator {
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
             invitationCode: nil,
-            transport: invitation.transport
+            transport: invitation.transport,
+            mailboxBootstrap: invitation.mailboxBootstrap,
+            expiresAt: invitation.mailboxBootstrap == nil ? nil : invitation.expiresAt
         )
     }
 
@@ -657,6 +732,10 @@ public final class ReceiverPairingCoordinator {
     ) throws -> ReceiverPairingCancellationOutcome {
         let expectedGeneration = expectedGeneration ?? settingsStore.receiverSettingsGenerationToken
         try beginPendingCancellation(expectedGeneration: expectedGeneration)
+        if let pending = try stateStore.loadPending(), pending.mailboxBootstrap != nil,
+           pending.publicationMayHaveOccurred, !pending.nativeCancellationConfirmed {
+            return .committedCleanupPending
+        }
         do {
             _ = try finishPendingCancellationIfNeeded(
                 expectedGeneration: expectedGeneration
@@ -676,6 +755,17 @@ public final class ReceiverPairingCoordinator {
     ) throws -> Bool {
         let hasCancellationMarker = try stateStore.hasPendingCancellation()
         let terminalIntentGeneration = settingsStore.terminalCancellationExpectedGeneration
+        if let pending = try stateStore.loadPending(), pending.mailboxBootstrap != nil,
+           hasCancellationMarker || terminalIntentGeneration != nil || pending.nativeCancellationConfirmed {
+            guard !pending.publicationMayHaveOccurred || pending.nativeCancellationConfirmed else {
+                throw ReceiverPairingStateError.nativeCancellationRequiresReceipt
+            }
+            let confirmed: ReceiverPendingPairing
+            if pending.nativeCancellationConfirmed { confirmed = pending }
+            else { confirmed = try stateStore.confirmNativeCancellation(pending) }
+            try finishNativeCancellation(confirmed)
+            return true
+        }
         guard hasCancellationMarker || terminalIntentGeneration != nil else { return false }
         let markerGeneration = hasCancellationMarker
             ? try stateStore.pendingCancellationExpectedGeneration()
@@ -720,6 +810,9 @@ public final class ReceiverPairingCoordinator {
         _ pending: ReceiverPendingPairing,
         expectedGeneration: String
     ) async throws -> ReceiverPairingCredential {
+        if pending.mailboxBootstrap != nil {
+            return try await completeNative(pending, expectedGeneration: expectedGeneration)
+        }
         let credential: ReceiverPairingCredential
         do {
             let mailboxIdentity: MailboxPublicIdentity?
@@ -768,6 +861,138 @@ public final class ReceiverPairingCoordinator {
         try stateStore.clearPending()
         return credential
     }
+
+    private func completeNative(_ initial: ReceiverPendingPairing, expectedGeneration: String) async throws -> ReceiverPairingCredential {
+        var pending = initial
+        try Task.checkCancellation()
+        guard try stateStore.loadPending() == pending, try !stateStore.hasPendingCancellation(),
+              settingsStore.terminalCancellationExpectedGeneration == nil, !pending.nativeCancellationConfirmed else {
+            throw CancellationError()
+        }
+        if pending.sealedRequest == nil {
+            try settingsStore.requireNativePairingAdmission(expectedGeneration: expectedGeneration)
+            try requireUnexpiredNativeInvitation(pending)
+            let request = try NativeMailboxPairing.seal(pending, keys: mailboxKeyStore)
+            pending = try stateStore.saveNativeRequest(request, for: pending, generation: expectedGeneration)
+        }
+        if !pending.publicationMayHaveOccurred { try requireUnexpiredNativeInvitation(pending) }
+        let device = try NativeMailboxPairing.verifyRequest(pending, keys: mailboxKeyStore)
+        let identity = try NativeMailboxPairing.identity(pending, device: device)
+        try requireNativeAuthority(pending, identity: identity)
+        guard let descriptor = pending.mailboxBootstrap, let request = pending.sealedRequest,
+              let generation = pending.nativeExpectedGeneration else { throw ReceiverPairingRedeemError.invalidResponse }
+        let io = nativeMailboxIO ?? NativeMailboxPairingIO.live()
+        try requireNativeAuthority(pending, identity: identity)
+        let directory = try io.resolve(descriptor)
+        try requireNativeAuthority(pending, identity: identity)
+        // A crash, cancelled Task, or provider error after this write is ambiguous.
+        // Only a request-bound cancellation receipt may retire that authority.
+        pending = try stateStore.markNativePublication(pending)
+        try requireNativeAuthority(pending, identity: identity)
+        try io.publish(directory.appendingPathComponent("request.hbp"), request)
+        try requireNativeAuthority(pending, identity: identity)
+        let response = try await nativeResponse("completion.hbp", directory: directory, io: io) {
+            try self.requireNativeAuthority(pending, identity: identity)
+        }
+        let credential = try NativeMailboxPairing.openCompletion(response, pending: pending, keys: mailboxKeyStore)
+        guard credential.mailboxIdentity == identity else { throw ReceiverPairingRedeemError.invalidResponse }
+        try requireNativeAuthority(pending, identity: identity)
+        try settingsStore.saveNativeMailboxPairing(identity, expectedGeneration: generation)
+        try stateStore.clearCommittedNativePending(pending)
+        return credential
+    }
+
+    private func requireUnexpiredNativeInvitation(_ pending: ReceiverPendingPairing) throws {
+        guard let expiresAt = pending.expiresAt, let expiry = ISO8601DateFormatter().date(from: expiresAt), expiry > Date() else {
+            throw ReceiverPairingRedeemError.invitationInvalid
+        }
+    }
+
+    private func requireNativeAuthority(_ pending: ReceiverPendingPairing, identity: MailboxConnectionIdentityV1) throws {
+        try Task.checkCancellation()
+        guard try stateStore.loadPending() == pending, try !stateStore.hasPendingCancellation(),
+              settingsStore.terminalCancellationExpectedGeneration == nil, !pending.nativeCancellationConfirmed,
+              let generation = pending.nativeExpectedGeneration else { throw CancellationError() }
+        try settingsStore.requireNativePairingAuthority(identity, generation: generation)
+    }
+
+    private func resumeNativeCancellation(_ pending: ReceiverPendingPairing) async throws {
+        try requireNativeCancellationAuthority(pending)
+        if pending.nativeCancellationConfirmed || !pending.publicationMayHaveOccurred {
+            let confirmed: ReceiverPendingPairing
+            if pending.nativeCancellationConfirmed { confirmed = pending }
+            else { confirmed = try stateStore.confirmNativeCancellation(pending) }
+            try finishNativeCancellation(confirmed)
+            return
+        }
+        guard let descriptor = pending.mailboxBootstrap, let request = pending.sealedRequest else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let cancel = try NativeMailboxPairing.cancellation(pending, keys: mailboxKeyStore)
+        let io = nativeMailboxIO ?? NativeMailboxPairingIO.live()
+        let directory = try io.resolve(descriptor)
+        try requireNativeCancellationAuthority(pending)
+        // Publish intent first: if the original provider effect never completed,
+        // the receiver must see cancellation when the exact request arrives.
+        try io.publish(directory.appendingPathComponent("cancel.hbp"), cancel)
+        try requireNativeCancellationAuthority(pending)
+        try io.publish(directory.appendingPathComponent("request.hbp"), request)
+        try requireNativeCancellationAuthority(pending)
+        let response = try await nativeResponse("cancelled.hbp", directory: directory, io: io) {
+            try self.requireNativeCancellationAuthority(pending)
+        }
+        try NativeMailboxPairing.verifyCancellationReceipt(response, pending: pending)
+        try requireNativeCancellationAuthority(pending)
+        let confirmed = try stateStore.confirmNativeCancellation(pending)
+        try finishNativeCancellation(confirmed)
+    }
+
+    private func requireNativeCancellationAuthority(_ pending: ReceiverPendingPairing) throws {
+        try Task.checkCancellation()
+        let cancelling = try stateStore.hasPendingCancellation()
+        guard try stateStore.loadPending() == pending,
+              pending.nativeCancellationConfirmed || cancelling
+                || settingsStore.terminalCancellationExpectedGeneration != nil else { throw CancellationError() }
+    }
+
+    private func finishNativeCancellation(_ pending: ReceiverPendingPairing) throws {
+        guard pending.nativeCancellationConfirmed, try stateStore.loadPending() == pending else { throw CancellationError() }
+        if pending.publicationMayHaveOccurred, let generation = pending.nativeExpectedGeneration {
+            let device = try NativeMailboxPairing.verifyRequest(pending, keys: mailboxKeyStore)
+            let identity = try NativeMailboxPairing.identity(pending, device: device)
+            try settingsStore.clearCancelledNativePairing(identity, generation: generation)
+        }
+        // Confirmed lives in the pending record until all other markers are gone.
+        // A partial cleanup cannot enter HTTP cancellation or activate completion.
+        try settingsStore.finishTerminalCancellationIntent()
+        try stateStore.finishPendingCancellation()
+        try stateStore.clearPending()
+    }
+
+    private func nativeResponse(
+        _ name: String, directory: URL, io: NativeMailboxPairingIO, requireAuthority: () throws -> Void
+    ) async throws -> Data {
+        let url = directory.appendingPathComponent(name)
+        for attempt in 0..<15 {
+            try requireAuthority()
+            try io.hydrate(url)
+            try requireAuthority()
+            let bytes = try io.read(url)
+            try requireAuthority()
+            if let bytes {
+                guard !bytes.isEmpty, bytes.count <= NativeMailboxPairing.maximumBytes else {
+                    throw ReceiverPairingRedeemError.invalidResponse
+                }
+                return bytes
+            }
+            if attempt < 14 {
+                try await io.wait()
+                try requireAuthority()
+            }
+        }
+        throw MailboxLocatorError.storageFailure
+    }
+
 }
 
 private struct PairingRedeemRequest: Encodable {
@@ -823,5 +1048,271 @@ private struct PairingCompletionPayload: Decodable {
         case mailboxReceiverAgreementPublicKey = "mailbox_receiver_agreement_public_key"
         case mailboxReceiverSigningKeyID = "mailbox_receiver_signing_key_id"
         case mailboxReceiverAgreementKeyID = "mailbox_receiver_agreement_key_id"
+    }
+}
+
+extension NativeMailboxPairingIO {
+    static func live() -> NativeMailboxPairingIO {
+        var locator: MailboxPairingLocatorV1?
+        @MainActor func checked(_ url: URL) throws -> MailboxPairingLocatorV1 {
+            guard let locator else { throw MailboxLocatorError.containerUnavailable }
+            try MailboxLocatorV1.requirePairingFile(url, locator: locator)
+            return locator
+        }
+        return NativeMailboxPairingIO(resolve: { descriptor in
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            let resolved = try MailboxLocatorV1.resolvePairing(invitationID: descriptor.invitationID)
+            locator = resolved
+            return resolved.directory
+            #else
+            throw MailboxLocatorError.containerUnavailable
+            #endif
+        }, publish: { url, bytes in
+            try FileProviderMailboxEnvelopePublisher().publishPairing(bytes, to: url, locator: checked(url))
+        }, read: { url in
+            let locator = try checked(url)
+            guard try MailboxLocatorV1.pairingFileExists(url, locator: locator) else { return nil }
+            #if os(iOS)
+            let values = try url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+            if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus != .current { return nil }
+            #endif
+            let bytes = try MailboxRegularFileReader.read(url, maximumBytes: 65_536) {
+                try MailboxLocatorV1.revalidatePairing(locator)
+            }
+            try MailboxLocatorV1.revalidatePairing(locator)
+            return bytes
+        }, hydrate: { url in
+            let locator = try checked(url)
+            if try MailboxLocatorV1.pairingFileExists(url, locator: locator) {
+                #if os(iOS)
+                try FileManager.default.startDownloadingUbiquitousItem(at: url)
+                #endif
+            }
+            try MailboxLocatorV1.revalidatePairing(locator)
+        }, wait: { try await Task.sleep(for: .seconds(1)) })
+    }
+}
+
+// Native enrollment wire belongs to the existing pairing coordinator. Kept in
+// this target member so both the package and the App compile the same codec.
+private enum NativeMailboxPairing {
+    static let maximumBytes = 65_536
+    private static let domain = "health-bridge/mailbox-pairing/v1/"
+    private static let requestFields: Set<String> = [
+        "v", "kind", "invitation_id", "sender_signing_public_key", "ephemeral_public_key", "nonce", "ciphertext", "signature",
+    ]
+    private static let completionFields: Set<String> = [
+        "v", "kind", "invitation_id", "sender_signing_public_key", "request_sha256", "nonce", "ciphertext", "signature",
+    ]
+    private static let cancellationFields: Set<String> = [
+        "v", "kind", "invitation_id", "request_sha256", "sender_signing_public_key", "signature",
+    ]
+
+    static func activeIdentity(_ keys: MailboxKeyStore) throws -> MailboxPublicIdentity {
+        // A persisted request must never initialize replacement keys on replay.
+        _ = try keys.agreementPrivateKey()
+        return try keys.loadOrCreate()
+    }
+
+    static func seal(_ pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> Data {
+        try pending.validateNativeState()
+        guard let bootstrap = pending.mailboxBootstrap, let secret = pending.invitationSecret else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let shared = try exchange(ephemeral, peer: bytes(bootstrap.receiverAgreementPublicKey, count: 32))
+        let identity = try keys.loadOrCreate()
+        let nonce = AES.GCM.Nonce()
+        var envelope: [String: HBJCS1Value] = [
+            "v": .integer(1), "kind": .string("request"), "invitation_id": .string(bootstrap.invitationID),
+            "sender_signing_public_key": .string(identity.signingPublicKey.base64URLEncodedString()),
+            "ephemeral_public_key": .string(ephemeral.publicKey.rawRepresentation.base64URLEncodedString()),
+            "nonce": .string(nonce.withUnsafeBytes { Data($0) }.base64URLEncodedString()),
+        ]
+        let plaintext: [String: HBJCS1Value] = [
+            "invitation_secret": .string(secret), "installation_id": .string(pending.installationID),
+            "device_credential": .string(pending.deviceCredential), "platform": .string("ios"),
+            "device_signing_public_key": .string(identity.signingPublicKey.base64URLEncodedString()),
+            "device_agreement_public_key": .string(identity.agreementPublicKey.base64URLEncodedString()),
+        ]
+        let sealed = try AES.GCM.seal(canonical(plaintext),
+            using: derive(shared, salt: invitationBytes(bootstrap), purpose: "request/key"), nonce: nonce,
+            authenticating: prefixed("request/aad\0", fields: envelope))
+        envelope["ciphertext"] = .string((sealed.ciphertext + sealed.tag).base64URLEncodedString())
+        envelope["signature"] = .string(try keys.sign(prefixed("request/signature\0", fields: envelope)).base64URLEncodedString())
+        return try bounded(canonical(envelope))
+    }
+
+    static func verifyRequest(_ pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> MailboxPublicIdentity {
+        guard let request = pending.sealedRequest, let bootstrap = pending.mailboxBootstrap else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let identity = try activeIdentity(keys)
+        var fields = try object(request, keys: requestFields)
+        guard fields["v"] == .integer(1), fields["kind"] == .string("request"),
+              fields["invitation_id"] == .string(bootstrap.invitationID),
+              fields["sender_signing_public_key"] == .string(identity.signingPublicKey.base64URLEncodedString()) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        _ = try bytes(string(fields, "ephemeral_public_key"), count: 32)
+        _ = try bytes(string(fields, "nonce"), count: 12)
+        guard try bytes(string(fields, "ciphertext")).count >= 16 else { throw ReceiverPairingRedeemError.invalidResponse }
+        let signature = try bytes(string(fields, "signature"), count: 64)
+        fields.removeValue(forKey: "signature")
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: identity.signingPublicKey)
+        guard try publicKey.isValidSignature(signature, for: prefixed("request/signature\0", fields: fields)) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        return identity
+    }
+
+    static func identity(_ pending: ReceiverPendingPairing, device: MailboxPublicIdentity) throws -> MailboxConnectionIdentityV1 {
+        guard let bootstrap = pending.mailboxBootstrap else { throw ReceiverPairingRedeemError.invalidResponse }
+        let signing = try bytes(bootstrap.receiverSigningPublicKey, count: 32)
+        let agreement = try bytes(bootstrap.receiverAgreementPublicKey, count: 32)
+        let installation = hash(Data("health-bridge-pairing:installation:\(pending.installationID)".utf8))
+        let receiverID = hash(Data("health-bridge/mailbox/v1/receiver-id\0".utf8) + signing).prefixDataV1(16)
+        let deviceID = hash(Data("health-bridge/mailbox/v1/device-id\0".utf8) + installation).prefixDataV1(16)
+        let binding = hash(Data("health-bridge/mailbox/v1/connection-binding\0".utf8)
+            + receiverID + deviceID + device.signingPublicKey + device.agreementPublicKey + signing + agreement)
+        return MailboxConnectionIdentityV1(
+            receiverID: receiverID.hexV1, deviceID: deviceID.hexV1,
+            devicePrincipal: "installation:" + installation.hexV1,
+            deviceSigningKeyID: device.signingKeyID, deviceAgreementKeyID: device.agreementKeyID,
+            receiverSigningKeyID: try DeliveryProtocolV1.keyID(algorithm: "ed25519", publicKey: signing),
+            receiverAgreementKeyID: try DeliveryProtocolV1.keyID(algorithm: "x25519", publicKey: agreement),
+            receiverSigningPublicKey: bootstrap.receiverSigningPublicKey,
+            receiverAgreementPublicKey: bootstrap.receiverAgreementPublicKey,
+            opaqueBinding: binding.base64URLEncodedString(), connectionGeneration: 1)
+    }
+
+    static func openCompletion(_ encoded: Data, pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> ReceiverPairingCredential {
+        let device = try verifyRequest(pending, keys: keys)
+        let expected = try identity(pending, device: device)
+        guard let request = pending.sealedRequest, let bootstrap = pending.mailboxBootstrap else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        var fields = try authenticatedReceiverMessage(encoded, kind: "completion", fields: completionFields, pending: pending)
+        let ciphertext = try bytes(string(fields, "ciphertext"))
+        let nonce = try bytes(string(fields, "nonce"), count: 12)
+        fields.removeValue(forKey: "ciphertext")
+        guard ciphertext.count >= 16 else { throw ReceiverPairingRedeemError.invalidResponse }
+        // Fetch local material outside the peer-crypto error boundary.
+        let privateKey = try keys.agreementPrivateKey()
+        let shared = try exchange(privateKey, peer: bytes(bootstrap.receiverAgreementPublicKey, count: 32))
+        let salt = try invitationBytes(bootstrap) + hash(request)
+        let nonceKey = derive(shared, salt: salt, purpose: "completion/nonce")
+        guard nonce == nonceKey.withUnsafeBytes({ Data($0.prefix(12)) }) else { throw ReceiverPairingRedeemError.invalidResponse }
+        let plaintext: Data
+        do {
+            let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: nonce),
+                ciphertext: ciphertext.dropLast(16), tag: ciphertext.suffix(16))
+            plaintext = try AES.GCM.open(box, using: derive(shared, salt: salt, purpose: "completion/key"),
+                authenticating: prefixed("completion/aad\0", fields: fields))
+        } catch { throw ReceiverPairingRedeemError.invalidResponse }
+        let payload = try object(plaintext, keys: [
+            "schema_id", "schema_version", "label", "receiver_url", "mailbox_protocol_version", "mailbox_receiver_id",
+            "mailbox_device_id", "mailbox_receiver_binding_id", "mailbox_connection_generation",
+            "mailbox_receiver_signing_public_key", "mailbox_receiver_agreement_public_key",
+            "mailbox_receiver_signing_key_id", "mailbox_receiver_agreement_key_id",
+        ])
+        guard payload["schema_id"] == .string(ReceiverPairingCredential.supportedSchemaID),
+              payload["schema_version"] == .string(ReceiverPairingCredential.supportedSchemaVersion),
+              payload["receiver_url"] == .null, payload["mailbox_protocol_version"] == .integer(1),
+              payload["mailbox_connection_generation"] == .integer(1),
+              payload["mailbox_receiver_id"] == .string(expected.receiverID),
+              payload["mailbox_device_id"] == .string(expected.deviceID),
+              payload["mailbox_receiver_binding_id"] == .string(expected.opaqueBinding),
+              payload["mailbox_receiver_signing_public_key"] == .string(expected.receiverSigningPublicKey),
+              payload["mailbox_receiver_agreement_public_key"] == .string(expected.receiverAgreementPublicKey),
+              payload["mailbox_receiver_signing_key_id"] == .string(expected.receiverSigningKeyID),
+              payload["mailbox_receiver_agreement_key_id"] == .string(expected.receiverAgreementKeyID) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        return ReceiverPairingCredential(label: try string(payload, "label"), receiverURLString: "",
+            bearerToken: "", tokenPrefix: "", mailboxIdentity: expected)
+    }
+
+    static func cancellation(_ pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> Data {
+        let device = try verifyRequest(pending, keys: keys)
+        guard let request = pending.sealedRequest, let bootstrap = pending.mailboxBootstrap else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        var fields: [String: HBJCS1Value] = ["v": .integer(1), "kind": .string("cancel"),
+            "invitation_id": .string(bootstrap.invitationID), "request_sha256": .string(hash(request).hexV1),
+            "sender_signing_public_key": .string(device.signingPublicKey.base64URLEncodedString())]
+        fields["signature"] = .string(try keys.sign(prefixed("cancel/signature\0", fields: fields)).base64URLEncodedString())
+        return try bounded(canonical(fields))
+    }
+
+    static func verifyCancellationReceipt(_ encoded: Data, pending: ReceiverPendingPairing) throws {
+        _ = try authenticatedReceiverMessage(encoded, kind: "cancelled", fields: cancellationFields, pending: pending)
+    }
+
+    private static func authenticatedReceiverMessage(
+        _ encoded: Data, kind: String, fields required: Set<String>, pending: ReceiverPendingPairing
+    ) throws -> [String: HBJCS1Value] {
+        guard let request = pending.sealedRequest, let bootstrap = pending.mailboxBootstrap else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        var fields = try object(encoded, keys: required)
+        guard fields["v"] == .integer(1), fields["kind"] == .string(kind),
+              fields["invitation_id"] == .string(bootstrap.invitationID),
+              fields["request_sha256"] == .string(hash(request).hexV1),
+              fields["sender_signing_public_key"] == .string(bootstrap.receiverSigningPublicKey) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        let signature = try bytes(string(fields, "signature"), count: 64)
+        fields.removeValue(forKey: "signature")
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: bytes(bootstrap.receiverSigningPublicKey, count: 32))
+        guard try publicKey.isValidSignature(signature, for: prefixed(kind + "/signature\0", fields: fields)) else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        return fields
+    }
+
+    private static func exchange(_ key: Curve25519.KeyAgreement.PrivateKey, peer: Data) throws -> SharedSecret {
+        do { return try key.sharedSecretFromKeyAgreement(with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: peer)) }
+        catch { throw ReceiverPairingRedeemError.invalidResponse }
+    }
+    private static func derive(_ shared: SharedSecret, salt: Data, purpose: String) -> SymmetricKey {
+        shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt, sharedInfo: Data((domain + purpose).utf8), outputByteCount: 32)
+    }
+    private static func invitationBytes(_ bootstrap: MailboxBootstrapDescriptor) throws -> Data {
+        guard let bytes = Data(hexV1: bootstrap.invitationID), bytes.count == 16,
+              bytes.hexV1 == bootstrap.invitationID else { throw ReceiverPairingRedeemError.invalidResponse }
+        return bytes
+    }
+    private static func hash(_ data: Data) -> Data { Data(SHA256.hash(data: data)) }
+    private static func canonical(_ fields: [String: HBJCS1Value]) throws -> Data {
+        try DeliveryProtocolV1.encodeMetadata(.object(fields))
+    }
+    private static func prefixed(_ purpose: String, fields: [String: HBJCS1Value]) throws -> Data {
+        try Data((domain + purpose).utf8) + canonical(fields)
+    }
+    private static func bounded(_ data: Data) throws -> Data {
+        guard !data.isEmpty, data.count <= maximumBytes else { throw ReceiverPairingRedeemError.invalidResponse }
+        return data
+    }
+    private static func object(_ encoded: Data, keys: Set<String>) throws -> [String: HBJCS1Value] {
+        guard case .object(let fields) = try DeliveryProtocolV1.decodeMetadata(bounded(encoded)), Set(fields.keys) == keys else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        return fields
+    }
+    private static func string(_ fields: [String: HBJCS1Value], _ name: String) throws -> String {
+        guard case .string(let value) = fields[name] else { throw ReceiverPairingRedeemError.invalidResponse }
+        return value
+    }
+    private static func bytes(_ text: String, count: Int? = nil) throws -> Data {
+        guard !text.isEmpty, text.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
+            || (48...57).contains($0) || $0 == 45 || $0 == 95 }) else { throw ReceiverPairingRedeemError.invalidResponse }
+        let padded = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+            + String(repeating: "=", count: (4 - text.count % 4) % 4)
+        guard let bytes = Data(base64Encoded: padded), bytes.base64URLEncodedString() == text else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        if let count, bytes.count != count { throw ReceiverPairingRedeemError.invalidResponse }
+        return bytes
     }
 }

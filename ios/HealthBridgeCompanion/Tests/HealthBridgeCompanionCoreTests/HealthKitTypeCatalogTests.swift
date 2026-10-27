@@ -134,6 +134,11 @@ final class HealthKitTypeCatalogTests: XCTestCase {
             "number_of_alcoholic_beverages",
             "nike_fuel",
             "hydration",
+            "dietary_energy_consumed",
+            "dietary_protein",
+            "dietary_carbohydrates",
+            "dietary_fat_total",
+            "dietary_fiber",
         ]
 
         for typeCode in expected {
@@ -142,6 +147,20 @@ final class HealthKitTypeCatalogTests: XCTestCase {
             XCTAssertFalse(entry.usesDedicatedSyncLane, typeCode)
             XCTAssertTrue(entry.backgroundEligible, typeCode)
             XCTAssertFalse(entry.healthKitIdentifier.isEmpty, typeCode)
+        }
+
+        let dietaryUnits = [
+            "dietary_energy_consumed": "kcal",
+            "dietary_protein": "g",
+            "dietary_carbohydrates": "g",
+            "dietary_fat_total": "g",
+            "dietary_fiber": "g",
+        ]
+        for (typeCode, unit) in dietaryUnits {
+            let entry = try XCTUnwrap(HealthKitTypeCatalog.entry(for: typeCode), typeCode)
+            XCTAssertEqual(entry.canonicalUnit, unit, typeCode)
+            XCTAssertEqual(entry.aggregation, .sum, typeCode)
+            XCTAssertEqual(HealthKitTypeCatalog.healthType(from: entry).category, .nutrition, typeCode)
         }
 
         let canonicalEnergy = try XCTUnwrap(HealthKitTypeCatalog.entry(for: "energy"))

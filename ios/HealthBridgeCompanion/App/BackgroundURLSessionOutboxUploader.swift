@@ -101,6 +101,9 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     ) async throws -> Int {
         rememberOutboxDirectory(outbox.directoryURL)
         await recoverPersistedTaskCompletions()
+        try await outbox.prepareNutritionCompatibility {
+            guard isUploadAllowed(), !Task.isCancelled else { throw CancellationError() }
+        }
         _ = try directCursorFinalizer(outbox: outbox).finalizeDirectAcknowledgments(
             receiverBindingID: receiverBindingID
         )
@@ -126,8 +129,20 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
               legacyEventFinalizationCoordinator.stateSnapshot().isIdle else {
             return 0
         }
-        let pendingItems = try outbox.uploadablePendingItems(for: receiverBindingID)
+        let allPending = try outbox.uploadablePendingItems(for: receiverBindingID)
+        let hasNutrition = try outbox.containsPreparedNutrition(in: allPending)
+        let support = hasNutrition
+            ? await ReceiverClient().nutritionSupport(forBatchURL: receiverURL, bearerToken: bearerToken)
+            : NutritionSupport.unknown
+        guard isUploadAllowed(), !Task.isCancelled else { return 0 }
+        guard try outbox.uploadablePendingItems(for: receiverBindingID) == allPending else {
+            throw CancellationError()
+        }
+        let pendingItems = hasNutrition
+            ? try outbox.nutritionCompatibleItems(for: receiverBindingID, support: support)
+            : allPending
         guard !pendingItems.isEmpty else { return 0 }
+        let preparedPending = try outbox.pendingItems()
         guard let scheduledItemIDs = await currentScheduledItemIDs() else {
             return 0
         }
@@ -140,6 +155,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             return 0
         }
         guard isUploadAllowed() else { return 0 }
+        guard try outbox.pendingItems() == preparedPending else { throw CancellationError() }
         let directTransport = DirectHTTPTransport(
             receiverURL: receiverURL,
             bearerToken: bearerToken,
@@ -206,15 +222,20 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         do {
             let bearerToken = try settingsStore.loadBearerToken()
             guard !bearerToken.isEmpty else { return }
+            let generation = settingsStore.receiverSettingsGenerationToken
             let outbox = try FileOutbox(directory: outboxDirectory)
             _ = try await schedulePendingUploads(
                 outbox: outbox,
                 receiverURL: receiverURL,
                 bearerToken: bearerToken,
-                receiverGeneration: settingsStore.receiverSettingsGenerationToken,
+                receiverGeneration: generation,
                 receiverBindingID: receiverBindingID,
                 isUploadAllowed: { [weak self] in
                     self?.automaticContinuationAdmissionIsOpen == true
+                        && settingsStore.receiverSettingsGenerationToken == generation
+                        && settingsStore.receiverBindingID == receiverBindingID
+                        && settingsStore.receiverURLString == receiverURLString
+                        && (try? settingsStore.loadBearerToken()) == bearerToken
                 }
             )
         } catch {
@@ -749,7 +770,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                 receiverGeneration: record.receiverGeneration,
                 receiverBindingID: record.receiverBindingID
             )
-            guard let finalizationOutcome = finishCompletedUpload(
+            guard let finalizationOutcome = await finishCompletedUpload(
                 descriptor: descriptor,
                 completion: completion
             ) else {
@@ -883,7 +904,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let finalizationOutcome = self.finishCompletedUpload(
+            let finalizationOutcome = await self.finishCompletedUpload(
                 descriptor: descriptor,
                 completion: completion
             )
@@ -913,37 +934,50 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     private func finishCompletedUpload(
         descriptor: DirectUploadCompletionDescriptor,
         completion: BackgroundUploadTaskCompletion
-    ) -> DirectUploadFinalizationOutcome? {
+    ) async -> DirectUploadFinalizationOutcome? {
         guard let outboxDirectory = currentOutboxDirectory() else {
             return nil
         }
         do {
             let outbox = try FileOutbox(directory: outboxDirectory)
             let settingsStore = ReceiverSettingsStore()
-            let outcome = try DirectUploadFinalizer.finish(
+            let receiverURL = settingsStore.receiverURLString
+            let validate = { @MainActor in
+                try Task.checkCancellation()
+                try outbox.requireUploadAdmission()
+                guard settingsStore.receiverSettingsGenerationToken == descriptor.receiverGeneration,
+                      settingsStore.receiverBindingID == descriptor.receiverBindingID,
+                      settingsStore.receiverURLString == receiverURL else {
+                    throw CancellationError()
+                }
+            }
+            let outcome = try await DirectUploadFinalizer.finishForSync(
                 descriptor: descriptor,
                 completion: completion,
                 currentReceiverGeneration: settingsStore.receiverSettingsGenerationToken,
                 currentReceiverBindingID: settingsStore.receiverBindingID,
+                validate: validate,
                 recoverSleepBaseline: { itemID, minimumResetEpoch in
                     let manifestStore = try FileSleepSyncManifestStore(
                         fileURL: outboxDirectory
                             .deletingLastPathComponent()
                             .appendingPathComponent("sleep-sync-manifest-v1.json")
                     )
-                    try SleepBaselineRejectionRecovery.recover(
+                    try await SleepBaselineRejectionRecovery.recover(
                         itemID: itemID,
                         minimumResetEpoch: minimumResetEpoch,
                         outbox: outbox,
                         manifestStore: manifestStore,
-                        epochStore: SleepResetEpochStore()
+                        epochStore: SleepResetEpochStore(),
+                        validate: validate
                     )
                 },
                 retire: { itemID, receiverBindingID in
-                    _ = try self.directCursorFinalizer(outbox: outbox)
-                        .recordDirectReceiverAcceptance(
+                    _ = try await self.directCursorFinalizer(outbox: outbox)
+                        .recordDirectReceiverAcceptanceForSync(
                             itemID: itemID,
-                            receiverBindingID: receiverBindingID
+                            receiverBindingID: receiverBindingID,
+                            validate: validate
                         )
                     // A replayed successful callback may follow durable payload retirement.
                     outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)

@@ -1,27 +1,30 @@
 # Changelog
 
-## Receiver/CLI 1.1.4
+## Unreleased
 
-A maintenance patch based on Receiver/CLI 1.1.3:
+Main retains its development features and migrations. Forward-porting the
+Receiver/CLI 1.1.5 source version, release-check concurrency fix, and published
+installation references does not include those features in the maintenance
+release.
 
-- Repair signed Mailbox ACK helper packaging and installation by excluding and
-  rejecting AppleDouble metadata and checking the installed final archive.
-- Validate protected maintenance source authorization at release boundaries.
-- Update the development-only filelock dependency to 4.2.1.
+## Receiver/CLI 1.1.5
 
-The Mac-only mailbox Beta requires the matching 1.1.4 helper. iOS Companion
-1.1.1 (50), Batch Protocol 1.0.0 / `health_bridge.batch.v1`, iOS source, and schemas
-are unchanged. No TestFlight update or database migration is required. Receiver
-query, catalog, nutrition, sleep, status, and query-window behavior stays at 1.1.3.
+Published as [receiver-v1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5),
+this bounded maintenance release is based on Receiver/CLI 1.1.3. It repairs signed
+macOS Mailbox ACK helper archive creation and installation and adds protected
+candidate preparation, publication reconciliation, and recovery checks.
 
-Use the [1.1.4 release notes](.github/release/notes-receiver-v1.1.4.md) and their
-installation commands only after the exact release and all eight assets have
-been published and verified.
+Receiver query behavior and database migrations remain as in 1.1.3. Compatible
+iOS Companion 1.1.1 (50) and Batch Protocol health_bridge.batch.v1 (1.0.0) are
+unchanged. See the [exact release notes](.github/release/notes-receiver-v1.1.5.md)
+for scope and assets.
+
+The retained receiver-v1.1.4 tag was never published and is unsupported.
 
 ## Historical releases
 
-The original release notes remain unchanged:
-
+The retained `receiver-v1.1.4` tag was never published. Its notes are historical candidate material, not a published release contract.
+The original published release notes remain unchanged:
 - [Receiver/CLI 1.1.3](.github/release/notes-receiver-v1.1.3.md)
 - [Receiver/CLI 1.1.2](.github/release/notes-receiver-v1.1.2.md)
 - [Receiver/CLI 1.1.1](.github/release/notes-receiver-v1.1.1.md)

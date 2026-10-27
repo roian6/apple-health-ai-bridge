@@ -24,7 +24,7 @@ FILES_TO_SCAN = (
     Path("docs/architecture.md"),
     Path(".github/release/criteria.md"),
     Path(".github/release/app-review-notes-template.md"),
-    Path("CONTRIBUTING.md"),
+    Path(".github/CONTRIBUTING.md"),
     Path("fixtures/health_bridge_batch_v1.synthetic.json"),
     Path("fixtures/health_bridge_batch_v1.synthetic.ndjson"),
     Path("src/health_bridge/cli.py"),
@@ -162,7 +162,7 @@ def test_repository_has_no_unpublished_node_wrapper_surface() -> None:
 def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     # Given
     readme = Path("README.md").read_text()
-    security = Path("SECURITY.md").read_text()
+    security = Path(".github/SECURITY.md").read_text()
     setup_template = Path(".github/ISSUE_TEMPLATE/setup_feedback.yml").read_text(
         encoding="utf-8"
     )
@@ -211,7 +211,7 @@ def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None
     assert "<h1>Apple Health AI Bridge</h1>" in readme
     assert "Health Bridge for AI" not in readme
     assert "open-source project behind" not in readme
-    assert "https://github.com/roian6/apple-health-ai-bridge.git@" in readme
+    assert "(docs/setup.md)" in readme
 
 
 def test_readme_uses_official_app_store_install_artwork() -> None:
@@ -234,8 +234,9 @@ def test_readme_uses_official_app_store_install_artwork() -> None:
 
 
 def test_readme_links_status_badges_to_their_public_sources() -> None:
-    header = (
-        Path("README.md").read_text(encoding="utf-8").split("</div>", maxsplit=1)[0]
+    documents = "\n".join(
+        Path(document).read_text(encoding="utf-8")
+        for document in ("README.md", ".github/CONTRIBUTING.md")
     )
     repository = "roian6/apple-health-ai-bridge"
     expected_links = (
@@ -252,28 +253,41 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
             f"https://img.shields.io/github/actions/workflow/status/{repository}/ios.yml?branch=main",
         ),
         ("LICENSE", f"https://img.shields.io/github/license/{repository}?"),
+        (
+            f"https://glama.ai/mcp/servers/{repository}",
+            f"https://glama.ai/mcp/servers/{repository}/badges/score.svg",
+        ),
+        (
+            f"https://scorecard.dev/viewer/?uri=github.com/{repository}",
+            f"https://api.scorecard.dev/projects/github.com/{repository}/badge",
+        ),
     )
     for target, endpoint in expected_links:
         match = re.search(
             rf'<a href="{re.escape(target)}">\s*(<img\b[^>]*>)\s*</a>',
-            header,
+            documents,
         )
         assert match is not None, target
         image = unescape(match.group(1))
         assert endpoint in image
-        assert "style=flat-square" in image
-        assert 'height="20"' in image
 
 
 def test_readme_introduces_user_workflows_before_installation_details() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     introduction, setup = readme.split("## Get started", maxsplit=1)
+    setup_guide = Path("docs/setup.md").read_text(encoding="utf-8")
+    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
 
     assert any(line.startswith("> ") for line in introduction.splitlines())
     assert "```bash" not in introduction
     assert "health-bridge setup" not in introduction
-    assert "uv tool install" in setup
+    assert "(docs/setup.md)" in setup
+    assert re.search(
+        rf'uv tool install "{install_source}@receiver-v\d+\.\d+\.\d+"',
+        setup_guide,
+    )
     assert "docs/setup.md#connect-an-mcp-client-intentionally" in setup
+    assert "(#choose-your-ai)" in setup
 
 
 def test_readme_keeps_continuous_value_with_ios_timing_boundary() -> None:
@@ -305,7 +319,7 @@ def test_package_metadata_connects_distribution_to_public_surfaces() -> None:
 
     assert project["name"] == "apple-health-ai-bridge"
     assert project["description"] == (
-        "Open-source receiver and read-only CLI/MCP package for Health Bridge for AI."
+        "Open-source receiver and read-only CLI/MCP package for Apple Health AI Bridge."
     )
     assert project["scripts"] == {"health-bridge": "health_bridge.cli:run"}
     assert project["keywords"] == [
@@ -448,10 +462,7 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     assert "agent-managed private HTTPS ingress" not in route_language
     assert "agent-managed service plan" not in route_language
 
-    assert (
-        "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.3/docs/setup.md)"
-    ) in readme
+    assert "(docs/setup.md)" in readme
     assert "private HTTPS route" in readme
     ordered_steps = (
         "Choose one of the following routes",
@@ -488,7 +499,7 @@ def test_setup_connects_an_existing_store_before_the_first_ai_question() -> None
 
 def test_contributor_and_release_docs_match_ci_release_gates() -> None:
     agents = Path("AGENTS.md").read_text()
-    contributing = Path("CONTRIBUTING.md").read_text()
+    contributing = Path(".github/CONTRIBUTING.md").read_text()
     release_criteria = Path(".github/release/criteria.md").read_text()
 
     for text in (contributing, release_criteria):
@@ -524,15 +535,15 @@ def test_current_component_identities_are_explicit() -> None:
     ).read_text()
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
     server_manifest = Path("server.json").read_text()
-    security = Path("SECURITY.md").read_text()
+    security = Path(".github/SECURITY.md").read_text()
 
     assert f'version = "{__version__}"' in pyproject
     assert f'__version__: Final = "{__version__}"' in package_init
     assert f'"version": "{__version__}"' in server_manifest
-    assert xcode_project.count("MARKETING_VERSION = 1.1.1;") == 2
-    assert xcode_project.count("CURRENT_PROJECT_VERSION = 50;") == 2
-    assert '?? "1.1.1"' in content_view
-    assert '?? "50"' in content_view
+    assert xcode_project.count("MARKETING_VERSION = 1.2.0;") == 2
+    assert xcode_project.count("CURRENT_PROJECT_VERSION = 51;") == 2
+    assert '?? "1.2.0"' in content_view
+    assert '?? "51"' in content_view
     assert "pre-1.0" not in security
 
 
@@ -542,10 +553,7 @@ def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion()
     readme = Path("README.md").read_text()
     setup = Path("docs/setup.md").read_text()
 
-    assert (
-        "(https://github.com/roian6/apple-health-ai-bridge/"
-        "blob/receiver-v1.1.3/docs/setup.md#remove-local-bridge-data)"
-    ) in readme
+    assert "(docs/setup.md#remove-local-bridge-data)" in readme
     assert "health-bridge receiver purge" not in readme
     assert "health-bridge receiver purge" in setup
     assert "--confirm" in setup

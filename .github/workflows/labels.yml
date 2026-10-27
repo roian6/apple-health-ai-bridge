@@ -1,0 +1,18 @@
+name: Label issue areas
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions: {}
+
+jobs:
+  label:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # Issue-only fallback: the pinned action reads configuration from main.
+      - uses: fuxingloh/multi-labeler@bcd50af464202999e57f556b4aefcf05a34abf85 # v5.0.0

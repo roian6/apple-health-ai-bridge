@@ -148,7 +148,8 @@ public final class MailboxQAHarness {
     }
 
     @discardableResult
-    public func scanAndFinalize() throws -> MailboxQADurableStateV1 {
+    @MainActor
+    public func scanAndFinalize() async throws -> MailboxQADurableStateV1 {
         guard let itemID = state.itemID else {
             throw MailboxQAHarnessError.invalidState
         }
@@ -163,7 +164,7 @@ public final class MailboxQAHarness {
                 }
                 try observe(.ackVerified)
                 let previousCount = state.finalizationCount
-                let finalized = try coordinator.finalizeCommitted(itemID: itemID)
+                let finalized = try await coordinator.finalizeCommitted(itemID: itemID)
                 guard finalized.phase == .committedFinalized else {
                     throw MailboxQAHarnessError.invalidState
                 }

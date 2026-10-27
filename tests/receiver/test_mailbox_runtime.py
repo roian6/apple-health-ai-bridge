@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import time
 from contextlib import closing
 from threading import Event, Thread
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Self, cast, final
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -14,7 +16,17 @@ import pytest
 
 import health_bridge.receiver.mailbox_runtime as runtime_module
 import health_bridge.receiver.server as server_module
+from health_bridge.mailbox.connections import (
+    MailboxConnectionError,
+    MailboxConnectionErrorCode,
+    MailboxConnectionStore,
+)
 from health_bridge.mailbox.models import MailboxImportResult
+from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublisher,
+    NativeAckPublisherConfig,
+)
+from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from tests.mailbox.importer_support import (
     configured_importer,
     database_counts,
@@ -22,17 +34,32 @@ from tests.mailbox.importer_support import (
     opened_receipt,
     write_delivery,
 )
+from tests.receiver.delivery_acceptance_support import connection
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     from health_bridge.mailbox.filesystem import MailboxDirectoryHandle
+    from health_bridge.receiver.delivery_acceptance import DeliveryTrustedConnection
 
 
 RECEIVER_ID = "02" * 16
 DEVICE_ID = "03" * 16
 SECOND_DEVICE_ID = "04" * 16
+
+
+@pytest.fixture(autouse=True)
+def synthetic_capability_connection_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Runtime fixtures must never fall through to the user's real connection store.
+    def unavailable(_path: Path) -> DeliveryTrustedConnection:
+        raise MailboxConnectionError(MailboxConnectionErrorCode.UNAVAILABLE)
+
+    monkeypatch.setattr(
+        MailboxConnectionStore,
+        "production",
+        lambda: SimpleNamespace(load=unavailable),
+    )
 
 
 @final
@@ -731,3 +758,228 @@ def test_direct_serve_receiver_never_starts_mailbox_worker(
         connection,
     ):
         assert connection.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_empty_paired_mailbox_publishes_capabilities_after_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    calls: list[Path] = []
+    published: list[bytes] = []
+
+    def publish(directory: MailboxDirectoryHandle, payload: bytes) -> None:
+        assert calls == [mailbox]
+        published.append(payload)
+        _ = (directory.path / "receiver-capabilities.json").write_bytes(payload)
+
+    def load(_path: Path) -> DeliveryTrustedConnection:
+        return connection()
+
+    monkeypatch.setattr(
+        MailboxConnectionStore,
+        "production",
+        lambda: SimpleNamespace(load=load),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "default_native_ack_publisher",
+        lambda: SimpleNamespace(publish_capabilities=publish),
+    )
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+    worker.run_once()
+    assert calls == [mailbox]
+    assert len(published) == 1
+    assert json.loads(published[0])["capabilities"]["nutrition_supported"] is True
+    worker.run_once()
+    assert len(published) == 1
+    restarted = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+    restarted.run_once()
+    assert calls == [mailbox, mailbox]
+    assert len(published) == 1
+
+
+def test_default_capability_publication_uses_configured_connection_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "mailboxes"
+    mailbox = _mailbox(root)
+    keys = MailboxKeyStore.for_testing(
+        state_dir=tmp_path / "keys", anchor_dir=tmp_path / "anchor"
+    )
+    connections = MailboxConnectionStore.for_testing(tmp_path / "connections", keys)
+    calls: list[Path] = []
+    loaded: list[Path] = []
+    published: list[bytes] = []
+
+    def load(store: MailboxConnectionStore, path: Path) -> DeliveryTrustedConnection:
+        assert store is connections
+        loaded.append(path)
+        return connection()
+
+    def publish(directory: MailboxDirectoryHandle, payload: bytes) -> None:
+        assert calls == [mailbox]
+        published.append(payload)
+        _ = (directory.path / "receiver-capabilities.json").write_bytes(payload)
+
+    monkeypatch.setattr(MailboxConnectionStore, "load", load)
+    monkeypatch.setattr(
+        runtime_module,
+        "default_native_ack_publisher",
+        lambda: SimpleNamespace(publish_capabilities=publish),
+    )
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=tmp_path / "receiver.sqlite",
+        mailbox_root=root,
+        pairing_connections=connections,
+        importer_factory=lambda _db, path, _directory: _RecordingImporter(path, calls),
+    )
+
+    worker.run_once()
+
+    assert loaded == [mailbox]
+    assert len(published) == 1
+    assert json.loads(published[0])["capabilities"]["nutrition_supported"] is True
+    assert worker.health_error() is None
+
+
+@pytest.mark.parametrize("metadata_failure", [False, True])
+def test_metadata_failure_preserves_real_import_ack_and_maintenance_cadence(
+    tmp_path: Path,
+    metadata_failure: bool,
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    attempts: list[int] = []
+    clock = [0.0]
+
+    def publish(_directory: MailboxDirectoryHandle) -> None:
+        assert database_counts(value) == (1, 1, 1)
+        assert opened_receipt(next(value.acks.glob("*.hba"))).result == "committed"
+        attempts.append(1)
+        if metadata_failure:
+            raise TimeoutError
+
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=value.db_path,
+        mailbox_root=tmp_path,
+        importer_factory=lambda _db, _path, _directory: configured_importer(value),
+        capability_publisher=publish,
+        monotonic=lambda: clock[0],
+    )
+    worker.run_once()
+    # Import changed the ACK lane; its next settling pass remains eligible.
+    worker.run_once()
+    settled_attempts = len(attempts)
+    worker.run_once()
+    assert len(attempts) == settled_attempts
+    clock[0] += 301
+    worker.run_once()
+    assert len(attempts) == settled_attempts + 1
+    assert worker.health_error() is None
+    assert database_counts(value) == (1, 1, 1)
+
+
+def _malformed_capability_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[NativeAckPublisher, list[str]]:
+    executable = tmp_path / "synthetic-helper"
+    _ = executable.write_bytes(b"synthetic")
+    executable.chmod(0o700)
+    protocol = tmp_path / "protocol"
+    publisher = NativeAckPublisher(NativeAckPublisherConfig(executable, protocol, 1))
+    attempts: list[str] = []
+
+    def helper(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        operation, request_id = argv[1].split(":")
+        assert operation == "capabilities"
+        assert (protocol / "staging" / f"{request_id}.json").is_file()
+        receipt = protocol / "receipts" / f"{request_id}.json"
+        _ = receipt.write_text("[" * 1500 + "]" * 1500)
+        receipt.chmod(0o600)
+        attempts.append(request_id)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", helper)
+    return publisher, attempts
+
+
+def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = environment(tmp_path)
+    _ = write_delivery(value)
+    publisher, attempts = _malformed_capability_helper(tmp_path, monkeypatch)
+
+    def load(_path: Path) -> DeliveryTrustedConnection:
+        return connection()
+
+    monkeypatch.setattr(
+        MailboxConnectionStore,
+        "production",
+        lambda: SimpleNamespace(load=load),
+    )
+    monkeypatch.setattr(
+        runtime_module, "default_native_ack_publisher", lambda: publisher
+    )
+    worker = runtime_module.MailboxRuntimeWorker(
+        db_path=value.db_path,
+        mailbox_root=tmp_path,
+        importer_factory=lambda _db, _path, _directory: configured_importer(value),
+        poll_interval_seconds=0.01,
+    )
+    first_cycle, resume, second_cycle = Event(), Event(), Event()
+    run_once = worker.run_once
+
+    def observe_cycle() -> None:
+        first = not first_cycle.is_set()
+        try:
+            run_once()
+            if not first:
+                second_cycle.set()
+        finally:
+            if first:
+                first_cycle.set()
+                assert resume.wait(5), "test did not release the first real cycle"
+
+    monkeypatch.setattr(worker, "run_once", observe_cycle)
+    try:
+        worker.start()
+        assert first_cycle.wait(5)
+        assert attempts
+        assert database_counts(value) == (1, 1, 1)
+        first_ack = value.acks / f"{'01' * 16}.hba"
+        assert opened_receipt(first_ack).result == "committed"
+        original_ack = first_ack.read_bytes()
+        # A later delivery must be handled by the same live worker after bad metadata.
+        _ = write_delivery(value, envelope_byte=2)
+        resume.set()
+        continued = second_cycle.wait(5)
+        assert not worker.terminal_error(), worker.health_error()
+        assert continued
+        assert worker.is_alive()
+        second_ack = value.acks / f"{'02' * 16}.hba"
+        assert opened_receipt(second_ack, envelope_byte=2).result == "committed"
+        assert first_ack.read_bytes() == original_ack
+        assert database_counts(value) == (1, 2, 2)
+    finally:
+        resume.set()
+        stopped = worker.stop()
+    assert stopped
+    assert worker.health_error() is None
+    assert len(attempts) >= 2
+    for lane in ("requests", "staging", "receipts"):
+        assert not list((tmp_path / "protocol" / lane).iterdir())

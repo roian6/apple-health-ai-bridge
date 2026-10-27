@@ -10,14 +10,17 @@ import health_bridge
 from health_bridge.contract import HealthBridgeBatchV1
 from health_bridge.contract.batch_v1 import DeletedRecord, Sample, SyncCursor
 from health_bridge.ingest import ingest_batch
+from health_bridge.mcp.server import dispatch_request
 from health_bridge.queries import get_daily_summary, get_timeseries
 from health_bridge.queries.models import DailySummaryResult
+from health_bridge.status import BridgeStatusSnapshot
 from tests.fixture_helpers import FIXTURE_PATH
 from tests.mcp.committed_read_support import (
     JSON_OBJECT,
     line_process,
     send,
     status_payload,
+    status_request,
 )
 
 if TYPE_CHECKING:
@@ -353,6 +356,61 @@ def test_real_consumers_stop_advertising_invalid_total(
                 summary = DailySummaryResult.model_validate_json(json.dumps(after))
     # Then: actual consumer output cannot present the old 6 as a current total.
     assert summary.days[0].daily_activity_totals.get("steps") is None
+
+
+def test_fresh_raw_cursor_does_not_certify_or_restore_daily_projection(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "synthetic.sqlite"
+    _send(db, _batch((_daily(),), sequence=1, statistics=True))
+    assert _total(db) == 6.0
+
+    raw_change = _batch((_raw(),), sequence=2)
+    anchor = SyncCursor(
+        source_key=_fixture().sources[0].source_key,
+        cursor_kind="anchored_step_sync",
+        cursor_value="synthetic-current-step-checkpoint",
+    )
+    _send(
+        db,
+        raw_change.model_copy(
+            update={
+                "sync": raw_change.sync.model_copy(
+                    update={"cursors": (*raw_change.sync.cursors, anchor)}
+                ),
+            },
+        ),
+    )
+
+    response = dispatch_request(db, status_request())
+    snapshot = BridgeStatusSnapshot.model_validate_json(
+        json.dumps(status_payload(response))
+    )
+
+    assert snapshot.metrics["steps"].cursor_count == 1
+    assert snapshot.metrics["steps"].latest_cursor_updated_at is not None
+    assert snapshot.metrics["steps"].record_count == 2
+    assert snapshot.metrics["steps"].latest_record_end == END
+    assert _total(db) is None
+    assert any(
+        point.projection_status == "last_known"
+        for point in get_timeseries(db, ("steps",), START, END).points
+    )
+    assert tuple(cursor.cursor_kind for cursor in snapshot.sync_cursors) == (
+        "anchored_step_sync",
+    )
+
+    cursor_only = _batch()
+    _send(
+        db,
+        cursor_only.model_copy(
+            update={"sync": cursor_only.sync.model_copy(update={"cursors": (anchor,)})}
+        ),
+    )
+    assert _total(db) is None
+
+    _send(db, _batch((_daily(7.0),), sequence=3, statistics=True))
+    assert _total(db) == 7.0
 
 
 root_batch = _batch

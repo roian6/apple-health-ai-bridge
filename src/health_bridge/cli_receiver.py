@@ -22,6 +22,10 @@ from health_bridge.cli_receiver_start import (
 )
 from health_bridge.launchd import load_runnable_launch_agent_request
 from health_bridge.mailbox.connections import MailboxConnectionStore
+from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublicationError,
+    default_native_ack_publisher,
+)
 from health_bridge.private_files import (
     ensure_private_directory,
     write_private_text_file,
@@ -656,11 +660,11 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
         typer.Option("--label", help="Human-readable device or companion label."),
     ],
     receiver_url: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--receiver-url", help="Receiver /v1/batches URL for the companion."
         ),
-    ],
+    ] = None,
     transport: Annotated[
         PublicReceiverTransport,
         typer.Option(
@@ -720,6 +724,7 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
     if output_format in {"json", "deeplink"} and not print_secret:
         typer.echo(PAIRING_FORMAT_REQUIRES_FLAG_MESSAGE, err=True)
         raise typer.Exit(code=1)
+    receiver_url = _pairing_receiver_url(receiver_url, transport, legacy_v1)
     selected_transport = _select_transport_or_exit(
         transport,
         mailbox_root=mailbox_root,
@@ -731,7 +736,7 @@ def create_pairing(  # noqa: PLR0912, PLR0913 - Typer exposes CLI branches/optio
         bundle = create_receiver_pairing_bundle(
             db,
             label=label,
-            receiver_url=receiver_url,
+            receiver_url=receiver_url or "",
         )
     else:
         bundle = create_receiver_pairing_invitation_bundle(
@@ -980,3 +985,23 @@ def _validate_receiver_url(url: str) -> None:
     if parsed.scheme not in {"http", "https"}:
         typer.echo("Receiver smoke failed: URL must use http or https.", err=True)
         raise typer.Exit(code=1)
+
+
+def _pairing_receiver_url(
+    receiver_url: str | None,
+    transport: PublicReceiverTransport,
+    legacy_v1: bool,
+) -> str | None:
+    if not receiver_url:
+        if transport != "icloud-mailbox" or legacy_v1:
+            typer.echo(
+                "--receiver-url is required for Direct or legacy pairing.", err=True
+            )
+            raise typer.Exit(code=1)
+        try:
+            default_native_ack_publisher().require_native_pairing()
+        except NativeAckPublicationError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        return None
+    return receiver_url

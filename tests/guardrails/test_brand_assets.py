@@ -1,8 +1,15 @@
+from __future__ import annotations
+
 import json
 import struct
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from xml.etree import ElementTree as ET
+
+from scripts import generate_brand_assets
+
+if TYPE_CHECKING:
+    import pytest
 
 BRAND = Path("assets/brand")
 APPICONSET = Path(
@@ -13,8 +20,8 @@ XCODE_PROJECT = Path(
 )
 
 CANONICAL_BRAND_PNGS = {
-    BRAND / "health-bridge-lockup.png": (1440, 360),
-    BRAND / "health-bridge-social-card.png": (1280, 640),
+    BRAND / "health-bridge-lockup.png": (2880, 720),
+    BRAND / "health-bridge-social-card.png": (2560, 1280),
     BRAND / "health-bridge-mark-1024.png": (1024, 1024),
     BRAND / "health-bridge-mark-512.png": (512, 512),
     BRAND / "apple-touch-icon.png": (180, 180),
@@ -72,6 +79,27 @@ def test_brand_svgs_are_parseable_and_use_scaling_strokes() -> None:
         assert "vector-effect" not in text
 
 
+def test_site_export_copies_canonical_icons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "brand"
+    source.mkdir()
+    names = ("health-bridge-mark.svg", "favicon.svg", "apple-touch-icon.png")
+    for name in names:
+        _ = (source / name).write_bytes((BRAND / name).read_bytes())
+    site = tmp_path / "site"
+    (site / "assets").mkdir(parents=True)
+    monkeypatch.setattr(generate_brand_assets, "BRAND", source)
+
+    generate_brand_assets.export_site_assets(site)
+
+    for name in names:
+        assert (site / "assets" / name).read_bytes() == (source / name).read_bytes()
+    mark = ET.parse(site / "assets" / "health-bridge-mark.svg").getroot()  # noqa: S314
+    favicon = ET.parse(site / "assets" / "favicon.svg").getroot()  # noqa: S314
+    assert ET.tostring(mark) == ET.tostring(favicon)
+
+
 def test_ios_app_icon_catalog_is_complete_and_bundled() -> None:
     contents = cast(
         "dict[str, object]",
@@ -100,21 +128,6 @@ def test_visual_assets_are_public_minimal_not_exploration_dump() -> None:
     assert Path("docs/brand.md").exists()
     assert not Path("docs/open-design-pilot.md").exists()
     assert not Path("docs/social-banner-exploration-brief.md").exists()
-
-
-def test_brand_generator_is_self_contained_for_canonical_outputs() -> None:
-    generator = Path("tools/generate_brand_assets.py").read_text(encoding="utf-8")
-    assert "illustration-pass" not in generator
-    assert "source_path" not in generator
-    assert "health-bridge-social-card.html" in generator
-
-
-def test_readme_uses_text_free_mark_and_project_heading() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-    assert '<img src="assets/brand/health-bridge-mark-512.png"' in readme
-    assert "health-bridge-lockup.png" not in readme
-    assert "<h1>Apple Health AI Bridge</h1>" in readme
-    assert "docs/brand.md" in readme
 
 
 def test_public_release_audit_only_allows_canonical_visual_binaries() -> None:

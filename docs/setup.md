@@ -1,10 +1,8 @@
-# Set up Health Bridge for AI
+# Set up Apple Health AI Bridge
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 
-## Release availability
-
-This versioned guide targets Receiver/CLI `1.1.5`. Before running its installation commands, confirm that [receiver-v1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5) is published and all eight matching release assets are present and verified. Until that check succeeds, use the [published 1.1.3 setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.3/docs/setup.md). Do not substitute `main`, the retired unpublished `receiver-v1.1.4` tag, or an older mailbox helper.
+This guide targets [Receiver/CLI `1.2.0`](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0). Confirm that the release is available before installing it. For the optional Mac-only Mailbox Beta, verify the matching helper and complete release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.2.0/docs/icloud-mailbox-service.md); do not substitute `main` or an older helper.
 
 ## Before you start
 
@@ -136,10 +134,10 @@ After setup, use the printed receiver command with the same bind and port. Keep 
 
 ## Install and run core setup
 
-After the release availability check above succeeds, install Receiver/CLI `1.1.5`:
+Once the release is published and verified, install Receiver/CLI `1.2.0`:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.5"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
 ```
 
 After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.
@@ -219,7 +217,7 @@ Pair only after the receiver and phone route are ready:
 
 1. On the receiver computer, open the generated pairing HTML file on a trusted screen. If the receiver is headless, securely copy that one file to a trusted local screen; do not publish it or place it on a web server.
 2. Scan the displayed QR with iPhone Camera and open the setup link. As a fallback, open the securely transferred HTML on the iPhone and tap its pairing button.
-3. Confirm the receiver connection in Health Bridge for AI.
+3. Confirm the receiver connection in the iPhone app.
 4. Tap **Allow Health Access**.
 5. Review Apple’s native HealthKit authorization sheet.
 6. Enable **Automatic Sync**.

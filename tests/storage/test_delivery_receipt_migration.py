@@ -291,7 +291,7 @@ def test_direct_only_open_leaves_receipt_ledger_dormant(tmp_path: Path) -> None:
         ).fetchone() == (0,)
 
 
-def test_wheel_and_sdist_include_receipt_migration(tmp_path: Path) -> None:
+def test_wheel_and_sdist_include_every_registered_migration(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     result = subprocess.run(
         ["uv", "build", "--out-dir", str(dist)],
@@ -303,6 +303,11 @@ def test_wheel_and_sdist_include_receipt_migration(tmp_path: Path) -> None:
     wheel = next(dist.glob("*.whl"))
     sdist = next(dist.glob("*.tar.gz"))
     with zipfile.ZipFile(wheel) as archive:
-        assert any(name.endswith(f"/{MIGRATION_ID}.sql") for name in archive.namelist())
+        wheel_members = archive.namelist()
     with tarfile.open(sdist) as archive:
-        assert any(name.endswith(f"/{MIGRATION_ID}.sql") for name in archive.getnames())
+        sdist_members = archive.getnames()
+
+    for migration_id in database.MIGRATION_IDS:
+        suffix = f"health_bridge/storage/migrations/{migration_id}.sql"
+        assert any(name.endswith(suffix) for name in wheel_members), migration_id
+        assert any(name.endswith(suffix) for name in sdist_members), migration_id

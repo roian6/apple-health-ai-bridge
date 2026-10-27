@@ -84,14 +84,15 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
     finish = uploader[start:end]
 
     for fragment in (
-        "DirectUploadFinalizer.finish(",
+        "DirectUploadFinalizer.finishForSync(",
         "currentReceiverGeneration: settingsStore.receiverSettingsGenerationToken",
         "currentReceiverBindingID: settingsStore.receiverBindingID",
     ):
         assert fragment in finish
 
     core = BACKGROUND_UPLOAD.read_text()
-    finalizer_start = core.index("public enum DirectUploadFinalizer")
+    owner_start = core.index("public enum DirectUploadFinalizer")
+    finalizer_start = core.index("public static func finish(", owner_start)
     finalizer_end = core.index(
         "public struct BackgroundUploadTaskOwnership", finalizer_start
     )
@@ -105,6 +106,14 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
     assert finalizer.index(generation_check) < finalizer.index(stale_result)
     assert finalizer.index(binding_check) < finalizer.index(stale_result)
     assert finalizer.index(stale_result) < finalizer.index(retire)
+    async_join = core[owner_start:finalizer_start]
+    assert "let outcome = finish(" in async_join
+    assert async_join.index("try validate()") < async_join.index(
+        "try await recoverSleepBaseline("
+    )
+    async_retire = "try await retire(descriptor.itemID, descriptor.receiverBindingID)"
+    assert f"try validate()\n            {async_retire}" in async_join
+    assert f"{async_retire}\n            try validate()" in async_join
 
     outbox = FILE_OUTBOX.read_text()
     accepted_start = outbox.index("public func recordDirectUploadAccepted(")

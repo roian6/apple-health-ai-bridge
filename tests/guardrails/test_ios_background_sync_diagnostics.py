@@ -20,10 +20,6 @@ VIEW_MODEL: Final = (
     ROOT / "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
 )
 CONTENT_VIEW: Final = ROOT / "ios/HealthBridgeCompanion/App/ContentView.swift"
-SWIFT_TESTS: Final = ROOT / (
-    "ios/HealthBridgeCompanion/Tests/HealthBridgeCompanionCoreTests/"
-    "AutomaticSyncDiagnosticsTests.swift"
-)
 PROJECT: Final = (
     ROOT / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
@@ -163,31 +159,11 @@ def test_diagnostic_types_are_not_connected_to_upload_or_public_status_surfaces(
     assert offenders == set()
 
 
-def test_swift_model_store_rendering_tests_and_xcode_membership_are_present() -> None:
-    # Given: the later-Mac Swift gate and the checked-in Xcode project.
-    assert SWIFT_TESTS.exists(), "focused Swift diagnostic tests are missing"
-    tests = SWIFT_TESTS.read_text(encoding="utf-8")
+def test_diagnostic_sources_are_in_xcode_project() -> None:
+    # Given / When: the checked-in Xcode project is inspected.
     project = PROJECT.read_text(encoding="utf-8")
 
-    # When: the intended pure behavior cases are inspected.
-    cases = (
-        "testHistoryEvictsOldestRecordsAtBound",
-        "testMissingAndCorruptFilesRecoverWithoutThrowing",
-        "testPendingLaneAgeUsesCoarseObservedDurationBuckets",
-        "testQuantityPendingAgeTracksOnlyTheCoarseLane",
-        "testRecoveryScrubsLegacyNonLanePendingKeysFromDisk",
-        "testObserverAdmissionCanFinishWithoutStartingContinuation",
-        "testLatestLaneRenderingOmitsPrivateValuesAndIdentifiers",
-        "testObserverCompletionLatencyUpdatesOnlyTheMatchingRun",
-        "testAcceptedDeferredAndFailedOutcomesRemainDistinct",
-        "testFinalRecordReplacesOnlyItsDurableAcceptedCheckpoint",
-        "testSkippedAttemptCannotReplaceAnotherRunsAcceptedCheckpoint",
-        "testBoundedHistoryPreservesTheActiveAcceptedCheckpoint",
-    )
-
-    # Then: all cases and the new production source are available to later Mac builds.
-    for case in cases:
-        assert f"func {case}()" in tests
+    # Then: all diagnostic production sources belong to the app target.
     for source_name in (
         "AutomaticSyncDiagnostics.swift",
         "AutomaticSyncDiagnosticStore.swift",

@@ -495,11 +495,15 @@ public final class FileOutbox {
         var receiverIdentity: String?
         var mailboxBinding: FileOutboxMailboxBindingV1?
         var deliveryState: FileOutboxDeliveryStateV1?
+        var nutritionProjectionPrepared: Bool? = nil
+        var nutritionOrderingVersion: Int? = nil
     }
 
     private struct SequenceManifest: Codable, Equatable {
         static let directOnlyVersion = 3
         static let mailboxVersion = 4
+        static let nutritionDirectVersion = 5
+        static let nutritionMailboxVersion = 6
 
         var version: Int
         var nextSequence: UInt64
@@ -509,10 +513,37 @@ public final class FileOutbox {
         var projectionRepairs: [String: [ProjectionRepair]]? = nil
         var projectionHistory: [String: Date]? = nil
         var projectionCompleted: [String: [ProjectionRepair]]? = nil
+        var nutritionSplits: [NutritionSplit]? = nil
+
+        var isMailbox: Bool {
+            version == Self.mailboxVersion || version == Self.nutritionMailboxVersion
+        }
+
+        mutating func useMailboxVersion() {
+            version = version >= Self.nutritionDirectVersion ? Self.nutritionMailboxVersion : Self.mailboxVersion
+        }
 
         static var empty: SequenceManifest {
             SequenceManifest(version: directOnlyVersion, nextSequence: 1, entries: [])
         }
+    }
+
+    private struct NutritionSplit: Codable, Equatable {
+        let parentID: String
+        let receiverIdentity: String
+        let parentSHA256: String
+        let supportedID: String
+        let supportedSHA256: String
+        let remainderID: String
+        let remainderSHA256: String
+        let cursors: Set<NutritionCursorKey>
+        var supportedAccepted: Bool = false
+        var remainderAccepted: Bool = false
+        var supportedPayload: Data?
+        var remainderPayload: Data?
+        var retiringParent: Bool = false
+
+        var completed: Bool { supportedAccepted && remainderAccepted }
     }
 
     private struct ProjectionInterval: Codable, Equatable {
@@ -620,6 +651,9 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    var observeNutritionCodec: @Sendable () -> Void = {}
+    var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
+    var nutritionSplitFault: (NutritionSplitBoundary) throws -> Void = { _ in }
 
     #if !HEALTH_BRIDGE_MAILBOX_QA
     public weak var automaticSyncDiagnosticDraft: AutomaticSyncDiagnosticDraft?
@@ -1031,7 +1065,8 @@ public final class FileOutbox {
                 id: id,
                 receiverIdentity: receiverIdentity,
                 mailboxBinding: nil,
-                deliveryState: nil
+                deliveryState: nil,
+                nutritionOrderingVersion: 1
             )
         )
         manifest.nextSequence = sequence + 1
@@ -1119,7 +1154,20 @@ public final class FileOutbox {
     }
 
     public func pendingItems() throws -> [FileOutboxItem] {
-        let manifest = try reconciledManifest()
+        try pendingItems(in: reconciledManifest())
+    }
+
+    func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
+        try requireUploadAdmission()
+        guard let manifest = try loadManifest() else { throw CancellationError() }
+        let known = Set(manifest.entries.map(\.id))
+        guard try payloadFileURLs().allSatisfy({ known.contains(payloadID(for: $0)) }) else {
+            throw CancellationError()
+        }
+        return try pendingItems(in: manifest)
+    }
+
+    private func pendingItems(in manifest: SequenceManifest) throws -> [FileOutboxItem] {
         let payloadIDs = Set(try payloadFileURLs().map { payloadID(for: $0) })
         return manifest.entries
             .sorted { $0.sequence < $1.sequence }
@@ -1214,7 +1262,7 @@ public final class FileOutbox {
         }) else {
             throw FileOutboxCursorCheckpointError.checkpointMismatch
         }
-        guard transactionIndex == 0 else {
+        guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
@@ -1227,6 +1275,9 @@ public final class FileOutbox {
         )
         let directAcknowledgedIDs = transaction.directAcknowledgedIDs
         guard transaction.entries.allSatisfy({ entry in
+            if manifest.nutritionSplits?.contains(where: { $0.parentID == entry.id }) == true {
+                return nutritionCollectionAccepted(entry.id, in: manifest, includingVerifiedACK: true)
+            }
             if directAcknowledgedIDs.contains(entry.id) {
                 return true
             }
@@ -1243,6 +1294,7 @@ public final class FileOutbox {
         }
         transactions.remove(at: transactionIndex)
         try persistEnqueueTransactions(transactions)
+        try recoverNutritionSplits()
     }
 
     public func acknowledgeCursorCheckpoint(
@@ -1264,6 +1316,11 @@ public final class FileOutbox {
         try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
+        }
+        if try nutritionCollectionOwner(itemID) != itemID {
+            try requireDirectRetirementAllowed(itemID: itemID)
+            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
+            return try directFinalizationRecordReady(receiverIdentity: receiverIdentity)
         }
         var transactions = try loadEnqueueTransactions()
         if let transactionIndex = transactions.firstIndex(where: {
@@ -1290,9 +1347,12 @@ public final class FileOutbox {
                 transactions[transactionIndex] = updated
                 try persistEnqueueTransactions(transactions)
             }
-            _ = try reconciledManifest()
-            guard transactionIndex == 0,
-                  updated.directAcknowledgedIDs == Set(updated.entries.map(\.id)) else {
+            let manifest = try reconciledManifest()
+            guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
+                  updated.entries.allSatisfy({
+                      updated.directAcknowledgedIDs.contains($0.id)
+                          || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: false)
+                  }) else {
                 return nil
             }
             return finalizationRecord
@@ -1312,18 +1372,53 @@ public final class FileOutbox {
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
-        _ = try reconciledManifest()
-        guard let transaction = try loadEnqueueTransactions().first,
-              let finalizationRecord = transaction.finalizationRecord,
-              transaction.entries.allSatisfy({
-                  $0.receiverIdentity == receiverIdentity
-              }),
-              finalizationRecord.cursorCheckpoint?.receiverIdentity
-                == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
-              transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)) else {
-            return nil
+        let manifest = try reconciledManifest()
+        let transactions = try loadEnqueueTransactions()
+        for (index, transaction) in transactions.enumerated() {
+            guard let finalizationRecord = transaction.finalizationRecord,
+                  transaction.entries.allSatisfy({ $0.receiverIdentity == receiverIdentity }),
+                  finalizationRecord.cursorCheckpoint?.receiverIdentity
+                    == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
+                  transaction.entries.allSatisfy({
+                      transaction.directAcknowledgedIDs.contains($0.id)
+                          || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: false)
+                  }),
+                  try canFinalizeNutritionIndependentTransaction(index, in: transactions) else {
+                continue
+            }
+            return finalizationRecord
         }
-        return finalizationRecord
+        return nil
+    }
+
+    private func canFinalizeNutritionIndependentTransaction(
+        _ index: Int, in transactions: [EnqueueTransaction]
+    ) throws -> Bool {
+        guard index > 0 else { return true }
+        let target = transactions[index]
+        for previous in transactions.prefix(index) {
+            guard previous.entries.allSatisfy({
+                $0.receiverIdentity == target.entries.first?.receiverIdentity
+            }) else { return false }
+            if let left = previous.cursorCheckpoint, let right = target.cursorCheckpoint,
+               left.receiverIdentity == right.receiverIdentity,
+               left.sourceKey == right.sourceKey, left.cursorKind == right.cursorKind { return false }
+            if !Set(previous.pendingGenerationRetirements?.keys.map { $0 } ?? [])
+                .isDisjoint(with: target.pendingGenerationRetirements?.keys.map { $0 } ?? []) {
+                return false
+            }
+            // Only held nutrition can be bypassed, never another ordinary FIFO lane.
+            for entry in previous.entries where !previous.directAcknowledgedIDs.contains(entry.id) {
+                if let split = try loadManifest()?.nutritionSplits?.first(where: { $0.parentID == entry.id }),
+                   !split.supportedAccepted {
+                    return false
+                }
+                guard let item = try pendingItem(id: entry.id) else { return false }
+                guard let prepared = try preparedNutritionPayload(for: item),
+                      prepared.containsNutrition else { return false }
+            }
+        }
+        return true
     }
 
     public func uploadablePendingItems(for receiverIdentity: String) throws -> [FileOutboxItem] {
@@ -1346,6 +1441,228 @@ public final class FileOutbox {
         return uploadable
     }
 
+    func prepareNutritionProjection(
+        for item: FileOutboxItem, payloads: (Data, Data), cursors: Set<NutritionCursorKey>
+    ) throws {
+        var manifest = try reconciledManifest()
+        guard let entry = manifest.entries.first(where: { $0.id == item.id }),
+              let identity = entry.receiverIdentity else {
+            throw ReceiverOutboxIdentityError.missingReceiverIdentity
+        }
+        guard !(manifest.nutritionSplits ?? []).contains(where: { $0.parentID == item.id }),
+              entry.nutritionOrderingVersion == 1,
+              entry.nutritionProjectionPrepared != true else { return }
+        guard entry.mailboxBinding == nil,
+              entry.deliveryState == nil || entry.deliveryState?.phase == .collected,
+              !(try hasEnvelopeArtifact(for: item.id)),
+              try loadMailboxEnvelopeFinalizationIntent() == nil else {
+            throw FileOutboxNutritionError.invalidSplit
+        }
+        guard let prepared = try preparedNutritionPayload(for: item) else { throw CancellationError() }
+        var childIDs: [String] = []
+        for _ in 0..<2 {
+            let sequence = manifest.nextSequence
+            guard sequence < UInt64.max else { throw SequenceError.exhausted }
+            let id = String(format: "%020llu-%@", sequence, UUID().uuidString.lowercased())
+            manifest.entries.append(SequenceEntry(
+                sequence: sequence, id: id, receiverIdentity: identity,
+                mailboxBinding: nil, deliveryState: nil, nutritionOrderingVersion: 1
+            ))
+            manifest.nextSequence += 1
+            childIDs.append(id)
+        }
+        var heldCursors = cursors
+        for transaction in try loadEnqueueTransactions()
+            where transaction.entries.contains(where: { $0.id == item.id }) {
+            if let checkpoint = transaction.cursorCheckpoint {
+                heldCursors.insert(NutritionCursorKey(
+                    sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+                ))
+            }
+        }
+        let split = NutritionSplit(
+            parentID: item.id, receiverIdentity: identity,
+            parentSHA256: Self.sha256(try Data(contentsOf: item.fileURL)),
+            supportedID: childIDs[0], supportedSHA256: Self.sha256(payloads.0),
+            remainderID: childIDs[1], remainderSHA256: Self.sha256(payloads.1),
+            cursors: heldCursors, supportedPayload: payloads.0, remainderPayload: payloads.1
+        )
+        manifest.version = manifest.isMailbox
+            ? SequenceManifest.nutritionMailboxVersion : SequenceManifest.nutritionDirectVersion
+        manifest.nutritionSplits = (manifest.nutritionSplits ?? []) + [split]
+        // The atomic manifest is the installation intent. No child is selectable
+        // until both exact payloads have been installed and the intent cleared.
+        try persistManifest(manifest)
+        try nutritionSplitFault(.intentPersisted)
+        try recoverNutritionSplits()
+        preparedNutritionPayloads[split.supportedID] = PreparedNutritionPayload(
+            revision: try NutritionPayloadRevision(finalPayloadURL(for: split.supportedID)),
+            containsNutrition: false, permitsSupported: true, projection: nil,
+            remainder: nil, cursors: []
+        )
+        preparedNutritionPayloads[split.remainderID] = PreparedNutritionPayload(
+            revision: try NutritionPayloadRevision(finalPayloadURL(for: split.remainderID)),
+            containsNutrition: true, permitsSupported: prepared.permitsSupported,
+            projection: nil, remainder: nil, cursors: prepared.cursors
+        )
+    }
+
+    func nutritionPendingGroups(for receiverIdentity: String) throws -> [NutritionPendingGroup] {
+        guard let manifest = try loadManifest() else { return [] }
+        let splits = manifest.nutritionSplits ?? []
+        guard splits.allSatisfy({
+            $0.supportedPayload == nil && $0.remainderPayload == nil && !$0.retiringParent
+        }) else { throw CancellationError() }
+        let items = try pendingItemsForNutritionValidation()
+        let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        let children = Set(splits.flatMap { [$0.supportedID, $0.remainderID] })
+        var groups: [NutritionPendingGroup] = []
+        for item in items.prefix(while: { $0.receiverIdentity == receiverIdentity }) {
+            if children.contains(item.id) { continue }
+            if let split = splits.first(where: { $0.parentID == item.id }) {
+                guard split.supportedAccepted || byID[split.supportedID] != nil,
+                      split.remainderAccepted || byID[split.remainderID] != nil else {
+                    throw FileOutboxNutritionError.invalidSplit
+                }
+                groups.append(.split(
+                    supported: split.supportedAccepted ? nil : byID[split.supportedID],
+                    remainder: split.remainderAccepted ? nil : byID[split.remainderID],
+                    cursors: split.cursors
+                ))
+            } else {
+                let entry = manifest.entries.first { $0.id == item.id }
+                groups.append(.original(
+                    item, permitsSplit: entry?.nutritionOrderingVersion == 1
+                        && entry?.nutritionProjectionPrepared != true
+                ))
+            }
+        }
+        return groups
+    }
+
+    private func nutritionCollectionOwner(_ itemID: String) throws -> String {
+        try loadManifest()?.nutritionSplits?.first(where: {
+            $0.supportedID == itemID || $0.remainderID == itemID
+        })?.parentID ?? itemID
+    }
+
+    private func nutritionCollectionAccepted(
+        _ parentID: String, in manifest: SequenceManifest, includingVerifiedACK: Bool
+    ) -> Bool {
+        guard let split = manifest.nutritionSplits?.first(where: { $0.parentID == parentID }) else {
+            return false
+        }
+        func accepted(_ id: String, recorded: Bool) -> Bool {
+            if recorded { return true }
+            guard includingVerifiedACK else { return false }
+            let phase = manifest.entries.first { $0.id == id }?.deliveryState?.phase
+            return phase == .ackVerified || phase == .committedFinalized
+        }
+        return accepted(split.supportedID, recorded: split.supportedAccepted)
+            && accepted(split.remainderID, recorded: split.remainderAccepted)
+    }
+
+    private func recordNutritionChildAcceptance(
+        itemID: String, receiverIdentity: String
+    ) throws {
+        guard var manifest = try loadManifest(),
+              let index = manifest.nutritionSplits?.firstIndex(where: {
+                  $0.supportedID == itemID || $0.remainderID == itemID
+              }),
+              var splits = manifest.nutritionSplits else { return }
+        guard splits[index].receiverIdentity == receiverIdentity else {
+            throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+        }
+        if splits[index].supportedID == itemID {
+            splits[index].supportedAccepted = true
+        } else {
+            splits[index].remainderAccepted = true
+        }
+        manifest.nutritionSplits = splits
+        try persistManifest(manifest)
+        try nutritionSplitFault(.acceptancePersisted)
+        try recoverNutritionSplits()
+    }
+
+    private func recoverNutritionSplits() throws {
+        guard var manifest = try loadManifest(),
+              var splits = manifest.nutritionSplits, !splits.isEmpty else { return }
+        let transactions = try loadEnqueueTransactions()
+        for index in splits.indices {
+            var split = splits[index]
+            if manifest.entries.first(where: { $0.id == split.supportedID })?.deliveryState?.phase == .committedFinalized {
+                split.supportedAccepted = true
+            }
+            if manifest.entries.first(where: { $0.id == split.remainderID })?.deliveryState?.phase == .committedFinalized {
+                split.remainderAccepted = true
+            }
+            if !split.retiringParent {
+                guard Self.sha256(try Data(contentsOf: finalPayloadURL(for: split.parentID)))
+                    == split.parentSHA256 else { throw FileOutboxNutritionError.invalidSplit }
+            }
+            for (id, payload, digest, accepted) in [
+                (split.supportedID, split.supportedPayload, split.supportedSHA256, split.supportedAccepted),
+                (split.remainderID, split.remainderPayload, split.remainderSHA256, split.remainderAccepted),
+            ] {
+                guard let payload else {
+                    if !accepted {
+                        guard Self.sha256(try Data(contentsOf: finalPayloadURL(for: id))) == digest else {
+                            throw FileOutboxNutritionError.invalidSplit
+                        }
+                    }
+                    continue
+                }
+                guard Self.sha256(payload) == digest else { throw FileOutboxNutritionError.invalidSplit }
+                let url = finalPayloadURL(for: id)
+                if fileManager.fileExists(atPath: url.path) {
+                    guard Self.sha256(try Data(contentsOf: url)) == digest else {
+                        throw FileOutboxNutritionError.invalidSplit
+                    }
+                } else {
+                    try payload.write(to: url, options: [.atomic])
+                    try Self.applySensitiveFileAttributes(to: url, fileManager: fileManager)
+                }
+                try nutritionSplitFault(id == split.supportedID ? .supportedPayloadInstalled : .remainderPayloadInstalled)
+            }
+            split.supportedPayload = nil
+            split.remainderPayload = nil
+            splits[index] = split
+        }
+        if manifest.nutritionSplits != splits {
+            manifest.nutritionSplits = splits
+            try persistManifest(manifest)
+            try nutritionSplitFault(.manifestCommitted)
+        }
+        for split in splits {
+            for (id, accepted) in [
+                (split.supportedID, split.supportedAccepted),
+                (split.remainderID, split.remainderAccepted),
+            ] where accepted && manifest.entries.first(where: { $0.id == id })?.mailboxBinding == nil {
+                try removeIfExists(finalPayloadURL(for: id))
+            }
+            guard split.completed,
+                  !transactions.contains(where: { $0.entries.contains(where: { $0.id == split.parentID }) }) else {
+                continue
+            }
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            try acknowledgeProjectionPayload(itemID: split.parentID, receiverBindingID: split.receiverIdentity)
+            guard let refreshed = try loadManifest() else { throw FileOutboxNutritionError.invalidSplit }
+            manifest = refreshed
+            #endif
+            guard let index = manifest.nutritionSplits?.firstIndex(where: { $0.parentID == split.parentID }) else {
+                throw FileOutboxNutritionError.invalidSplit
+            }
+            manifest.nutritionSplits?[index].retiringParent = true
+            try persistManifest(manifest)
+            try nutritionSplitFault(.retirementPersisted)
+            try removeIfExists(finalPayloadURL(for: split.parentID))
+            try nutritionSplitFault(.parentRemoved)
+            manifest.entries.removeAll { $0.id == split.parentID }
+            manifest.nutritionSplits?.remove(at: index)
+            try persistManifest(manifest)
+        }
+    }
+
     public func pendingItem(id: String) throws -> FileOutboxItem? {
         guard id == URL(fileURLWithPath: id).lastPathComponent, !id.isEmpty else {
             return nil
@@ -1355,6 +1672,9 @@ public final class FileOutbox {
 
     public func markUploaded(_ item: FileOutboxItem) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
+        if let identity = item.receiverIdentity {
+            try recordNutritionChildAcceptance(itemID: item.id, receiverIdentity: identity)
+        }
         #if !HEALTH_BRIDGE_MAILBOX_QA
         if let identity = item.receiverIdentity {
             try acknowledgeProjectionPayload(itemID: item.id, receiverBindingID: identity)
@@ -1393,14 +1713,32 @@ public final class FileOutbox {
         guard try downgradeReadiness() == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
-        let items = try pendingItems()
-        for item in items {
-            if fileManager.fileExists(atPath: item.fileURL.path) {
-                try fileManager.removeItem(at: item.fileURL)
+        let payloadURLs = try payloadFileURLs()
+        for transaction in try loadEnqueueTransactions() {
+            for entry in transaction.entries {
+                try removeIfExists(stagedPayloadURL(for: entry.id))
+            }
+        }
+        try removeIfExists(enqueueTransactionURL)
+        if var manifest = try loadManifest(),
+           manifest.version == SequenceManifest.nutritionDirectVersion {
+            let splitIDs = Set((manifest.nutritionSplits ?? []).flatMap {
+                [$0.parentID, $0.supportedID, $0.remainderID]
+            })
+            manifest.entries.removeAll { splitIDs.contains($0.id) }
+            manifest.nutritionSplits = nil
+            manifest.version = SequenceManifest.directOnlyVersion
+            // Retire recovery intent before payload deletion. The clear marker
+            // keeps admission closed if deletion is interrupted.
+            try persistManifest(manifest)
+        }
+        for url in payloadURLs {
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
             }
         }
         _ = try reconciledManifest()
-        return items.count
+        return payloadURLs.count
     }
 
     public func finishClearIntent() throws {
@@ -1516,7 +1854,7 @@ public final class FileOutbox {
                 throw FileOutboxMailboxError.invalidDeliveryState
             }
             manifest.entries[index].deliveryState = updated
-            manifest.version = SequenceManifest.mailboxVersion
+            manifest.useMailboxVersion()
             try persistManifest(manifest)
             return updated
         }
@@ -1527,7 +1865,7 @@ public final class FileOutbox {
             throw FileOutboxMailboxError.invalidDeliveryState
         }
         manifest.entries[index].deliveryState = updated
-        manifest.version = SequenceManifest.mailboxVersion
+        manifest.useMailboxVersion()
         try persistManifest(manifest)
         #if !HEALTH_BRIDGE_MAILBOX_QA
         switch updated.phase {
@@ -1550,13 +1888,14 @@ public final class FileOutbox {
         itemID: String,
         ownership: OutboxDeliveryOwnershipV1
     ) throws -> FileOutboxFinalizationRecord? {
+        let ownerID = try nutritionCollectionOwner(itemID)
         let transactions = try loadEnqueueTransactions()
         guard let transactionIndex = transactions.firstIndex(where: {
-            $0.entries.contains(where: { $0.id == itemID })
+            $0.entries.contains(where: { $0.id == ownerID })
         }) else {
             return nil
         }
-        guard transactionIndex == 0 else {
+        guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
@@ -1566,7 +1905,7 @@ public final class FileOutbox {
               }),
               finalizationRecord.cursorCheckpoint?.receiverIdentity
                 == ownership.receiverBindingID || finalizationRecord.cursorCheckpoint == nil,
-              transaction.entries.contains(where: { $0.id == itemID }) else {
+              transaction.entries.contains(where: { $0.id == ownerID }) else {
             return nil
         }
         let manifest = try reconciledManifest()
@@ -1577,6 +1916,7 @@ public final class FileOutbox {
         )
         guard transaction.entries.allSatisfy({
             states[$0.id] == .ackVerified || states[$0.id] == .committedFinalized
+                || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: true)
         }) else {
             return nil
         }
@@ -1612,6 +1952,9 @@ public final class FileOutbox {
         try persistManifest(manifest)
         try fault(.statePersisted)
         try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
+        if let identity = manifest.entries[index].receiverIdentity {
+            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: identity)
+        }
         return committed
     }
 
@@ -1656,7 +1999,8 @@ public final class FileOutbox {
                 ManifestVersion.self,
                 from: Data(contentsOf: manifestURL)
             )
-            if let header, header.version >= SequenceManifest.mailboxVersion {
+            if let header, header.version >= SequenceManifest.mailboxVersion,
+               header.version != SequenceManifest.nutritionDirectVersion {
                 return .hold(.v4Manifest)
             }
         }
@@ -1765,7 +2109,7 @@ public final class FileOutbox {
         manifest.entries[entryIndex].deliveryState = try Self.encryptedDeliveryState(
             manifest.entries[entryIndex].deliveryState
         )
-        manifest.version = SequenceManifest.mailboxVersion
+        manifest.useMailboxVersion()
         try persistManifest(manifest)
         if stopAfter == .manifestBound { return binding }
 
@@ -1821,7 +2165,7 @@ public final class FileOutbox {
         manifest.entries[entryIndex].deliveryState = try Self.encryptedDeliveryState(
             manifest.entries[entryIndex].deliveryState
         )
-        manifest.version = SequenceManifest.mailboxVersion
+        manifest.useMailboxVersion()
         try persistManifest(manifest)
         try removeIfExists(mailboxEnvelopeIntentURL)
     }
@@ -2063,7 +2407,8 @@ public final class FileOutbox {
                     id: id,
                     receiverIdentity: receiverIdentity,
                     mailboxBinding: nil,
-                    deliveryState: nil
+                    deliveryState: nil,
+                    nutritionOrderingVersion: 1
                 )
             )
             manifest.nextSequence = sequence + 1
@@ -2291,6 +2636,7 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
         var manifest = loadedManifest ?? .empty
@@ -2298,7 +2644,7 @@ public final class FileOutbox {
         if manifest.version < SequenceManifest.directOnlyVersion {
             manifest.version = SequenceManifest.directOnlyVersion
         }
-        if manifest.version == SequenceManifest.mailboxVersion {
+        if manifest.isMailbox {
             for index in manifest.entries.indices
                 where manifest.entries[index].deliveryState == nil {
                 manifest.entries[index].deliveryState = .stable(
@@ -2361,7 +2707,7 @@ public final class FileOutbox {
                     id: id,
                     receiverIdentity: nil,
                     mailboxBinding: nil,
-                    deliveryState: manifest.version == SequenceManifest.mailboxVersion
+                    deliveryState: manifest.isMailbox
                         ? .stable(.collected, ownership: nil)
                         : nil
                 )
@@ -2401,14 +2747,14 @@ public final class FileOutbox {
         let sequences = manifest.entries.map(\.sequence)
         let mailboxBindings = manifest.entries.compactMap(\.mailboxBinding)
         let deliveryStates = manifest.entries.compactMap(\.deliveryState)
-        guard (1 ... SequenceManifest.mailboxVersion).contains(manifest.version),
+        guard (1 ... SequenceManifest.nutritionMailboxVersion).contains(manifest.version),
               manifest.nextSequence > 0,
               ids.allSatisfy(isSafeItemID),
               Set(ids).count == ids.count,
               Set(sequences).count == sequences.count,
               sequences.allSatisfy({ $0 > 0 }),
               (sequences.max().map { manifest.nextSequence > $0 } ?? true),
-              (manifest.version == SequenceManifest.mailboxVersion
+              (manifest.isMailbox
                   ? !mailboxBindings.isEmpty || !deliveryStates.isEmpty
                   : mailboxBindings.isEmpty && deliveryStates.isEmpty),
               manifest.entries.allSatisfy({ entry in
@@ -2420,6 +2766,40 @@ public final class FileOutbox {
                   return bindingIsValid && deliveryStateIsValid(for: entry)
               }) else {
             throw SequenceError.invalidManifest
+        }
+        let splits = manifest.nutritionSplits ?? []
+        let parentIDs = Set(splits.map(\.parentID))
+        let childIDs = splits.flatMap { [$0.supportedID, $0.remainderID] }
+        guard splits.isEmpty || manifest.version >= SequenceManifest.nutritionDirectVersion,
+              parentIDs.count == splits.count,
+              Set(childIDs).count == childIDs.count,
+              parentIDs.isDisjoint(with: childIDs) else {
+            throw FileOutboxNutritionError.invalidSplit
+        }
+        for split in splits {
+            let parent = manifest.entries.first { $0.id == split.parentID }
+            guard isSafeItemID(split.parentID), !split.receiverIdentity.isEmpty,
+                  isSHA256(split.parentSHA256), isSHA256(split.supportedSHA256),
+                  isSHA256(split.remainderSHA256),
+                  split.retiringParent ? split.completed : parent?.receiverIdentity == split.receiverIdentity,
+                  parent?.mailboxBinding == nil,
+                  parent?.deliveryState == nil || parent?.deliveryState?.phase == .collected,
+                  (split.supportedPayload == nil) == (split.remainderPayload == nil),
+                  split.supportedPayload == nil || (!split.supportedAccepted && !split.remainderAccepted),
+                  split.cursors.allSatisfy({ !$0.sourceKey.isEmpty && !$0.cursorKind.isEmpty }) else {
+                throw FileOutboxNutritionError.invalidSplit
+            }
+            for (id, digest, accepted) in [
+                (split.supportedID, split.supportedSHA256, split.supportedAccepted),
+                (split.remainderID, split.remainderSHA256, split.remainderAccepted),
+            ] {
+                let child = manifest.entries.first { $0.id == id }
+                guard isSafeItemID(id),
+                      child?.receiverIdentity == split.receiverIdentity || (accepted && child == nil),
+                      child?.mailboxBinding?.payloadSHA256 == nil || child?.mailboxBinding?.payloadSHA256 == digest else {
+                    throw FileOutboxNutritionError.invalidSplit
+                }
+            }
         }
     }
 
@@ -2718,19 +3098,187 @@ public struct SleepSyncPendingTransition: Codable, Equatable, Sendable {
     }
 }
 
-public protocol SleepSyncManifestStoring {
+fileprivate struct SleepSyncFileRevision: Equatable, Sendable {
+    let number: UInt64?
+    let size: UInt64?
+    let modified: Date?
+    static let missing = SleepSyncFileRevision(number: nil, size: nil, modified: nil)
+}
+
+public struct SleepSyncStorageRevision: Equatable, Sendable {
+    fileprivate let files: [SleepSyncFileRevision]
+}
+
+public protocol SleepSyncManifestStoring: AnyObject {
     func loadManifest() throws -> SleepSyncManifest?
     func saveManifest(_ manifest: SleepSyncManifest) throws
     func loadPendingTransition() throws -> SleepSyncPendingTransition?
     func savePendingTransition(_ transition: SleepSyncPendingTransition) throws
     func clearPendingTransition(id: String) throws
     func resetSynchronizationState() throws
+    var recoveryMayBeNeeded: Bool { get }
+    func revisionForSync() throws -> SleepSyncStorageRevision
+    @MainActor func loadManifestForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncManifest?
+    @MainActor func loadPendingForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncPendingTransition?
+    @MainActor func saveManifestForSync(_ manifest: SleepSyncManifest, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
+    @MainActor func savePendingForSync(_ transition: SleepSyncPendingTransition, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
+    @MainActor func clearPendingForSync(id: String, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision
+}
+#endif
+
+public enum SleepSyncValueWork {
+    public static func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let work = Task.detached(priority: Task.currentPriority) {
+            try Task.checkCancellation()
+            let value = try operation()
+            try Task.checkCancellation()
+            return value
+        }
+        return try await withTaskCancellationHandler {
+            let value = try await work.value
+            try Task.checkCancellation()
+            return value
+        } onCancel: { work.cancel() }
+    }
 }
 
+#if !HEALTH_BRIDGE_MAILBOX_QA
 public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
+    enum CodecOperation: Hashable, Sendable {
+        case decodeManifest
+        case decodePending
+        case encodeManifest
+        case encodePending(tracked: Bool)
+    }
+
     private let fileURL: URL
     private let pendingTransitionFileURL: URL
     private let fileManager: FileManager
+    private var observeCodec: @Sendable (CodecOperation) -> Void = { _ in }
+    private typealias FileRevision = SleepSyncFileRevision
+    private var validatedManifest: FileRevision?
+    private var validatedPending: FileRevision?
+
+    private func revision(_ url: URL) throws -> FileRevision {
+        guard fileManager.fileExists(atPath: url.path) else { return .missing }
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        guard let number = attributes[.systemFileNumber] as? NSNumber,
+              let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return FileRevision(number: number.uint64Value, size: size.uint64Value, modified: modified)
+    }
+
+    private func revisions() throws -> [FileRevision] {
+        try [revision(fileURL), revision(pendingTransitionFileURL)]
+    }
+
+    public func revisionForSync() throws -> SleepSyncStorageRevision {
+        try SleepSyncStorageRevision(files: revisions())
+    }
+
+    public var recoveryMayBeNeeded: Bool {
+        guard let current = try? revisions(),
+              current[0] == validatedManifest, current[1] == validatedPending else { return true }
+        return current[1] != .missing
+    }
+
+    @MainActor
+    private func validateSnapshot(_ snapshot: [FileRevision], validate: @MainActor () throws -> Void) throws {
+        try Task.checkCancellation()
+        try validate()
+        guard try revisions() == snapshot else { throw CancellationError() }
+    }
+
+    @MainActor
+    public func loadManifestForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncManifest? {
+        let snapshot = try revisions()
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            try validateSnapshot(snapshot, validate: validate)
+            validatedManifest = .missing
+            return nil
+        }
+        let bytes = try Data(contentsOf: fileURL)
+        let observer = observeCodec
+        let value = try await SleepSyncValueWork.run {
+            observer(.decodeManifest)
+            return Result { try JSONDecoder().decode(SleepSyncManifest.self, from: bytes) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let decoded = try value.get()
+        validatedManifest = snapshot[0]
+        return decoded
+    }
+
+    @MainActor
+    public func loadPendingForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncPendingTransition? {
+        let snapshot = try revisions()
+        guard fileManager.fileExists(atPath: pendingTransitionFileURL.path) else {
+            try validateSnapshot(snapshot, validate: validate)
+            validatedPending = .missing
+            return nil
+        }
+        let bytes = try Data(contentsOf: pendingTransitionFileURL)
+        let observer = observeCodec
+        let value = try await SleepSyncValueWork.run {
+            observer(.decodePending)
+            return Result { try JSONDecoder().decode(SleepSyncPendingTransition.self, from: bytes) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let decoded = try value.get()
+        validatedPending = snapshot[1]
+        return decoded
+    }
+
+    @MainActor
+    public func saveManifestForSync(_ manifest: SleepSyncManifest, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision {
+        let snapshot = try revisions()
+        let observer = observeCodec
+        let encoded = try await SleepSyncValueWork.run {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            observer(.encodeManifest)
+            return Result { try encoder.encode(manifest) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let bytes = try encoded.get()
+        try bytes.write(to: fileURL, options: [.atomic])
+        try Self.applySensitiveFileAttributes(to: fileURL, permissions: 0o600, fileManager: fileManager)
+        validatedManifest = try revision(fileURL)
+        return try revisionForSync()
+    }
+
+    @MainActor
+    public func savePendingForSync(_ transition: SleepSyncPendingTransition, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision {
+        let snapshot = try revisions()
+        let observer = observeCodec
+        let encoded = try await SleepSyncValueWork.run {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            observer(.encodePending(tracked: transition.outboxItemID != nil))
+            return Result { try encoder.encode(transition) }
+        }
+        try validateSnapshot(snapshot, validate: validate)
+        let bytes = try encoded.get()
+        try bytes.write(to: pendingTransitionFileURL, options: [.atomic])
+        try Self.applySensitiveFileAttributes(to: pendingTransitionFileURL, permissions: 0o600, fileManager: fileManager)
+        validatedPending = try revision(pendingTransitionFileURL)
+        return try revisionForSync()
+    }
+
+    @MainActor
+    public func clearPendingForSync(id: String, validate: @MainActor () throws -> Void) async throws -> SleepSyncStorageRevision {
+        guard let pending = try await loadPendingForSync(validate: validate) else { return try revisionForSync() }
+        guard pending.id == id else { throw CocoaError(.fileWriteFileExists) }
+        try validate()
+        try fileManager.removeItem(at: pendingTransitionFileURL)
+        validatedPending = .missing
+        return try revisionForSync()
+    }
 
     public init(fileURL: URL, fileManager: FileManager = .default) throws {
         self.fileURL = fileURL
@@ -2759,15 +3307,26 @@ public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
         }
     }
 
+    convenience init(
+        fileURL: URL,
+        fileManager: FileManager = .default,
+        observeCodec: @escaping @Sendable (CodecOperation) -> Void
+    ) throws {
+        try self.init(fileURL: fileURL, fileManager: fileManager)
+        self.observeCodec = observeCodec
+    }
+
     public func loadManifest() throws -> SleepSyncManifest? {
         guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
         let data = try Data(contentsOf: fileURL)
+        observeCodec(.decodeManifest)
         return try JSONDecoder().decode(SleepSyncManifest.self, from: data)
     }
 
     public func saveManifest(_ manifest: SleepSyncManifest) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        observeCodec(.encodeManifest)
         let data = try encoder.encode(manifest)
         try data.write(to: fileURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(
@@ -2780,12 +3339,14 @@ public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
     public func loadPendingTransition() throws -> SleepSyncPendingTransition? {
         guard fileManager.fileExists(atPath: pendingTransitionFileURL.path) else { return nil }
         let data = try Data(contentsOf: pendingTransitionFileURL)
+        observeCodec(.decodePending)
         return try JSONDecoder().decode(SleepSyncPendingTransition.self, from: data)
     }
 
     public func savePendingTransition(_ transition: SleepSyncPendingTransition) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        observeCodec(.encodePending(tracked: transition.outboxItemID != nil))
         let data = try encoder.encode(transition)
         try data.write(to: pendingTransitionFileURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(
@@ -2804,6 +3365,7 @@ public final class FileSleepSyncManifestStore: SleepSyncManifestStoring {
     }
 
     public func resetSynchronizationState() throws {
+        defer { validatedManifest = nil; validatedPending = nil }
         if fileManager.fileExists(atPath: fileURL.path) {
             try fileManager.removeItem(at: fileURL)
         }
@@ -2888,41 +3450,41 @@ public enum SleepBaselineRejectionRecoveryError: Error, Equatable {
 }
 
 public enum SleepBaselineRejectionRecovery {
+    @MainActor
     public static func recover(
         itemID: String,
         minimumResetEpoch: UInt64,
         outbox: FileOutbox,
         manifestStore: SleepSyncManifestStoring,
-        epochStore: SleepResetEpochStore
-    ) throws {
-        guard var pendingTransition = try manifestStore.loadPendingTransition() else {
+        epochStore: SleepResetEpochStore,
+        validate: @escaping @MainActor () throws -> Void = {}
+    ) async throws {
+        var revision = try manifestStore.revisionForSync()
+        let items = try outbox.pendingItems()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try validate()
+            try outbox.requireUploadAdmission()
+            guard try manifestStore.revisionForSync() == revision,
+                  try outbox.pendingItems() == items else { throw CancellationError() }
+        }
+        guard var pending = try await manifestStore.loadPendingForSync(validate: check) else {
             throw SleepBaselineRejectionRecoveryError.missingPendingTransition
         }
-        var matchingItems = try matchingOutboxItems(
-            pendingTransition,
-            in: outbox
-        )
-        guard itemID.isEmpty
-            || pendingTransition.outboxItemID == itemID
-            || matchingItems.contains(where: { $0.id == itemID }) else {
+        var matching = try await matchingOutboxItems(pending, in: outbox, validate: check)
+        guard itemID.isEmpty || pending.outboxItemID == itemID
+                || matching.contains(where: { $0.id == itemID }) else {
             throw SleepBaselineRejectionRecoveryError.mismatchedOutboxItem
         }
-        if pendingTransition.outboxItemID == nil,
-           let rejectedItem = matchingItems.first(where: { $0.id == itemID }) {
-            pendingTransition = pendingTransition.assigningOutboxItemID(rejectedItem.id)
+        if pending.outboxItemID == nil, let rejected = matching.first(where: { $0.id == itemID }) {
+            pending = pending.assigningOutboxItemID(rejected.id)
         }
-        let rejectedTransition = pendingTransition.markingRejected(
-            minimumResetEpoch: max(
-                minimumResetEpoch,
-                pendingTransition.rejectedMinimumResetEpoch ?? 0
-            )
-        )
-        try manifestStore.savePendingTransition(rejectedTransition)
-        _ = try epochStore.reserveEpoch(
-            after: rejectedTransition.rejectedMinimumResetEpoch ?? 0
-        )
-        matchingItems = try matchingOutboxItems(rejectedTransition, in: outbox)
-        for item in matchingItems {
+        let rejected = pending.markingRejected(minimumResetEpoch: max(minimumResetEpoch, pending.rejectedMinimumResetEpoch ?? 0))
+        revision = try await manifestStore.savePendingForSync(rejected, validate: check)
+        try check()
+        _ = try epochStore.reserveEpoch(after: rejected.rejectedMinimumResetEpoch ?? 0)
+        matching = try await matchingOutboxItems(rejected, in: outbox, validate: check)
+        for item in matching {
             try outbox.markUploaded(item)
             #if !HEALTH_BRIDGE_MAILBOX_QA
             outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .rejected)
@@ -2931,19 +3493,25 @@ public enum SleepBaselineRejectionRecovery {
         try manifestStore.resetSynchronizationState()
     }
 
+    @MainActor
     private static func matchingOutboxItems(
-        _ pendingTransition: SleepSyncPendingTransition,
-        in outbox: FileOutbox
-    ) throws -> [FileOutboxItem] {
-        try outbox.pendingItems().filter { item in
-            if item.id == pendingTransition.outboxItemID {
-                return true
-            }
-            guard item.receiverIdentity == pendingTransition.receiverBindingID else {
-                return false
-            }
-            return try Data(contentsOf: item.fileURL) == pendingTransition.payload
+        _ pending: SleepSyncPendingTransition,
+        in outbox: FileOutbox,
+        validate: @MainActor () throws -> Void
+    ) async throws -> [FileOutboxItem] {
+        let items = try outbox.pendingItems()
+        let bytes = try items.map { item -> Data? in
+            guard item.id != pending.outboxItemID,
+                  item.receiverIdentity == pending.receiverBindingID else { return nil }
+            return try Data(contentsOf: item.fileURL)
         }
+        let matching = try await SleepSyncValueWork.run {
+            items.enumerated().compactMap { index, item in
+                item.id == pending.outboxItemID || bytes[index] == pending.payload ? item : nil
+            }
+        }
+        try validate()
+        return matching
     }
 }
 
@@ -3048,9 +3616,10 @@ struct SleepStorageOperationFailure: Error {
     let underlyingError: Error
 }
 
-func withSleepStorageOrigin<T>(_ operation: () throws -> T) throws -> T {
+@MainActor
+func withSleepStorageOrigin<T>(_ operation: @MainActor () async throws -> T) async throws -> T {
     do {
-        return try operation()
+        return try await operation()
     } catch let cancellation as CancellationError {
         throw cancellation
     } catch {
@@ -3068,6 +3637,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
     public let deviceCredential: String
     public let platform: String
     public let transport: ReceiverPairingTransport
+    public let mailboxBootstrap: MailboxBootstrapDescriptor?
+    public let expiresAt: String?
+    public let sealedRequest: Data?
+    public let nativeExpectedGeneration: String?
+    public let publicationMayHaveOccurred: Bool
+    public let nativeCancellationConfirmed: Bool
 
     public init(
         label: String,
@@ -3078,7 +3653,13 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         installationID: String,
         deviceCredential: String,
         platform: String,
-        transport: ReceiverPairingTransport = .direct
+        transport: ReceiverPairingTransport = .direct,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil,
+        sealedRequest: Data? = nil,
+        nativeExpectedGeneration: String? = nil,
+        publicationMayHaveOccurred: Bool = false,
+        nativeCancellationConfirmed: Bool = false
     ) {
         self.label = label
         self.receiverURLString = receiverURLString
@@ -3089,6 +3670,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         self.deviceCredential = deviceCredential
         self.platform = platform
         self.transport = transport
+        self.mailboxBootstrap = mailboxBootstrap
+        self.expiresAt = expiresAt
+        self.sealedRequest = sealedRequest
+        self.nativeExpectedGeneration = nativeExpectedGeneration
+        self.publicationMayHaveOccurred = publicationMayHaveOccurred
+        self.nativeCancellationConfirmed = nativeCancellationConfirmed
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -3102,6 +3689,8 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         case platform
         case transport
         case mailboxProtocolVersion
+        case mailboxBootstrap, expiresAt, sealedRequest, nativeExpectedGeneration
+        case publicationMayHaveOccurred, nativeCancellationConfirmed
     }
 
     public init(from decoder: Decoder) throws {
@@ -3122,6 +3711,12 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
             Int.self,
             forKey: .mailboxProtocolVersion
         )
+        mailboxBootstrap = try container.decodeIfPresent(MailboxBootstrapDescriptor.self, forKey: .mailboxBootstrap)
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+        sealedRequest = try container.decodeIfPresent(Data.self, forKey: .sealedRequest)
+        nativeExpectedGeneration = try container.decodeIfPresent(String.self, forKey: .nativeExpectedGeneration)
+        publicationMayHaveOccurred = try container.decodeIfPresent(Bool.self, forKey: .publicationMayHaveOccurred) ?? false
+        nativeCancellationConfirmed = try container.decodeIfPresent(Bool.self, forKey: .nativeCancellationConfirmed) ?? false
         switch (decodedTransport, legacyMailboxProtocolVersion) {
         case (.some(.direct), nil), (nil, nil):
             transport = .direct
@@ -3134,6 +3729,7 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
                 debugDescription: "Pending pairing transport is inconsistent."
             )
         }
+        try validateNativeState()
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -3147,6 +3743,14 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         try container.encode(deviceCredential, forKey: .deviceCredential)
         try container.encode(platform, forKey: .platform)
         try container.encode(transport, forKey: .transport)
+        if mailboxBootstrap != nil {
+            try container.encodeIfPresent(mailboxBootstrap, forKey: .mailboxBootstrap)
+            try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
+            try container.encodeIfPresent(sealedRequest, forKey: .sealedRequest)
+            try container.encodeIfPresent(nativeExpectedGeneration, forKey: .nativeExpectedGeneration)
+            try container.encode(publicationMayHaveOccurred, forKey: .publicationMayHaveOccurred)
+            try container.encode(nativeCancellationConfirmed, forKey: .nativeCancellationConfirmed)
+        }
         if transport == .mailbox {
             try container.encode(1, forKey: .mailboxProtocolVersion)
         }
@@ -3157,20 +3761,67 @@ public struct ReceiverPendingPairing: Codable, Equatable, Sendable {
         redeemURLString: String,
         invitationSecret: String?,
         invitationCode: String?,
-        transport: ReceiverPairingTransport = .direct
+        transport: ReceiverPairingTransport = .direct,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil
     ) -> Bool {
         self.receiverURLString == receiverURLString
             && self.redeemURLString == redeemURLString
             && self.invitationSecret == invitationSecret
             && self.invitationCode == invitationCode
             && self.transport == transport
+            && self.mailboxBootstrap == mailboxBootstrap
+            && self.expiresAt == expiresAt
             && platform == "ios"
+    }
+
+    func validateNativeState() throws {
+        guard mailboxBootstrap != nil else {
+            guard expiresAt == nil, sealedRequest == nil, nativeExpectedGeneration == nil,
+                  !publicationMayHaveOccurred, !nativeCancellationConfirmed else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+            return
+        }
+        guard transport == .mailbox, receiverURLString.isEmpty, redeemURLString.isEmpty,
+              invitationCode == nil, let secret = invitationSecret, !secret.isEmpty,
+              platform == "ios", secret.utf8.count <= 65_536,
+              let installation = UUID(uuidString: installationID), installation.uuidString.lowercased() == installationID,
+              (installation.uuid.6 >> 4) == 4, (installation.uuid.8 & 0xc0) == 0x80,
+              deviceCredential.hasPrefix("hb_"), deviceCredential.utf8.count >= 46, deviceCredential.utf8.count <= 256,
+              deviceCredential.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0)
+                || (48...57).contains($0) || $0 == 45 || $0 == 95 }),
+              let expiresAt, ISO8601DateFormatter().date(from: expiresAt) != nil,
+              (sealedRequest == nil) == (nativeExpectedGeneration == nil),
+              !publicationMayHaveOccurred || sealedRequest != nil else {
+            throw ReceiverPairingRedeemError.invalidResponse
+        }
+        if let sealedRequest {
+            guard let generation = nativeExpectedGeneration, generation.hasPrefix("g"),
+                  let number = UInt64(generation.dropFirst()), "g\(number)" == generation, number <= UInt64(Int.max),
+                  !sealedRequest.isEmpty, sealedRequest.count <= 65_536 else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+        }
+    }
+
+    func nativeState(
+        request: Data?, generation: String?, published: Bool, cancelled: Bool
+    ) -> ReceiverPendingPairing {
+        ReceiverPendingPairing(label: label, receiverURLString: receiverURLString,
+            redeemURLString: redeemURLString, invitationSecret: invitationSecret,
+            invitationCode: invitationCode, installationID: installationID,
+            deviceCredential: deviceCredential, platform: platform, transport: transport,
+            mailboxBootstrap: mailboxBootstrap, expiresAt: expiresAt, sealedRequest: request,
+            nativeExpectedGeneration: generation, publicationMayHaveOccurred: published,
+            nativeCancellationConfirmed: cancelled)
     }
 }
 
 public enum ReceiverPairingStateError: LocalizedError, Equatable {
     case pendingPairingConflict
     case legacyCancellationRequiresRetry
+    case nativeCancellationRequiresReceipt
 
     public var errorDescription: String? {
         switch self {
@@ -3178,6 +3829,8 @@ public enum ReceiverPairingStateError: LocalizedError, Equatable {
             "A different pairing is already pending. Resume or cancel it before starting another pairing."
         case .legacyCancellationRequiresRetry:
             "A cancellation from an older app version has unknown connection scope. Confirm Cancel Pending Pairing again to clear it safely."
+        case .nativeCancellationRequiresReceipt:
+            "Mailbox cancellation is pending receiver confirmation. Resume it before clearing pending pairing."
         }
     }
 }
@@ -3212,13 +3865,15 @@ public final class ReceiverPairingStateStore {
     }
 
     public func stage(invitation: ReceiverPairingInvitation) throws -> ReceiverPendingPairing {
-        try stage(
+        return try stage(
             label: invitation.label,
             receiverURLString: invitation.receiverURLString,
             redeemURLString: invitation.redeemURLString,
             invitationSecret: invitation.invitationSecret,
             invitationCode: nil,
-            transport: invitation.transport
+            transport: invitation.transport,
+            mailboxBootstrap: invitation.mailboxBootstrap,
+            expiresAt: invitation.mailboxBootstrap == nil ? nil : invitation.expiresAt
         )
     }
 
@@ -3240,11 +3895,23 @@ public final class ReceiverPairingStateStore {
     }
 
     public func clearPending() throws {
+        if let pending = try loadPending(), pending.mailboxBootstrap != nil,
+           pending.publicationMayHaveOccurred, !pending.nativeCancellationConfirmed {
+            throw ReceiverPairingStateError.nativeCancellationRequiresReceipt
+        }
+        try pendingStore.saveToken("")
+    }
+
+    func clearCommittedNativePending(_ pending: ReceiverPendingPairing) throws {
+        guard pending.mailboxBootstrap != nil, pending.publicationMayHaveOccurred,
+              try loadPending() == pending, try !hasPendingCancellation() else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
         try pendingStore.saveToken("")
     }
 
     public func resetPrivatePairingState() throws {
-        try clearPending()
+        try pendingStore.saveToken("")
         try finishPendingCancellation()
     }
 
@@ -3289,7 +3956,9 @@ public final class ReceiverPairingStateStore {
         redeemURLString: String,
         invitationSecret: String?,
         invitationCode: String?,
-        transport: ReceiverPairingTransport
+        transport: ReceiverPairingTransport,
+        mailboxBootstrap: MailboxBootstrapDescriptor? = nil,
+        expiresAt: String? = nil
     ) throws -> ReceiverPendingPairing {
         guard try !hasPendingCancellation() else {
             throw ReceiverPairingStateError.pendingPairingConflict
@@ -3300,11 +3969,26 @@ public final class ReceiverPairingStateStore {
                 redeemURLString: redeemURLString,
                 invitationSecret: invitationSecret,
                 invitationCode: invitationCode,
-                transport: transport
+                transport: transport,
+                mailboxBootstrap: mailboxBootstrap,
+                expiresAt: expiresAt
             ) else {
                 throw ReceiverPairingStateError.pendingPairingConflict
             }
             return existing
+        }
+        if let mailboxBootstrap {
+            guard transport == .mailbox, receiverURLString.isEmpty, redeemURLString.isEmpty,
+                  let secret = invitationSecret, !secret.isEmpty, secret.utf8.count <= 65_536, invitationCode == nil,
+                  let expiresAt, let expiry = ISO8601DateFormatter().date(from: expiresAt), expiry > Date(),
+                  let publicKey = Data(strictBase64URL: mailboxBootstrap.receiverAgreementPublicKey, count: 32) else {
+                throw ReceiverPairingRedeemError.invitationInvalid
+            }
+            // Reject low-order peer keys without touching the local key store.
+            do {
+                _ = try Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(
+                    with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey))
+            } catch { throw ReceiverPairingRedeemError.invalidResponse }
         }
         let installationID = try loadOrCreateInstallationID()
         let pending = ReceiverPendingPairing(
@@ -3316,14 +4000,53 @@ public final class ReceiverPairingStateStore {
             installationID: installationID,
             deviceCredential: deviceCredentialGenerator(),
             platform: "ios",
-            transport: transport
+            transport: transport,
+            mailboxBootstrap: mailboxBootstrap,
+            expiresAt: expiresAt
         )
+        try persistPending(pending)
+        return pending
+    }
+
+    func saveNativeRequest(_ bytes: Data, for pending: ReceiverPendingPairing, generation: String) throws -> ReceiverPendingPairing {
+        guard pending.mailboxBootstrap != nil, pending.sealedRequest == nil,
+              try loadPending() == pending, try !hasPendingCancellation() else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        let updated = pending.nativeState(request: bytes, generation: generation, published: false, cancelled: false)
+        try persistPending(updated)
+        return updated
+    }
+
+    func markNativePublication(_ pending: ReceiverPendingPairing) throws -> ReceiverPendingPairing {
+        guard pending.mailboxBootstrap != nil, pending.sealedRequest != nil,
+              try loadPending() == pending, try !hasPendingCancellation(), !pending.nativeCancellationConfirmed else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        if pending.publicationMayHaveOccurred { return pending }
+        let updated = pending.nativeState(request: pending.sealedRequest, generation: pending.nativeExpectedGeneration,
+            published: true, cancelled: false)
+        try persistPending(updated)
+        return updated
+    }
+
+    func confirmNativeCancellation(_ pending: ReceiverPendingPairing) throws -> ReceiverPendingPairing {
+        guard pending.mailboxBootstrap != nil, try loadPending() == pending else {
+            throw ReceiverPairingStateError.pendingPairingConflict
+        }
+        let updated = pending.nativeState(request: pending.sealedRequest, generation: pending.nativeExpectedGeneration,
+            published: pending.publicationMayHaveOccurred, cancelled: true)
+        try persistPending(updated)
+        return updated
+    }
+
+    private func persistPending(_ pending: ReceiverPendingPairing) throws {
+        try pending.validateNativeState()
         let encoded = try JSONEncoder().encode(pending)
         guard let string = String(data: encoded, encoding: .utf8) else {
             throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
         try pendingStore.saveToken(string)
-        return pending
     }
 }
 
@@ -3352,12 +4075,14 @@ public enum ReceiverOutboxAdmissionPolicy {
     public static func isReady(
         pendingReceiverIdentities: [String?],
         currentBindingID: String?,
-        hasBearerToken: Bool
+        hasBearerToken: Bool,
+        committedMailboxBindingID: String? = nil
     ) -> Bool {
-        if let currentBindingID, hasBearerToken {
+        if let currentBindingID,
+           hasBearerToken || (!currentBindingID.isEmpty && committedMailboxBindingID == currentBindingID) {
             return pendingReceiverIdentities.allSatisfy { $0 == currentBindingID }
         }
-        guard currentBindingID == nil, !hasBearerToken else {
+        guard currentBindingID == nil, !hasBearerToken, committedMailboxBindingID == nil else {
             return false
         }
         return pendingReceiverIdentities.isEmpty
@@ -3827,8 +4552,13 @@ public final class ReceiverSettingsStore {
 
     public var receiverURLString: String {
         if let stored = try? loadStoredConnectionRecord() {
-            return directHTTPConfiguration(in: stored)?.receiverURLString
-                ?? Self.defaultReceiverURLString
+            if let direct = directHTTPConfiguration(in: stored) {
+                return direct.receiverURLString
+            }
+            if case .v2(let record) = stored, isPairedMailbox(record) {
+                return ""
+            }
+            return Self.defaultReceiverURLString
         }
         return userDefaults.string(forKey: receiverURLKey) ?? Self.defaultReceiverURLString
     }
@@ -3846,9 +4576,13 @@ public final class ReceiverSettingsStore {
 
     public var receiverBindingID: String? {
         guard let stored = try? loadStoredConnectionRecord(),
-              let direct = directHTTPConfiguration(in: stored),
-              !direct.bearerToken.isEmpty,
               !localScope(in: stored).bindingID.isEmpty else {
+            return nil
+        }
+        if case .v2(let record) = stored, isPairedMailbox(record) {
+            return record.localScope.bindingID
+        }
+        guard directHTTPConfiguration(in: stored)?.bearerToken.isEmpty == false else {
             return nil
         }
         return localScope(in: stored).bindingID
@@ -3871,7 +4605,8 @@ public final class ReceiverSettingsStore {
                 try restorePreCutoverV1IfExactMatch(current)
                 record = current
             }
-            return directHTTPConfiguration(in: record)?.bearerToken.isEmpty == false
+            return (isPairedMailbox(record)
+                || directHTTPConfiguration(in: record)?.bearerToken.isEmpty == false)
                 ? record.localScope.bindingID
                 : nil
         }
@@ -3980,6 +4715,64 @@ public final class ReceiverSettingsStore {
             ]
         )
         try persist(record)
+    }
+
+    func requireNativePairingAdmission(expectedGeneration: String) throws {
+        let record = try authoritativeRecordForMutation()
+        guard terminalCancellationExpectedGeneration == nil else { throw CancellationError() }
+        guard "g\(record.localScope.generation)" == expectedGeneration else { throw ReceiverSettingsGenerationError.staleGeneration }
+        guard record.activation != .paired(activeTransport: .mailbox) else {
+            throw ReceiverSettingsRecordError.transportSwitchRequiresCommittedEmptyOutbox
+        }
+    }
+
+    func requireNativePairingAuthority(_ identity: MailboxConnectionIdentityV1, generation: String) throws {
+        let record = try authoritativeRecordForMutation()
+        if "g\(record.localScope.generation)" == generation, record.activation != .paired(activeTransport: .mailbox) { return }
+        guard try nativePairingWasCommitted(identity, generation: generation) else { throw ReceiverSettingsGenerationError.staleGeneration }
+    }
+
+    func nativePairingWasCommitted(_ identity: MailboxConnectionIdentityV1, generation: String) throws -> Bool {
+        let record = try authoritativeRecordForMutation()
+        guard let prior = Self.nativePairingGeneration(generation), prior < UInt64(Int.max) else { return false }
+        return record.activation == .paired(activeTransport: .mailbox)
+            && record.mailboxIdentity == .available(identity)
+            && record.localScope.bindingID == identity.opaqueBinding
+            && record.localScope.generation == prior + 1
+    }
+
+    func saveNativeMailboxPairing(_ identity: MailboxConnectionIdentityV1, expectedGeneration: String) throws {
+        guard terminalCancellationExpectedGeneration == nil else { throw CancellationError() }
+        if try nativePairingWasCommitted(identity, generation: expectedGeneration) { return }
+        let previous = try authoritativeRecordForMutation()
+        guard "g\(previous.localScope.generation)" == expectedGeneration else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
+        guard previous.activation != .paired(activeTransport: .mailbox) else {
+            throw ReceiverSettingsRecordError.transportSwitchRequiresCommittedEmptyOutbox
+        }
+        var configurations: [ReceiverTransportConfigurationV1] = []
+        if let direct = directHTTPConfiguration(in: previous) {
+            configurations.append(.directHTTP(activation: .inactive, configuration: direct))
+        }
+        configurations.append(.mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1()))
+        let record = ReceiverConnectionRecordV2(
+            localScope: ReceiverLocalConnectionScopeV1(
+                generation: try Self.nextGeneration(after: previous.localScope.generation), bindingID: identity.opaqueBinding),
+            mailboxIdentity: .available(identity), activation: .paired(activeTransport: .mailbox),
+            transportConfigurations: configurations)
+        try persist(record)
+    }
+
+    func clearCancelledNativePairing(_ identity: MailboxConnectionIdentityV1, generation: String) throws {
+        // Never clear a pre-existing or later connection on behalf of an old request.
+        guard try nativePairingWasCommitted(identity, generation: generation) else { return }
+        try clearReceiverSettingsForTerminalCancellation(expectedGeneration: receiverSettingsGenerationToken)
+    }
+
+    private static func nativePairingGeneration(_ token: String) -> UInt64? {
+        guard token.hasPrefix("g"), let value = UInt64(token.dropFirst()), "g\(value)" == token else { return nil }
+        return value
     }
 
     public func saveMailboxPairing(
@@ -4551,6 +5344,16 @@ public final class ReceiverSettingsStore {
                 throw ReceiverSettingsRecordError.invalidRecord
             }
         }
+    }
+
+    // Call only after stored-record validation, which checks identity keys,
+    // a nonempty binding and exactly one matching active configuration.
+    private func isPairedMailbox(_ record: ReceiverConnectionRecordV2) -> Bool {
+        guard record.activation == .paired(activeTransport: .mailbox),
+              case .available = record.mailboxIdentity else {
+            return false
+        }
+        return true
     }
 
     private func localScope(in stored: StoredConnectionRecord) -> ReceiverLocalConnectionScopeV1 {

@@ -44,7 +44,7 @@ TIMESERIES_SQL: Final = (
     "and projection.client_record_id=samples.client_record_id "
     "where samples.type_code in ({placeholders}) "
     "and samples.start_time >= ? and samples.start_time < ? "
-    "order by samples.start_time, samples.type_code "
+    "order by samples.start_time, samples.type_code, samples.sample_id "
     "limit ?"
 )
 

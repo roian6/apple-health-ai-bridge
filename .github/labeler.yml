@@ -1,0 +1,39 @@
+version: v1
+
+# Append-only area fallback: CodeRabbit owns automatic primary-type classification.
+labels:
+  - label: 'area: ios'
+    matcher:
+      title: '^[a-z]+\(ios\)!?:'
+      body: '(?:^|\r?\n)### (?:Affected area|Setup flow)\r?\n[\t \r\n]*(?:iOS app or HealthKit|App Store installation|iOS self-build|TestFlight installation|Apple Health permission|Foreground sync)(?:\r?\n|$)'
+      files: ['ios/**']
+  - label: 'area: receiver'
+    matcher:
+      title: '^[a-z]+\((?:receiver|mailbox|macos|pairing)\)!?:'
+      body: '(?:^|\r?\n)### (?:Affected area|Setup flow)\r?\n[\t \r\n]*(?:Receiver or pairing|Local or private receiver setup|Pairing or setup page)(?:\r?\n|$)'
+      files:
+        - 'macos/**'
+        - 'src/health_bridge/{receiver,mailbox,mailbox_qa}/**'
+        - 'src/health_bridge/{_mailbox*,mailbox*,cli_receiver*,cli_mailbox*,cli_setup*}.py'
+        - 'tests/{receiver,mailbox*,macos}/**'
+        - 'tests/**/test_{receiver,mailbox,pairing,launchd}*.py'
+  - label: 'area: mcp'
+    matcher:
+      title: '^[a-z]+\(mcp\)!?:'
+      body: '(?:^|\r?\n)### (?:Affected area|Setup flow)\r?\n[\t \r\n]*(?:MCP queries|MCP client setup)(?:\r?\n|$)'
+      files: ['src/health_bridge/mcp/**', 'src/health_bridge/cli_mcp.py', 'tests/mcp/**', 'tests/**/test_mcp*.py', 'server.json']
+  - label: 'area: python'
+    matcher:
+      title: '^[a-z]+\((?:python|cli|storage)\)!?:'
+      body: '(?:^|\r?\n)### Affected area\r?\n[\t \r\n]*Python CLI or package(?:\r?\n|$)'
+      files: ['src/**', 'tests/**', 'fixtures/**', 'fuzz/**', 'scripts/fuzz/**', 'typings/**', 'pyproject.toml', 'uv.lock', 'build-constraints.txt', '.github/release/build-constraints.txt', '.python-version']
+  - label: 'area: docs'
+    matcher:
+      title: '^(docs(\([^\r\n)]+\))?!?:|[a-z]+\(docs\)!?:)'
+      body: '(?:^|\r?\n)### (?:Affected area|Setup flow)\r?\n[\t \r\n]*(?:Documentation or setup|README synthetic quickstart|Documentation or positioning)(?:\r?\n|$)'
+      files: ['docs/**', 'assets/**', '**/*.md', '.github/{CONTRIBUTING,SECURITY,SUPPORT}.md', 'LICENSE']
+  - label: 'area: ci'
+    matcher:
+      title: '^[a-z]+\((?:ci|release|github)\)!?:'
+      body: '(?:^|\r?\n)### Affected area\r?\n[\t \r\n]*Release or CI(?:\r?\n|$)'
+      files: ['.github/**', 'scripts/**', 'tools/**', '.gitleaks.toml', '.gitignore']

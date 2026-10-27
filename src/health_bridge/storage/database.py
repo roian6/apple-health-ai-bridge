@@ -34,6 +34,10 @@ from health_bridge.storage._database_migrations import (
     migration_was_applied as _migration_was_applied,
 )
 from health_bridge.storage._migration_backup_files import DELIVERY_RECEIPT_MIGRATION_ID
+from health_bridge.storage._query_database import (
+    DatabaseReadError,
+    connect_query_database,
+)
 
 __all__ = [
     "connect_database",
@@ -56,6 +60,8 @@ MIGRATION_IDS: Final = (
     "009_pairing_transport",
     "010_daily_projection_state",
     "011_daily_projection_fence_order",
+    "012_catalogue_coverage_index",
+    "013_mailbox_enrollment",
 )
 
 
@@ -192,3 +198,21 @@ def _apply_post_receipt_migrations(
         if _migration_was_applied(connection, migration_id):
             continue
         _apply_migration(connection, migration_id, db_path)
+
+
+@contextmanager
+def connect_live_readonly_database(
+    db_path: Path,
+) -> Generator[sqlite3.Connection, None, None]:
+    """Use the current shared, read-only query owner for bootstrap reads."""
+    try:
+        with connect_query_database(db_path) as connection:
+            yield connection
+    except DatabaseReadError as exc:
+        if isinstance(exc.__cause__, BlockingIOError):
+            raise exc.__cause__ from exc
+        if isinstance(exc.__cause__, sqlite3.OperationalError) and getattr(
+            exc.__cause__, "sqlite_errorcode", None
+        ) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            raise exc.__cause__ from exc
+        raise

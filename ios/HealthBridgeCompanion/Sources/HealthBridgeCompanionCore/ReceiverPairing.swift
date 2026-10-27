@@ -102,7 +102,49 @@ public struct ReceiverPairingBundle: Equatable, Sendable {
     }
 }
 
-public struct ReceiverPairingInvitation: Equatable, Sendable {
+public struct MailboxBootstrapDescriptor: Codable, Equatable, Sendable {
+    public let version: Int
+    public let invitationID: String
+    public let receiverSigningPublicKey: String
+    public let receiverAgreementPublicKey: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case version
+        case invitationID = "invitation_id"
+        case receiverSigningPublicKey = "receiver_signing_public_key"
+        case receiverAgreementPublicKey = "receiver_agreement_public_key"
+    }
+
+    private struct FieldKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: FieldKey.self)
+        guard Set(fields.allKeys.map(\.stringValue)) == Set(CodingKeys.allCases.map(\.rawValue)) else {
+            throw ReceiverPairingBundleError.invalidJSON
+        }
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        invitationID = try values.decode(String.self, forKey: .invitationID)
+        receiverSigningPublicKey = try values.decode(String.self, forKey: .receiverSigningPublicKey)
+        receiverAgreementPublicKey = try values.decode(String.self, forKey: .receiverAgreementPublicKey)
+        guard version == 1,
+              invitationID.utf8.count == 32,
+              let identifier = Data(hexV1: invitationID),
+              identifier.hexV1 == invitationID,
+              Data(strictBase64URL: receiverSigningPublicKey, count: 32) != nil,
+              Data(strictBase64URL: receiverAgreementPublicKey, count: 32) != nil else {
+            throw ReceiverPairingBundleError.invalidJSON
+        }
+    }
+}
+
+public struct ReceiverPairingInvitation: Codable, Equatable, Sendable {
     public static let supportedSchemaID = "health_bridge.receiver_pairing_invitation.v2"
     public static let supportedSchemaVersion = "2.0.0"
 
@@ -115,8 +157,9 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
     public let expiresAt: String
     public let transport: ReceiverPairingTransport
     public let mailboxProtocolVersion: Int?
-    public let receiverURL: URL
-    public let redeemURL: URL
+    public let mailboxBootstrap: MailboxBootstrapDescriptor?
+    public let receiverURL: URL?
+    public let redeemURL: URL?
 
     public init(jsonData: Data) throws {
         let payload: InvitationPairingPayload
@@ -125,6 +168,29 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         } catch {
             throw ReceiverPairingBundleError.invalidJSON
         }
+        try self.init(payload: payload)
+    }
+
+    public init(from decoder: Decoder) throws {
+        try self.init(payload: InvitationPairingPayload(from: decoder))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try InvitationPairingPayload(
+            schemaID: schemaID,
+            schemaVersion: schemaVersion,
+            label: label,
+            receiverURL: mailboxBootstrap == nil ? receiverURLString : nil,
+            redeemURL: mailboxBootstrap == nil ? redeemURLString : nil,
+            invitationSecret: invitationSecret,
+            expiresAt: expiresAt,
+            transport: transport,
+            mailboxProtocolVersion: mailboxProtocolVersion,
+            mailboxBootstrap: mailboxBootstrap
+        ).encode(to: encoder)
+    }
+
+    private init(payload: InvitationPairingPayload) throws {
         guard payload.schemaID == Self.supportedSchemaID,
               payload.schemaVersion == Self.supportedSchemaVersion else {
             throw ReceiverPairingBundleError.unsupportedSchema
@@ -138,10 +204,28 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         default:
             throw ReceiverPairingBundleError.unsupportedTransport
         }
-        let receiverURL = try validatedHTTPURL(payload.receiverURL)
-        let redeemURL = try validatedHTTPURL(payload.redeemURL)
-        guard urlOrigin(receiverURL) == urlOrigin(redeemURL) else {
-            throw ReceiverPairingBundleError.crossOriginRedeemURL
+        let receiverURL: URL?
+        let redeemURL: URL?
+        if payload.mailboxBootstrap != nil {
+            guard transport == .mailbox,
+                  payload.receiverURL == nil,
+                  payload.redeemURL == nil else {
+                throw ReceiverPairingBundleError.unsupportedTransport
+            }
+            receiverURL = nil
+            redeemURL = nil
+        } else {
+            guard let receiverString = payload.receiverURL,
+                  let redeemString = payload.redeemURL else {
+                throw ReceiverPairingBundleError.invalidJSON
+            }
+            let validatedReceiver = try validatedHTTPURL(receiverString)
+            let validatedRedeem = try validatedHTTPURL(redeemString)
+            guard urlOrigin(validatedReceiver) == urlOrigin(validatedRedeem) else {
+                throw ReceiverPairingBundleError.crossOriginRedeemURL
+            }
+            receiverURL = validatedReceiver
+            redeemURL = validatedRedeem
         }
         guard !payload.invitationSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ReceiverPairingBundleError.emptyInvitationSecret
@@ -149,12 +233,13 @@ public struct ReceiverPairingInvitation: Equatable, Sendable {
         self.schemaID = payload.schemaID
         self.schemaVersion = payload.schemaVersion
         self.label = payload.label
-        self.receiverURLString = payload.receiverURL
-        self.redeemURLString = payload.redeemURL
+        self.receiverURLString = payload.receiverURL ?? ""
+        self.redeemURLString = payload.redeemURL ?? ""
         self.invitationSecret = payload.invitationSecret
         self.expiresAt = payload.expiresAt
         self.transport = transport
         self.mailboxProtocolVersion = payload.mailboxProtocolVersion
+        self.mailboxBootstrap = payload.mailboxBootstrap
         self.receiverURL = receiverURL
         self.redeemURL = redeemURL
     }
@@ -302,16 +387,17 @@ private struct LegacyPairingPayload: Decodable {
     }
 }
 
-private struct InvitationPairingPayload: Decodable {
+private struct InvitationPairingPayload: Codable {
     let schemaID: String
     let schemaVersion: String
     let label: String
-    let receiverURL: String
-    let redeemURL: String
+    let receiverURL: String?
+    let redeemURL: String?
     let invitationSecret: String
     let expiresAt: String
     let transport: ReceiverPairingTransport?
     let mailboxProtocolVersion: Int?
+    let mailboxBootstrap: MailboxBootstrapDescriptor?
 
     enum CodingKeys: String, CodingKey {
         case schemaID = "schema_id"
@@ -323,6 +409,7 @@ private struct InvitationPairingPayload: Decodable {
         case expiresAt = "expires_at"
         case transport
         case mailboxProtocolVersion = "mailbox_protocol_version"
+        case mailboxBootstrap = "mailbox_bootstrap"
     }
 }
 

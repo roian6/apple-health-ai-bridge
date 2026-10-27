@@ -1,6 +1,6 @@
-# Public preview QA
+# Public release QA
 
-Use this guide to check a public developer-preview build without exposing private health data or receiver credentials.
+Use this guide to check a public release candidate without exposing private health data or receiver credentials.
 
 ## Synthetic quickstart
 
@@ -8,12 +8,12 @@ Run this first on a fresh checkout. It uses only synthetic fixture data.
 
 ```bash
 uv sync --all-extras --dev
-uv run health-bridge init --db .tmp/qa-public-preview.sqlite
+uv run health-bridge init --db .tmp/qa-public-release.sqlite
 uv run health-bridge ingest-fixture \
-  --db .tmp/qa-public-preview.sqlite \
+  --db .tmp/qa-public-release.sqlite \
   --input fixtures/health_bridge_batch_v1.synthetic.json
-uv run health-bridge status --db .tmp/qa-public-preview.sqlite --markdown
-uv run health-bridge mcp smoke --db .tmp/qa-public-preview.sqlite
+uv run health-bridge status --db .tmp/qa-public-release.sqlite --markdown
+uv run health-bridge mcp smoke --db .tmp/qa-public-release.sqlite
 ```
 
 Pass condition:

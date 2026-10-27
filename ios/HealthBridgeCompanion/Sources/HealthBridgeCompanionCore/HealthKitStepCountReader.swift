@@ -390,7 +390,7 @@ public final class HealthKitWorkoutReader: @unchecked Sendable {
     }
 }
 
-private func workoutSummary(for workout: HKWorkout) -> HealthKitWorkoutSummary {
+func workoutSummary(for workout: HKWorkout) -> HealthKitWorkoutSummary {
     HealthKitWorkoutSummary(
         uuid: workout.uuid,
         workoutType: workoutTypeString(for: workout.workoutActivityType),
@@ -424,6 +424,10 @@ private func activeEnergyKcal(for workout: HKWorkout) -> Double? {
 }
 
 private func workoutTypeString(for activityType: HKWorkoutActivityType) -> String {
+    if #available(iOS 17.0, macOS 14.0, *), activityType == .underwaterDiving {
+        return "underwater_diving"
+    }
+
     switch activityType {
     case .running:
         return "running"
@@ -455,8 +459,144 @@ private func workoutTypeString(for activityType: HKWorkoutActivityType) -> Strin
         return "dance"
     case .mindAndBody:
         return "mind_and_body"
-    default:
+    case .americanFootball:
+        return "american_football"
+    case .archery:
+        return "archery"
+    case .australianFootball:
+        return "australian_football"
+    case .badminton:
+        return "badminton"
+    case .baseball:
+        return "baseball"
+    case .basketball:
+        return "basketball"
+    case .bowling:
+        return "bowling"
+    case .boxing:
+        return "boxing"
+    case .climbing:
+        return "climbing"
+    case .cricket:
+        return "cricket"
+    case .crossTraining:
+        return "cross_training"
+    case .curling:
+        return "curling"
+    case .danceInspiredTraining:
+        return "dance_inspired_training"
+    case .equestrianSports:
+        return "equestrian_sports"
+    case .fencing:
+        return "fencing"
+    case .fishing:
+        return "fishing"
+    case .golf:
+        return "golf"
+    case .gymnastics:
+        return "gymnastics"
+    case .handball:
+        return "handball"
+    case .hockey:
+        return "hockey"
+    case .hunting:
+        return "hunting"
+    case .lacrosse:
+        return "lacrosse"
+    case .martialArts:
+        return "martial_arts"
+    case .mixedMetabolicCardioTraining:
+        return "mixed_metabolic_cardio_training"
+    case .paddleSports:
+        return "paddle_sports"
+    case .play:
+        return "play"
+    case .preparationAndRecovery:
+        return "preparation_and_recovery"
+    case .racquetball:
+        return "racquetball"
+    case .rugby:
+        return "rugby"
+    case .sailing:
+        return "sailing"
+    case .skatingSports:
+        return "skating_sports"
+    case .snowSports:
+        return "snow_sports"
+    case .soccer:
+        return "soccer"
+    case .softball:
+        return "softball"
+    case .squash:
+        return "squash"
+    case .stairClimbing:
+        return "stair_climbing"
+    case .surfingSports:
+        return "surfing_sports"
+    case .tableTennis:
+        return "table_tennis"
+    case .tennis:
+        return "tennis"
+    case .trackAndField:
+        return "track_and_field"
+    case .volleyball:
+        return "volleyball"
+    case .waterFitness:
+        return "water_fitness"
+    case .waterPolo:
+        return "water_polo"
+    case .waterSports:
+        return "water_sports"
+    case .wrestling:
+        return "wrestling"
+    case .barre:
+        return "barre"
+    case .crossCountrySkiing:
+        return "cross_country_skiing"
+    case .downhillSkiing:
+        return "downhill_skiing"
+    case .flexibility:
+        return "flexibility"
+    case .jumpRope:
+        return "jump_rope"
+    case .kickboxing:
+        return "kickboxing"
+    case .snowboarding:
+        return "snowboarding"
+    case .stairs:
+        return "stairs"
+    case .stepTraining:
+        return "step_training"
+    case .wheelchairWalkPace:
+        return "wheelchair_walk_pace"
+    case .wheelchairRunPace:
+        return "wheelchair_run_pace"
+    case .taiChi:
+        return "tai_chi"
+    case .mixedCardio:
+        return "mixed_cardio"
+    case .handCycling:
+        return "hand_cycling"
+    case .discSports:
+        return "disc_sports"
+    case .fitnessGaming:
+        return "fitness_gaming"
+    case .cardioDance:
+        return "cardio_dance"
+    case .socialDance:
+        return "social_dance"
+    case .pickleball:
+        return "pickleball"
+    case .cooldown:
+        return "cooldown"
+    case .swimBikeRun:
+        return "swim_bike_run"
+    case .transition:
+        return "transition"
+    case .other:
         return "other"
+    default:
+        return "healthkit_activity_\(activityType.rawValue)"
     }
 }
 

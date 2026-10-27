@@ -569,6 +569,65 @@ public struct AnchoredSleepManifestPlan: Equatable, Sendable {
     }
 }
 
+public struct AnchoredSleepSyncPreparation: Equatable, Sendable {
+    public let transition: AnchoredSleepSyncTransition
+    public let payload: Data
+}
+
+public struct AnchoredSleepSyncPreparer: Sendable {
+    private let beforePreparation: @Sendable () -> Void
+
+    public init() {
+        self.beforePreparation = {}
+    }
+
+    init(beforePreparation: @escaping @Sendable () -> Void) {
+        self.beforePreparation = beforePreparation
+    }
+
+    public func prepare(
+        plan: AnchoredSleepManifestPlan,
+        changes: HealthKitAnchoredSleepChanges,
+        receiverSettingsGeneration: String,
+        historyDepth: HealthHistoryDepth,
+        generatedAt: Date
+    ) async throws -> AnchoredSleepSyncPreparation? {
+        try Task.checkCancellation()
+
+        // Only immutable values cross this boundary; storage and delivery keep their owner.
+        let work = Task.detached(priority: Task.currentPriority) { [beforePreparation] () throws -> AnchoredSleepSyncPreparation? in
+            try Task.checkCancellation()
+            beforePreparation()
+            try Task.checkCancellation()
+
+            guard let transition = SleepSyncBatchFactory.makeAnchoredSleepTransition(
+                previousManifest: plan.previousManifest,
+                changes: changes,
+                receiverSettingsGeneration: receiverSettingsGeneration,
+                historyDepth: historyDepth,
+                historyStartDate: plan.historyStartDate,
+                forceRepublishAll: plan.forceRepublishAll,
+                generatedAt: generatedAt
+            ) else {
+                return nil
+            }
+
+            try Task.checkCancellation()
+            let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+            try Task.checkCancellation()
+            return AnchoredSleepSyncPreparation(transition: transition, payload: payload)
+        }
+
+        return try await withTaskCancellationHandler {
+            let result = try await work.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: {
+            work.cancel()
+        }
+    }
+}
+
 public enum SleepSyncBatchFactory {
     public static let foregroundCursorKind = "foreground_sleep_sync"
     public static let anchoredCursorKind = "anchored_sleep_sync"

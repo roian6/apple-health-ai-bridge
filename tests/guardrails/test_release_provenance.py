@@ -12,7 +12,6 @@ import pytest
 from pydantic import JsonValue, TypeAdapter
 from typing_extensions import TypedDict
 
-from health_bridge import __version__
 from tests.guardrails.release_version_fixtures import (
     ReleaseTree,
     commit_release_tree,
@@ -27,6 +26,7 @@ BUILD = "receiver-build-provenance.intoto.jsonl"
 FINAL = "receiver-final-provenance.intoto.jsonl"
 REPOSITORY = "roian6/apple-health-ai-bridge"
 TAG = "receiver-v1.1.3"
+DOCUMENTED_TAG = "receiver-v1.2.0"
 
 
 def run_documented_proof(
@@ -55,6 +55,9 @@ calls = pathlib.Path(os.environ['DOC_PROOF_CALLS'])
 previous = calls.read_text().splitlines() if calls.exists() else []
 with calls.open('a') as stream:
     stream.write(command + '\\n')
+if command == 'gh':
+    with calls.with_name('shell-attestation-argv.jsonl').open('a') as stream:
+        stream.write(json.dumps(sys.argv[1:]) + '\\n')
 with calls.with_suffix('.jsonl').open('a') as stream:
     stream.write(json.dumps([command, *sys.argv[1:]]) + '\\n')
 if command == 'gh' and previous.count('gh') + 1 == int(os.environ['DOC_PROOF_FAIL_GH']):
@@ -80,7 +83,7 @@ if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
         [
             "set +e +u",
             "set +o pipefail",
-            f"tag=receiver-v{__version__}",
+            f"tag={DOCUMENTED_TAG}",
             "commit=" + "1" * 40,
             input_control,
             'verification_flags_before="$-"',
@@ -137,6 +140,29 @@ def test_documented_proof_preserves_parent_shell(
     assert marker.endswith(" yes"), marker
 
 
+def test_documented_proof_selects_build_and_publication_source_refs(
+    tmp_path: Path,
+) -> None:
+    completed, _ = run_documented_proof(tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFICATION_PARENT 0 yes" in completed.stdout
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "shell-attestation-argv.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 6
+    assert [call[call.index("--bundle") + 1] for call in calls] == [BUILD] * 3 + [
+        FINAL
+    ] * 3
+    for index, call in enumerate(calls):
+        expected_ref = (
+            "refs/heads/release" if index < 3 else f"refs/tags/{DOCUMENTED_TAG}"
+        )
+        assert call[call.index("--source-ref") + 1] == expected_ref
+        assert call[call.index("--source-digest") + 1] == "1" * 40
+        assert call[call.index("--signer-digest") + 1] == "1" * 40
+
+
 def test_documented_proof_reports_success(tmp_path: Path) -> None:
     completed, calls = run_documented_proof(tmp_path)
     assert completed.returncode == 0, completed.stderr
@@ -148,22 +174,21 @@ def test_documented_proof_reports_success(tmp_path: Path) -> None:
         TypeAdapter(list[str]).validate_json(line)
         for line in (tmp_path / "shell-calls.jsonl").read_text().splitlines()
     ]
+    documented_version = DOCUMENTED_TAG.removeprefix("receiver-v")
     core = [
-        f"apple_health_ai_bridge-{__version__}-py3-none-any.whl",
-        f"apple_health_ai_bridge-{__version__}.tar.gz",
+        f"apple_health_ai_bridge-{documented_version}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{documented_version}.tar.gz",
         "release-metadata.json",
     ]
     final = [
-        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
-        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{documented_version}.zip",
+        f"HealthBridgeMailboxAckPublisher-{documented_version}.manifest.json",
         "SHA256SUMS",
     ]
     for actual, subject in zip(arguments[:6], core + final, strict=True):
         is_core = subject in core
         workflow = "release.yml" if is_core else "publish-release.yml"
-        source_ref = (
-            "refs/heads/release" if is_core else f"refs/tags/receiver-v{__version__}"
-        )
+        source_ref = "refs/heads/release" if is_core else f"refs/tags/{DOCUMENTED_TAG}"
         assert actual == [
             "gh",
             "attestation",

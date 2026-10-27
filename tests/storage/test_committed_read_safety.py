@@ -12,9 +12,13 @@ from health_bridge.mcp import server
 from health_bridge.mcp.server import dispatch_request, mcp_smoke_result
 from health_bridge.mcp.types import JsonMapping, JsonObject
 from health_bridge.queries import catalog
-from health_bridge.queries._common import connect_readonly, fetch_store_period
+from health_bridge.queries._common import (
+    connect_readonly,
+    fetch_all_sources,
+    fetch_latest_sync_window,
+)
 from health_bridge.queries.catalog import list_synced_metrics
-from health_bridge.queries.models import Period
+from health_bridge.queries.models import Period, SourceUsed
 from health_bridge.storage._query_database import DatabaseReadError
 from health_bridge.storage.database import connect_database
 from health_bridge.storage.sqlite_rows import fetch_one_int
@@ -83,24 +87,47 @@ def test_threaded_receiver_writer_and_reader_keep_committed_results(
     assert status_payload(dispatch_request(db_path, status_request())) != previous
 
 
-@pytest.mark.parametrize("boundary", ["query", "smoke"])
+@pytest.mark.parametrize("boundary", ["window", "sources", "smoke"])
 def test_component_queries_share_outer_transaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    boundary: Literal["query", "smoke"],
+    boundary: Literal["window", "sources", "smoke"],
 ) -> None:
     db_path = initialized_fixture_db(tmp_path)
+    previous = list_synced_metrics(db_path)
     outcomes: list[str] = []
-    with line_process([sys.executable, "-u", "-c", WRITER, str(db_path)]) as writer:
+    writer_script = WRITER.replace(
+        "    connection.execute('delete from workouts')",
+        """    connection.execute('delete from workouts')
+    connection.execute("update sources set name='Synthetic committed writer'")
+    connection.execute(
+        "update sync_runs set sync_window_start='2026-06-10T00:00:00Z', "
+        "sync_window_end='2026-06-11T00:00:00Z'"
+    )""",
+    )
+    with (
+        monkeypatch.context() as read_hooks,
+        line_process(
+            [sys.executable, "-u", "-c", writer_script, str(db_path)]
+        ) as writer,
+    ):
         assert receive(writer) == "ready"
-        if boundary == "query":
+        if boundary == "window":
 
-            def between_query_selects(connection: sqlite3.Connection) -> Period:
+            def before_window(connection: sqlite3.Connection) -> Period | None:
                 outcomes.append(send(writer, "commit"))
-                return fetch_store_period(connection)
+                return fetch_latest_sync_window(connection)
 
-            monkeypatch.setattr(catalog, "fetch_store_period", between_query_selects)
-            assert list_synced_metrics(db_path).metrics
+            read_hooks.setattr(catalog, "fetch_latest_sync_window", before_window)
+        elif boundary == "sources":
+
+            def before_sources(
+                connection: sqlite3.Connection,
+            ) -> tuple[SourceUsed, ...]:
+                outcomes.append(send(writer, "commit"))
+                return fetch_all_sources(connection)
+
+            read_hooks.setattr(catalog, "fetch_all_sources", before_sources)
         else:
 
             def between_tools(path: Path, request: JsonMapping) -> JsonObject:
@@ -109,10 +136,20 @@ def test_component_queries_share_outer_transaction(
                     outcomes.append(send(writer, "commit"))
                 return result
 
-            monkeypatch.setattr(server, "dispatch_request", between_tools)
+            read_hooks.setattr(server, "dispatch_request", between_tools)
             assert mcp_smoke_result(db_path)["called_tool"] == "list_synced_metrics"
+
+        if boundary != "smoke":
+            assert list_synced_metrics(db_path) == previous
+
         assert outcomes == ["blocked"]
         assert send(writer, "commit") == "committed"
+
+    committed = list_synced_metrics(db_path)
+    assert committed.metrics != previous.metrics
+    assert committed.stored_coverage != previous.stored_coverage
+    assert committed.latest_sync_window != previous.latest_sync_window
+    assert committed.sources_used != previous.sources_used
 
 
 @pytest.mark.parametrize(

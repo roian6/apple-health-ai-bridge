@@ -176,13 +176,31 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     assert "historyDepth: currentHistoryDepth" in body
     assert "anchorCursorValue: manifestPlan.anchorCursorValue" in body
     assert "historyStartDate: manifestPlan.historyStartDate" in body
-    assert "forceRepublishAll: manifestPlan.forceRepublishAll" in body
-    reservation = body.index("sleepManifestStore.saveManifest(reservation)")
-    journal = body.index("sleepManifestStore.savePendingTransition(pendingTransition)")
+    assert "plan: manifestPlan" in body
+    factory = (
+        ROOT
+        / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore"
+        / "StepCountSyncBatchFactory.swift"
+    ).read_text()
+    preparer = factory[
+        factory.index("public struct AnchoredSleepSyncPreparer") : factory.index(
+            "public enum SleepSyncBatchFactory"
+        )
+    ]
+    assert "forceRepublishAll: plan.forceRepublishAll" in preparer
+    reservation = body.index(
+        "sleepManifestStore.saveManifestForSync(reservation, validate: validate)"
+    )
+    journal = body.index(
+        "sleepManifestStore.savePendingForSync(pendingTransition, validate: validate)"
+    )
     delivery = body.index("deliverPendingSleepTransition(", journal)
-    manifest_commit = body.index("try store.saveManifest(pendingTransition.manifest)")
+    prefix = "try await store."
+    manifest_commit = body.index(
+        f"{prefix}saveManifestForSync(pendingTransition.manifest, validate: validate)"
+    )
     journal_clear = body.index(
-        "try store.clearPendingTransition(id: pendingTransition.id)"
+        f"{prefix}clearPendingForSync(id: pendingTransition.id, validate: validate)"
     )
     assert reservation < journal < delivery < manifest_commit < journal_clear
 
@@ -225,7 +243,7 @@ def test_public_copy_does_not_claim_every_observer_registration_succeeds() -> No
     architecture = (ROOT / "docs" / "architecture.md").read_text()
     testflight = (ROOT / ".github" / "release" / "testflight-checklist.md").read_text()
     review_notes = (
-        ROOT / "docs" / "maintainers" / "app-review-notes-template.example.md"
+        ROOT / ".github" / "release" / "app-review-notes-template.md"
     ).read_text()
 
     assert "Full observer registration" not in readme
