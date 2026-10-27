@@ -98,7 +98,7 @@ The detailed procedure, evidence fields, and validator requirements are in
 cutover, confirm a clean uninstall/reinstall, absent bundle, and empty
 **Not Connected** first launch; verify the advertised `/health` route, scan the
 setup-page QR with the iPhone Camera, and do not relaunch before pairing commits.
-`devicectl --payload-url` was not used. Exercise native permission prompts and
+Confirm that `devicectl --payload-url` was not used. Exercise native permission prompts and
 record exactly one invitation redemption and one active mapped credential.
 
 Complete **All** history sync and unchanged-data idempotence with zero duplicate

@@ -125,7 +125,7 @@ def test_public_docs_do_not_claim_external_schema_clone() -> None:
         Path("AGENTS.md"),
         Path(".github/CONTRIBUTING.md"),
         Path(".github/SECURITY.md"),
-        Path(".github/CONTRIBUTING.md"),
+        Path(".github/SUPPORT.md"),
         *Path("docs").rglob("*.md"),
     ]
     forbidden_markers = (
