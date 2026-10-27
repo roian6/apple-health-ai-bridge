@@ -1714,6 +1714,12 @@ public final class FileOutbox {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let payloadURLs = try payloadFileURLs()
+        for transaction in try loadEnqueueTransactions() {
+            for entry in transaction.entries {
+                try removeIfExists(stagedPayloadURL(for: entry.id))
+            }
+        }
+        try removeIfExists(enqueueTransactionURL)
         if var manifest = try loadManifest(),
            manifest.version == SequenceManifest.nutritionDirectVersion {
             let splitIDs = Set((manifest.nutritionSplits ?? []).flatMap {

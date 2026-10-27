@@ -23,9 +23,64 @@ final class NutritionClearTests: XCTestCase {
     }
 
     @MainActor
+    func testSplitClearRetiresPartiallyAcknowledgedTransaction() async throws {
+        let outbox = try fixture(acceptedSibling: true)
+        defer { try? FileManager.default.removeItem(at: outbox.directoryURL) }
+        try await outbox.prepareNutritionCompatibility()
+        _ = try outbox.nutritionCompatibleItems(for: "synthetic", support: .unsupported)
+        XCTAssertEqual(try outbox.pendingItems().count, 3)
+
+        XCTAssertEqual(try outbox.clearPending(), 3)
+
+        let reopened = try FileOutbox(directory: outbox.directoryURL)
+        XCTAssertTrue(try reopened.pendingItems().isEmpty)
+        XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: "synthetic"))
+        XCTAssertFalse(reopened.clearIntentIsActive)
+    }
+
+    @MainActor
+    func testClearResumesWithAcknowledgedJournalAfterPayloadsWereRemoved() async throws {
+        let outbox = try fixture(acceptedSibling: true)
+        defer { try? FileManager.default.removeItem(at: outbox.directoryURL) }
+        try await outbox.prepareNutritionCompatibility()
+        _ = try outbox.nutritionCompatibleItems(for: "synthetic", support: .unsupported)
+        let payloads = try outbox.pendingItems()
+        try outbox.beginClearIntent()
+        for payload in payloads {
+            try FileManager.default.removeItem(at: payload.fileURL)
+        }
+        let reopened = try FileOutbox(directory: outbox.directoryURL)
+
+        XCTAssertEqual(try reopened.clearPendingWhileIntentIsActive(), 0)
+        try reopened.finishClearIntent()
+
+        XCTAssertTrue(try FileOutbox(directory: outbox.directoryURL).pendingItems().isEmpty)
+        XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: "synthetic"))
+        XCTAssertFalse(reopened.clearIntentIsActive)
+    }
+
+    @MainActor
+    func testClearRemovesPartiallyStagedTransactionPayloads() throws {
+        let outbox = try fixture()
+        defer { try? FileManager.default.removeItem(at: outbox.directoryURL) }
+        try outbox.stageEnqueueSequenceForTesting(
+            [Data("staged-one".utf8), Data("staged-two".utf8)],
+            receiverIdentity: "synthetic", stagedPayloadCount: 1
+        )
+
+        XCTAssertEqual(try outbox.clearPending(), 1)
+
+        let children = try FileManager.default.contentsOfDirectory(
+            at: outbox.directoryURL, includingPropertiesForKeys: nil
+        )
+        XCTAssertFalse(children.contains { $0.pathExtension == "staged" })
+        XCTAssertTrue(try FileOutbox(directory: outbox.directoryURL).pendingItems().isEmpty)
+    }
+
+    @MainActor
     func testInterruptedSplitClearResumesWithoutRecoveringDeletedPayloads() async throws {
         let fileManager = InterruptedRemoval()
-        let outbox = try fixture(fileManager: fileManager)
+        let outbox = try fixture(fileManager: fileManager, acceptedSibling: true)
         defer { try? FileManager.default.removeItem(at: outbox.directoryURL) }
         try await outbox.prepareNutritionCompatibility()
         _ = try outbox.nutritionCompatibleItems(for: "synthetic", support: .unsupported)
@@ -105,7 +160,10 @@ final class NutritionClearTests: XCTestCase {
     }
 
     @MainActor
-    private func fixture(fileManager: FileManager = .default) throws -> FileOutbox {
+    private func fixture(
+        fileManager: FileManager = .default,
+        acceptedSibling: Bool = false
+    ) throws -> FileOutbox {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let outbox = try FileOutbox(directory: directory, fileManager: fileManager)
         let window = HealthBridgeTimeWindow(
@@ -130,13 +188,29 @@ final class NutritionClearTests: XCTestCase {
             )],
             sleepSessions: [], deletedRecords: [], sync: HealthBridgeSyncContext(syncWindow: window, cursors: [])
         )
-        _ = try outbox.enqueueSequence(
-            [JSONEncoder().encode(batch)], receiverIdentity: "synthetic",
+        var payloads = [try JSONEncoder().encode(batch)]
+        if acceptedSibling {
+            let ordinary = HealthBridgeBatchV1(
+                generatedAt: batch.generatedAt, exportWindow: window, sources: batch.sources,
+                healthTypes: batch.healthTypes.filter { $0.category != .nutrition },
+                samples: [], workouts: batch.workouts, sleepSessions: [], deletedRecords: [],
+                sync: batch.sync
+            )
+            payloads.insert(try JSONEncoder().encode(ordinary), at: 0)
+        }
+        let items = try outbox.enqueueSequence(
+            payloads, receiverIdentity: "synthetic",
             cursorCheckpoint: FileOutboxCursorCheckpoint(
                 receiverIdentity: "synthetic", sourceKey: "synthetic.phone",
                 cursorKind: "dietary_protein", cursorValue: "unaccepted"
             )
         )
+        if acceptedSibling {
+            let accepted = try XCTUnwrap(items.first)
+            XCTAssertNil(try outbox.recordDirectUploadAccepted(
+                itemID: accepted.id, receiverIdentity: "synthetic"
+            ))
+        }
         return outbox
     }
 }
