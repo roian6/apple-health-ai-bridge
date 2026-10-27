@@ -1713,14 +1713,26 @@ public final class FileOutbox {
         guard try downgradeReadiness() == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
-        let items = try pendingItems()
-        for item in items {
-            if fileManager.fileExists(atPath: item.fileURL.path) {
-                try fileManager.removeItem(at: item.fileURL)
+        let payloadURLs = try payloadFileURLs()
+        if var manifest = try loadManifest(),
+           manifest.version == SequenceManifest.nutritionDirectVersion {
+            let splitIDs = Set((manifest.nutritionSplits ?? []).flatMap {
+                [$0.parentID, $0.supportedID, $0.remainderID]
+            })
+            manifest.entries.removeAll { splitIDs.contains($0.id) }
+            manifest.nutritionSplits = nil
+            manifest.version = SequenceManifest.directOnlyVersion
+            // Retire recovery intent before payload deletion. The clear marker
+            // keeps admission closed if deletion is interrupted.
+            try persistManifest(manifest)
+        }
+        for url in payloadURLs {
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
             }
         }
         _ = try reconciledManifest()
-        return items.count
+        return payloadURLs.count
     }
 
     public func finishClearIntent() throws {
@@ -1981,7 +1993,8 @@ public final class FileOutbox {
                 ManifestVersion.self,
                 from: Data(contentsOf: manifestURL)
             )
-            if let header, header.version >= SequenceManifest.mailboxVersion {
+            if let header, header.version >= SequenceManifest.mailboxVersion,
+               header.version != SequenceManifest.nutritionDirectVersion {
                 return .hold(.v4Manifest)
             }
         }
