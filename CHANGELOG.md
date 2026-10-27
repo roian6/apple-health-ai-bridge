@@ -23,6 +23,8 @@ The retained receiver-v1.1.4 tag was never published and is unsupported.
 
 ## Historical releases
 
+The retained `receiver-v1.1.4` tag was never published. Its notes are historical candidate material, not a published release contract.
+The original published release notes remain unchanged:
 - [Receiver/CLI 1.1.3](.github/release/notes-receiver-v1.1.3.md)
 - [Receiver/CLI 1.1.2](.github/release/notes-receiver-v1.1.2.md)
 - [Receiver/CLI 1.1.1](.github/release/notes-receiver-v1.1.1.md)

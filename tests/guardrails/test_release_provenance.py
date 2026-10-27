@@ -58,6 +58,8 @@ with calls.open('a') as stream:
 if command == 'gh':
     with calls.with_name('shell-attestation-argv.jsonl').open('a') as stream:
         stream.write(json.dumps(sys.argv[1:]) + '\\n')
+with calls.with_suffix('.jsonl').open('a') as stream:
+    stream.write(json.dumps([command, *sys.argv[1:]]) + '\\n')
 if command == 'gh' and previous.count('gh') + 1 == int(os.environ['DOC_PROOF_FAIL_GH']):
     sys.exit(17)
 if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
@@ -168,6 +170,47 @@ def test_documented_proof_reports_success(tmp_path: Path) -> None:
     assert "Release proof verified." in completed.stdout
     assert "Release proof FAILED." not in completed.stdout + completed.stderr
     assert calls == ["gh"] * 6 + ["shasum"]
+    arguments = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "shell-calls.jsonl").read_text().splitlines()
+    ]
+    documented_version = DOCUMENTED_TAG.removeprefix("receiver-v")
+    core = [
+        f"apple_health_ai_bridge-{documented_version}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{documented_version}.tar.gz",
+        "release-metadata.json",
+    ]
+    final = [
+        f"HealthBridgeMailboxAckPublisher-{documented_version}.zip",
+        f"HealthBridgeMailboxAckPublisher-{documented_version}.manifest.json",
+        "SHA256SUMS",
+    ]
+    for actual, subject in zip(arguments[:6], core + final, strict=True):
+        is_core = subject in core
+        workflow = "release.yml" if is_core else "publish-release.yml"
+        source_ref = "refs/heads/release" if is_core else f"refs/tags/{DOCUMENTED_TAG}"
+        assert actual == [
+            "gh",
+            "attestation",
+            "verify",
+            subject,
+            "--repo",
+            REPOSITORY,
+            "--bundle",
+            BUILD if is_core else FINAL,
+            "--signer-workflow",
+            f"{REPOSITORY}/.github/workflows/{workflow}",
+            "--source-ref",
+            source_ref,
+            "--source-digest",
+            "1" * 40,
+            "--signer-digest",
+            "1" * 40,
+            "--deny-self-hosted-runners",
+            "--predicate-type",
+            "https://slsa.dev/provenance/v1",
+        ]
+    assert arguments[6] == ["shasum", "-a", "256", "-c", "SHA256SUMS"]
 
 
 @pytest.mark.parametrize("failed_gh", [1, 3, 4, 6])

@@ -90,6 +90,8 @@ You can also follow release news and see what we're working on next.
 - **Understand and build:** [Architecture](docs/architecture.md) · [Compatibility](docs/versioning.md) · [Batch protocol](docs/reference/batch-v1.md) · [SQLite schema](docs/reference/sqlite-v1.md) · [Brand guide](docs/brand.md)
 - **Contribute:** [Development setup](.github/CONTRIBUTING.md) · [Contribution ideas](docs/contribution-ideas.md) · [Build the iPhone app](docs/self-build.md)
 
+Published components: **Receiver/CLI** `1.1.5` · **iOS Companion** `1.1.1` (build `50`) · **Batch Protocol** `1.0.0`. See [release downloads](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5), [candidate source versions](component-versions.json), and the [compatibility policy](docs/versioning.md).
+
 ## License
 
 <a href="LICENSE"><img src="https://img.shields.io/github/license/roian6/apple-health-ai-bridge?label=&amp;style=flat-square" alt="License: Apache-2.0" height="20"></a>

@@ -1201,3 +1201,15 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
         f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip",
         f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.manifest.json",
     }
+
+
+@pytest.mark.parametrize("guide", ["setup.md", "icloud-mailbox-service.md"])
+def test_versioned_guide_links_published_release_before_commands(guide: str) -> None:
+    document = (ROOT / "docs" / guide).read_text(encoding="utf-8")
+    repository = "https://github.com/roian6/apple-health-ai-bridge"
+    release_link = f"({repository}/releases/tag/receiver-v{PUBLISHED_RECEIVER_VERSION})"
+    assert document.index(release_link) < document.index("```bash\n")
+    if guide == "icloud-mailbox-service.md":
+        assert document.index(release_link) < document.index(
+            f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip"
+        )

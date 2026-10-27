@@ -2,7 +2,7 @@
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 
-This guide targets the published [Receiver/CLI `1.1.5` release](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5). Install the pinned version below rather than `main`. If you choose the macOS iCloud Mailbox Beta, verify the matching helper and release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md) before installing them; do not substitute an older helper.
+This guide targets the published [Receiver/CLI `1.1.5` release](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5). Verify the matching helper and complete release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md) before installing them; do not substitute `main` or an older helper.
 
 ## Before you start
 
