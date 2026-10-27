@@ -1,9 +1,12 @@
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import cast
+
+import pytest
 
 IOS_ROOT = Path("ios/HealthBridgeCompanion")
 PROJECT = IOS_ROOT / "HealthBridgeCompanion.xcodeproj/project.pbxproj"
@@ -186,6 +189,64 @@ def test_production_seal_target_guard_accepts_public_lane_and_rejects_mixed_lane
         text=True,
     )
     assert mixed.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "lane",
+    [
+        (HIDDEN_TARGET, "A25174000000000000000001"),
+        (PUBLIC_TARGET, "A27174000000000000000001"),
+    ],
+)
+@pytest.mark.parametrize(
+    "extra_entry",
+    [
+        "791B6DD3C7F0AD1188DEA17C, ",
+        "791B6DD3C7F0AD1188DEA17C /* HealthBridgeCompanionApp.swift in Sources */, ",
+        "791B6DD3C7F0AD1188DEA17C /* ReceiverCapabilities.swift in Sources */, ",
+    ],
+    ids=["uncommented-source", "unexpected-member", "duplicate-member"],
+)
+def test_production_seal_rejects_extra_source_entries(
+    tmp_path: Path, lane: tuple[str, str], extra_entry: str
+) -> None:
+    # Given: a temporary project with real schemes and an extra production source.
+    target_name, phase_id = lane
+    project = tmp_path / "HealthBridgeCompanion.xcodeproj/project.pbxproj"
+    project.parent.mkdir()
+    _ = shutil.copytree(
+        PROJECT.parent / "xcshareddata", project.parent / "xcshareddata"
+    )
+    text = PROJECT.read_text(encoding="utf-8")
+    marker = (
+        f"{phase_id} /* Sources */ = {{isa = PBXSourcesBuildPhase; "
+        "buildActionMask = 2147483647; files = ("
+    )
+    assert text.count(marker) == 1
+    _ = project.write_text(text.replace(marker, marker + extra_entry), encoding="utf-8")
+
+    # When: the real seal CLI validates the mutated target and matching scheme.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/production-identity-seal.py",
+            "assert-target",
+            "--project",
+            str(project),
+            "--scheme-name",
+            target_name,
+            "--target-name",
+            target_name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    # Then: bare IDs, unexpected members, and duplicates cannot bypass the seal.
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert '"result":"rejected"' in result.stdout
 
 
 def test_public_documents_info_plist_declares_public_document_scope() -> None:

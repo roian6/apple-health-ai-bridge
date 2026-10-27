@@ -6516,7 +6516,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               try outbox.uploadablePendingItems(for: receiverIdentity) == allPending else {
             throw CancellationError()
         }
-        let pendingItems = hasNutrition
+        var pendingItems = hasNutrition
             ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
             : allPending
         var attemptedCount = 0
@@ -6524,7 +6524,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         var failedItemIDs: [String] = []
         var failedDescriptions: [String] = []
         var lastDirectUploadResult: ReceiverUploadResult?
-        for item in pendingItems {
+        while let item = pendingItems.first {
             try requireCurrentPayloadDeliveryTarget(target)
             try outbox.requireUploadAdmission()
             attemptedCount += 1
@@ -6543,6 +6543,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 lastDirectAcceptance = (item.id, receiverIdentity, expectedGeneration, bootstrapRetryGeneration)
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .accepted)
                 uploadedCount += 1
+                pendingItems = hasNutrition
+                    ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
+                    : Array(pendingItems.dropFirst())
             } catch is CancellationError {
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .cancelled)
                 throw CancellationError()

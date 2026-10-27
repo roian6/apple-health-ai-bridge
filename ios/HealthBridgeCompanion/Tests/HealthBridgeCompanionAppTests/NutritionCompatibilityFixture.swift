@@ -10,6 +10,7 @@ final class NutritionReceiver: @unchecked Sendable {
     private var statusValue = 202
     private var batchesValue: [HealthBridgeBatchV1] = []
     private var recordsValue: [String: HealthBridgeSample] = [:]
+    private var workoutsValue: [String: HealthBridgeWorkout] = [:]
     private var credentialsValue: [String] = []
     var capability: Capability {
         get { lock.withLock { capabilityValue } }
@@ -21,6 +22,7 @@ final class NutritionReceiver: @unchecked Sendable {
     }
     var batches: [HealthBridgeBatchV1] { lock.withLock { batchesValue } }
     var records: [HealthBridgeSample] { lock.withLock { Array(recordsValue.values) } }
+    var workouts: [HealthBridgeWorkout] { lock.withLock { Array(workoutsValue.values) } }
     var credentials: [String] { lock.withLock { credentialsValue } }
 
     func respond(_ request: URLRequest, body: Data?) throws -> (Int, Data) {
@@ -48,6 +50,9 @@ final class NutritionReceiver: @unchecked Sendable {
             }
             if statusValue == 202 {
                 for sample in batch.samples { recordsValue[sample.clientRecordID] = sample }
+                for workout in batch.workouts {
+                    workoutsValue[workout.sourceKey + "\n" + workout.clientRecordID] = workout
+                }
             }
             return (statusValue, Data(#"{"status":"accepted"}"#.utf8))
         }
@@ -189,7 +194,7 @@ final class NutritionFixture {
         )
     }
 
-    func mixedBatch() throws -> HealthBridgeBatchV1 {
+    func mixedBatch(workoutEnergy: Double? = nil) throws -> HealthBridgeBatchV1 {
         let now = Date(timeIntervalSince1970: 1_790_000_000)
         let batches = try ["weight", "dietary_protein"].map { type in
             if ids[type] == nil { ids[type] = UUID() }
@@ -208,15 +213,21 @@ final class NutritionFixture {
         return HealthBridgeBatchV1(
             generatedAt: first.generatedAt, exportWindow: first.exportWindow, sources: first.sources,
             healthTypes: batches.flatMap(\.healthTypes), samples: batches.flatMap(\.samples),
-            workouts: [], sleepSessions: [], deletedRecords: [],
+            workouts: workoutEnergy.map { energy in
+                [HealthBridgeWorkout(
+                    clientRecordID: "synthetic-workout", sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                    workoutType: "running", startTime: first.exportWindow.startTime,
+                    endTime: first.exportWindow.endTime, durationSeconds: 0, energyKcal: energy
+                )]
+            } ?? [], sleepSessions: [], deletedRecords: [],
             sync: HealthBridgeSyncContext(syncWindow: first.sync.syncWindow, cursors: batches.flatMap(\.sync.cursors))
         )
     }
 
-    func enqueueMixed() throws -> FileOutboxItem {
+    func enqueueMixed(workoutEnergy: Double? = nil) throws -> FileOutboxItem {
         let identity = try XCTUnwrap(settings.receiverBindingID)
         return try XCTUnwrap(outbox.enqueueSequence(
-            [JSONEncoder().encode(mixedBatch())], receiverIdentity: identity,
+            [JSONEncoder().encode(mixedBatch(workoutEnergy: workoutEnergy))], receiverIdentity: identity,
             cursorCheckpoint: FileOutboxCursorCheckpoint(
                 receiverIdentity: identity, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
                 cursorKind: GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "dietary_protein"),

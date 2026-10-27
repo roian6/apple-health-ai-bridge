@@ -8,6 +8,7 @@ Keep automatic sync responsive while sleep data is prepared, and get clearer sle
 
 - Sleep data preparation runs away from the main actor so automatic sync can stay responsive.
 - Nutrition delivery is gated by explicit Receiver capability. When supported, the Companion sends the five documented nutrition types; unknown or unsupported capability holds nutrition without treating missing records as zero.
+- Mixed nutrition batches retain their delivery order and receipt history, so enabling nutrition later doesn't replay older workout or sample values.
 - Sleep queries use the requested local timezone and keep separate observed periods, naps, coverage, and unknown evidence distinct.
 - Sync status separates retained record coverage from the latest successful sync window and reports per-metric checkpoints.
 - Workout exports preserve stable identity and HealthKit activity types, including distinct names for historical activity types and unmapped HealthKit values.
@@ -24,6 +25,8 @@ Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`
 Before installing or upgrading from `1.1.5`, confirm that the matching signed iOS build and complete Receiver/CLI release packet are available and verified. Only then use the pinned install command below and the [versioned setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.2.0/docs/setup.md).
 
 Before upgrading, stop the Receiver and back up the database. Keep the existing database, credentials, and pairing. Initialization applies migration `012_catalogue_coverage_index`, which builds a catalogue coverage index synchronously and may need extra disk space or wait for database readers or writers. It also applies migration `013_mailbox_enrollment` for native Mailbox enrollment state. The project doesn't support running an older Receiver/CLI against a database after these migrations; restore the pre-upgrade database backup before returning to an older version.
+
+The Companion uses a newer queue format after splitting a mixed nutrition batch. Older Companion builds cannot open that queue. An older mixed queue with incomplete delivery history is kept on hold rather than replayed or deleted; contact support before resetting private sync state.
 
 ```bash
 uv tool install --force "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
