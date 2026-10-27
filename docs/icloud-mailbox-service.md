@@ -24,21 +24,21 @@ that developer-no-access boundary remains true.
 
 ## Release availability
 
-These instructions apply to the published Receiver/CLI and helper `1.1.5`.
-Confirm that [receiver-v1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5)
+These instructions target Receiver/CLI and helper `1.2.0`.
+Confirm that [receiver-v1.2.0](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0)
 and its complete asset set are available, then verify the release identity,
 provenance, and checksums below before installing anything. Do not substitute
 `main`, the retired unpublished `receiver-v1.1.4` tag, or an older helper.
 
 ## Install and verify the signed helper
-Use the Receiver/CLI `1.1.5` GitHub Release assets. Download these files with a
+Use the Receiver/CLI `1.2.0` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.5-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.5.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.5.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.5.manifest.json`;
+- `apple_health_ai_bridge-1.2.0-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.2.0.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.zip`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.manifest.json`;
 - `release-metadata.json`;
 - `receiver-build-provenance.intoto.jsonl`;
 - `SHA256SUMS`;
@@ -81,9 +81,9 @@ immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
-For this `1.1.5` release, metadata schema `health_bridge.release.v4` binds the
+For this `1.2.0` release, metadata schema `health_bridge.release.v4` binds the
 build proof to `release.yml@refs/heads/release` and the final proof to
-`publish-release.yml@refs/tags/receiver-v1.1.5`. Both source and signer digests
+`publish-release.yml@refs/tags/receiver-v1.2.0`. Both source and signer digests
 must equal the independently verified signed tag's exact commit, not a later
 branch HEAD.
 
@@ -100,7 +100,7 @@ Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
+metadata. From the asset directory, set `tag` to `receiver-v1.2.0` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -166,22 +166,21 @@ After every proof and checksum check succeeds, install the wheel, structurally
 validate the helper, and explicitly install it:
 
 ```bash
-uv tool install ./apple_health_ai_bridge-1.1.5-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.2.0-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```
 
-The `receiver-v1.1.5` artifact and proof instructions above preserve the
-supported URL-based flow. They do not establish that those released assets
-support native URL-free pairing. Native pairing requires a specifically
-qualified matching receiver, helper, and companion build set. The helper must
+Native URL-free pairing requires a specifically qualified matching Receiver/CLI
+`1.2.0`, helper `1.2.0`, and iOS Companion `1.2.0 (51)` build set. Check the
+release's compatibility and native qualification before using that path. The helper must
 be owned and ready, and it must implement the native cancellation capability
 described below. Do not infer native support from the helper version or a
 `ready` status alone.

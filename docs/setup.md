@@ -2,7 +2,7 @@
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 
-This guide targets the published [Receiver/CLI `1.1.5` release](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5). Verify the matching helper and complete release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md) before installing them; do not substitute `main` or an older helper.
+This guide targets [Receiver/CLI `1.2.0`](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0). Confirm that the release is available before installing it. For the optional Mac-only Mailbox Beta, verify the matching helper and complete release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.2.0/docs/icloud-mailbox-service.md); do not substitute `main` or an older helper.
 
 ## Before you start
 
@@ -134,10 +134,10 @@ After setup, use the printed receiver command with the same bind and port. Keep 
 
 ## Install and run core setup
 
-Install the published Receiver/CLI `1.1.5`:
+Once the release is published and verified, install Receiver/CLI `1.2.0`:
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.1.5"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
 ```
 
 After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.

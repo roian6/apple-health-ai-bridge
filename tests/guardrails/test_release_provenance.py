@@ -26,7 +26,7 @@ BUILD = "receiver-build-provenance.intoto.jsonl"
 FINAL = "receiver-final-provenance.intoto.jsonl"
 REPOSITORY = "roian6/apple-health-ai-bridge"
 TAG = "receiver-v1.1.3"
-DOCUMENTED_TAG = "receiver-v1.1.5"
+DOCUMENTED_TAG = "receiver-v1.2.0"
 
 
 def run_documented_proof(

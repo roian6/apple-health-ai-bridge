@@ -2,7 +2,7 @@
 
 **Coordinated release.**
 
-Keep automatic sync responsive while sleep data is prepared, and get clearer sleep, workout, nutrition, and sync-coverage results. This coordinated source candidate advances Receiver/CLI and iOS Companion while keeping Batch Protocol 1.0.0 compatible.
+Keep automatic sync responsive while sleep data is prepared, and get clearer sleep, workout, nutrition, and sync-coverage results. This coordinated release advances Receiver/CLI and iOS Companion while keeping Batch Protocol 1.0.0 compatible.
 
 ## Highlights
 
@@ -21,7 +21,7 @@ Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`
 
 ## Install or upgrade
 
-The published Receiver/CLI baseline remains `1.1.5` (`receiver-v1.1.5`). Keep your current installation until this coordinated candidate is approved and its release is published and verified. Only then use the pinned install command below.
+Before installing or upgrading from `1.1.5`, confirm that the matching signed iOS build and complete Receiver/CLI release packet are available and verified. Only then use the pinned install command below and the [versioned setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.2.0/docs/setup.md).
 
 Before upgrading, stop the Receiver and back up the database. Keep the existing database, credentials, and pairing. Initialization applies migration `012_catalogue_coverage_index`, which builds a catalogue coverage index synchronously and may need extra disk space or wait for database readers or writers. It also applies migration `013_mailbox_enrollment` for native Mailbox enrollment state. The project doesn't support running an older Receiver/CLI against a database after these migrations; restore the pre-upgrade database backup before returning to an older version.
 

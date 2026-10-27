@@ -1137,7 +1137,7 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     assert re.findall(pin_pattern, readme) == []
     pins = re.findall(pin_pattern, setup)
     assert pins, "No versioned install pin found in docs/setup.md"
-    assert set(pins) == {f"receiver-v{PUBLISHED_RECEIVER_VERSION}"}, (
+    assert set(pins) == {f"receiver-v{__version__}"}, (
         f"Found stale install pins in docs/setup.md: {pins}"
     )
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
@@ -1146,10 +1146,9 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
 
 
 def test_roadmap_matches_readme_current_receiver_release() -> None:
-    setup = (ROOT / "docs/setup.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs/roadmap.md").read_text(encoding="utf-8")
-    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
-    current_receiver = re.search(rf'{install_source}@receiver-v([^\s"]+)', setup)
+    current_receiver = re.search(r"/releases/tag/receiver-v([^\s)]+)", readme)
 
     assert current_receiver is not None
     assert current_receiver.group(1) == PUBLISHED_RECEIVER_VERSION
@@ -1163,13 +1162,8 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     mailbox = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
 
     assert re.search(r"\]\(setup\.md(?:#[^)]+)?\)", self_build)
-    assert (
-        f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/icloud-mailbox-service.md)"
-        in setup
-    )
-    release_notes_path = (
-        ROOT / f".github/release/notes-receiver-v{PUBLISHED_RECEIVER_VERSION}.md"
-    )
+    assert f"/blob/receiver-v{__version__}/docs/icloud-mailbox-service.md)" in setup
+    release_notes_path = ROOT / f".github/release/notes-receiver-v{__version__}.md"
     assert release_notes_path.is_file()
     release_notes = release_notes_path.read_text(encoding="utf-8")
     expected_assets = set(re.findall(r"^- `([^`]+)`[.;]?", release_notes, re.MULTILINE))
@@ -1180,26 +1174,26 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
         re.findall(r"^- `([^`]+)`[.;]?", download_section, re.MULTILINE)
     )
     assert expected_assets == {
-        "apple_health_ai_bridge-1.1.5-py3-none-any.whl",
-        "apple_health_ai_bridge-1.1.5.tar.gz",
+        f"apple_health_ai_bridge-{__version__}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{__version__}.tar.gz",
         "release-metadata.json",
         "receiver-build-provenance.intoto.jsonl",
-        "HealthBridgeMailboxAckPublisher-1.1.5.zip",
-        "HealthBridgeMailboxAckPublisher-1.1.5.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
         "SHA256SUMS",
         "receiver-final-provenance.intoto.jsonl",
     }
     assert downloaded_assets == expected_assets
     assert set(
         re.findall(r"apple_health_ai_bridge-[\w.]+-py3-none-any\.whl", mailbox)
-    ) == {f"apple_health_ai_bridge-{PUBLISHED_RECEIVER_VERSION}-py3-none-any.whl"}
+    ) == {f"apple_health_ai_bridge-{__version__}-py3-none-any.whl"}
     assert set(
         re.findall(
             r"HealthBridgeMailboxAckPublisher-[\d.]+(?:zip|manifest\.json)", mailbox
         )
     ) == {
-        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip",
-        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
+        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
     }
 
 
@@ -1207,9 +1201,9 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
 def test_versioned_guide_links_published_release_before_commands(guide: str) -> None:
     document = (ROOT / "docs" / guide).read_text(encoding="utf-8")
     repository = "https://github.com/roian6/apple-health-ai-bridge"
-    release_link = f"({repository}/releases/tag/receiver-v{PUBLISHED_RECEIVER_VERSION})"
+    release_link = f"({repository}/releases/tag/receiver-v{__version__})"
     assert document.index(release_link) < document.index("```bash\n")
     if guide == "icloud-mailbox-service.md":
         assert document.index(release_link) < document.index(
-            f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip"
+            f"HealthBridgeMailboxAckPublisher-{__version__}.zip"
         )
