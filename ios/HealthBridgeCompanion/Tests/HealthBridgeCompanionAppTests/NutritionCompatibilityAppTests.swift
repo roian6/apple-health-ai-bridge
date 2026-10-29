@@ -7,6 +7,83 @@ import XCTest
 
 @MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
+    func testDiscreteActivityRawACKRetiresGenerationWithoutDailyStatistics() async throws {
+        for value: Double? in [nil, 0, 7] {
+            let fixture = try NutritionFixture()
+            defer { fixture.cleanup() }
+            fixture.values = value.map { ["uv_exposure": $0] } ?? [:]
+            let store = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+            try store.setEnabledDurably(true)
+            CompanionHealthPermissionRequestStore(userDefaults: fixture.defaults).recordCompletedRequest(
+                runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                    forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+                )
+            )
+            var dailyReads = 0
+            let vm = try await fixture.makeViewModel(
+                eligibleTypeCodes: ["uv_exposure"],
+                readDailyActivityAggregates: { types, start, _, calendar in
+                    dailyReads += 1
+                    for entry in HealthKitGenericQuantityReader.readableQuantityEntries(for: types) {
+                        let type = try XCTUnwrap(HealthKitQuantitySampleMapper.quantityType(for: entry))
+                        _ = try HealthKitGenericQuantityReader.dailyActivityStatisticsQuery(
+                            quantityType: type, predicate: nil,
+                            anchorDate: calendar.startOfDay(for: start), interval: DateComponents(day: 1)
+                        )
+                    }
+                    return []
+                }
+            )
+            XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+            let coordinator = HealthKitBackgroundDeliveryCoordinator(
+                healthDataAvailable: { false },
+                executeQuery: { _ in XCTFail("Unexpected HealthKit observer query") },
+                stopQuery: { _ in }, enableDelivery: { _, completion in completion(false, nil) },
+                disableDelivery: { _ in }
+            )
+            let runtime = HealthBridgeCompanionApplicationRuntime(
+                viewModel: vm, automaticSyncPlatform: AutomaticSyncRuntime.Platform(
+                    scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+                    setUploadAdmission: { _ in }, beginBackgroundOwner: { _ in {} },
+                    healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+                )
+            )
+            try store.markPendingObserverTypeCodes(["uv_exposure"])
+            XCTAssertNotNil(try store.loadPendingObserverTypeCodeGenerations()["uv_exposure"])
+
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["uv_exposure"]))
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await vm.waitForBootstrapAndForegroundWork()
+
+            XCTAssertEqual(fixture.reads, ["uv_exposure"])
+            XCTAssertEqual(dailyReads, 0, "A supported discrete metric must not enter the daily-sum reader")
+            XCTAssertFalse(vm.statusIsError)
+            XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+            let automaticCursor = try fixture.cursors.cursorValue(
+                receiverBindingID: XCTUnwrap(fixture.settings.receiverBindingID),
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "uv_exposure")
+            )
+            XCTAssertNil(try fixture.cursor("uv_exposure"), "Automatic fallback must not claim the shared cursor")
+            if let value {
+                XCTAssertEqual(fixture.receiver.records.count, 1)
+                let sample = try XCTUnwrap(fixture.receiver.records.first)
+                XCTAssertEqual(sample.typeCode, "uv_exposure")
+                XCTAssertEqual(sample.value, value)
+                XCTAssertEqual(sample.metadata["sample_kind"], "raw_quantity")
+                XCTAssertEqual(automaticCursor, fixture.anchor)
+                XCTAssertNil(try store.loadPendingObserverTypeCodeGenerations()["uv_exposure"])
+            } else {
+                XCTAssertTrue(fixture.receiver.records.isEmpty, "Unknown data must not become an invented zero")
+                XCTAssertNil(automaticCursor)
+                XCTAssertNil(try store.loadPendingObserverTypeCodeGenerations()["uv_exposure"])
+            }
+            XCTAssertTrue(fixture.receiver.batches.flatMap(\.samples).allSatisfy {
+                $0.metadata["sample_kind"] == "raw_quantity"
+            })
+        }
+    }
+
     func testNativeURLFreeCapabilitiesCollectAndPublishNutrition() async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }

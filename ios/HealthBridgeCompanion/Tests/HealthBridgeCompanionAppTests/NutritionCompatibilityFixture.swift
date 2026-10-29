@@ -133,7 +133,10 @@ final class NutritionFixture {
 
     func makeViewModel(
         mailbox: NutritionMailboxFixture? = nil,
-        eligibleTypeCodes: [String]? = nil
+        eligibleTypeCodes: [String]? = nil,
+        readDailyActivityAggregates: (@MainActor (
+            [String], Date, Date, Calendar
+        ) async throws -> [HealthKitDailyActivityAggregate])? = nil
     ) async throws -> HealthBridgeCompanionViewModel {
         let vm = HealthBridgeCompanionViewModel(
             receiverClient: client, settingsStore: settings,
@@ -155,7 +158,7 @@ final class NutritionFixture {
             sleepResetEpochStore: SleepResetEpochStore(tokenStore: NutritionTokenStore(), epochFloorProvider: { 1 }),
             mailboxKeyStore: mailbox?.keys ?? MailboxKeyStore(service: suite, keychain: NutritionKeychain()),
             automaticSyncEligibleTypeCodesForTesting: eligibleTypeCodes,
-            readDailyActivityAggregates: { _, _, _, _ in [] },
+            readDailyActivityAggregates: readDailyActivityAggregates ?? { _, _, _, _ in [] },
             scheduleDirectBackgroundUploads: { 0 },
             cancelInheritedLegacyUploads: {
                 BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)

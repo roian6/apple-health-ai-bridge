@@ -123,7 +123,7 @@ public enum HealthKitTypeCatalog {
         quantityEntry("estimated_workout_effort_score", "Estimated Workout Effort Score", "HKQuantityTypeIdentifierEstimatedWorkoutEffortScore", "apple_effort_score", sensitivity: .moderate, aggregation: .latest),
         quantityEntry("environmental_audio_exposure", "Environmental Audio Exposure", "HKQuantityTypeIdentifierEnvironmentalAudioExposure", "dBASPL", sensitivity: .moderate, aggregation: .minMaxAverage),
         quantityEntry("headphone_audio_exposure", "Headphone Audio Exposure", "HKQuantityTypeIdentifierHeadphoneAudioExposure", "dBASPL", sensitivity: .moderate, aggregation: .minMaxAverage),
-        quantityEntry("uv_exposure", "UV Exposure", "HKQuantityTypeIdentifierUVExposure", "count", sensitivity: .moderate, aggregation: .sum),
+        quantityEntry("uv_exposure", "UV Exposure", "HKQuantityTypeIdentifierUVExposure", "count", sensitivity: .moderate, aggregation: .minMaxAverage),
         quantityEntry("inhaler_usage", "Inhaler Usage", "HKQuantityTypeIdentifierInhalerUsage", "count", sensitivity: .high, aggregation: .sum),
         quantityEntry("electrodermal_activity", "Electrodermal Activity", "HKQuantityTypeIdentifierElectrodermalActivity", "S", sensitivity: .high, aggregation: .minMaxAverage),
         quantityEntry("push_count", "Push Count", "HKQuantityTypeIdentifierPushCount", "count", sensitivity: .low, aggregation: .sum),

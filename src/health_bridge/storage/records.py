@@ -116,8 +116,15 @@ def _upsert_samples(connection: sqlite3.Connection, batch: HealthBridgeBatchV1) 
                 legacy_key=(sample.type_code, sample.client_record_id),
                 canonical_key=(canonical_type_code, canonical_client_record_id),
             )
+        metadata = sample.metadata
+        if (
+            canonical_type_code == "uv_exposure"
+            and metadata.get("sample_kind") == "raw_quantity"
+            and metadata.get("aggregation") == "sum"
+        ):
+            metadata = {**metadata, "aggregation": "min_max_average"}
         metadata_json = json.dumps(
-            sample.metadata,
+            metadata,
             sort_keys=True,
             separators=(",", ":"),
         )

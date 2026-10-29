@@ -7158,6 +7158,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 return "No supported Apple Health data types are available for this sync. | domain=HealthKitGenericQuantityReaderError | code=empty_read_type_set"
             case .anchorUnavailable:
                 return "Apple Health did not return an anchored quantity cursor. | domain=HealthKitGenericQuantityReaderError | code=anchor_unavailable"
+            case .unsupportedCumulativeStatistics(let identifier):
+                return "Apple Health does not support daily totals for \(identifier). Raw quantity sync remains supported. | domain=HealthKitGenericQuantityReaderError | code=unsupported_cumulative_statistics"
             }
         }
         let nsError = error as NSError
