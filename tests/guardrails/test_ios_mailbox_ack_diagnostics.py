@@ -194,7 +194,24 @@ def _assert_shared_engine_ack_backpressure(
     raw_read = steps.index(
         "let raw = await performRecentStepCounts(executionMode: .automatic)"
     )
-    assert steps.index("let flushed = await flushPendingOutbox()") < raw_read
+    assert (
+        steps.index("let flushed = try await flushAutomaticPendingOutbox()") < raw_read
+    )
+    automatic_flush = _region(
+        source,
+        "private func flushAutomaticPendingOutbox()",
+        "private func flushPendingOutbox(",
+    )
+    assert (
+        "guard settingsStore.activeTransport == .directHTTP else {" in automatic_flush
+    )
+    assert automatic_flush.index(
+        "return await flushPendingOutbox(executionMode: .automatic)"
+    ) < (
+        automatic_flush.index("return try await runWithExclusiveDirectOutboxTransfer {")
+    )
+    assert "await self.flushPendingOutbox(executionMode: .automatic)" in automatic_flush
+    assert "viewModel.flushPendingOutbox(executionMode: .foreground)" in source
     assert re.search(
         str.join(
             "",

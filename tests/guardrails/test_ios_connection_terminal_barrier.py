@@ -127,7 +127,8 @@ def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
         "cursorFinalizer.recordDirectReceiverAcceptance(", post_response_check
     )
     assert response < post_response_check < acceptance
-    assert "catch is CancellationError" in pending
+    assert "catch let cancellation as CancellationError" in pending
+    assert "throw cancellation" in pending
 
 
 def test_terminal_request_reservation_precancels_pairing() -> None:
