@@ -1655,7 +1655,8 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     assert (
         foreground_outbox_body.count("requireCurrentPayloadDeliveryTarget(target)") >= 5
     )
-    assert "catch is CancellationError" in foreground_outbox_body
+    assert "catch let cancellation as CancellationError" in foreground_outbox_body
+    assert "throw cancellation" in foreground_outbox_body
     assert all(
         marker in foreground_outbox_body
         for marker in (

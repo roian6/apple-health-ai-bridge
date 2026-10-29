@@ -207,7 +207,7 @@ def test_rejected_sleep_epoch_recovery_is_durable_before_fifo_retirement() -> No
         in source[view_recovery_start:view_recovery_end]
     )
 
-    flush_start = source.index("private func flushPendingOutbox()")
+    flush_start = source.index("private func flushPendingOutbox(")
     flush_end = source.index("\n    func clearPendingOutbox()", flush_start)
     assert "RejectedSleepBaselineOutboxItem" in source[flush_start:flush_end]
 
