@@ -496,11 +496,14 @@ public final class FileOutbox {
         var mailboxBinding: FileOutboxMailboxBindingV1?
         var deliveryState: FileOutboxDeliveryStateV1?
         var nutritionProjectionPrepared: Bool? = nil
+        var nutritionOrderingVersion: Int? = nil
     }
 
     private struct SequenceManifest: Codable, Equatable {
         static let directOnlyVersion = 3
         static let mailboxVersion = 4
+        static let nutritionDirectVersion = 5
+        static let nutritionMailboxVersion = 6
 
         var version: Int
         var nextSequence: UInt64
@@ -510,10 +513,37 @@ public final class FileOutbox {
         var projectionRepairs: [String: [ProjectionRepair]]? = nil
         var projectionHistory: [String: Date]? = nil
         var projectionCompleted: [String: [ProjectionRepair]]? = nil
+        var nutritionSplits: [NutritionSplit]? = nil
+
+        var isMailbox: Bool {
+            version == Self.mailboxVersion || version == Self.nutritionMailboxVersion
+        }
+
+        mutating func useMailboxVersion() {
+            version = version >= Self.nutritionDirectVersion ? Self.nutritionMailboxVersion : Self.mailboxVersion
+        }
 
         static var empty: SequenceManifest {
             SequenceManifest(version: directOnlyVersion, nextSequence: 1, entries: [])
         }
+    }
+
+    private struct NutritionSplit: Codable, Equatable {
+        let parentID: String
+        let receiverIdentity: String
+        let parentSHA256: String
+        let supportedID: String
+        let supportedSHA256: String
+        let remainderID: String
+        let remainderSHA256: String
+        let cursors: Set<NutritionCursorKey>
+        var supportedAccepted: Bool = false
+        var remainderAccepted: Bool = false
+        var supportedPayload: Data?
+        var remainderPayload: Data?
+        var retiringParent: Bool = false
+
+        var completed: Bool { supportedAccepted && remainderAccepted }
     }
 
     private struct ProjectionInterval: Codable, Equatable {
@@ -623,6 +653,7 @@ public final class FileOutbox {
     private let fileManager: FileManager
     var observeNutritionCodec: @Sendable () -> Void = {}
     var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
+    var nutritionSplitFault: (NutritionSplitBoundary) throws -> Void = { _ in }
 
     #if !HEALTH_BRIDGE_MAILBOX_QA
     public weak var automaticSyncDiagnosticDraft: AutomaticSyncDiagnosticDraft?
@@ -1034,7 +1065,8 @@ public final class FileOutbox {
                 id: id,
                 receiverIdentity: receiverIdentity,
                 mailboxBinding: nil,
-                deliveryState: nil
+                deliveryState: nil,
+                nutritionOrderingVersion: 1
             )
         )
         manifest.nextSequence = sequence + 1
@@ -1243,6 +1275,9 @@ public final class FileOutbox {
         )
         let directAcknowledgedIDs = transaction.directAcknowledgedIDs
         guard transaction.entries.allSatisfy({ entry in
+            if manifest.nutritionSplits?.contains(where: { $0.parentID == entry.id }) == true {
+                return nutritionCollectionAccepted(entry.id, in: manifest, includingVerifiedACK: true)
+            }
             if directAcknowledgedIDs.contains(entry.id) {
                 return true
             }
@@ -1259,6 +1294,7 @@ public final class FileOutbox {
         }
         transactions.remove(at: transactionIndex)
         try persistEnqueueTransactions(transactions)
+        try recoverNutritionSplits()
     }
 
     public func acknowledgeCursorCheckpoint(
@@ -1280,6 +1316,11 @@ public final class FileOutbox {
         try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
+        }
+        if try nutritionCollectionOwner(itemID) != itemID {
+            try requireDirectRetirementAllowed(itemID: itemID)
+            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
+            return try directFinalizationRecordReady(receiverIdentity: receiverIdentity)
         }
         var transactions = try loadEnqueueTransactions()
         if let transactionIndex = transactions.firstIndex(where: {
@@ -1306,9 +1347,12 @@ public final class FileOutbox {
                 transactions[transactionIndex] = updated
                 try persistEnqueueTransactions(transactions)
             }
-            _ = try reconciledManifest()
+            let manifest = try reconciledManifest()
             guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
-                  updated.directAcknowledgedIDs == Set(updated.entries.map(\.id)) else {
+                  updated.entries.allSatisfy({
+                      updated.directAcknowledgedIDs.contains($0.id)
+                          || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: false)
+                  }) else {
                 return nil
             }
             return finalizationRecord
@@ -1328,14 +1372,17 @@ public final class FileOutbox {
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
-        _ = try reconciledManifest()
+        let manifest = try reconciledManifest()
         let transactions = try loadEnqueueTransactions()
         for (index, transaction) in transactions.enumerated() {
             guard let finalizationRecord = transaction.finalizationRecord,
                   transaction.entries.allSatisfy({ $0.receiverIdentity == receiverIdentity }),
                   finalizationRecord.cursorCheckpoint?.receiverIdentity
                     == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
-                  transaction.directAcknowledgedIDs == Set(transaction.entries.map(\.id)),
+                  transaction.entries.allSatisfy({
+                      transaction.directAcknowledgedIDs.contains($0.id)
+                          || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: false)
+                  }),
                   try canFinalizeNutritionIndependentTransaction(index, in: transactions) else {
                 continue
             }
@@ -1362,6 +1409,10 @@ public final class FileOutbox {
             }
             // Only held nutrition can be bypassed, never another ordinary FIFO lane.
             for entry in previous.entries where !previous.directAcknowledgedIDs.contains(entry.id) {
+                if let split = try loadManifest()?.nutritionSplits?.first(where: { $0.parentID == entry.id }),
+                   !split.supportedAccepted {
+                    return false
+                }
                 guard let item = try pendingItem(id: entry.id) else { return false }
                 guard let prepared = try preparedNutritionPayload(for: item),
                       prepared.containsNutrition else { return false }
@@ -1390,26 +1441,226 @@ public final class FileOutbox {
         return uploadable
     }
 
-    func prepareNutritionProjection(for item: FileOutboxItem, payload: Data) throws {
-        let manifest = try reconciledManifest()
+    func prepareNutritionProjection(
+        for item: FileOutboxItem, payloads: (Data, Data), cursors: Set<NutritionCursorKey>
+    ) throws {
+        var manifest = try reconciledManifest()
         guard let entry = manifest.entries.first(where: { $0.id == item.id }),
               let identity = entry.receiverIdentity else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
         }
-        guard entry.nutritionProjectionPrepared != true else { return }
-        // Persist the child before the marker. A crash between these writes can
-        // replay stable record identities, but cannot lose supported records.
-        let projection = try enqueueIfAbsent(payload, receiverIdentity: identity).item
-        preparedNutritionPayloads[projection.id] = PreparedNutritionPayload(
-            revision: try NutritionPayloadRevision(projection.fileURL),
-            containsNutrition: false, permitsSupported: true, projection: nil
-        )
-        var updated = try reconciledManifest()
-        guard let index = updated.entries.firstIndex(where: { $0.id == item.id }) else {
-            throw SequenceError.invalidManifest
+        guard !(manifest.nutritionSplits ?? []).contains(where: { $0.parentID == item.id }),
+              entry.nutritionOrderingVersion == 1,
+              entry.nutritionProjectionPrepared != true else { return }
+        guard entry.mailboxBinding == nil,
+              entry.deliveryState == nil || entry.deliveryState?.phase == .collected,
+              !(try hasEnvelopeArtifact(for: item.id)),
+              try loadMailboxEnvelopeFinalizationIntent() == nil else {
+            throw FileOutboxNutritionError.invalidSplit
         }
-        updated.entries[index].nutritionProjectionPrepared = true
-        try persistManifest(updated)
+        guard let prepared = try preparedNutritionPayload(for: item) else { throw CancellationError() }
+        var childIDs: [String] = []
+        for _ in 0..<2 {
+            let sequence = manifest.nextSequence
+            guard sequence < UInt64.max else { throw SequenceError.exhausted }
+            let id = String(format: "%020llu-%@", sequence, UUID().uuidString.lowercased())
+            manifest.entries.append(SequenceEntry(
+                sequence: sequence, id: id, receiverIdentity: identity,
+                mailboxBinding: nil, deliveryState: nil, nutritionOrderingVersion: 1
+            ))
+            manifest.nextSequence += 1
+            childIDs.append(id)
+        }
+        var heldCursors = cursors
+        for transaction in try loadEnqueueTransactions()
+            where transaction.entries.contains(where: { $0.id == item.id }) {
+            if let checkpoint = transaction.cursorCheckpoint {
+                heldCursors.insert(NutritionCursorKey(
+                    sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+                ))
+            }
+        }
+        let split = NutritionSplit(
+            parentID: item.id, receiverIdentity: identity,
+            parentSHA256: Self.sha256(try Data(contentsOf: item.fileURL)),
+            supportedID: childIDs[0], supportedSHA256: Self.sha256(payloads.0),
+            remainderID: childIDs[1], remainderSHA256: Self.sha256(payloads.1),
+            cursors: heldCursors, supportedPayload: payloads.0, remainderPayload: payloads.1
+        )
+        manifest.version = manifest.isMailbox
+            ? SequenceManifest.nutritionMailboxVersion : SequenceManifest.nutritionDirectVersion
+        manifest.nutritionSplits = (manifest.nutritionSplits ?? []) + [split]
+        // The atomic manifest is the installation intent. No child is selectable
+        // until both exact payloads have been installed and the intent cleared.
+        try persistManifest(manifest)
+        try nutritionSplitFault(.intentPersisted)
+        try recoverNutritionSplits()
+        preparedNutritionPayloads[split.supportedID] = PreparedNutritionPayload(
+            revision: try NutritionPayloadRevision(finalPayloadURL(for: split.supportedID)),
+            containsNutrition: false, permitsSupported: true, projection: nil,
+            remainder: nil, cursors: []
+        )
+        preparedNutritionPayloads[split.remainderID] = PreparedNutritionPayload(
+            revision: try NutritionPayloadRevision(finalPayloadURL(for: split.remainderID)),
+            containsNutrition: true, permitsSupported: prepared.permitsSupported,
+            projection: nil, remainder: nil, cursors: prepared.cursors
+        )
+    }
+
+    func nutritionPendingGroups(for receiverIdentity: String) throws -> [NutritionPendingGroup] {
+        guard let manifest = try loadManifest() else { return [] }
+        let splits = manifest.nutritionSplits ?? []
+        guard splits.allSatisfy({
+            $0.supportedPayload == nil && $0.remainderPayload == nil && !$0.retiringParent
+        }) else { throw CancellationError() }
+        let items = try pendingItemsForNutritionValidation()
+        let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        let children = Set(splits.flatMap { [$0.supportedID, $0.remainderID] })
+        var groups: [NutritionPendingGroup] = []
+        for item in items.prefix(while: { $0.receiverIdentity == receiverIdentity }) {
+            if children.contains(item.id) { continue }
+            if let split = splits.first(where: { $0.parentID == item.id }) {
+                guard split.supportedAccepted || byID[split.supportedID] != nil,
+                      split.remainderAccepted || byID[split.remainderID] != nil else {
+                    throw FileOutboxNutritionError.invalidSplit
+                }
+                groups.append(.split(
+                    supported: split.supportedAccepted ? nil : byID[split.supportedID],
+                    remainder: split.remainderAccepted ? nil : byID[split.remainderID],
+                    cursors: split.cursors
+                ))
+            } else {
+                let entry = manifest.entries.first { $0.id == item.id }
+                groups.append(.original(
+                    item, permitsSplit: entry?.nutritionOrderingVersion == 1
+                        && entry?.nutritionProjectionPrepared != true
+                ))
+            }
+        }
+        return groups
+    }
+
+    private func nutritionCollectionOwner(_ itemID: String) throws -> String {
+        try loadManifest()?.nutritionSplits?.first(where: {
+            $0.supportedID == itemID || $0.remainderID == itemID
+        })?.parentID ?? itemID
+    }
+
+    private func nutritionCollectionAccepted(
+        _ parentID: String, in manifest: SequenceManifest, includingVerifiedACK: Bool
+    ) -> Bool {
+        guard let split = manifest.nutritionSplits?.first(where: { $0.parentID == parentID }) else {
+            return false
+        }
+        func accepted(_ id: String, recorded: Bool) -> Bool {
+            if recorded { return true }
+            guard includingVerifiedACK else { return false }
+            let phase = manifest.entries.first { $0.id == id }?.deliveryState?.phase
+            return phase == .ackVerified || phase == .committedFinalized
+        }
+        return accepted(split.supportedID, recorded: split.supportedAccepted)
+            && accepted(split.remainderID, recorded: split.remainderAccepted)
+    }
+
+    private func recordNutritionChildAcceptance(
+        itemID: String, receiverIdentity: String
+    ) throws {
+        guard var manifest = try loadManifest(),
+              let index = manifest.nutritionSplits?.firstIndex(where: {
+                  $0.supportedID == itemID || $0.remainderID == itemID
+              }),
+              var splits = manifest.nutritionSplits else { return }
+        guard splits[index].receiverIdentity == receiverIdentity else {
+            throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+        }
+        if splits[index].supportedID == itemID {
+            splits[index].supportedAccepted = true
+        } else {
+            splits[index].remainderAccepted = true
+        }
+        manifest.nutritionSplits = splits
+        try persistManifest(manifest)
+        try nutritionSplitFault(.acceptancePersisted)
+        try recoverNutritionSplits()
+    }
+
+    private func recoverNutritionSplits() throws {
+        guard var manifest = try loadManifest(),
+              var splits = manifest.nutritionSplits, !splits.isEmpty else { return }
+        let transactions = try loadEnqueueTransactions()
+        for index in splits.indices {
+            var split = splits[index]
+            if manifest.entries.first(where: { $0.id == split.supportedID })?.deliveryState?.phase == .committedFinalized {
+                split.supportedAccepted = true
+            }
+            if manifest.entries.first(where: { $0.id == split.remainderID })?.deliveryState?.phase == .committedFinalized {
+                split.remainderAccepted = true
+            }
+            if !split.retiringParent {
+                guard Self.sha256(try Data(contentsOf: finalPayloadURL(for: split.parentID)))
+                    == split.parentSHA256 else { throw FileOutboxNutritionError.invalidSplit }
+            }
+            for (id, payload, digest, accepted) in [
+                (split.supportedID, split.supportedPayload, split.supportedSHA256, split.supportedAccepted),
+                (split.remainderID, split.remainderPayload, split.remainderSHA256, split.remainderAccepted),
+            ] {
+                guard let payload else {
+                    if !accepted {
+                        guard Self.sha256(try Data(contentsOf: finalPayloadURL(for: id))) == digest else {
+                            throw FileOutboxNutritionError.invalidSplit
+                        }
+                    }
+                    continue
+                }
+                guard Self.sha256(payload) == digest else { throw FileOutboxNutritionError.invalidSplit }
+                let url = finalPayloadURL(for: id)
+                if fileManager.fileExists(atPath: url.path) {
+                    guard Self.sha256(try Data(contentsOf: url)) == digest else {
+                        throw FileOutboxNutritionError.invalidSplit
+                    }
+                } else {
+                    try payload.write(to: url, options: [.atomic])
+                    try Self.applySensitiveFileAttributes(to: url, fileManager: fileManager)
+                }
+                try nutritionSplitFault(id == split.supportedID ? .supportedPayloadInstalled : .remainderPayloadInstalled)
+            }
+            split.supportedPayload = nil
+            split.remainderPayload = nil
+            splits[index] = split
+        }
+        if manifest.nutritionSplits != splits {
+            manifest.nutritionSplits = splits
+            try persistManifest(manifest)
+            try nutritionSplitFault(.manifestCommitted)
+        }
+        for split in splits {
+            for (id, accepted) in [
+                (split.supportedID, split.supportedAccepted),
+                (split.remainderID, split.remainderAccepted),
+            ] where accepted && manifest.entries.first(where: { $0.id == id })?.mailboxBinding == nil {
+                try removeIfExists(finalPayloadURL(for: id))
+            }
+            guard split.completed,
+                  !transactions.contains(where: { $0.entries.contains(where: { $0.id == split.parentID }) }) else {
+                continue
+            }
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            try acknowledgeProjectionPayload(itemID: split.parentID, receiverBindingID: split.receiverIdentity)
+            guard let refreshed = try loadManifest() else { throw FileOutboxNutritionError.invalidSplit }
+            manifest = refreshed
+            #endif
+            guard let index = manifest.nutritionSplits?.firstIndex(where: { $0.parentID == split.parentID }) else {
+                throw FileOutboxNutritionError.invalidSplit
+            }
+            manifest.nutritionSplits?[index].retiringParent = true
+            try persistManifest(manifest)
+            try nutritionSplitFault(.retirementPersisted)
+            try removeIfExists(finalPayloadURL(for: split.parentID))
+            try nutritionSplitFault(.parentRemoved)
+            manifest.entries.removeAll { $0.id == split.parentID }
+            manifest.nutritionSplits?.remove(at: index)
+            try persistManifest(manifest)
+        }
     }
 
     public func pendingItem(id: String) throws -> FileOutboxItem? {
@@ -1421,6 +1672,9 @@ public final class FileOutbox {
 
     public func markUploaded(_ item: FileOutboxItem) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
+        if let identity = item.receiverIdentity {
+            try recordNutritionChildAcceptance(itemID: item.id, receiverIdentity: identity)
+        }
         #if !HEALTH_BRIDGE_MAILBOX_QA
         if let identity = item.receiverIdentity {
             try acknowledgeProjectionPayload(itemID: item.id, receiverBindingID: identity)
@@ -1459,14 +1713,32 @@ public final class FileOutbox {
         guard try downgradeReadiness() == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
-        let items = try pendingItems()
-        for item in items {
-            if fileManager.fileExists(atPath: item.fileURL.path) {
-                try fileManager.removeItem(at: item.fileURL)
+        let payloadURLs = try payloadFileURLs()
+        for transaction in try loadEnqueueTransactions() {
+            for entry in transaction.entries {
+                try removeIfExists(stagedPayloadURL(for: entry.id))
+            }
+        }
+        try removeIfExists(enqueueTransactionURL)
+        if var manifest = try loadManifest(),
+           manifest.version == SequenceManifest.nutritionDirectVersion {
+            let splitIDs = Set((manifest.nutritionSplits ?? []).flatMap {
+                [$0.parentID, $0.supportedID, $0.remainderID]
+            })
+            manifest.entries.removeAll { splitIDs.contains($0.id) }
+            manifest.nutritionSplits = nil
+            manifest.version = SequenceManifest.directOnlyVersion
+            // Retire recovery intent before payload deletion. The clear marker
+            // keeps admission closed if deletion is interrupted.
+            try persistManifest(manifest)
+        }
+        for url in payloadURLs {
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
             }
         }
         _ = try reconciledManifest()
-        return items.count
+        return payloadURLs.count
     }
 
     public func finishClearIntent() throws {
@@ -1582,7 +1854,7 @@ public final class FileOutbox {
                 throw FileOutboxMailboxError.invalidDeliveryState
             }
             manifest.entries[index].deliveryState = updated
-            manifest.version = SequenceManifest.mailboxVersion
+            manifest.useMailboxVersion()
             try persistManifest(manifest)
             return updated
         }
@@ -1593,7 +1865,7 @@ public final class FileOutbox {
             throw FileOutboxMailboxError.invalidDeliveryState
         }
         manifest.entries[index].deliveryState = updated
-        manifest.version = SequenceManifest.mailboxVersion
+        manifest.useMailboxVersion()
         try persistManifest(manifest)
         #if !HEALTH_BRIDGE_MAILBOX_QA
         switch updated.phase {
@@ -1616,9 +1888,10 @@ public final class FileOutbox {
         itemID: String,
         ownership: OutboxDeliveryOwnershipV1
     ) throws -> FileOutboxFinalizationRecord? {
+        let ownerID = try nutritionCollectionOwner(itemID)
         let transactions = try loadEnqueueTransactions()
         guard let transactionIndex = transactions.firstIndex(where: {
-            $0.entries.contains(where: { $0.id == itemID })
+            $0.entries.contains(where: { $0.id == ownerID })
         }) else {
             return nil
         }
@@ -1632,7 +1905,7 @@ public final class FileOutbox {
               }),
               finalizationRecord.cursorCheckpoint?.receiverIdentity
                 == ownership.receiverBindingID || finalizationRecord.cursorCheckpoint == nil,
-              transaction.entries.contains(where: { $0.id == itemID }) else {
+              transaction.entries.contains(where: { $0.id == ownerID }) else {
             return nil
         }
         let manifest = try reconciledManifest()
@@ -1643,6 +1916,7 @@ public final class FileOutbox {
         )
         guard transaction.entries.allSatisfy({
             states[$0.id] == .ackVerified || states[$0.id] == .committedFinalized
+                || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: true)
         }) else {
             return nil
         }
@@ -1678,6 +1952,9 @@ public final class FileOutbox {
         try persistManifest(manifest)
         try fault(.statePersisted)
         try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
+        if let identity = manifest.entries[index].receiverIdentity {
+            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: identity)
+        }
         return committed
     }
 
@@ -1722,7 +1999,8 @@ public final class FileOutbox {
                 ManifestVersion.self,
                 from: Data(contentsOf: manifestURL)
             )
-            if let header, header.version >= SequenceManifest.mailboxVersion {
+            if let header, header.version >= SequenceManifest.mailboxVersion,
+               header.version != SequenceManifest.nutritionDirectVersion {
                 return .hold(.v4Manifest)
             }
         }
@@ -1831,7 +2109,7 @@ public final class FileOutbox {
         manifest.entries[entryIndex].deliveryState = try Self.encryptedDeliveryState(
             manifest.entries[entryIndex].deliveryState
         )
-        manifest.version = SequenceManifest.mailboxVersion
+        manifest.useMailboxVersion()
         try persistManifest(manifest)
         if stopAfter == .manifestBound { return binding }
 
@@ -1887,7 +2165,7 @@ public final class FileOutbox {
         manifest.entries[entryIndex].deliveryState = try Self.encryptedDeliveryState(
             manifest.entries[entryIndex].deliveryState
         )
-        manifest.version = SequenceManifest.mailboxVersion
+        manifest.useMailboxVersion()
         try persistManifest(manifest)
         try removeIfExists(mailboxEnvelopeIntentURL)
     }
@@ -2129,7 +2407,8 @@ public final class FileOutbox {
                     id: id,
                     receiverIdentity: receiverIdentity,
                     mailboxBinding: nil,
-                    deliveryState: nil
+                    deliveryState: nil,
+                    nutritionOrderingVersion: 1
                 )
             )
             manifest.nextSequence = sequence + 1
@@ -2357,6 +2636,7 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
         var manifest = loadedManifest ?? .empty
@@ -2364,7 +2644,7 @@ public final class FileOutbox {
         if manifest.version < SequenceManifest.directOnlyVersion {
             manifest.version = SequenceManifest.directOnlyVersion
         }
-        if manifest.version == SequenceManifest.mailboxVersion {
+        if manifest.isMailbox {
             for index in manifest.entries.indices
                 where manifest.entries[index].deliveryState == nil {
                 manifest.entries[index].deliveryState = .stable(
@@ -2427,7 +2707,7 @@ public final class FileOutbox {
                     id: id,
                     receiverIdentity: nil,
                     mailboxBinding: nil,
-                    deliveryState: manifest.version == SequenceManifest.mailboxVersion
+                    deliveryState: manifest.isMailbox
                         ? .stable(.collected, ownership: nil)
                         : nil
                 )
@@ -2467,14 +2747,14 @@ public final class FileOutbox {
         let sequences = manifest.entries.map(\.sequence)
         let mailboxBindings = manifest.entries.compactMap(\.mailboxBinding)
         let deliveryStates = manifest.entries.compactMap(\.deliveryState)
-        guard (1 ... SequenceManifest.mailboxVersion).contains(manifest.version),
+        guard (1 ... SequenceManifest.nutritionMailboxVersion).contains(manifest.version),
               manifest.nextSequence > 0,
               ids.allSatisfy(isSafeItemID),
               Set(ids).count == ids.count,
               Set(sequences).count == sequences.count,
               sequences.allSatisfy({ $0 > 0 }),
               (sequences.max().map { manifest.nextSequence > $0 } ?? true),
-              (manifest.version == SequenceManifest.mailboxVersion
+              (manifest.isMailbox
                   ? !mailboxBindings.isEmpty || !deliveryStates.isEmpty
                   : mailboxBindings.isEmpty && deliveryStates.isEmpty),
               manifest.entries.allSatisfy({ entry in
@@ -2486,6 +2766,40 @@ public final class FileOutbox {
                   return bindingIsValid && deliveryStateIsValid(for: entry)
               }) else {
             throw SequenceError.invalidManifest
+        }
+        let splits = manifest.nutritionSplits ?? []
+        let parentIDs = Set(splits.map(\.parentID))
+        let childIDs = splits.flatMap { [$0.supportedID, $0.remainderID] }
+        guard splits.isEmpty || manifest.version >= SequenceManifest.nutritionDirectVersion,
+              parentIDs.count == splits.count,
+              Set(childIDs).count == childIDs.count,
+              parentIDs.isDisjoint(with: childIDs) else {
+            throw FileOutboxNutritionError.invalidSplit
+        }
+        for split in splits {
+            let parent = manifest.entries.first { $0.id == split.parentID }
+            guard isSafeItemID(split.parentID), !split.receiverIdentity.isEmpty,
+                  isSHA256(split.parentSHA256), isSHA256(split.supportedSHA256),
+                  isSHA256(split.remainderSHA256),
+                  split.retiringParent ? split.completed : parent?.receiverIdentity == split.receiverIdentity,
+                  parent?.mailboxBinding == nil,
+                  parent?.deliveryState == nil || parent?.deliveryState?.phase == .collected,
+                  (split.supportedPayload == nil) == (split.remainderPayload == nil),
+                  split.supportedPayload == nil || (!split.supportedAccepted && !split.remainderAccepted),
+                  split.cursors.allSatisfy({ !$0.sourceKey.isEmpty && !$0.cursorKind.isEmpty }) else {
+                throw FileOutboxNutritionError.invalidSplit
+            }
+            for (id, digest, accepted) in [
+                (split.supportedID, split.supportedSHA256, split.supportedAccepted),
+                (split.remainderID, split.remainderSHA256, split.remainderAccepted),
+            ] {
+                let child = manifest.entries.first { $0.id == id }
+                guard isSafeItemID(id),
+                      child?.receiverIdentity == split.receiverIdentity || (accepted && child == nil),
+                      child?.mailboxBinding?.payloadSHA256 == nil || child?.mailboxBinding?.payloadSHA256 == digest else {
+                    throw FileOutboxNutritionError.invalidSplit
+                }
+            }
         }
     }
 

@@ -37,7 +37,7 @@ You'll need an **iPhone running iOS 18 or later**, a **macOS or Linux computer**
 3. **Pair your iPhone.** [Scan the pairing QR](docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
 4. **Connect your AI.** [Choose your client](#choose-your-ai), then [ask your first question](docs/setup.md#ask-your-first-question).
 
-For the Mac-only iCloud Mailbox Beta, use the same release's [helper verification and installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md). The maintenance release preserves 1.1.3 query behavior; newer features in main remain unreleased.
+For the Mac-only iCloud Mailbox Beta, use the same release's [helper verification and installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md). Receiver/CLI 1.2.0 is published, but its matching iOS Companion 1.2.0 (build 51) is still under App Store and external TestFlight review. The App Store version currently available is iOS Companion 1.1.1 (build 50), so this quickstart stays on Receiver/CLI 1.1.5 until the matched app build is available and the install defaults are deliberately moved together.
 
 ## Choose your AI
 

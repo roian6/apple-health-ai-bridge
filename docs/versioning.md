@@ -2,17 +2,17 @@
 
 Apple Health AI Bridge contains independently released components. Always include the component name when presenting a version; the phrase “repository version” is intentionally avoided because a Git checkout is identified by a commit or tag, not by a single product version.
 
-## Source compatibility
+## Forward-port source versions
 
-| Surface | Current version | Public identifier |
+| Surface | Source version | Identifier or status |
 | --- | --- | --- |
-| Receiver/CLI | `1.1.5` | Release tag `receiver-v1.1.5` |
-| iOS Companion | `1.1.1` | Source candidate build `50` |
+| Receiver/CLI | `1.2.0` | Published as `receiver-v1.2.0` |
+| iOS Companion | `1.2.0` (build `51`) | App Store and external TestFlight review pending |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture.
+The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture. These source versions do not set public installation defaults: the App Store currently offers iOS Companion `1.1.1` (build `50`), while build `51` remains under review and is not available through the App Store or external TestFlight. Keep the guided Receiver/CLI install pinned to `1.1.5` until the matching app build is available and the controlled cutover updates commands, guide links, helper references and compatibility copy together.
 
-The published `receiver-v1.1.5` is a bounded maintenance release based on `receiver-v1.1.3`. Main carries the matching source version after forward-porting release metadata and workflow fixes, while its additional runtime features and migrations remain unreleased. Use the immutable release tag and its tagged installation guides for the published behavior.
+Receiver/CLI `1.2.0` is published. The App Store and external TestFlight distribution of iOS Companion `1.2.0` (build `51`) is still pending review, so do not present the coordinated build set as available. The current installation default remains Receiver/CLI `1.1.5`; do not infer general compatibility between that app and Receiver/CLI `1.2.0`.
 
 ### One stable release branch
 
@@ -86,30 +86,10 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 
 ## Release presentation
 
-GitHub release display names are separate from immutable release tags. Through
-Receiver/CLI `1.1.3`, the display name remains the exact raw tag, including the
-historical `v1.0.0` and `v1.0.1` names. Starting at `1.1.4`, the display name must
-be exactly `Receiver/CLI <version>`; for example, `Receiver/CLI 1.1.4` for
-`receiver-v1.1.4`. The raw tag is not an alternative display name for these new
-releases.
+Release titles use the component/version format validated by `release_tools.py`. The committed notes must retain complete `Compatible iOS Companion` and `Compatible Batch Protocol` declarations matching `component-versions.json`; do not split a declaration across Markdown table cells.
 
-The release tool's `tag-info` JSON derives `title` from the canonical tag. The
-release reconciler uses that value when creating a draft, and
-the shared identity verifier requires it at the core, helper, final-draft and
-published stages. Publication preserves the verified draft title; it does not
-patch the title afterward. At every stage, the release body must still exactly
-match the source notes file.
+During initial staging, publication and recovery, the hosted title and body must exactly match the source-bound notes at the signed tag. This keeps publication retries deterministic and prevents an unexplained identity mismatch from being accepted.
 
-This presentation rule does not rename tags, notes files or assets, change
-component versions, or relax source binding, helper requirements, signatures,
-checksums or provenance verification.
+After publication, GitHub permits the title and release notes to be edited while keeping the tag and assets immutable. Maintainers may improve factual copy without rebuilding or replacing the verified packet. The explicit read-only `--published-artifacts-only` mode of `verify-published` and `verify-final-published` skips only hosted title/body equality; all other existing artifact, metadata, state and tag checks remain in force.
 
-Use labels such as:
-
-```text
-Receiver/CLI 1.1.5
-Compatible iOS Companion 1.1.1 (build 50)
-Batch Protocol health_bridge.batch.v1 (1.0.0)
-```
-
-Avoid an unlabeled phrase such as “Health Bridge 1.1.0” when it could be read as the app, receiver, or protocol version.
+Default verification and publication recovery stay strict. The artifact-only mode does not review the prose or perform the caller's independent release-ID, source-eligibility and authenticated download checks. See [Editing published release copy](release-operations.md#editing-published-release-copy).

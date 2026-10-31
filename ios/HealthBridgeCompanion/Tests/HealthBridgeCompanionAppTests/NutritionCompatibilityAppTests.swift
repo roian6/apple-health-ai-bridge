@@ -7,6 +7,126 @@ import XCTest
 
 @MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
+    func testNutritionRefreshCancellationDoesNotReclassifyAcceptedUpload() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        fixture.receiver.capability = .unsupported
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let vm = try await fixture.makeViewModel(eligibleTypeCodes: ["dietary_protein"])
+        _ = try fixture.enqueueMixed()
+        var newlyQueued: FileOutboxItem?
+        fixture.outbox.nutritionSplitFault = { boundary in
+            guard case .acceptancePersisted = boundary, newlyQueued == nil else { return }
+            newlyQueued = try fixture.enqueueMixed()
+        }
+        let engine = AutomaticSyncEngine(
+            pendingStore: background,
+            processType: { _, _ in .blocked },
+            performOpportunity: { opportunity, processPendingTypes in
+                _ = await vm.performAutomaticSyncOpportunity(
+                    opportunity: opportunity,
+                    processPendingTypes: processPendingTypes
+                )
+            }
+        )
+
+        try await engine.requestRun(reason: .observerBatch(typeCodes: ["dietary_protein"]))
+
+        XCTAssertEqual(fixture.receiver.batches.count, 1)
+        XCTAssertFalse(NutritionCompatibility.containsNutrition(
+            try XCTUnwrap(fixture.receiver.batches.first)
+        ))
+        let pending = try XCTUnwrap(newlyQueued)
+        XCTAssertNotNil(try fixture.outbox.pendingItem(id: pending.id))
+        let failure = Mirror(reflecting: vm).children.first {
+            $0.label == "backgroundAutomaticSyncFailure"
+        }?.value as? AutomaticSyncDiagnosticFailure
+        XCTAssertNil(failure, "Refreshing later queued work must not reclassify the accepted transport")
+    }
+
+    func testDiscreteActivityRawACKRetiresGenerationWithoutDailyStatistics() async throws {
+        for value: Double? in [nil, 0, 7] {
+            let fixture = try NutritionFixture()
+            defer { fixture.cleanup() }
+            fixture.values = value.map { ["uv_exposure": $0] } ?? [:]
+            let store = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+            try store.setEnabledDurably(true)
+            CompanionHealthPermissionRequestStore(userDefaults: fixture.defaults).recordCompletedRequest(
+                runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                    forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+                )
+            )
+            var dailyReads = 0
+            let vm = try await fixture.makeViewModel(
+                eligibleTypeCodes: ["uv_exposure"],
+                readDailyActivityAggregates: { types, start, _, calendar in
+                    dailyReads += 1
+                    for entry in HealthKitGenericQuantityReader.readableQuantityEntries(for: types) {
+                        let type = try XCTUnwrap(HealthKitQuantitySampleMapper.quantityType(for: entry))
+                        _ = try HealthKitGenericQuantityReader.dailyActivityStatisticsQuery(
+                            quantityType: type, predicate: nil,
+                            anchorDate: calendar.startOfDay(for: start), interval: DateComponents(day: 1)
+                        )
+                    }
+                    return []
+                }
+            )
+            XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+            let coordinator = HealthKitBackgroundDeliveryCoordinator(
+                healthDataAvailable: { false },
+                executeQuery: { _ in XCTFail("Unexpected HealthKit observer query") },
+                stopQuery: { _ in }, enableDelivery: { _, completion in completion(false, nil) },
+                disableDelivery: { _ in }
+            )
+            let runtime = HealthBridgeCompanionApplicationRuntime(
+                viewModel: vm, automaticSyncPlatform: AutomaticSyncRuntime.Platform(
+                    scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+                    setUploadAdmission: { _ in }, beginBackgroundOwner: { _ in {} },
+                    healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+                )
+            )
+            try store.markPendingObserverTypeCodes(["uv_exposure"])
+            XCTAssertNotNil(try store.loadPendingObserverTypeCodeGenerations()["uv_exposure"])
+
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["uv_exposure"]))
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await vm.waitForBootstrapAndForegroundWork()
+
+            XCTAssertEqual(fixture.reads, ["uv_exposure"])
+            XCTAssertEqual(dailyReads, 0, "A supported discrete metric must not enter the daily-sum reader")
+            XCTAssertFalse(vm.statusIsError)
+            XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+            let automaticCursor = try fixture.cursors.cursorValue(
+                receiverBindingID: XCTUnwrap(fixture.settings.receiverBindingID),
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "uv_exposure")
+            )
+            XCTAssertNil(try fixture.cursor("uv_exposure"), "Automatic fallback must not claim the shared cursor")
+            if let value {
+                XCTAssertEqual(fixture.receiver.records.count, 1)
+                let sample = try XCTUnwrap(fixture.receiver.records.first)
+                XCTAssertEqual(sample.typeCode, "uv_exposure")
+                XCTAssertEqual(sample.value, value)
+                XCTAssertEqual(sample.metadata["sample_kind"], "raw_quantity")
+                XCTAssertEqual(automaticCursor, fixture.anchor)
+                XCTAssertNil(try store.loadPendingObserverTypeCodeGenerations()["uv_exposure"])
+            } else {
+                XCTAssertTrue(fixture.receiver.records.isEmpty, "Unknown data must not become an invented zero")
+                XCTAssertNil(automaticCursor)
+                XCTAssertNil(try store.loadPendingObserverTypeCodeGenerations()["uv_exposure"])
+            }
+            XCTAssertTrue(fixture.receiver.batches.flatMap(\.samples).allSatisfy {
+                $0.metadata["sample_kind"] == "raw_quantity"
+            })
+        }
+    }
+
     func testNativeURLFreeCapabilitiesCollectAndPublishNutrition() async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
@@ -104,17 +224,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
         XCTAssertNil(try fixture.base.outbox.pendingItem(id: original.id))
         let remaining = try fixture.base.outbox.pendingItems()
-        XCTAssertEqual(remaining.count, 1, "Unknown support retains the unacknowledged supported projection")
-        let projection = try XCTUnwrap(remaining.first)
-        XCTAssertNotEqual(projection.id, original.id)
-        XCTAssertEqual(projection.receiverIdentity, original.receiverIdentity)
-        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: projection.fileURL))
-        XCTAssertFalse(NutritionCompatibility.containsNutrition(batch))
-        XCTAssertEqual(batch.samples.map(\.typeCode), ["weight"])
-        XCTAssertTrue(batch.sync.cursors.isEmpty)
-        XCTAssertEqual(projection.deliveryState?.phase, .collected)
-        XCTAssertNil(projection.deliveryState?.ownership)
-        XCTAssertNil(projection.deliveryState?.committedReceipt, "Unacknowledged projection must not inherit the original receipt")
+        XCTAssertTrue(remaining.isEmpty, "An already published original must not create a second supported delivery")
     }
 
     func testCapabilityTokenFailureDoesNotReportQuantitySyncSuccess() async throws {
@@ -157,10 +267,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
         XCTAssertNil(try fixture.base.outbox.pendingItem(id: original.id))
         let remaining = try fixture.base.outbox.pendingItems()
-        XCTAssertEqual(remaining.count, 1)
-        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: XCTUnwrap(remaining.first).fileURL))
-        XCTAssertFalse(NutritionCompatibility.containsNutrition(batch))
-        XCTAssertTrue(batch.sync.cursors.isEmpty)
+        XCTAssertTrue(remaining.isEmpty)
         XCTAssertEqual(fixture.base.receiver.records.count, 2)
         XCTAssertTrue(fixture.base.receiver.credentials.isEmpty)
     }
@@ -352,7 +459,12 @@ final class NutritionCompatibilityAppTests: XCTestCase {
     func testMixedDurableRetryUpgradePreservesAnchorAndDeduplicates() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
-        let original = try fixture.enqueueMixed()
+        let original = try fixture.enqueueMixed(workoutEnergy: 10)
+        fixture.values["weight"] = 71
+        let update = try XCTUnwrap(NutritionCompatibility.supportedProjection(fixture.mixedBatch(workoutEnergy: 20)))
+        _ = try fixture.outbox.enqueue(
+            JSONEncoder().encode(update), receiverIdentity: XCTUnwrap(fixture.settings.receiverBindingID)
+        )
         let bytes = try Data(contentsOf: original.fileURL)
         fixture.receiver.capability = .unsupported
         let vm = try await fixture.makeViewModel()
@@ -360,6 +472,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertNil(try fixture.cursor("dietary_protein"))
         XCTAssertEqual(try Data(contentsOf: original.fileURL), bytes)
         XCTAssertTrue(fixture.receiver.batches.allSatisfy { !NutritionCompatibility.containsNutrition($0) })
+        XCTAssertEqual(fixture.receiver.workouts.map(\.energyKcal), [20])
         let priorWeightIDs = Set(fixture.receiver.records.filter { $0.typeCode == "weight" }.map(\.clientRecordID))
         let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
         let before = try reopened.pendingItems().map(\.id)
@@ -376,6 +489,7 @@ final class NutritionCompatibilityAppTests: XCTestCase {
         XCTAssertFalse(try fixture.outbox.pendingItems().contains { $0.id == original.id })
         XCTAssertEqual(fixture.receiver.records.filter { $0.typeCode == "dietary_protein" }.map(\.value), [12])
         XCTAssertEqual(Set(fixture.receiver.records.filter { $0.typeCode == "weight" }.map(\.clientRecordID)), priorWeightIDs)
+        XCTAssertEqual(fixture.receiver.workouts.map(\.energyKcal), [20])
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
     }
 
@@ -448,30 +562,44 @@ final class NutritionCompatibilityAppTests: XCTestCase {
     func testMailboxLegacyMixedUpgradeAuthenticatedACKAndDeduplication() async throws {
         let fixture = try NutritionMailboxFixture()
         defer { fixture.base.cleanup() }
-        let original = try fixture.base.enqueueMixed()
+        let original = try fixture.base.enqueueMixed(workoutEnergy: 10)
+        let update = try XCTUnwrap(NutritionCompatibility.supportedProjection(fixture.base.mixedBatch(workoutEnergy: 20)))
+        let newer = try fixture.base.outbox.enqueue(
+            JSONEncoder().encode(update), receiverIdentity: XCTUnwrap(fixture.base.settings.receiverBindingID)
+        )
         let bytes = try Data(contentsOf: original.fileURL)
         fixture.base.receiver.capability = .legacy
         try fixture.removeCapabilities()
         _ = try await fixture.delivery().publishPendingFIFOHead()
-        let projection = try XCTUnwrap(fixture.base.outbox.pendingItems().first { $0.id != original.id })
+        let projection = try XCTUnwrap(fixture.base.outbox.pendingItems().first { $0.deliveryState?.phase == .providerObserved })
         XCTAssertEqual(projection.deliveryState?.phase, .providerObserved)
+        XCTAssertNil(try fixture.base.outbox.pendingItem(id: newer.id)?.mailboxBinding)
         let supported = try fixture.receiveAndAcknowledge(projection)
         XCTAssertFalse(NutritionCompatibility.containsNutrition(supported))
         let oldACK = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
         XCTAssertEqual(oldACK.finalizedCount, 1)
         XCTAssertNil(try fixture.base.cursor("dietary_protein"))
         XCTAssertEqual(try Data(contentsOf: original.fileURL), bytes)
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        _ = try fixture.receiveAndAcknowledge(newer)
+        let supportedUpdate = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+        XCTAssertEqual(supportedUpdate.finalizedCount, 1)
+        XCTAssertEqual(fixture.base.receiver.workouts.map(\.energyKcal), [20])
         fixture.base.receiver.capability = .supported
         try fixture.writeCapabilities()
 
         _ = try await fixture.delivery().publishPendingFIFOHead()
-        _ = try fixture.receiveAndAcknowledge(original)
+        let remainder = try XCTUnwrap(fixture.base.outbox.pendingItems().first { $0.deliveryState?.phase == .providerObserved })
+        XCTAssertNotEqual(remainder.id, original.id)
+        let nutrition = try fixture.receiveAndAcknowledge(remainder)
+        XCTAssertTrue(nutrition.workouts.isEmpty)
         let upgraded = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
 
         XCTAssertEqual(upgraded.finalizedCount, 1)
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
         XCTAssertEqual(fixture.base.receiver.records.count, 2)
         XCTAssertEqual(fixture.base.receiver.records.filter { $0.typeCode == "dietary_protein" }.map(\.value), [12])
+        XCTAssertEqual(fixture.base.receiver.workouts.map(\.energyKcal), [20])
         XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
     }
 

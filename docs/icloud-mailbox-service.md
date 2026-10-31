@@ -22,21 +22,23 @@ project developer does not have access to either endpoint or the transmitted
 HealthKit records. App Store Connect may remain “Data Not Collected” only while
 that developer-no-access boundary remains true.
 
-## Install and verify Receiver/CLI 1.1.5
+## Release availability
 
-These install and verification instructions apply to the published Receiver/CLI
-`1.1.5` release. Download its complete asset set and verify the release identity,
+These instructions target Receiver/CLI and helper `1.2.0`.
+Confirm that [receiver-v1.2.0](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0)
+and its complete asset set are available, then verify the release identity,
 provenance, and checksums below before installing anything. Do not substitute
-`main` or an older helper; the receiver and helper must both be version `1.1.5`.
+`main`, the retired unpublished `receiver-v1.1.4` tag, or an older helper.
 
-Use the Receiver/CLI `1.1.5` GitHub Release assets. Download these files with a
+## Install and verify the signed helper
+Use the Receiver/CLI `1.2.0` GitHub Release assets. Download these files with a
 browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.1.5-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.1.5.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.1.5.zip`;
-- `HealthBridgeMailboxAckPublisher-1.1.5.manifest.json`;
+- `apple_health_ai_bridge-1.2.0-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.2.0.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.zip`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.manifest.json`;
 - `release-metadata.json`;
 - `receiver-build-provenance.intoto.jsonl`;
 - `SHA256SUMS`;
@@ -79,17 +81,26 @@ immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
-For this `1.1.5` release, metadata schema `health_bridge.release.v4` binds the
+For this `1.2.0` release, metadata schema `health_bridge.release.v4` binds the
 build proof to `release.yml@refs/heads/release` and the final proof to
-`publish-release.yml@refs/tags/receiver-v1.1.5`. Both source and signer digests
+`publish-release.yml@refs/tags/receiver-v1.2.0`. Both source and signer digests
 must equal the independently verified signed tag's exact commit, not a later
 branch HEAD.
+
+The publisher's candidate source receipt binds `source_commit`, `source_tree`,
+`source_tag`, and `tag_object` to that identity; candidate artifact verification
+also pins its original run and attempt. Before running the commands below,
+confirm that `release-metadata.json` declares schema v4 and that its `git` tag,
+tag object, commit, and tree match the verified signed tag and helper manifest.
+Stop on any mismatch. These commands verify published artifact proofs; they do
+not replace source eligibility, native helper qualification, or candidate
+receipt checks. See [release operations](release-operations.md).
 
 Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to `receiver-v1.1.5` and
+metadata. From the asset directory, set `tag` to `receiver-v1.2.0` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -155,22 +166,21 @@ After every proof and checksum check succeeds, install the wheel, structurally
 validate the helper, and explicitly install it:
 
 ```bash
-uv tool install ./apple_health_ai_bridge-1.1.5-py3-none-any.whl
+uv tool install ./apple_health_ai_bridge-1.2.0-py3-none-any.whl
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.1.5.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.1.5.manifest.json \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
   --json
 health-bridge mailbox helper status --json
 ```
 
-The `receiver-v1.1.5` artifact and proof instructions above preserve the
-supported URL-based flow. They do not establish that those released assets
-support native URL-free pairing. Native pairing requires a specifically
-qualified matching receiver, helper, and companion build set. The helper must
+Native URL-free pairing requires a specifically qualified matching Receiver/CLI
+`1.2.0`, helper `1.2.0`, and iOS Companion `1.2.0 (51)` build set. Check the
+release's compatibility and native qualification before using that path. The helper must
 be owned and ready, and it must implement the native cancellation capability
 described below. Do not infer native support from the helper version or a
 `ready` status alone.
@@ -336,8 +346,11 @@ retried. Empty owner-only recovery markers and directories may remain.
 
 ## Upgrade or reconfigure
 
-Use the explicit one-step upgrade command to change an executable path,
-receiver path, mailbox selection, or generated service-artifact version:
+Service reconfiguration and helper replacement are separate operations. For a
+first installation, install and verify the helper above, then install the
+service below. To change an existing service's executable path, receiver path,
+mailbox selection, or generated service-artifact version without replacing the
+helper, use the service `upgrade` command:
 
 ```bash
 health-bridge mailbox service upgrade \
@@ -359,6 +372,84 @@ attempts to reactivate the old job. `upgraded` reports a changed generation;
 `already_current` reports an idempotent request. The fixed
 `upgrade_recovery_required` error means automatic rollback or reactivation did
 not complete and the owned service state needs operator inspection.
+
+The service `upgrade` command changes only the LaunchAgent and its service
+configuration. It does not install or replace the signed helper. Installing a
+different helper generation over an occupied helper location returns
+`{"code": "foreign_helper"}` and leaves that generation untouched. The
+`helper install` command is create-only, except that reinstalling the exact
+already-owned release is idempotent.
+
+## Replace the installed helper
+
+First complete the eight-asset provenance and checksum procedure above, and
+confirm the new helper archive and manifest are from the intended release.
+Helper verification and installation require that release version to match the
+installed Receiver/CLI version. Have the exact service executable, database,
+mailbox, and container values ready before removing the service configuration.
+Use the existing paths and identity unless you intend to reconfigure them.
+
+Verify the new helper assets before stopping the existing service:
+
+```bash
+health-bridge mailbox helper verify \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
+  --json
+```
+
+Then stop and remove the owned service, confirm the current helper is ready,
+retire that exact owned helper generation to quarantine, and install the
+verified helper from the same Receiver/CLI release:
+
+```bash
+health-bridge mailbox service uninstall --json
+health-bridge mailbox helper status --json
+health-bridge mailbox helper uninstall --json
+health-bridge mailbox helper install \
+  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
+  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
+  --json
+health-bridge mailbox helper status --json
+```
+
+Continue only when helper status reports `{"code": "ready"}`. Then restore the
+service with the original or intentionally updated values:
+
+```bash
+health-bridge mailbox service install \
+  --executable /absolute/path/to/health-bridge \
+  --db "$HEALTH_BRIDGE_DB" \
+  --mailbox-root "$HEALTH_BRIDGE_MAILBOX_ROOT" \
+  --icloud-container-identifier "$HEALTH_BRIDGE_ICLOUD_CONTAINER_IDENTIFIER" \
+  --json
+health-bridge mailbox service status --json
+```
+
+Service uninstall stops the loaded LaunchAgent and removes only its verified
+owned service artifacts. It does not remove the receiver database, mailbox,
+encryption keys, pairing state, or HealthKit data. Helper uninstall requires the
+installed generation to pass its ownership and platform checks, then atomically
+moves it to a private `.helpers-retired-*` quarantine. If service uninstall
+reports manifest drift, helper status is not `ready`, or helper uninstall
+fails, stop there. Do not delete, extract over, or manually move either
+generation.
+
+Helper replacement is not one atomic transaction with the service. A failed
+helper install does not restore the quarantined helper or restart the service;
+leave the service uninstalled and the quarantine untouched while resolving the
+failure. Service `upgrade` has a separate rollback for service artifacts, but
+it is not a helper rollback command. There is no supported command to restore a
+quarantined helper generation.
+
+For an existing pairing, native capability is separate from helper `ready`
+status and version. A qualified updated Receiver/helper may publish its signed
+capability declaration during an ordinary eligible maintenance pass, as
+described in [Receiver capability declaration](#receiver-capability-declaration).
+Helper replacement does not require new pairing or key creation. Do not run
+`receiver create-pairing` as an upgrade check; it creates a new invitation.
+Continue to require the documented matched-build and native qualification
+before relying on URL-free pairing.
 
 Check the service with:
 

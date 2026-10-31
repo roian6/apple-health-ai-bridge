@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from release_tools import read_versions
+
 MAX_OFFLINE_PREFLIGHT_SECONDS = 8.0
 LEAF = None
 EVIDENCE_SCHEMA: dict[str, Any] = {
@@ -218,8 +220,13 @@ def validate(  # noqa: PLR0915
     _validate_structure(document, EVIDENCE_SCHEMA)
     _require_equal(document, "schema_version", 1)
     _require_equal(document, "synthetic", False)
-    _require_equal(document, "candidate.marketing_version", "1.0.0")
-    _require_equal(document, "candidate.build_number", 15)
+    versions = read_versions(Path(__file__).resolve().parents[1])
+    _require_equal(
+        document,
+        "candidate.marketing_version",
+        versions.ios_marketing_version,
+    )
+    _require_equal(document, "candidate.build_number", int(versions.ios_build))
     _require_bound_hash(document, "candidate.source_tree", expected_source_tree, 40)
     _require_bound_hash(
         document,

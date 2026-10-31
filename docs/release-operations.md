@@ -107,6 +107,17 @@ Reissue the same staging or publication operation with the original immutable ID
 
 Do not clobber assets, delete/recreate drafts, sign a replacement for an existing valid proof or retry a whole run as a substitute for reconciliation. Preserve the exact failure and remote identities for diagnosis. The retired unpublished `receiver-v1.1.4` tag remains untouched; its policy record accounts for the patch gap without pretending it was published.
 
+## Editing published release copy
+
+GitHub allows an immutable release's title and notes to be edited while protecting its tag and assets. Use that distinction for readability, upgrade guidance and factual corrections, not to rebuild an already-verified packet.
+
+1. Review proposed copy against released component metadata, actual Apple/TestFlight availability and upgrade constraints. Preserve the original source-bound notes at the signed tag as the publication record.
+2. Independently identify the intended existing release ID and exact source/tag. Download the release assets and verify their identity, signatures, checksums and provenance using the established procedures. Those identity and download checks remain the caller's responsibility.
+3. Run the applicable `verify-published` or `verify-final-published` command with its normal arguments plus `--published-artifacts-only`. It still loads and validates required frozen-source inputs and enforces its existing state, tag and artifact/metadata gates. It skips only hosted title/body equality; it does not approve the prose or authenticate an unchecked release ID.
+4. Edit only the hosted title/notes. Read back the rendered copy and repeat the artifact audit against the same release and asset identities. Retain the command, source, snapshot and result with the editorial change record.
+
+The flag is opt-in and is not accepted by staging, draft verification or publication commands. Without it, published verification still checks exact source-bound title/body text. Do not pass this mode into publication recovery, relax `release_reconciliation.py`, or retry a publisher to accept edited prose. An editorial update must not move a tag, replace an asset, refresh a signature, change a compatibility manifest or recreate a release.
+
 ## iOS source checkpoints
 
 An iOS checkpoint uses an exact reviewed release source and a local signed `ios-v<version>-build.<build>` tag. Before pushing that tag, qualify its source and component transition:

@@ -26,7 +26,7 @@ BUILD = "receiver-build-provenance.intoto.jsonl"
 FINAL = "receiver-final-provenance.intoto.jsonl"
 REPOSITORY = "roian6/apple-health-ai-bridge"
 TAG = "receiver-v1.1.3"
-DOCUMENTED_TAG = "receiver-v1.1.5"
+DOCUMENTED_TAG = "receiver-v1.2.0"
 
 
 def run_documented_proof(
@@ -58,6 +58,8 @@ with calls.open('a') as stream:
 if command == 'gh':
     with calls.with_name('shell-attestation-argv.jsonl').open('a') as stream:
         stream.write(json.dumps(sys.argv[1:]) + '\\n')
+with calls.with_suffix('.jsonl').open('a') as stream:
+    stream.write(json.dumps([command, *sys.argv[1:]]) + '\\n')
 if command == 'gh' and previous.count('gh') + 1 == int(os.environ['DOC_PROOF_FAIL_GH']):
     sys.exit(17)
 if command == 'shasum' and os.environ['DOC_PROOF_FAIL_CHECKSUM'] == '1':
@@ -168,6 +170,47 @@ def test_documented_proof_reports_success(tmp_path: Path) -> None:
     assert "Release proof verified." in completed.stdout
     assert "Release proof FAILED." not in completed.stdout + completed.stderr
     assert calls == ["gh"] * 6 + ["shasum"]
+    arguments = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "shell-calls.jsonl").read_text().splitlines()
+    ]
+    documented_version = DOCUMENTED_TAG.removeprefix("receiver-v")
+    core = [
+        f"apple_health_ai_bridge-{documented_version}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{documented_version}.tar.gz",
+        "release-metadata.json",
+    ]
+    final = [
+        f"HealthBridgeMailboxAckPublisher-{documented_version}.zip",
+        f"HealthBridgeMailboxAckPublisher-{documented_version}.manifest.json",
+        "SHA256SUMS",
+    ]
+    for actual, subject in zip(arguments[:6], core + final, strict=True):
+        is_core = subject in core
+        workflow = "release.yml" if is_core else "publish-release.yml"
+        source_ref = "refs/heads/release" if is_core else f"refs/tags/{DOCUMENTED_TAG}"
+        assert actual == [
+            "gh",
+            "attestation",
+            "verify",
+            subject,
+            "--repo",
+            REPOSITORY,
+            "--bundle",
+            BUILD if is_core else FINAL,
+            "--signer-workflow",
+            f"{REPOSITORY}/.github/workflows/{workflow}",
+            "--source-ref",
+            source_ref,
+            "--source-digest",
+            "1" * 40,
+            "--signer-digest",
+            "1" * 40,
+            "--deny-self-hosted-runners",
+            "--predicate-type",
+            "https://slsa.dev/provenance/v1",
+        ]
+    assert arguments[6] == ["shasum", "-a", "256", "-c", "SHA256SUMS"]
 
 
 @pytest.mark.parametrize("failed_gh", [1, 3, 4, 6])
@@ -375,6 +418,482 @@ def remote_release(
             }
         )
     )
+
+
+@pytest.fixture
+def published_artifact_packet(
+    tmp_path: Path, receiver_release_repo: Path, native_transport_mock: Path
+) -> tuple[str, ...]:
+    """Build the current eight-asset shape with synthetic native transport."""
+    tag = "receiver-v1.2.0"
+    write_release_tree(
+        receiver_release_repo,
+        ReleaseTree("1.2.0", tag, "coordinated", "1.2.0", "51", "1.0.0"),
+    )
+    _ = commit_release_tree(receiver_release_repo, "synthetic published audit")
+    args = build_helper_packet(tmp_path, receiver_release_repo, "1.2.0")
+    dist = tmp_path / "dist"
+    mock_bundle(
+        dist,
+        native_transport_mock,
+        BUILD,
+        {
+            "apple_health_ai_bridge-1.2.0-py3-none-any.whl",
+            "apple_health_ai_bridge-1.2.0.tar.gz",
+            "release-metadata.json",
+        },
+    )
+    result = run_tool("final-checksums", *args, "--output", str(dist / "SHA256SUMS"))
+    assert result.returncode == 0, result.stderr
+    mock_bundle(
+        dist,
+        native_transport_mock,
+        FINAL,
+        {
+            "HealthBridgeMailboxAckPublisher-1.2.0.zip",
+            "HealthBridgeMailboxAckPublisher-1.2.0.manifest.json",
+            "SHA256SUMS",
+        },
+    )
+    remote = tmp_path / "release.json"
+    remote_release(
+        dist, receiver_release_repo, remote, tag=tag, title="Receiver/CLI 1.2.0"
+    )
+    payload = TypeAdapter(ReleaseRecord).validate_json(remote.read_bytes())
+    payload["draft"] = False
+    _ = remote.write_text(json.dumps(payload))
+    return (
+        *args,
+        "--release-json",
+        str(remote),
+        "--notes-file",
+        str(receiver_release_repo / f".github/release/notes-{tag}.md"),
+    )
+
+
+@pytest.mark.parametrize("audit", [False, True], ids=["strict", "explicit"])
+@pytest.mark.parametrize("drift", ["none", "title", "body", "whitespace", "table"])
+def test_published_artifact_audit_accepts_only_explicit_prose_drift(
+    tmp_path: Path,
+    published_artifact_packet: tuple[str, ...],
+    audit: bool,
+    drift: Literal["none", "title", "body", "whitespace", "table"],
+) -> None:
+    # Given a current final packet and independently supplied source inputs.
+    remote = tmp_path / "release.json"
+    payload = TypeAdapter(ReleaseRecord).validate_json(remote.read_bytes())
+    match drift:
+        case "none":
+            pass
+        case "title":
+            payload["name"] = "Updated published title"
+        case "body":
+            payload["body"] = "Updated published notes"
+        case "whitespace":
+            payload["body"] = " " + payload["body"] + "\n"
+        case "table":
+            payload["body"] += (
+                "\n| Component | Version |\n| --- | --- |\n| CLI | 1.2.0 |\n"
+            )
+        case _:
+            assert_never(drift)
+    _ = remote.write_text(json.dumps(payload))
+    dist = tmp_path / "dist"
+    before = {path.name: path.read_bytes() for path in dist.iterdir()}
+    assert len(before) == 8
+    assert len((dist / "SHA256SUMS").read_text().splitlines()) == 6
+    calls_file = tmp_path / "calls.jsonl"
+    _ = calls_file.write_text("")
+
+    # When the real CLI verifies the snapshot.
+    result = run_tool(
+        "verify-final-published",
+        *published_artifact_packet,
+        *(("--published-artifacts-only",) if audit else ()),
+    )
+
+    # Then only explicit audit accepts drift, without writes or proof signing.
+    assert result.returncode == (0 if audit or drift == "none" else 1), result.stderr
+    assert {path.name: path.read_bytes() for path in dist.iterdir()} == before
+    assert TypeAdapter(ReleaseRecord).validate_json(remote.read_bytes()) == payload
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in calls_file.read_text().splitlines()
+    ]
+    assert all(call[:2] == ["attestation", "verify"] for call in calls)
+    if result.returncode == 0:
+        assert len(calls) == 6
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("tag", "release metadata"),
+        ("draft", "release metadata"),
+        ("prerelease", "release metadata"),
+        ("missing", "file set"),
+        ("extra", "file set"),
+        ("duplicate", "invalid asset"),
+        ("state", "not ready"),
+        ("size", "remote asset digest"),
+        ("digest", "remote asset digest"),
+    ],
+)
+def test_published_artifact_audit_preserves_integrity_rejections(
+    tmp_path: Path,
+    published_artifact_packet: tuple[str, ...],
+    mutation: Literal[
+        "tag",
+        "draft",
+        "prerelease",
+        "missing",
+        "extra",
+        "duplicate",
+        "state",
+        "size",
+        "digest",
+    ],
+    error: str,
+) -> None:
+    # Given prose drift plus a distinct integrity violation.
+    remote = tmp_path / "release.json"
+    payload = TypeAdapter(ReleaseRecord).validate_json(remote.read_bytes())
+    payload["name"] = "Updated title"
+    payload["body"] = "Updated notes"
+    match mutation:
+        case "tag":
+            payload["tag_name"] = TAG
+        case "draft":
+            payload["draft"] = True
+        case "prerelease":
+            payload["prerelease"] = True
+        case "missing":
+            _ = payload["assets"].pop()
+        case "extra":
+            payload["assets"].append({**payload["assets"][0], "name": "extra"})
+        case "duplicate":
+            payload["assets"].append(payload["assets"][0])
+        case "state":
+            payload["assets"][0]["state"] = "new"
+        case "size":
+            payload["assets"][0]["size"] += 1
+        case "digest":
+            payload["assets"][0]["digest"] = "sha256:" + "0" * 64
+        case _:
+            assert_never(mutation)
+    _ = remote.write_text(json.dumps(payload))
+    _ = (tmp_path / "calls.jsonl").write_text("")
+
+    # When audit mode runs, it must reach the original integrity check.
+    result = run_tool(
+        "verify-final-published",
+        *published_artifact_packet,
+        "--published-artifacts-only",
+    )
+
+    # Then the corruption, not a parser/prose failure, rejects the packet.
+    assert result.returncode == 1, result.stderr
+    assert error in result.stderr
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "calls.jsonl").read_text().splitlines()
+    ]
+    assert all(call[:2] == ["attestation", "verify"] for call in calls)
+
+
+@pytest.mark.parametrize("mutation", ["commit", "tag_object", "tree", "scope", "ios"])
+def test_published_artifact_audit_keeps_exact_metadata(
+    tmp_path: Path,
+    published_artifact_packet: tuple[str, ...],
+    mutation: Literal["commit", "tag_object", "tree", "scope", "ios"],
+) -> None:
+    # Given inconsistent metadata in a current published packet.
+    metadata = tmp_path / "dist/release-metadata.json"
+    record = TypeAdapter(dict[str, JsonValue]).validate_json(metadata.read_bytes())
+    match mutation:
+        case "commit" | "tag_object" | "tree":
+            identity = record["git"]
+            assert isinstance(identity, dict)
+            identity[mutation] = "0" * 40
+        case "scope":
+            record["release_scope"] = "receiver"
+        case "ios":
+            ios = record["ios"]
+            assert isinstance(ios, dict)
+            ios["build"] = "99"
+        case _:
+            assert_never(mutation)
+    _ = metadata.write_text(json.dumps(record))
+
+    # When the actual CLI audits the packet, then metadata remains exact.
+    result = run_tool(
+        "verify-final-published",
+        *published_artifact_packet,
+        "--published-artifacts-only",
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "release metadata version, scope, source, or compatibility" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("helper", "signed mailbox helper digest"),
+        ("manifest", "helper manifest digest"),
+        ("core-proof", "native provenance"),
+        ("final-proof", "native provenance"),
+        ("missing-core", "file set"),
+        ("missing-final", "file set"),
+        ("checksum", "checksum manifest"),
+        ("source-notes", "compatible Batch Protocol"),
+    ],
+)
+def test_published_artifact_audit_keeps_packet_and_frozen_source(
+    tmp_path: Path,
+    published_artifact_packet: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Literal[
+        "helper",
+        "manifest",
+        "core-proof",
+        "final-proof",
+        "missing-core",
+        "missing-final",
+        "checksum",
+        "source-notes",
+    ],
+    error: str,
+) -> None:
+    # Given corruption in the packet or its independently supplied inputs.
+    args = list(published_artifact_packet)
+    match mutation:
+        case "helper" | "manifest":
+            flag = (
+                "--helper-sha256"
+                if mutation == "helper"
+                else "--helper-manifest-sha256"
+            )
+            args[args.index(flag) + 1] = "0" * 64
+        case "core-proof" | "final-proof":
+            monkeypatch.setenv(
+                "PROVENANCE_REJECT", BUILD if mutation == "core-proof" else FINAL
+            )
+        case "missing-core" | "missing-final":
+            (
+                tmp_path / "dist" / (BUILD if mutation == "missing-core" else FINAL)
+            ).unlink()
+        case "checksum":
+            with (tmp_path / "dist/SHA256SUMS").open("a") as stream:
+                _ = stream.write("0" * 64 + "  SHA256SUMS\n")
+        case "source-notes":
+            notes = Path(args[args.index("--notes-file") + 1])
+            _ = notes.write_text(
+                "\n".join(
+                    line
+                    for line in notes.read_text().splitlines()
+                    if not line.startswith("Compatible Batch Protocol:")
+                )
+            )
+        case _:
+            assert_never(mutation)
+    _ = (tmp_path / "calls.jsonl").write_text("")
+
+    # When audit mode runs, it must reach the original integrity check.
+    result = run_tool("verify-final-published", *args, "--published-artifacts-only")
+
+    # Then the corruption, not a parser/prose failure, rejects the packet.
+    assert result.returncode == 1, result.stderr
+    assert error in result.stderr
+    calls = [
+        TypeAdapter(list[str]).validate_json(line)
+        for line in (tmp_path / "calls.jsonl").read_text().splitlines()
+    ]
+    assert all(call[:2] == ["attestation", "verify"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "verify-draft",
+        "verify-core-draft",
+        "verify-helper-draft",
+        "verify-final-draft",
+        "verify-final",
+        "verify-helper",
+        "verify-packet",
+        "verify-core",
+        "final-checksums",
+        "checksums",
+        "manifest",
+        "validate",
+        "verify-execution",
+        "tag-info",
+    ],
+)
+def test_published_artifact_flag_rejected_by_unsupported_cli(
+    tmp_path: Path, published_artifact_packet: tuple[str, ...], command: str
+) -> None:
+    # Given an unsupported command, when the actual CLI receives the flag.
+    result = run_tool(command, "--published-artifacts-only", "--help")
+
+    # Then argparse help must not advertise the unsupported option.
+    assert result.returncode == 0, result.stderr
+    assert "--published-artifacts-only" not in result.stdout
+    args = list(published_artifact_packet)
+    if command not in {"verify-helper-draft", "verify-final-draft"}:
+        del args[args.index("--release-json") :]
+    if command in {
+        "verify-draft",
+        "verify-core-draft",
+        "verify-packet",
+        "verify-core",
+        "checksums",
+        "manifest",
+        "validate",
+        "verify-execution",
+        "tag-info",
+    }:
+        position = args.index("--helper-sha256")
+        del args[position : position + 4]
+    if command in {"validate", "verify-execution", "tag-info"}:
+        position = args.index("--dist-dir")
+        del args[position : position + 2]
+    if command in {"validate", "tag-info"}:
+        del args[args.index("--tag-object") :]
+    if command == "tag-info":
+        del args[:2]
+    if command in {"verify-draft", "verify-core-draft"}:
+        args.extend(published_artifact_packet[-4:])
+    if command in {"checksums", "manifest", "final-checksums"}:
+        args.extend(("--output", str(tmp_path / "output")))
+    if command == "verify-execution":
+        position = args.index("--tag-object")
+        del args[position : position + 2]
+        args.extend(("--workflow", "release.yml"))
+    rejected = run_tool(command, *args, "--published-artifacts-only")
+    assert rejected.returncode == 2
+    assert "unrecognized arguments: --published-artifacts-only" in rejected.stderr
+
+
+@pytest.mark.parametrize("command", ["verify-published", "verify-final-published"])
+def test_published_artifact_cli_help_advertises_explicit_mode(command: str) -> None:
+    result = run_tool(command, "--help")
+
+    assert result.returncode == 0, result.stderr
+    assert "--published-artifacts-only" in result.stdout
+
+
+@pytest.mark.parametrize("verifier", ["legacy", "final", "helper"])
+def test_published_artifact_direct_draft_bypass_rejected(
+    tmp_path: Path, published_artifact_packet: tuple[str, ...], verifier: str
+) -> None:
+    # Given valid inputs, bypassing argparse must not weaken draft verification.
+    args = published_artifact_packet
+    runner = tmp_path / "direct.py"
+    _ = runner.write_text(f"""import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+from release_tools import (
+    DraftVerificationRequest, FinalReleaseVerificationRequest,
+    verify_release_state, verify_final_release_state,
+)
+args = {args!r}
+def value(flag): return args[args.index(flag) + 1]
+request = DraftVerificationRequest(
+    Path(value("--repo")), Path(value("--dist-dir")), Path(value("--release-json")),
+    Path(value("--notes-file")), value("--tag"), value("--tag-object"),
+    value("--commit"), value("--tree"),
+)
+if {verifier!r} == "legacy":
+    verify_release_state(request, expected_draft=True, published_artifacts_only=True)
+else:
+    verify_final_release_state(
+        FinalReleaseVerificationRequest(
+            request, value("--helper-sha256"), value("--helper-manifest-sha256"),
+        ), expected_draft={verifier != "helper"!r},
+        final={verifier != "helper"!r}, published_artifacts_only=True,
+    )
+""")
+
+    # When a direct caller requests the published-only purpose for drafts.
+    result = subprocess.run(
+        [sys.executable, str(runner)], capture_output=True, text=True, check=False
+    )
+
+    # Then reject explicitly rather than silently falling back or bypassing.
+    assert result.returncode == 1
+    assert (
+        "published artifact audit requires a final release packet"
+        if verifier == "helper"
+        else "published artifact audit requires a published release"
+    ) in result.stderr
+
+
+@pytest.mark.parametrize("audit", [False, True], ids=["strict", "explicit"])
+@pytest.mark.parametrize("corrupt", [False, True], ids=["intact", "bad-digest"])
+def test_published_artifact_legacy_verifier_keeps_remote_checks(
+    tmp_path: Path, receiver_release_repo: Path, audit: bool, corrupt: bool
+) -> None:
+    # Given the legacy four-asset shape with edited hosted prose.
+    args = build_helper_packet(tmp_path, receiver_release_repo)
+    args = args[: args.index("--helper-sha256")]
+    dist = tmp_path / "dist"
+    for path in dist.glob("HealthBridgeMailboxAckPublisher-*"):
+        path.unlink()
+    _ = (dist / "SHA256SUMS").write_text("legacy checksum fixture\n")
+    remote = tmp_path / "release.json"
+    remote_release(dist, receiver_release_repo, remote, tag="receiver-v1.1.1")
+    payload = TypeAdapter(ReleaseRecord).validate_json(remote.read_bytes())
+    payload["draft"] = False
+    payload["name"] = "Edited title"
+    payload["body"] = "Edited notes"
+    if corrupt:
+        payload["assets"][0]["digest"] = "sha256:" + "0" * 64
+    _ = remote.write_text(json.dumps(payload))
+
+    # When the published legacy command receives an explicit audit purpose.
+    result = run_tool(
+        "verify-published",
+        *args,
+        "--release-json",
+        str(remote),
+        "--notes-file",
+        str(receiver_release_repo / ".github/release/notes-receiver-v1.1.1.md"),
+        *(("--published-artifacts-only",) if audit else ()),
+    )
+
+    # Then title/body drift is optional, but digest checks remain mandatory.
+    assert result.returncode == (0 if audit and not corrupt else 1), result.stderr
+    if audit and corrupt:
+        assert "remote asset digest mismatch" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--repo",
+        "--tag",
+        "--tag-object",
+        "--commit",
+        "--tree",
+        "--helper-sha256",
+        "--helper-manifest-sha256",
+        "--notes-file",
+    ],
+)
+def test_published_artifact_audit_requires_frozen_source_inputs(
+    published_artifact_packet: tuple[str, ...], flag: str
+) -> None:
+    # Given one omitted input, when the actual audit CLI parses the request.
+    args = list(published_artifact_packet)
+    position = args.index(flag)
+    del args[position : position + 2]
+    result = run_tool("verify-final-published", *args, "--published-artifacts-only")
+
+    # Then artifact audit does not invent defaults from downloaded metadata.
+    assert result.returncode == 2
+    assert flag in result.stderr
 
 
 @pytest.mark.parametrize(

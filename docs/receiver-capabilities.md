@@ -34,6 +34,16 @@ The companion also requires the exact `Content-Type: application/json` and
 `Cache-Control: no-store` response headers before decoding. Missing or different
 header values leave support unknown.
 
+## Reverse-proxy routing
+
+For an approved private HTTPS route, allow only the existing phone endpoints
+`GET /health`, `POST /v1/batches`, and `POST /v1/pairing/redeem`, plus
+authenticated `GET /v1/capabilities`. Forward the capability request's
+`Authorization: Bearer ...` header unchanged, and pass its response through
+with the exact `Content-Type: application/json` and `Cache-Control: no-store`
+headers. Keep the endpoint behind the same approved private route; do not add
+public or unauthenticated access or expose other Receiver paths.
+
 Missing, malformed, invalid or revoked credentials receive HTTP 401 with
 `{"error":"unauthorized"}` and `WWW-Authenticate: Bearer`. An authentication
 storage failure receives HTTP 500 with
