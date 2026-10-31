@@ -4863,7 +4863,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }, read: { url in
             try requirePrivateURL(url)
             if url.lastPathComponent == "completion.hbp" { completionReads += 1 }
-            return FileManager.default.fileExists(atPath: url.path) ? try Data(contentsOf: url) : nil
+            return FileManager.default.fileExists(atPath: url.path) ? .available(try Data(contentsOf: url)) : .missing
         }, hydrate: { url in
             try requirePrivateURL(url)
         }, wait: { throw ExchangeFailure.responseUnavailable })
@@ -5141,7 +5141,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
                 throw ExchangeFailure.invalidPeer
             }
             if url.lastPathComponent == "completion.hbp" { responseReads += 1 }
-            return FileManager.default.fileExists(atPath: url.path) ? try Data(contentsOf: url) : nil
+            return FileManager.default.fileExists(atPath: url.path) ? .available(try Data(contentsOf: url)) : .missing
         }, hydrate: { url in
             guard url.isFileURL, url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/") else {
                 XCTFail("Operation escaped private fixture root")
@@ -5274,7 +5274,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             XCTAssertTrue(try XCTUnwrap(state.loadPending()).publicationMayHaveOccurred)
             publications += 1
             try ExchangePeer.write(bytes, to: url)
-        }, read: { _ in nil }, hydrate: { _ in }, wait: { throw ExchangeFailure.responseUnavailable })
+        }, read: { _ in .missing }, hydrate: { _ in }, wait: { throw ExchangeFailure.responseUnavailable })
         let runtime = try fixture.makeRuntime(cleanup: nil, nativeMailboxIO: io, pairingStateStore: state)
         addTeardownBlock { @MainActor in
             runtime.automaticSyncRuntime.stopAdmission()
@@ -5322,7 +5322,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         let io = NativeMailboxPairingIO(resolve: { _ in
             resolutions += 1
             throw ExchangeFailure.responseUnavailable
-        }, publish: { _, _ in publications += 1 }, read: { _ in nil },
+        }, publish: { _, _ in publications += 1 }, read: { _ in .missing },
             hydrate: { _ in }, wait: { throw ExchangeFailure.responseUnavailable })
         let runtime = try fixture.makeRuntime(cleanup: nil, nativeMailboxIO: io, pairingStateStore: state)
         addTeardownBlock { @MainActor in
@@ -5409,6 +5409,10 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }, publish: { url, bytes in
             guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
                 else { throw ExchangeFailure.invalidPeer }
+            if FileManager.default.fileExists(atPath: url.path),
+               try MailboxRegularFileReader.read(url, maximumBytes: 65_536) != bytes {
+                throw MailboxPublicationError.conflict
+            }
             let pending = try XCTUnwrap(state.loadPending())
             let request = try XCTUnwrap(pending.sealedRequest)
             XCTAssertTrue(pending.publicationMayHaveOccurred)
@@ -5433,10 +5437,13 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
                 else { throw ExchangeFailure.invalidPeer }
             if locallyCommitted, url.lastPathComponent == "completion.hbp" {
                 pendingStore.rejectNextEmptySave = true
-                return try Data(contentsOf: url)
+                return .available(try Data(contentsOf: url))
             }
-            guard url.lastPathComponent == "cancelled.hbp", receiptAvailable else { return nil }
-            return try Data(contentsOf: url)
+            if url.lastPathComponent == "cancel.hbp" {
+                return FileManager.default.fileExists(atPath: url.path) ? .available(try Data(contentsOf: url)) : .missing
+            }
+            guard url.lastPathComponent == "cancelled.hbp", receiptAvailable else { return .missing }
+            return .available(try Data(contentsOf: url))
         }, hydrate: { url in
             guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
                 else { throw ExchangeFailure.invalidPeer }
@@ -5577,9 +5584,9 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }, read: { url in
             guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
                 else { throw ExchangeFailure.invalidPeer }
-            guard completionAvailable else { return nil }
+            guard completionAvailable else { return .missing }
             responseReads += 1
-            return try Data(contentsOf: url)
+            return .available(try Data(contentsOf: url))
         }, hydrate: { url in
             guard url.standardizedFileURL.path.hasPrefix(privateRoot.standardizedFileURL.path + "/")
                 else { throw ExchangeFailure.invalidPeer }
