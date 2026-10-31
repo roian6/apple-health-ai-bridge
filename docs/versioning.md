@@ -86,30 +86,10 @@ Batch Protocol versions describe the wire contract, not either product artifact.
 
 ## Release presentation
 
-GitHub release display names are separate from immutable release tags. Through
-Receiver/CLI `1.1.3`, the display name remains the exact raw tag, including the
-historical `v1.0.0` and `v1.0.1` names. Starting at `1.1.4`, the display name must
-be exactly `Receiver/CLI <version>`; for example, `Receiver/CLI 1.1.4` for
-`receiver-v1.1.4`. The raw tag is not an alternative display name for these new
-releases.
+Release titles use the component/version format validated by `release_tools.py`. The committed notes must retain complete `Compatible iOS Companion` and `Compatible Batch Protocol` declarations matching `component-versions.json`; do not split a declaration across Markdown table cells.
 
-The release tool's `tag-info` JSON derives `title` from the canonical tag. The
-release reconciler uses that value when creating a draft, and
-the shared identity verifier requires it at the core, helper, final-draft and
-published stages. Publication preserves the verified draft title; it does not
-patch the title afterward. At every stage, the release body must still exactly
-match the source notes file.
+During initial staging, publication and recovery, the hosted title and body must exactly match the source-bound notes at the signed tag. This keeps publication retries deterministic and prevents an unexplained identity mismatch from being accepted.
 
-This presentation rule does not rename tags, notes files or assets, change
-component versions, or relax source binding, helper requirements, signatures,
-checksums or provenance verification.
+After publication, GitHub permits the title and release notes to be edited while keeping the tag and assets immutable. Maintainers may improve factual copy without rebuilding or replacing the verified packet. The explicit read-only `--published-artifacts-only` mode of `verify-published` and `verify-final-published` skips only hosted title/body equality; all other existing artifact, metadata, state and tag checks remain in force.
 
-Use labels such as:
-
-```text
-Receiver/CLI 1.1.5
-Compatible iOS Companion 1.1.1 (build 50)
-Batch Protocol health_bridge.batch.v1 (1.0.0)
-```
-
-Avoid an unlabeled phrase such as “Health Bridge 1.1.0” when it could be read as the app, receiver, or protocol version.
+Default verification and publication recovery stay strict. The artifact-only mode does not review the prose or perform the caller's independent release-ID, source-eligibility and authenticated download checks. See [Editing published release copy](release-operations.md#editing-published-release-copy).
