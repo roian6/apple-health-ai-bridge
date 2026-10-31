@@ -1484,6 +1484,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try settingsStore.resetInvalidConnectionRecord()
             connectionStateNeedsRecovery = false
         } else {
+            if settingsStore.activeTransport == .mailbox,
+               mailboxKeyStore.diagnosticState() == .lost {
+                try settingsStore.beginTerminalCancellationIntent(
+                    expectedGeneration: settingsStore.receiverSettingsGenerationToken
+                )
+            }
             try settingsStore.resolveTerminalCancellationForPrivateReset()
         }
         try pairingStateStore.resetPrivatePairingState()

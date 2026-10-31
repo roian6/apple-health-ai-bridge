@@ -5771,6 +5771,102 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         try await assertMailboxColdRestoreIsReady(mailboxOnly: false)
     }
 
+    func testConfirmedPrivateResetUnpairsLostKeyMailboxWithoutRegeneratingKeys() async throws {
+        // Given: Keychain material survives but the local trust files are lost.
+        let fixture = try MailboxLaunchFixture(
+            representation: .raw, enabled: false, mailboxOnly: true
+        )
+        try fixture.keychain.removeTrust(service: fixture.keyService, record: .expectedIdentity)
+        try fixture.keychain.removeTrust(service: fixture.keyService, record: .monotonicGeneration)
+        let runtime = try fixture.makeRuntime(cleanup: nil)
+        addTeardownBlock { @MainActor in
+            await runtime.viewModel.waitForAutomaticSyncDisableCleanup()
+            await fixture.join(runtime)
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.ownersStarted, fixture.ownersFinished)
+            fixture.removeOwnedStores()
+        }
+        await runtime.bootstrap()
+        await fixture.join(runtime)
+        XCTAssertEqual(runtime.viewModel.mailboxKeyDiagnosticState, .lost)
+        XCTAssertFalse(runtime.viewModel.canSendConnectionTest)
+        XCTAssertFalse(runtime.viewModel.canResetLostMailboxConnectionKey)
+
+        // When: the user explicitly confirms private sync-state reset.
+        await runtime.viewModel.clearPendingOutbox()
+        await fixture.join(runtime)
+
+        // Then: key replacement remains explicit, but its recovery is reachable.
+        XCTAssertTrue(try fixture.settings.receiverSettingsAreCleared())
+        XCTAssertEqual(fixture.keys.diagnosticState(), .lost)
+        XCTAssertTrue(runtime.viewModel.canResetLostMailboxConnectionKey)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertTrue(fixture.reads.isEmpty)
+    }
+
+    func testConfirmedPrivateResetKeepsHealthyMailboxConnection() async throws {
+        // Given: a healthy committed Mailbox connection with automatic sync off.
+        let (fixture, runtime) = try makeFixture(
+            representation: .raw, enabled: false, mailboxOnly: true
+        )
+        await runtime.bootstrap()
+        await fixture.join(runtime)
+        let record = try fixture.settings.currentConnectionRecordV2()
+        let keys = try fixture.keys.loadOrCreate()
+        XCTAssertTrue(runtime.viewModel.canSendConnectionTest)
+
+        // When: the user explicitly resets local sync progress.
+        await runtime.viewModel.clearPendingOutbox()
+        await fixture.join(runtime)
+
+        // Then: healthy connection authority and keys are not discarded.
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), record)
+        XCTAssertEqual(try fixture.keys.loadOrCreate(), keys)
+        XCTAssertTrue(runtime.viewModel.canSendConnectionTest)
+        XCTAssertTrue(fixture.reads.isEmpty)
+    }
+
+    func testConfirmedPrivateResetKeepsDirectConnectionWithLostMailboxKeys() async throws {
+        // Given: Direct is paired while the unused Mailbox trust files are lost.
+        let fixture = try MailboxLaunchFixture(
+            representation: .raw, enabled: false, unpaired: true
+        )
+        try fixture.settings.save(
+            receiverURLString: "https://receiver.example/v1/batches",
+            bearerToken: "synthetic-direct-credential"
+        )
+        try fixture.keychain.removeTrust(service: fixture.keyService, record: .expectedIdentity)
+        try fixture.keychain.removeTrust(service: fixture.keyService, record: .monotonicGeneration)
+        let runtime = try fixture.makeRuntime(cleanup: nil)
+        addTeardownBlock { @MainActor in
+            await runtime.viewModel.waitForAutomaticSyncDisableCleanup()
+            await fixture.join(runtime)
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.ownersStarted, fixture.ownersFinished)
+            fixture.removeOwnedStores()
+        }
+        await runtime.bootstrap()
+        await fixture.join(runtime)
+        let record = try fixture.settings.currentConnectionRecordV2()
+        XCTAssertEqual(fixture.settings.activeTransport, .directHTTP)
+        XCTAssertEqual(fixture.keys.diagnosticState(), .lost)
+
+        // When: the user explicitly resets local sync progress.
+        await runtime.viewModel.clearPendingOutbox()
+        await fixture.join(runtime)
+
+        // Then: unused Mailbox key loss must not remove Direct authority.
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), record)
+        XCTAssertEqual(try fixture.settings.loadBearerToken(), "synthetic-direct-credential")
+        XCTAssertEqual(fixture.keys.diagnosticState(), .lost)
+        XCTAssertTrue(runtime.viewModel.canSendConnectionTest)
+        XCTAssertTrue(fixture.reads.isEmpty)
+    }
+
     private func assertMailboxColdRestoreIsReady(mailboxOnly: Bool) async throws {
         let (fixture, runtime) = try makeFixture(representation: .raw, enabled: false, mailboxOnly: mailboxOnly)
         let record = try XCTUnwrap(fixture.settings.currentConnectionRecordV2())
@@ -6097,6 +6193,8 @@ private final class MailboxLaunchFixture {
     let sleep: FileSleepSyncManifestStore
     let outbox: FileOutbox
     let diagnostics: AutomaticSyncDiagnosticStore
+    let keychain = MemoryMailboxKeychain()
+    let keyService = "synthetic.launch.\(UUID().uuidString)"
     let keys: MailboxKeyStore
     let identity: MailboxConnectionIdentityV1
     let ackContext: MailboxAckContext
@@ -6144,7 +6242,7 @@ private final class MailboxLaunchFixture {
         sleep = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
         outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
         diagnostics = AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json"))
-        keys = MailboxKeyStore(service: "synthetic.launch.\(UUID().uuidString)", keychain: MemoryMailboxKeychain())
+        keys = MailboxKeyStore(service: keyService, keychain: keychain)
         let device = try keys.loadOrCreate()
         let receiverID = Data(repeating: 0x51, count: 16)
         let deviceID = Data(repeating: 0x52, count: 16)
