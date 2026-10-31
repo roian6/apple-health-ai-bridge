@@ -422,12 +422,14 @@ def test_validation_can_bind_helper_to_installed_receiver_version(
     tmp_path: Path,
 ) -> None:
     archive, manifest = _release(tmp_path)
+    expected_version = "0.0.0"
+    assert expected_version != VERSION
 
     with pytest.raises(HelperError) as raised:
         _ = validate_helper_release(
             archive,
             manifest,
-            expected_version="1.2.0",
+            expected_version=expected_version,
         )
 
     assert raised.value.code is HelperErrorCode.SOURCE_MISMATCH

@@ -62,6 +62,7 @@ MIGRATION_IDS: Final = (
     "011_daily_projection_fence_order",
     "012_catalogue_coverage_index",
     "013_mailbox_enrollment",
+    "014_uv_raw_aggregation",
 )
 
 

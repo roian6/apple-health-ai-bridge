@@ -347,7 +347,9 @@ TIMESERIES_TYPES: Final[tuple[TimeseriesType, ...]] = (
         "Headphone volume",
         "min_max_average",
     ),
-    TimeseriesType("uv_exposure", "count", "environmental", "UV exposure", "sum"),
+    TimeseriesType(
+        "uv_exposure", "count", "environmental", "UV exposure", "min_max_average"
+    ),
     TimeseriesType("inhaler_usage", "count", "environmental", "Inhaler usage", "sum"),
     TimeseriesType(
         "weather_temperature",

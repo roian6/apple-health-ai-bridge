@@ -19,13 +19,29 @@ def _duplicate_json_fields(field: str, first: str, second: str) -> str:
     return f'"{field}": "{first}", "{field}": "{second}"'
 
 
+def _declared_ios_version() -> tuple[str, int]:
+    path = Path(__file__).resolve().parents[2] / "component-versions.json"
+    components = cast(
+        "dict[str, object]",
+        json.loads(path.read_text(encoding="utf-8")),
+    )
+    ios = cast("dict[str, object]", components["ios_companion"])
+    marketing_version = ios.get("marketing_version")
+    build = ios.get("build")
+    assert isinstance(marketing_version, str)
+    assert isinstance(build, str)
+    assert build.isdecimal()
+    return marketing_version, int(build)
+
+
 def _valid_evidence() -> dict[str, object]:
+    marketing_version, build_number = _declared_ios_version()
     return {
         "schema_version": 1,
         "synthetic": False,
         "candidate": {
-            "marketing_version": "1.0.0",
-            "build_number": 15,
+            "marketing_version": marketing_version,
+            "build_number": build_number,
             "source_tree": EXPECTED_SOURCE_TREE,
             "executable_sha256": EXPECTED_APP_SHA256,
         },
@@ -187,6 +203,27 @@ def test_fresh_device_evidence_validator_accepts_complete_aggregate_evidence(
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "fresh-device evidence: PASS"
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid_value"),
+    [
+        ("candidate.marketing_version", "1.0.0"),
+        ("candidate.build_number", 15),
+    ],
+)
+def test_fresh_device_evidence_validator_rejects_wrong_candidate_versions(
+    tmp_path: Path,
+    path: str,
+    invalid_value: object,
+) -> None:
+    evidence = _valid_evidence()
+    _set_path(evidence, path, invalid_value)
+
+    completed = _run_validator(tmp_path, evidence)
+
+    assert completed.returncode == 1
+    assert f"invalid field: {path}" in completed.stderr
 
 
 @pytest.mark.parametrize(

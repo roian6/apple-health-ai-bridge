@@ -81,6 +81,7 @@ public enum HealthKitGenericQuantityReaderError: Error, Equatable {
     case invalidWindow
     case emptyReadableTypeSet
     case anchorUnavailable
+    case unsupportedCumulativeStatistics(String)
 }
 
 public enum HealthKitQuantitySampleMapper {
@@ -374,14 +375,13 @@ public final class HealthKitGenericQuantityReader: @unchecked Sendable {
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [.strictStartDate])
         let interval = DateComponents(day: 1)
         let anchorDate = calendar.startOfDay(for: start)
+        let query = try Self.dailyActivityStatisticsQuery(
+            quantityType: quantityType,
+            predicate: predicate,
+            anchorDate: anchorDate,
+            interval: interval
+        )
         return try await executeCancellableHealthKitQuery(healthStore: healthStore) { completion in
-            let query = HKStatisticsCollectionQuery(
-                quantityType: quantityType,
-                quantitySamplePredicate: predicate,
-                options: .cumulativeSum,
-                anchorDate: anchorDate,
-                intervalComponents: interval
-            )
             query.initialResultsHandler = { _, results, error in
                 if let error {
                     completion(.failure(error))
@@ -412,6 +412,24 @@ public final class HealthKitGenericQuantityReader: @unchecked Sendable {
             }
             return query
         }
+    }
+
+    static func dailyActivityStatisticsQuery(
+        quantityType: HKQuantityType,
+        predicate: NSPredicate?,
+        anchorDate: Date,
+        interval: DateComponents
+    ) throws -> HKStatisticsCollectionQuery {
+        guard quantityType.aggregationStyle == .cumulative else {
+            throw HealthKitGenericQuantityReaderError.unsupportedCumulativeStatistics(quantityType.identifier)
+        }
+        return HKStatisticsCollectionQuery(
+            quantityType: quantityType,
+            quantitySamplePredicate: predicate,
+            options: .cumulativeSum,
+            anchorDate: anchorDate,
+            intervalComponents: interval
+        )
     }
 
     static func dailyActivityValue(

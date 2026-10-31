@@ -63,6 +63,7 @@ QA_SOURCE_MEMBERS: Final = frozenset(
         "BatchV1.swift",
         "FileOutbox.swift",
         "HealthTypeRegistry.swift",
+        "NutritionCompatibility.swift",
         "ReceiverCapabilities.swift",
         "MailboxAckClassifier.swift",
         "MailboxAckDeletion.swift",
@@ -212,10 +213,15 @@ def _assert_target(project: Path, scheme_name: str, target_name: str) -> None:
     )
     if phase is None:
         raise ProductionSealError
-    members = re.findall(
-        r"/\* ([A-Za-z0-9]+\.swift) in Sources \*/",
-        phase.group("body"),
-    )
+    members: list[str] = []
+    for entry in phase.group("body").strip().removesuffix(",").split(","):
+        member = re.fullmatch(
+            r"\s*[A-F0-9]{24}\s+/\* ([A-Za-z0-9]+\.swift) in Sources \*/\s*",
+            entry,
+        )
+        if member is None:
+            raise ProductionSealError
+        members.append(member.group(1))
     scheme = (
         project.parent / f"xcshareddata/xcschemes/{scheme_name}.xcscheme"
     ).read_text(encoding="utf-8")

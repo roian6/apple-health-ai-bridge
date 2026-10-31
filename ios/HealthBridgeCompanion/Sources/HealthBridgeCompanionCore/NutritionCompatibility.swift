@@ -79,6 +79,54 @@ public enum NutritionCompatibility {
             sync: HealthBridgeSyncContext(syncWindow: batch.sync.syncWindow, cursors: [])
         )
     }
+
+    static func nutritionRemainder(_ batch: HealthBridgeBatchV1) -> HealthBridgeBatchV1 {
+        let types = batch.healthTypes.filter { $0.category == .nutrition || isNutrition($0.typeCode) }
+        return HealthBridgeBatchV1(
+            schemaID: batch.schemaID, schemaVersion: batch.schemaVersion,
+            generatedAt: batch.generatedAt, exportWindow: batch.exportWindow,
+            sources: batch.sources,
+            healthTypes: types.isEmpty ? batch.healthTypes : types,
+            samples: batch.samples.filter { isNutrition($0.typeCode) },
+            workouts: [], sleepSessions: [],
+            deletedRecords: batch.deletedRecords.filter { $0.clientRecordID.hasPrefix("hk-quantity-dietary-") },
+            sync: batch.sync
+        )
+    }
+}
+
+public enum FileOutboxNutritionError: LocalizedError {
+    case legacyProjectionRequiresRecovery
+    case invalidSplit
+
+    public var errorDescription: String? {
+        switch self {
+        case .legacyProjectionRequiresRecovery:
+            "An older mixed nutrition batch is held because its delivery history is incomplete. Pending data is kept. Contact support before resetting private sync state."
+        case .invalidSplit:
+            "The pending nutrition delivery could not be verified. Pending data is kept."
+        }
+    }
+}
+
+enum NutritionSplitBoundary: CaseIterable {
+    case intentPersisted
+    case supportedPayloadInstalled
+    case remainderPayloadInstalled
+    case manifestCommitted
+    case acceptancePersisted
+    case retirementPersisted
+    case parentRemoved
+}
+
+struct NutritionCursorKey: Codable, Hashable, Sendable {
+    let sourceKey: String
+    let cursorKind: String
+}
+
+enum NutritionPendingGroup {
+    case original(FileOutboxItem, permitsSplit: Bool)
+    case split(supported: FileOutboxItem?, remainder: FileOutboxItem?, cursors: Set<NutritionCursorKey>)
 }
 
 struct NutritionPayloadRevision: Equatable, Sendable {
@@ -104,6 +152,8 @@ struct PreparedNutritionPayload: Sendable {
     let containsNutrition: Bool
     let permitsSupported: Bool
     let projection: Data?
+    let remainder: Data?
+    let cursors: Set<NutritionCursorKey>
 
     func permits(_ support: NutritionSupport) -> Bool {
         !containsNutrition || (support == .supported && permitsSupported)
@@ -147,7 +197,13 @@ extension FileOutbox {
                 return (id, PreparedNutritionPayload(
                     revision: revision, containsNutrition: contains,
                     permitsSupported: NutritionCompatibility.permits(batch, support: .supported),
-                    projection: projection
+                    projection: projection,
+                    remainder: projection == nil ? nil : try JSONEncoder().encode(
+                        NutritionCompatibility.nutritionRemainder(batch)
+                    ),
+                    cursors: Set(batch.sync.cursors.map {
+                        NutritionCursorKey(sourceKey: $0.sourceKey, cursorKind: $0.cursorKind)
+                    })
                 ))
             })
         }
@@ -179,19 +235,47 @@ extension FileOutbox {
         for receiverIdentity: String, support: NutritionSupport
     ) throws -> [FileOutboxItem] {
         try requireUploadAdmission()
-        return try pendingItemsForNutritionValidation().prefix { $0.receiverIdentity == receiverIdentity }.filter { item in
-            guard let prepared = try preparedNutritionPayload(for: item) else { throw CancellationError() }
-            switch item.deliveryState?.phase {
-            case .published, .providerObserved, .ackVerified:
-                return true
-            default:
-                return prepared.permits(support)
+        var blockedCursors: Set<NutritionCursorKey> = []
+        var legacyHold = false
+        var selected: [FileOutboxItem] = []
+        for group in try nutritionPendingGroups(for: receiverIdentity) {
+            switch group {
+            case .original(let item, let permitsSplit):
+                guard let value = try preparedNutritionPayload(for: item) else { throw CancellationError() }
+                // Preserve the exact existing ACK path, independently of discovery.
+                switch item.deliveryState?.phase {
+                case .published, .providerObserved, .ackVerified:
+                    selected.append(item)
+                    continue
+                default: break
+                }
+                if value.projection != nil && !permitsSplit {
+                    legacyHold = true
+                    blockedCursors.formUnion(value.cursors)
+                } else if value.permits(support), blockedCursors.isDisjoint(with: value.cursors) {
+                    selected.append(item)
+                } else {
+                    blockedCursors.formUnion(value.cursors)
+                }
+            case .split(let supported, let remainder, let cursors):
+                guard blockedCursors.isDisjoint(with: cursors) else {
+                    blockedCursors.formUnion(cursors)
+                    continue
+                }
+                if let supported { return selected.isEmpty ? [supported] : selected }
+                if let remainder {
+                    guard let value = try preparedNutritionPayload(for: remainder) else { throw CancellationError() }
+                    if value.permits(support) { return selected.isEmpty ? [remainder] : selected }
+                    blockedCursors.formUnion(cursors)
+                }
             }
         }
+        if selected.isEmpty && legacyHold { throw FileOutboxNutritionError.legacyProjectionRequiresRecovery }
+        return selected
     }
 
-    /// Retain original payloads and checkpoints; deliver a durable, cursor-free
-    /// supported projection once. Replaying originals after upgrade is idempotent.
+    /// Keep the collection owner immutable, and deliver linked children in its
+    /// original position. A committed split never replays the mixed original.
     public func nutritionCompatibleItems(
         for receiverIdentity: String, support: NutritionSupport
     ) throws -> [FileOutboxItem] {
@@ -202,13 +286,13 @@ extension FileOutbox {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
         let owned = pending.prefix { $0.receiverIdentity == receiverIdentity }
-        let prepared = try owned.map { item in
+        for item in owned {
             guard let value = try preparedNutritionPayload(for: item) else { throw CancellationError() }
-            return (item, value)
-        }
-        for (item, value) in prepared {
-            if !value.permits(support), let projection = value.projection {
-                try prepareNutritionProjection(for: item, payload: projection)
+            if !value.permits(support), let projection = value.projection,
+               let remainder = value.remainder, item.mailboxBinding == nil {
+                try prepareNutritionProjection(
+                    for: item, payloads: (projection, remainder), cursors: value.cursors
+                )
             }
         }
         return try preparedNutritionItems(for: receiverIdentity, support: support)

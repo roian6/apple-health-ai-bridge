@@ -65,7 +65,7 @@ run_tests() {
       test_release_and_self_build_docs_reference_current_guidance \
       test_brand_readme_local_links_resolve_inside_repository \
       test_install_commands_are_pinned_to_their_receiver_release \
-      test_roadmap_matches_readme_current_receiver_release \
+      test_roadmap_links_to_readme_default_receiver_release \
       test_versioned_setup_links_to_matching_mailbox_release_assets; do
       test_args+=("tests/guardrails/test_release_management.py::$name")
     done

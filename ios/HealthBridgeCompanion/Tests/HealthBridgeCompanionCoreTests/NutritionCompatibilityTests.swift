@@ -201,7 +201,14 @@ final class NutritionCompatibilityTests: XCTestCase {
 
         XCTAssertTrue(retry.isEmpty)
         XCTAssertEqual(try Data(contentsOf: original.fileURL), payload)
-        XCTAssertEqual(try reopened.nutritionCompatibleItems(for: "synthetic", support: .supported).map(\.id), [original.id])
+        let remainder = try XCTUnwrap(
+            reopened.nutritionCompatibleItems(for: "synthetic", support: .supported).first
+        )
+        XCTAssertNotEqual(remainder.id, original.id)
+        XCTAssertNotEqual(remainder.id, projection.id)
+        let retained = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: remainder.fileURL))
+        XCTAssertEqual(retained.healthTypes.map(\.typeCode), ["dietary_protein"])
+        XCTAssertEqual(retained.sync, try JSONDecoder().decode(HealthBridgeBatchV1.self, from: payload).sync)
         XCTAssertThrowsError(try reopened.nutritionCompatibleItems(for: "replacement", support: .supported))
     }
 

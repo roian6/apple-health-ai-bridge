@@ -5,6 +5,60 @@ import XCTest
 import HealthKit
 
 final class HealthKitGenericQuantityReaderTests: XCTestCase {
+    func testSingleTypeActivityStatisticsUseCumulativeOptionsForReachableSumTypes() throws {
+        let reachableEntries = GenericQuantityCoveragePolicy.supportedQuantityEntries().filter {
+            $0.aggregation == .sum
+                && HealthKitTypeCatalog.healthType(from: $0).category == .activity
+        }
+        XCTAssertFalse(reachableEntries.isEmpty)
+        XCTAssertFalse(reachableEntries.contains { $0.typeCode == "uv_exposure" })
+        let anchor = try date("2026-06-15T00:00:00Z")
+        for entry in reachableEntries {
+            // The app reaggregates one broad quantity type, not only the default list.
+            let selected = HealthKitGenericQuantityReader.readableQuantityEntries(for: [entry.typeCode])
+            XCTAssertEqual(selected.map(\.typeCode), [entry.typeCode])
+            let type = try XCTUnwrap(HealthKitQuantitySampleMapper.quantityType(for: entry))
+            print("STATISTICS_COMPATIBILITY \(entry.typeCode) \(type.identifier) \(type.aggregationStyle.rawValue)")
+            if type.aggregationStyle == .cumulative {
+                let query = try HealthKitGenericQuantityReader.dailyActivityStatisticsQuery(
+                    quantityType: type, predicate: nil, anchorDate: anchor, interval: DateComponents(day: 1)
+                )
+                XCTAssertEqual(query.options, .cumulativeSum, entry.typeCode)
+                XCTAssertEqual(query.objectType, type, entry.typeCode)
+            } else {
+                XCTAssertThrowsError(try HealthKitGenericQuantityReader.dailyActivityStatisticsQuery(
+                    quantityType: type, predicate: nil, anchorDate: anchor, interval: DateComponents(day: 1)
+                ), entry.typeCode) { error in
+                    XCTAssertEqual(
+                        error as? HealthKitGenericQuantityReaderError,
+                        .unsupportedCumulativeStatistics(type.identifier)
+                    )
+                }
+            }
+        }
+    }
+
+    func testDiscreteTypesRemainReadableWithoutInventingDailyTotals() throws {
+        XCTAssertEqual(try catalogEntry("uv_exposure").aggregation, .minMaxAverage)
+        let anchor = try date("2026-06-15T00:00:00Z")
+        for typeCode in ["uv_exposure", "sleeping_breathing_disturbances"] {
+            let selected = HealthKitGenericQuantityReader.readableQuantityEntries(for: [typeCode])
+            XCTAssertEqual(selected.map(\.typeCode), [typeCode])
+            let entry = try XCTUnwrap(selected.first)
+            let type = try XCTUnwrap(HealthKitQuantitySampleMapper.quantityType(for: entry))
+            XCTAssertEqual(type.aggregationStyle, .discreteArithmetic)
+            XCTAssertNotNil(HealthKitQuantitySampleMapper.unit(for: entry))
+            XCTAssertThrowsError(try HealthKitGenericQuantityReader.dailyActivityStatisticsQuery(
+                quantityType: type, predicate: nil, anchorDate: anchor, interval: DateComponents(day: 1)
+            )) { error in
+                XCTAssertEqual(
+                    error as? HealthKitGenericQuantityReaderError,
+                    .unsupportedCumulativeStatistics(type.identifier)
+                )
+            }
+        }
+    }
+
     func testDailyActivityValuePreservesExplicitZeroAndPositiveSum() throws {
         let entry = try catalogEntry("flights_climbed")
         let unit = try XCTUnwrap(HealthKitQuantitySampleMapper.unit(for: entry))

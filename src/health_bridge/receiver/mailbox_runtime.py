@@ -10,6 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Final, Protocol, final
@@ -252,7 +253,11 @@ def _production_importer(
     return production_importer(db_path, mailbox_path, directory=directory)
 
 
-def _publish_capabilities(directory: MailboxDirectoryHandle) -> None:
+def _publish_capabilities(
+    directory: MailboxDirectoryHandle,
+    *,
+    connections: MailboxConnectionStore | None = None,
+) -> None:
     # Keep receiver/package initialization out of the module import path.
     from health_bridge.mailbox.capabilities import (  # noqa: PLC0415
         publish_receiver_capabilities,
@@ -263,7 +268,11 @@ def _publish_capabilities(directory: MailboxDirectoryHandle) -> None:
 
     _ = publish_receiver_capabilities(
         directory,
-        load_connection=MailboxConnectionStore.production().load,
+        load_connection=(
+            connections
+            if connections is not None
+            else MailboxConnectionStore.production()
+        ).load,
         publish=publish,
     )
 
@@ -383,7 +392,11 @@ class MailboxRuntimeWorker:
         self._pairing_keys = pairing_keys
         self._pairing_connections = pairing_connections
         self._pairing_publisher = pairing_publisher
-        self._capability_publisher = capability_publisher
+        self._capability_publisher = (
+            partial(_publish_capabilities, connections=pairing_connections)
+            if capability_publisher is _publish_capabilities
+            else capability_publisher
+        )
         self._mailbox_root = mailbox_root
         self._importer_factory = importer_factory
         self._poll_interval_seconds = poll_interval_seconds
@@ -408,38 +421,47 @@ class MailboxRuntimeWorker:
     def _bootstrap_once(self) -> bool:
         native_rows: list[tuple[str, str | None]] = []
         if self._pairing_keys is not None and self._pairing_connections is not None:
-            with connect_live_readonly_database(self._db_path) as database:
-                awaiting_root = (
-                    database.execute(
-                        """select 1 where not exists (
+            try:
+                with connect_live_readonly_database(self._db_path) as database:
+                    awaiting_root = (
+                        database.execute(
+                            """select 1 where not exists (
                         select 1 from pairing_invitations where redeemed_at is not null
                     ) and exists (
                         select 1 from pairing_invitations where transport = 'mailbox'
                         and revoked_at is null and expires_at > ?
                     )""",
-                        (datetime.now(UTC).isoformat().replace("+00:00", "Z"),),
-                    ).fetchone()
-                    is not None
-                )
-                query = """select pairing_invitation_id, redeemed_at
+                            (datetime.now(UTC).isoformat().replace("+00:00", "Z"),),
+                        ).fetchone()
+                        is not None
+                    )
+                    query = """select pairing_invitation_id, redeemed_at
                     from pairing_invitations where transport = 'mailbox'
                     and receiver_url = '' and pairing_invitation_id > ?
                     order by pairing_invitation_id limit 128"""
-                rows = database.execute(query, (self._pairing_cursor,)).fetchall()
-                if not rows and self._pairing_cursor:
-                    self._pairing_cursor = ""
                     rows = database.execute(query, (self._pairing_cursor,)).fetchall()
-                native_rows = TypeAdapter(list[tuple[str, str | None]]).validate_python(
-                    rows
-                )
-            try:
-                entry = self._mailbox_root.lstat()
-            except FileNotFoundError:
-                if awaiting_root:
-                    return True
+                    if not rows and self._pairing_cursor:
+                        self._pairing_cursor = ""
+                        rows = database.execute(
+                            query, (self._pairing_cursor,)
+                        ).fetchall()
+                    native_rows = TypeAdapter(
+                        list[tuple[str, str | None]]
+                    ).validate_python(rows)
+                try:
+                    entry = self._mailbox_root.lstat()
+                except FileNotFoundError:
+                    if awaiting_root:
+                        return True
+                    raise MailboxDiscoveryError(
+                        MailboxDiscoveryErrorCode.ROOT_UNAVAILABLE
+                    ) from None
+            except BlockingIOError:
+                raise
+            except OSError as exc:
                 raise MailboxDiscoveryError(
-                    MailboxDiscoveryErrorCode.ROOT_UNAVAILABLE
-                ) from None
+                    MailboxDiscoveryErrorCode.STORAGE_UNAVAILABLE
+                ) from exc
             if not stat.S_ISDIR(entry.st_mode):
                 raise MailboxDiscoveryError(MailboxDiscoveryErrorCode.UNSAFE_ROOT)
             # Retained invitations remain eligible across pages. Authenticated
