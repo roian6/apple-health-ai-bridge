@@ -6594,9 +6594,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 lastDirectAcceptance = (item.id, receiverIdentity, expectedGeneration, bootstrapRetryGeneration)
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .accepted)
                 uploadedCount += 1
-                pendingItems = hasNutrition
-                    ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
-                    : Array(pendingItems.dropFirst())
             } catch let cancellation as CancellationError {
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .cancelled)
                 if finalizePendingSleep {
@@ -6623,6 +6620,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 failedDescriptions.append(describe(error))
                 break
             }
+            pendingItems = hasNutrition
+                ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
+                : Array(pendingItems.dropFirst())
         }
         try requireCurrentPayloadDeliveryTarget(target)
         return (

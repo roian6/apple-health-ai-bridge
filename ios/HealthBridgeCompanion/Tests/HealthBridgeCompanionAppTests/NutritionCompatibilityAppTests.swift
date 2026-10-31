@@ -7,6 +7,49 @@ import XCTest
 
 @MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
+    func testNutritionRefreshCancellationDoesNotReclassifyAcceptedUpload() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        fixture.receiver.capability = .unsupported
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let vm = try await fixture.makeViewModel(eligibleTypeCodes: ["dietary_protein"])
+        _ = try fixture.enqueueMixed()
+        var newlyQueued: FileOutboxItem?
+        fixture.outbox.nutritionSplitFault = { boundary in
+            guard case .acceptancePersisted = boundary, newlyQueued == nil else { return }
+            newlyQueued = try fixture.enqueueMixed()
+        }
+        let engine = AutomaticSyncEngine(
+            pendingStore: background,
+            processType: { _, _ in .blocked },
+            performOpportunity: { opportunity, processPendingTypes in
+                _ = await vm.performAutomaticSyncOpportunity(
+                    opportunity: opportunity,
+                    processPendingTypes: processPendingTypes
+                )
+            }
+        )
+
+        try await engine.requestRun(reason: .observerBatch(typeCodes: ["dietary_protein"]))
+
+        XCTAssertEqual(fixture.receiver.batches.count, 1)
+        XCTAssertFalse(NutritionCompatibility.containsNutrition(
+            try XCTUnwrap(fixture.receiver.batches.first)
+        ))
+        let pending = try XCTUnwrap(newlyQueued)
+        XCTAssertNotNil(try fixture.outbox.pendingItem(id: pending.id))
+        let failure = Mirror(reflecting: vm).children.first {
+            $0.label == "backgroundAutomaticSyncFailure"
+        }?.value as? AutomaticSyncDiagnosticFailure
+        XCTAssertNil(failure, "Refreshing later queued work must not reclassify the accepted transport")
+    }
+
     func testDiscreteActivityRawACKRetiresGenerationWithoutDailyStatistics() async throws {
         for value: Double? in [nil, 0, 7] {
             let fixture = try NutritionFixture()
