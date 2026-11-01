@@ -2,14 +2,14 @@
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 
-This guide documents [Receiver/CLI `1.2.0`](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0), but does not change the guided installation default. For the current default, follow the [Receiver/CLI `1.1.5` setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/setup.md). Use the 1.2.0 instructions below only after the matching signed iOS Companion `1.2.0` (build `51`) is available through a supported distribution and the installation defaults are deliberately moved together. For the optional Mac-only Mailbox Beta, verify the matching helper and complete release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.2.0/docs/icloud-mailbox-service.md); do not substitute `main` or an older helper.
+This guide uses the coordinated installation default: [Receiver/CLI `1.2.0`](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0), iOS Companion `1.2.0` (build `51`), and Batch Protocol `health_bridge.batch.v1` (`1.0.0`). Check the installed app version and build before pairing or upgrading. For the optional Mac-only Mailbox Beta, verify the matching helper and complete release assets using the maintained [mailbox installation guide](icloud-mailbox-service.md), which also covers helper replacement; do not install Receiver or helper code from `main` or substitute an older helper.
 
 ## Before you start
 
 You need:
 
 - an iPhone running iOS 18 or later;
-- the [iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806); TestFlight builds and self-build options are listed on the [install status page](https://healthbridge.chanhyo.dev/install/);
+- iOS Companion `1.2.0` (build `51`) from the [App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806), listed as Health Bridge for AI, or the [TestFlight beta](https://testflight.apple.com/join/GF4dbSEV); self-build options are listed on the [install status page](https://healthbridge.chanhyo.dev/install/);
 - a macOS or Linux computer for the receiver and private database; native Windows is not currently supported;
 - [`uv`](https://docs.astral.sh/uv/);
 - for continuous sync away from home, either an existing Tailscale connection or an agent-assisted private HTTPS ingress; for an explicit local-only evaluation, a same-LAN route with the limitations below;
@@ -134,9 +134,9 @@ Continue with the common setup sequence below. Route C must use its explicit `0.
 
 After setup, use the printed receiver command with the same bind and port. Keep the iPhone on that LAN, grant the app's iOS Local Network permission, derive the health URL as `${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}/health`, and open that exact URL on the physical iPhone before pairing. The Local Network permission alert may fail to resolve the first attempt if access is denied or the route does not recover in time. If an exit node is active, enable **Allow LAN access** or use Route A or Route B instead.
 
-## Existing users: conditional Receiver/CLI 1.2.0 upgrade
+## Existing users: Receiver/CLI 1.2.0 upgrade
 
-Use this recipe only after the matching signed iOS Companion `1.2.0` (build `51`) is available through a supported distribution. Receiver/CLI `1.2.0` is published, but that alone does not make the coordinated app and Receiver set available or change the default install. Until the matching app is available and a deliberate cutover is made, keep the existing Receiver/CLI `1.1.5` installation.
+Upgrade Receiver/CLI `1.1.5` to `1.2.0` together with the matching signed iOS Companion `1.2.0` (build `51`). If your installed app still shows an older build, update it through the App Store or TestFlight before using this matched set. Keep your existing database, device credentials, and pairing.
 
 1. Record the exact database path and existing receiver launch configuration. Stop the Receiver through its current service manager and confirm no process is using the database. Using your established SQLite backup procedure, create and verify an owner-only backup of that database before upgrading, including any SQLite sidecar files that remain. Do not copy a live database.
 2. Verify the complete Receiver/CLI `1.2.0` release packet and the matching signed iOS app build. Do not install from `main`, an unverified checkout, or an older helper.
@@ -162,7 +162,7 @@ The Companion uses a newer queue format after splitting a mixed nutrition batch.
 
 ## Install and run core setup
 
-Only after the matching signed iOS Companion `1.2.0` (build `51`) is available through a supported distribution and the coordinated installation cutover is deliberate, install Receiver/CLI `1.2.0`:
+Install the published Receiver/CLI `1.2.0` for iOS Companion `1.2.0` (build `51`):
 
 ```bash
 uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
