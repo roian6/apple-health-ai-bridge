@@ -14,8 +14,8 @@ from health_bridge import __version__
 from tests.guardrails.test_release_recovery import recovery_transport
 
 ROOT = Path(__file__).parents[2]
-# Reviewed published baseline: receiver-v1.1.5 at 6940fe41, not the source candidate.
-PUBLISHED_RECEIVER_VERSION: Final = "1.1.5"
+# Published installation baseline; source labels alone do not select this pin.
+PUBLISHED_RECEIVER_VERSION: Final = "1.2.0"
 RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 RELEASE_NOTES = ROOT / ".github/release/notes-receiver-v1.1.1.md"
@@ -1129,11 +1129,8 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
         r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)'
     )
     assert f"/releases/tag/receiver-v{PUBLISHED_RECEIVER_VERSION})" in readme
-    assert f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/setup.md)" in readme
-    assert (
-        f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/icloud-mailbox-service.md)"
-        in readme
-    )
+    assert "(docs/setup.md)" in readme
+    assert "(docs/icloud-mailbox-service.md)" in readme
     assert re.findall(pin_pattern, readme) == []
     pins = re.findall(pin_pattern, setup)
     assert pins, "No versioned install pin found in docs/setup.md"
@@ -1162,7 +1159,7 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     mailbox = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
 
     assert re.search(r"\]\(setup\.md(?:#[^)]+)?\)", self_build)
-    assert f"/blob/receiver-v{__version__}/docs/icloud-mailbox-service.md)" in setup
+    assert "(icloud-mailbox-service.md)" in setup
     release_notes_path = ROOT / f".github/release/notes-receiver-v{__version__}.md"
     assert release_notes_path.is_file()
     release_notes = release_notes_path.read_text(encoding="utf-8")

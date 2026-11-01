@@ -2,17 +2,17 @@
 
 Apple Health AI Bridge contains independently released components. Always include the component name when presenting a version; the phrase “repository version” is intentionally avoided because a Git checkout is identified by a commit or tag, not by a single product version.
 
-## Forward-port source versions
+## Current installation default
 
-| Surface | Source version | Identifier or status |
+| Surface | Version | Identifier or distribution |
 | --- | --- | --- |
 | Receiver/CLI | `1.2.0` | Published as `receiver-v1.2.0` |
-| iOS Companion | `1.2.0` (build `51`) | App Store and external TestFlight review pending |
+| iOS Companion | `1.2.0` (build `51`) | [App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806) or [TestFlight](https://testflight.apple.com/join/GF4dbSEV) |
 | Batch Protocol | `1.0.0` | `health_bridge.batch.v1` |
 
-The authoritative machine-readable mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture. These source versions do not set public installation defaults: the App Store currently offers iOS Companion `1.1.1` (build `50`), while build `51` remains under review and is not available through the App Store or external TestFlight. Keep the guided Receiver/CLI install pinned to `1.1.5` until the matching app build is available and the controlled cutover updates commands, guide links, helper references and compatibility copy together.
+Use the maintained [setup guide](setup.md) for installation and existing-user upgrades, and check the installed app version and build before pairing. Encrypted iCloud Mailbox remains an explicit opt-in, Mac-only Beta with a separately verified `1.2.0` helper; Direct remains the default transport.
 
-Receiver/CLI `1.2.0` is published. The App Store and external TestFlight distribution of iOS Companion `1.2.0` (build `51`) is still pending review, so do not present the coordinated build set as available. The current installation default remains Receiver/CLI `1.1.5`; do not infer general compatibility between that app and Receiver/CLI `1.2.0`.
+The authoritative machine-readable source mapping is [`component-versions.json`](../component-versions.json). It declares `release_scope` explicitly. Validation compares the index with the Python package, Xcode settings and canonical Batch fixture. Matching source version labels do not mean every commit on `main` shipped in build `51`: the later iOS corrections in #147, #150, and #152 remain [Unreleased](../CHANGELOG.md#unreleased). Published tags, signed source notes, and release assets retain their frozen identities.
 
 ### One stable release branch
 
