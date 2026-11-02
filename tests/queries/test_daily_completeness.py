@@ -170,10 +170,11 @@ def test_malformed_stored_marker_is_not_missing(
             "2018-11-05T02:00:00Z",
         ),
         (
-            "2026-11-01",
+            # Historical repeated midnight; Cuba canceled the 2026 fallback.
+            "2025-11-02",
             "America/Havana",
-            "2026-11-01T04:00:00Z",
-            "2026-11-02T05:00:00Z",
+            "2025-11-02T04:00:00Z",
+            "2025-11-03T05:00:00Z",
         ),
     ],
 )
@@ -213,22 +214,45 @@ def test_full_day_requires_both_exact_boundaries(
 
 
 @pytest.mark.parametrize(
-    ("day", "start", "end"),
+    ("day", "zone", "start", "end"),
     [
-        ("2026-03-08", "2026-03-08T05:00:00Z", "2026-03-09T05:00:00Z"),
-        ("2026-11-01", "2026-11-01T04:00:00Z", "2026-11-02T04:00:00Z"),
+        (
+            "2026-03-08",
+            "America/New_York",
+            "2026-03-08T05:00:00Z",
+            "2026-03-09T05:00:00Z",
+        ),
+        (
+            "2026-11-01",
+            "America/New_York",
+            "2026-11-01T04:00:00Z",
+            "2026-11-02T04:00:00Z",
+        ),
+        (
+            "2025-11-02",
+            "America/Havana",
+            "2025-11-02T04:00:00Z",
+            "2025-11-03T04:00:00Z",
+        ),
+        (
+            "2025-11-02",
+            "America/Havana",
+            "2025-11-02T05:00:00Z",
+            "2025-11-03T05:00:00Z",
+        ),
     ],
 )
 def test_fixed_twenty_four_hours_is_not_a_dst_day(
     tmp_path: Path,
     day: str,
+    zone: str,
     start: str,
     end: str,
 ) -> None:
     metadata = {
         **COMPLETE,
         "calendar_day": day,
-        "time_zone_identifier": "America/New_York",
+        "time_zone_identifier": zone,
     }
     observation = _day(_ingest_samples(tmp_path, [(start, end, 6.0, metadata)]), day)
     assert observation.sample_counts == {"steps": 1}
