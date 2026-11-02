@@ -258,6 +258,7 @@ def test_native_pairing_preserves_safe_helper_diagnostics(
     stage: str,
     diagnostic: str,
 ) -> None:
+    monkeypatch.setattr(receiver_cli, "sys", SimpleNamespace(platform="darwin"))
     publisher = NativeAckPublisher(NativeAckPublisherConfig(tmp_path / "helper"))
 
     def configured() -> NativeAckPublisher:
