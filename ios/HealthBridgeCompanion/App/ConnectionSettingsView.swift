@@ -8,6 +8,7 @@ struct ConnectionSettingsView: View {
     @State private var showPrivateResetConfirmation = false
     @State private var showMailboxKeyResetConfirmation = false
     @State private var showPendingPairingCancellationConfirmation = false
+    @State private var hasCheckedConnection = false
     @FocusState private var inputFocus: InputField?
 
     private enum InputField: Hashable {
@@ -26,7 +27,7 @@ struct ConnectionSettingsView: View {
 
             if !viewModel.receiverSettingsSaved {
                 Section {
-                    DisclosureGroup("Advanced connection editing") {
+                    DisclosureGroup("Use an invitation code") {
                         Text("Server address")
                         TextField("https://receiver.example", text: $viewModel.manualPairingServer)
                             .accessibilityLabel("Server address")
@@ -152,23 +153,27 @@ struct ConnectionSettingsView: View {
                 )
             }
 
-            Button {
-                Task { await viewModel.checkConnection() }
-            } label: {
-                if viewModel.isCheckingConnection {
-                    ProgressView(
-                        viewModel.usesMailboxTransport ? "Checking mailbox folder" : "Checking connection"
-                    )
-                } else {
-                    Label(
-                        viewModel.usesMailboxTransport ? "Check Mailbox Folder" : "Check Connection",
-                        systemImage: viewModel.usesMailboxTransport ? "lock.icloud" : "network"
-                    )
+            if viewModel.receiverSettingsSaved {
+                Button {
+                    hasCheckedConnection = true
+                    Task { await viewModel.checkConnection() }
+                } label: {
+                    if viewModel.isCheckingConnection {
+                        ProgressView(
+                            viewModel.usesMailboxTransport ? "Checking mailbox folder" : "Checking connection"
+                        )
+                    } else {
+                        Label(
+                            viewModel.usesMailboxTransport ? "Check Mailbox Folder" : "Check Connection",
+                            systemImage: viewModel.usesMailboxTransport ? "lock.icloud" : "network"
+                        )
+                    }
                 }
+                .disabled(!viewModel.canSendConnectionTest || viewModel.isCheckingConnection)
             }
-            .disabled(!viewModel.canSendConnectionTest || viewModel.isCheckingConnection)
 
-            if viewModel.receiverSettingsSaved && !viewModel.hasPendingPairing {
+            if viewModel.receiverSettingsSaved && !viewModel.hasPendingPairing
+                && (hasCheckedConnection || viewModel.statusIsError || !viewModel.nutritionNotice.isEmpty) {
                 InlineNotice(
                     message: viewModel.displayStatusMessage,
                     systemImage: viewModel.statusIsError ? "exclamationmark.triangle" : "info.circle",
@@ -222,23 +227,15 @@ struct ConnectionSettingsView: View {
 
     private var setupSection: some View {
         Section {
-            Text("Private setup link")
-                .font(.subheadline)
-            TextField("Paste setup link", text: $viewModel.pairingImportText, axis: .vertical)
-                .lineLimit(2...4)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .privacySensitive()
-                .accessibilityLabel("Private setup link")
-                .focused($inputFocus, equals: .link)
-            Button(viewModel.canSendConnectionTest ? "Replace Connection" : "Connect from Setup Link") {
-                inputFocus = nil
-                Task { await viewModel.importPairingText() }
-            }
-            .disabled(!viewModel.canImportPairingText || viewModel.isPairing)
-
-            if viewModel.isPairing {
-                ProgressView("Connecting")
+            if viewModel.canSendConnectionTest {
+                DisclosureGroup("Replace Connection") {
+                    setupFields
+                    Text("Use a new setup link to replace this iPhone's saved connection.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                setupFields
             }
             if let correction = viewModel.pairingInputCorrection {
                 InlineNotice(
@@ -248,13 +245,35 @@ struct ConnectionSettingsView: View {
                 )
             }
         } header: {
-            Text(viewModel.canSendConnectionTest ? "Replace connection" : "Setup link")
+            if !viewModel.canSendConnectionTest {
+                Text("Setup link")
+            }
         } footer: {
-            Text(
-                viewModel.canSendConnectionTest
-                    ? "Paste a new setup link only if you want to replace this iPhone's saved connection."
-                    : "Setup links contain private connection details. Only paste them here. Do not share them in chat or screenshots."
-            )
+            if !viewModel.canSendConnectionTest {
+                Text("Setup links contain private connection details. Only paste them here. Do not share them in chat or screenshots.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var setupFields: some View {
+        Text("Private setup link")
+            .font(.subheadline)
+        TextField("Paste setup link", text: $viewModel.pairingImportText, axis: .vertical)
+            .lineLimit(2...4)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .privacySensitive()
+            .accessibilityLabel("Private setup link")
+            .focused($inputFocus, equals: .link)
+        Button(viewModel.canSendConnectionTest ? "Replace Connection" : "Connect from Setup Link") {
+            inputFocus = nil
+            Task { await viewModel.importPairingText() }
+        }
+        .disabled(!viewModel.canImportPairingText || viewModel.isPairing)
+
+        if viewModel.isPairing {
+            ProgressView("Connecting")
         }
     }
 

@@ -38,23 +38,6 @@ struct ContentView: View {
                         syncControlCard
                     }
 
-                    if viewModel.syncPresentation.phase == .ready
-                        && viewModel.lastAcceptedTransferObservation != nil {
-                        NavigationLink {
-                            AIGuideView(viewModel: viewModel)
-                        } label: {
-                            CardRow(
-                                title: "Connect an AI client",
-                                subtitle: "Set up your assistant separately",
-                                systemImage: "desktopcomputer",
-                                tint: .blue
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .background(Color(.secondarySystemGroupedBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                    }
-
                     detailsSection
                 }
                 .padding(.horizontal, HealthBridgeSpacing.screen)
@@ -102,19 +85,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let observation = viewModel.lastAcceptedTransferObservation {
-                    Text(observation.evidenceKind == .directResponse
-                        ? "Direct response observed" : "Receiver confirmation observed")
+                    Text("Last transfer confirmed")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.top, 8)
                     Text(observation.observedAt, format: .dateTime.year().month(.abbreviated).day().hour().minute())
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } else if viewModel.healthPermissionsRequested && viewModel.canSendConnectionTest {
-                    Text("No transfer response recorded for this connection.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 8)
                 }
             }
             Spacer(minLength: 0)
@@ -326,14 +303,14 @@ struct ContentView: View {
 
     private var syncControlCard: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SectionHeader(
-                title: "Sync",
-                subtitle: "Send allowed Apple Health data to your receiver."
-            )
+            Text("Sync")
+                .font(.title3.weight(.bold))
 
             if !viewModel.healthPermissionNotice.isEmpty {
                 InlineNotice(
-                    message: viewModel.healthPermissionNotice,
+                    message: viewModel.healthPermissionNoticeIsError
+                        ? viewModel.healthPermissionNotice
+                        : "Access request finished. Only data you allow in Apple Health can sync.",
                     systemImage: viewModel.healthPermissionNoticeIsError
                         ? "exclamationmark.circle.fill" : "info.circle.fill",
                     tint: viewModel.healthPermissionNoticeIsError ? .orange : .blue
@@ -441,6 +418,7 @@ private struct AppDetailsView: View {
 
     private static let privacyPolicyURL = URL(string: "https://healthbridge.chanhyo.dev/privacy/")!
     private static let supportURL = URL(string: "https://healthbridge.chanhyo.dev/support/")!
+    private static let setupGuideURL = URL(string: "https://healthbridge.chanhyo.dev/install/")!
 
     var body: some View {
         List {
@@ -460,18 +438,14 @@ private struct AppDetailsView: View {
                 NavigationLink {
                     ActivityDiagnosticsView(viewModel: viewModel)
                 } label: {
-                    Label("Activity & Diagnostics", systemImage: "list.bullet.rectangle")
+                    Label("Activity", systemImage: "list.bullet.rectangle")
                 }
-                NavigationLink {
-                    AIGuideView(viewModel: viewModel)
-                } label: {
-                    Label("Use with AI", systemImage: "desktopcomputer")
-                }
+                Link("Setup Guide", destination: Self.setupGuideURL)
+                Link("Support", destination: Self.supportURL)
             }
             Section("About") {
                 LabeledContent("Version", value: appVersion)
                 Link("Privacy Policy", destination: Self.privacyPolicyURL)
-                Link("Support", destination: Self.supportURL)
             }
         }
         .navigationTitle("Settings")

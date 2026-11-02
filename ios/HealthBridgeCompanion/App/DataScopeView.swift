@@ -61,31 +61,6 @@ struct DataScopeView: View {
             } footer: {
                 Text("Limits vary by data type. Changing this preference does not reset progress or resend older records.")
             }
-
-            Section {
-                Text(viewModel.historicalBackfillSummary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if !viewModel.historicalBackfillState.selectedTypeCodes.isEmpty {
-                    Text("Saved range: \(HealthHistoryDepthPresentation.summary(selected: viewModel.historicalBackfillState.historyDepth))")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("Additional history")
-            } footer: {
-                Text("Progress for selected data types; queued records may still be awaiting delivery.")
-            }
-
-            Section("Nutrition compatibility") {
-                if viewModel.nutritionNotice.isEmpty {
-                    Text("No nutrition compatibility details are available.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(viewModel.nutritionNotice)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
         }
         .navigationTitle("Health Data")
     }

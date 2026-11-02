@@ -2,17 +2,18 @@ import SwiftUI
 
 struct ActivityDiagnosticsView: View {
     @ObservedObject var viewModel: HealthBridgeCompanionViewModel
-    @Environment(\.dismiss) private var dismiss
     @State private var showsAdvanced = false
 
     var body: some View {
         Form {
             Section("Current status") {
-                Label(viewModel.syncPresentation.title, systemImage: viewModel.syncPresentation.symbol)
-                    .font(.headline)
-                Text(viewModel.syncPresentation.phase == .needsAttention
-                    ? viewModel.displayStatusMessage : viewModel.syncPresentation.detail)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(viewModel.syncPresentation.title, systemImage: viewModel.syncPresentation.symbol)
+                        .font(.headline)
+                    Text(viewModel.syncPresentation.phase == .needsAttention
+                        ? viewModel.displayStatusMessage : viewModel.syncPresentation.detail)
+                        .foregroundStyle(.secondary)
+                }
                 nextAction
             }
 
@@ -43,6 +44,18 @@ struct ActivityDiagnosticsView: View {
                     LabeledContent("Last run", value: viewModel.automaticSyncRunLine)
                     Text(viewModel.automaticSyncLaneDiagnosticLine)
                         .textSelection(.enabled)
+                    if !viewModel.historicalBackfillState.selectedTypeCodes.isEmpty {
+                        Text(viewModel.historicalBackfillSummary)
+                        LabeledContent(
+                            "History range",
+                            value: HealthHistoryDepthPresentation.summary(
+                                selected: viewModel.historicalBackfillState.historyDepth
+                            )
+                        )
+                    }
+                    if !viewModel.nutritionNotice.isEmpty {
+                        Text(viewModel.nutritionNotice)
+                    }
                 }
                 .font(.footnote)
             }
@@ -59,19 +72,15 @@ struct ActivityDiagnosticsView: View {
         } else if viewModel.hasPendingSleepTransition
             || viewModel.hasPendingOutboxDeletion
             || viewModel.mailboxKeyDiagnosticState == .lost {
-            Text("Review recovery options in Settings > Connection.")
-                .foregroundStyle(.secondary)
-            Button("Back to Settings") { dismiss() }
+            NavigationLink("Open Connection") {
+                ConnectionSettingsView(viewModel: viewModel)
+            }
         } else {
             switch viewModel.syncPresentation.phase {
-            case .recoveryRequired, .connectionRequired, .unpaired:
-                Text("Open Connection in Settings to continue.")
-                    .foregroundStyle(.secondary)
-                Button("Back to Settings") { dismiss() }
-            case .pendingPairing:
-                Text("Return to the main screen to retry or cancel pending pairing.")
-                    .foregroundStyle(.secondary)
-                Button("Back to Settings") { dismiss() }
+            case .recoveryRequired, .connectionRequired, .unpaired, .pendingPairing:
+                NavigationLink("Open Connection") {
+                    ConnectionSettingsView(viewModel: viewModel)
+                }
             case .pairing, .syncing:
                 Text("Wait for the current action to finish.")
                     .foregroundStyle(.secondary)
