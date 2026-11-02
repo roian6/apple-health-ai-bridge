@@ -216,6 +216,38 @@ directory. Do not substitute an arbitrary or default container. The private
 database and HTML setup page belong in owner-only local directories, not in the
 iCloud mailbox.
 
+Native URL-free `receiver create-pairing` and Mailbox `receiver start` run a
+write preflight to check whether that receiver process can create and remove a
+file in the helper protocol root. A successful preflight does not guarantee
+later publication: access or storage can fail during a pairing attempt.
+`helper_container_access_denied` means an explicit protocol-root operation
+returned EPERM or EACCES. It identifies the failed operation, not whether the
+cause was macOS container protection, a file permission, or another policy.
+
+Pairing registration can be committed before the helper publishes its
+completion. If publication then fails, the receiver reports degraded health
+with HTTP 503 and retries the retained request. After resolving the access
+failure, restart the receiver process responsible for that setup. For a
+foreground receiver, stop and start the same `receiver start` command. For the
+LaunchAgent, use `health-bridge mailbox service restart --json`, then confirm
+`running_healthy` with `health-bridge mailbox service status --json`. Once the
+receiver is running again, use **Retry Pairing** in the companion to retrieve
+the completion for the existing request. Don't delete the database or create a
+new pairing just because publication failed.
+
+Foreground Terminal access and a LaunchAgent's access are separate contexts.
+Permission available to Terminal does not prove that the helper or the
+separately launched receiver has the same access. Apple's documentation
+describes access to protected app containers and the role of code-signing
+identity for apps and helper tools, including launch agents:
+[Accessing files from the macOS App Sandbox](https://developer.apple.com/documentation/security/accessing-files-from-the-macos-app-sandbox.md)
+and [Protecting local app data using containers on macOS](https://developer.apple.com/documentation/xcode/protecting-local-app-data-using-containers.md).
+Those documents don't identify which executable is responsible for a particular
+denial in this setup. Diagnose the process and operation before changing
+access. One reporter said granting Terminal Full Disk Access and restarting
+fixed their macOS 27.0.1 case. That's a reported workaround, not a universal
+Apple requirement or a verified diagnosis of the responsible process.
+
 The helper status command must report `{"code": "ready"}`. Readiness verifies
 the installed helper generation and platform checks, but does not prove native
 pairing support. The URL-free `receiver create-pairing` command itself checks

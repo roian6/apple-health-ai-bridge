@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import time
 from collections.abc import Callable, Iterable
 from contextlib import suppress
@@ -38,7 +39,11 @@ from health_bridge.mailbox.filesystem import (
     read_final_at,
     revalidate_final_at,
 )
-from health_bridge.mailbox.native_ack_publication import default_native_ack_publisher
+from health_bridge.mailbox.native_ack_publication import (
+    NativePairingPublicationError,
+    NativePairingPublicationErrorCode,
+    default_native_ack_publisher,
+)
 from health_bridge.receiver._mailbox_key_models import (
     MailboxKeyStoreError,
     MailboxKeyStoreErrorCode,
@@ -417,9 +422,12 @@ class MailboxRuntimeWorker:
         self._confirmed_pairings: dict[str, FileIdentity] = {}
         self._settled_pairings: dict[str, _SettledPairing] = {}
         self._pairing_cursor = ""
+        self._last_pairing_error: str | None = None
+        self._pairing_sweep_error: str | None = None
 
     def _bootstrap_once(self) -> bool:
         native_rows: list[tuple[str, str | None]] = []
+        completed_sweep = False
         if self._pairing_keys is not None and self._pairing_connections is not None:
             try:
                 with connect_live_readonly_database(self._db_path) as database:
@@ -441,6 +449,7 @@ class MailboxRuntimeWorker:
                     order by pairing_invitation_id limit 128"""
                     rows = database.execute(query, (self._pairing_cursor,)).fetchall()
                     if not rows and self._pairing_cursor:
+                        completed_sweep = True
                         self._pairing_cursor = ""
                         rows = database.execute(
                             query, (self._pairing_cursor,)
@@ -464,6 +473,7 @@ class MailboxRuntimeWorker:
                 ) from exc
             if not stat.S_ISDIR(entry.st_mode):
                 raise MailboxDiscoveryError(MailboxDiscoveryErrorCode.UNSAFE_ROOT)
+            self._finish_pairing_scan(completed=completed_sweep or not native_rows)
             # Retained invitations remain eligible across pages. Authenticated
             # caches survive page boundaries and revalidate each visited input.
             for invitation_id, _ in native_rows:
@@ -476,6 +486,44 @@ class MailboxRuntimeWorker:
                     # Keyset progress avoids an invalid peer starving older rows.
                     break
         return False
+
+    def _finish_pairing_scan(self, *, completed: bool) -> None:
+        # An unrelated success cannot resolve a prior failure. Only a whole
+        # error-free keyset sweep clears the bounded latch.
+        if completed:
+            self._set_pairing_error(self._pairing_sweep_error)
+            self._pairing_sweep_error = None
+
+    def _set_pairing_error(self, code: str | None) -> None:
+        with self._lifecycle_lock:
+            changed = code != self._last_pairing_error
+            self._last_pairing_error = code
+        if changed and code is not None:
+            _ = sys.stderr.write(f"{code}\n")
+
+    def _record_pairing_error(self, code: NativePairingPublicationErrorCode) -> None:
+        self._pairing_sweep_error = code.value
+        self._set_pairing_error(code.value)
+
+    def _record_pairing_io_error(self, exc: Exception, *, publishing: bool) -> None:
+        if not isinstance(exc, (OSError, MailboxFileError)):
+            return
+        if isinstance(exc, NativePairingPublicationError):
+            self._record_pairing_error(exc.code)
+            return
+        # Absent or unsafe peer input is not a publication attempt. Other IO,
+        # including missing owned publication artifacts, remains observable.
+        missing = isinstance(exc, FileNotFoundError) or isinstance(
+            exc.__cause__, FileNotFoundError
+        )
+        unsafe_peer = (
+            isinstance(exc, MailboxFileError)
+            and exc.code is not MailboxFileErrorCode.STORAGE_UNAVAILABLE
+        )
+        if publishing or not (missing or unsafe_peer):
+            self._record_pairing_error(
+                NativePairingPublicationErrorCode.PUBLICATION_FAILED
+            )
 
     def run_once(self) -> None:
         try:
@@ -566,6 +614,7 @@ class MailboxRuntimeWorker:
         pairing_fd = -1
         invitation_fd = -1
         attempted = False
+        publishing = False
         try:
             root_fd = open_directory(self._mailbox_root)
             pairing_fd = open_directory_at(root_fd, "pairing")
@@ -653,6 +702,7 @@ class MailboxRuntimeWorker:
                     validate_request=validate_registration,
                 )
                 validate_publication = validate_request
+            publishing = True
             published = self._publish_pairing_response(
                 path,
                 invitation_fd,
@@ -675,7 +725,8 @@ class MailboxRuntimeWorker:
             HBJCS1Error,
             MailboxConnectionError,
             ValueError,
-        ):
+        ) as exc:
+            self._record_pairing_io_error(exc, publishing=publishing)
             return attempted
         else:
             return True
@@ -700,7 +751,9 @@ class MailboxRuntimeWorker:
             )
             validate()
             if published.content != response:
-                raise NativePairingError
+                raise NativePairingPublicationError(
+                    NativePairingPublicationErrorCode.PUBLICATION_FAILED
+                )
             if self._confirmed_pairings.get(path.name) == published.identity:
                 return published.identity
         publisher = (
@@ -713,7 +766,9 @@ class MailboxRuntimeWorker:
         )
         validate()
         if published.content != response:
-            raise NativePairingError
+            raise NativePairingPublicationError(
+                NativePairingPublicationErrorCode.PUBLICATION_FAILED
+            )
         self._confirmed_pairings[path.name] = published.identity
         return published.identity
 
@@ -753,7 +808,11 @@ class MailboxRuntimeWorker:
 
     def health_error(self) -> str | None:
         with self._lifecycle_lock:
-            return self._terminal_error or self._last_discovery_error
+            return (
+                self._terminal_error
+                or self._last_discovery_error
+                or self._last_pairing_error
+            )
 
     def terminal_error(self) -> bool:
         with self._lifecycle_lock:

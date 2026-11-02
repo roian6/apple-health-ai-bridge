@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
 import plistlib
 import subprocess
 import sys
@@ -10,8 +12,13 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+import health_bridge.mailbox.native_ack_publication as publication
 from health_bridge.mailbox import helper_distribution_contract, helper_lifecycle
-from health_bridge.mailbox.filesystem import open_mailbox_directory
+from health_bridge.mailbox.filesystem import (
+    MailboxFileError,
+    MailboxFileErrorCode,
+    open_mailbox_directory,
+)
 from health_bridge.mailbox.helper_lifecycle import HelperError, HelperErrorCode
 from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublicationError,
@@ -344,3 +351,84 @@ def test_native_setup_refuses_helper_without_cancellation_capability(
     with pytest.raises(NativeAckPublicationError, match="capability"):
         publisher.require_native_pairing()
     assert not (tmp_path / "protocol").exists()
+
+
+@pytest.mark.parametrize("boundary", ["prepare", "staging", "request", "receipt"])
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        (
+            PermissionError(errno.EACCES, "private-path"),
+            "helper_container_access_denied",
+        ),
+        (
+            PermissionError(errno.EPERM, "private-path"),
+            "helper_container_access_denied",
+        ),
+        (OSError(errno.ENOSPC, "private-path"), "native_pairing_publication_failed"),
+        (OSError(errno.EIO, "private-path"), "native_pairing_publication_failed"),
+        (PermissionError("unsafe private-path"), "native_pairing_publication_failed"),
+    ],
+)
+def test_issue154_protocol_io_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    fault: OSError,
+    code: str,
+) -> None:
+    publisher = _publisher(tmp_path)
+    directory = tmp_path / ("44" * 16)
+    directory.mkdir()
+
+    def capability(_publisher: NativeAckPublisher) -> None:
+        pass
+
+    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"")
+
+    monkeypatch.setattr(NativeAckPublisher, "require_native_pairing", capability)
+    monkeypatch.setattr(subprocess, "run", run)
+    operation = {
+        "prepare": "ensure_private_directory",
+        "staging": "_write_private_bytes",
+        "request": "write_private_text_file",
+        "receipt": "_read_receipt",
+    }[boundary]
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        if boundary == "receipt":
+            raise MailboxFileError(MailboxFileErrorCode.STORAGE_UNAVAILABLE) from fault
+        raise fault
+
+    monkeypatch.setattr(publication, operation, fail)
+    with pytest.raises((NativeAckPublicationError, MailboxFileError)) as raised:
+        publisher.publish_pairing(directory, b"synthetic-completion")
+    assert getattr(raised.value, "code", None) == code
+    assert str(raised.value) == code
+    for lane in ("requests", "staging", "receipts"):
+        path = tmp_path / "protocol" / lane
+        assert not path.exists() or not list(path.iterdir())
+
+
+@pytest.mark.parametrize("lane", ["protocol", "requests", "staging", "receipts"])
+def test_issue154_preflight_writes_and_removes_each_protocol_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    publisher = _publisher(tmp_path)
+    original = os.replace
+    touched: set[str] = set()
+
+    def replace(source: Path, destination: Path) -> None:
+        touched.add(destination.parent.name)
+        assert source.stat().st_mode & 0o777 == 0o600
+        if destination.parent.name == lane:
+            raise PermissionError(errno.EACCES, "synthetic-private-path")
+        original(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(NativeAckPublicationError) as raised:
+        publisher.probe_protocol_storage()
+    assert getattr(raised.value, "code", None) == "helper_container_access_denied"
+    assert lane in touched
+    assert all(path.is_dir() for path in (tmp_path / "protocol").rglob("*"))
