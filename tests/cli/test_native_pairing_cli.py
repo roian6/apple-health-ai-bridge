@@ -8,6 +8,7 @@ import health_bridge.cli_receiver as receiver_cli
 import health_bridge.mailbox.native_ack_publication as publication
 from health_bridge.cli import app
 from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublicationError,
     NativeAckPublisher,
     NativeAckPublisherConfig,
 )
@@ -119,3 +120,52 @@ def test_issue154_native_pairing_denied_before_invitation_creation(
     assert result.stderr.strip() == "helper_container_access_denied"
     assert not database.exists()
     assert not (tmp_path / "pair.html").exists()
+
+
+@pytest.mark.parametrize(
+    ("stage", "diagnostic"),
+    [
+        ("readiness", "native ACK helper is not ready"),
+        ("capability", "native pairing helper capability unavailable"),
+    ],
+)
+def test_native_pairing_preserves_safe_helper_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    diagnostic: str,
+) -> None:
+    publisher = NativeAckPublisher(
+        NativeAckPublisherConfig(tmp_path / "helper", tmp_path / "protocol")
+    )
+
+    def configured() -> NativeAckPublisher:
+        if stage == "readiness":
+            raise NativeAckPublicationError(diagnostic)
+        return publisher
+
+    def capability(_publisher: NativeAckPublisher) -> None:
+        raise NativeAckPublicationError(diagnostic)
+
+    monkeypatch.setattr(receiver_cli, "default_native_ack_publisher", configured)
+    monkeypatch.setattr(NativeAckPublisher, "require_native_pairing", capability)
+    database = tmp_path / "health.sqlite"
+    result = CliRunner().invoke(
+        app,
+        [
+            "receiver",
+            "create-pairing",
+            "--db",
+            str(database),
+            "--label",
+            "synthetic",
+            "--transport",
+            "icloud-mailbox",
+            "--setup-page",
+            str(tmp_path / "pair.html"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert result.stderr.strip() == diagnostic
+    assert not database.exists()
+    assert not (tmp_path / "protocol").exists()

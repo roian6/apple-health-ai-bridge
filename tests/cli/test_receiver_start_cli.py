@@ -13,9 +13,11 @@ from health_bridge.cli import app
 from health_bridge.launchd import LaunchdServiceError, LaunchdServiceErrorCode
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublicationError,
     NativeAckPublisher,
     NativeAckPublisherConfig,
 )
+from health_bridge.private_files import ensure_private_directory
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
 
@@ -219,8 +221,9 @@ def test_receiver_start_maps_keyboard_interrupt_to_clean_exit(
     )
 
 
-def test_issue154_mailbox_start_denied_before_server_binding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("access_denied", [False, True])
+def test_issue154_mailbox_start_checks_storage_without_native_pairing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access_denied: bool
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     publisher = NativeAckPublisher(
@@ -231,7 +234,8 @@ def test_issue154_mailbox_start_denied_before_server_binding(
     )
 
     def capability(_publisher: NativeAckPublisher) -> None:
-        pass
+        message = "native pairing helper capability unavailable"
+        raise NativeAckPublicationError(message)
 
     def selected(*_args: object, **_kwargs: object) -> ReceiverTransport:
         return ReceiverTransport.MAILBOX
@@ -247,10 +251,14 @@ def test_issue154_mailbox_start_denied_before_server_binding(
 
     monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve)
 
-    def denied(*_args: object, **_kwargs: object) -> None:
-        raise PermissionError(errno.EPERM, "synthetic-secret-path")
+    original = ensure_private_directory
 
-    monkeypatch.setattr(publication, "ensure_private_directory", denied)
+    def prepare(path: Path) -> None:
+        if access_denied:
+            raise PermissionError(errno.EPERM, "synthetic-secret-path")
+        original(path)
+
+    monkeypatch.setattr(publication, "ensure_private_directory", prepare)
     result = CliRunner().invoke(
         app,
         [
@@ -262,6 +270,12 @@ def test_issue154_mailbox_start_denied_before_server_binding(
             str(tmp_path / "mailbox"),
         ],
     )
-    assert result.exit_code == 1
-    assert result.stderr.strip() == "helper_container_access_denied"
-    assert bound == []
+    if access_denied:
+        assert result.exit_code == 1
+        assert result.stderr.strip() == "helper_container_access_denied"
+        assert bound == []
+    else:
+        assert result.exit_code == 0, result.output
+        assert bound == [True]
+        assert "receiver listening" in result.stderr
+        assert (tmp_path / "protocol/receipts").is_dir()
