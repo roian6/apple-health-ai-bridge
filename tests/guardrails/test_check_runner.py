@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -27,7 +28,41 @@ if [[ "$program" == uname ]]; then printf 'Darwin\\n'; fi
 if [[ "$program" == uv && "${1:-}" == run && "${2:-}" == "${FAIL_ON:-}" ]]; then
   exit 23
 fi
-if [[ "$program" == xcodebuild && "${FAIL_ON:-}" == xcodebuild ]]; then exit 23; fi
+if [[ "$program" == xcodebuild && "${FAIL_ON:-}" == xcodebuild &&
+      " $* " == *" build "* ]]; then
+  exit 23
+fi
+if [[ "$program" == native-tests ]]; then
+  if [[ "${FAIL_ON:-}" == native-tests ]]; then exit 24; fi
+  case "${FAIL_ON:-}" in
+    missing-summary) exit 0 ;;
+    zero-cases) printf 'CASES=0 PASSED=0 FAILED=0 SKIPPED=0\\n' ;;
+    skipped) printf 'CASES=3 PASSED=2 FAILED=0 SKIPPED=1\\n' ;;
+    failed-cases) printf 'CASES=3 PASSED=2 FAILED=1 SKIPPED=0\\n' ;;
+    *) printf 'CASES=3 PASSED=3 FAILED=0 SKIPPED=0\\n' ;;
+  esac
+fi
+if [[ "$program" == xcrun && "${1:-}" == swiftc && " $* " == *" -o "* ]]; then
+  if [[ "${FAIL_ON:-}" == compile ]]; then exit 25; fi
+  while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == -o ]]; then
+      if [[ "${FAIL_ON:-}" != missing-binary ]]; then cp "$0" "$2"; fi
+      break
+    fi
+    shift
+  done
+fi
+if [[ "$program" == xcrun && "${1:-}" == lipo ]]; then printf 'arm64\\n'; fi
+if [[ "$program" == xcodebuild && " $* " == *" -sdk macosx "* ]]; then
+  if [[ "${FAIL_ON:-}" == helper-build ]]; then exit 26; fi
+  for arg in "$@"; do
+    if [[ "$arg" == CONFIGURATION_BUILD_DIR=* && "${FAIL_ON:-}" != missing-app ]]; then
+      app="${arg#*=}/HealthBridgeMailboxAckPublisher.app/Contents/MacOS"
+      mkdir -p "$app"
+      cp /bin/echo "$app/HealthBridgeMailboxAckPublisher"
+    fi
+  done
+fi
 """
 
 
@@ -36,7 +71,7 @@ def tools(tmp_path: Path) -> tuple[Mapping[str, str], Path]:
     directory = tmp_path / "bin"
     directory.mkdir()
     calls = tmp_path / "calls"
-    for name in ("uv", "bash", "uname", "swift", "xcodebuild"):
+    for name in ("uv", "bash", "uname", "swift", "xcodebuild", "xcrun"):
         script = directory / name
         _ = script.write_text(RECORDER)
         script.chmod(0o755)
@@ -139,7 +174,11 @@ def test_native_runner_preserves_both_targets_and_unsigned_sdks(
         for call in recorded
     )
     assert any(call[0] == "swift" and call[2] == "test" for call in recorded)
-    builds = [call for call in recorded if call[0] == "xcodebuild"]
+    builds = [
+        call
+        for call in recorded
+        if call[0] == "xcodebuild" and "-target" in call and "macosx" not in call
+    ]
     assert {
         (call[call.index("-target") + 1], call[call.index("-sdk") + 1])
         for call in builds
@@ -173,7 +212,87 @@ def test_native_build_failure_cannot_become_success(
     )
     # Then: it stops with the compiler's nonzero status, not a later successful build.
     assert result.returncode == 23
-    assert len([call for call in _calls(calls) if call[0] == "xcodebuild"]) == 1
+    builds = [
+        call for call in _calls(calls) if call[0] == "xcodebuild" and "-target" in call
+    ]
+    assert len(builds) == 1
+
+
+@pytest.mark.parametrize(
+    "route", [("native", "native"), ("native-builds", "full"), ("full",)]
+)
+def test_helper_gate_executes_fresh_binary_and_retains_identity(
+    tools: tuple[Mapping[str, str], Path], route: tuple[str, ...]
+) -> None:
+    # Given: compiler/build recorders produce runnable artifacts at the requested paths.
+    environment, calls = tools
+    helper = Path(environment["CHECKS_OUTPUT_DIR"]) / "helper"
+    helper.mkdir(parents=True)
+    (helper / "stale").touch()
+    # When: a native-capable route runs the real orchestration.
+    result = subprocess.run(
+        ["/bin/bash", str(RUNNER), *route],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    # Then: the new host actually ran and receipts identify those fresh artifacts.
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (helper / "stale").exists()
+    assert any(call[:2] == ["native-tests", str(ROOT)] for call in _calls(calls))
+    binary = helper / "native-tests"
+    app = helper / "build/HealthBridgeMailboxAckPublisher.app/Contents/MacOS"
+    assert (app / "HealthBridgeMailboxAckPublisher").is_file()
+    assert (helper / "sources-before.sha256").read_bytes() == (
+        helper / "sources-after.sha256"
+    ).read_bytes()
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert digest in (helper / "native-tests-before.sha256").read_text()
+    assert digest in (helper / "native-tests-after.sha256").read_text()
+    assert (helper / "test.log").read_text() == "CASES=3 PASSED=3 FAILED=0 SKIPPED=0\n"
+    receipt = (helper / "commands.log").read_text()
+    assert f"argv: {binary}" in receipt
+    assert "exit: 0" in receipt
+    assert (helper / "app.sha256").is_file()
+    assert (helper / "architectures.log").read_text().splitlines() == ["arm64", "arm64"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "exit_code"),
+    [
+        ("compile", 25),
+        ("native-tests", 24),
+        ("helper-build", 26),
+        ("missing-binary", 1),
+        ("missing-summary", 1),
+        ("zero-cases", 1),
+        ("skipped", 1),
+        ("failed-cases", 1),
+        ("missing-app", 1),
+    ],
+)
+def test_helper_gate_rejects_missing_artifacts_and_failed_work(
+    tools: tuple[Mapping[str, str], Path], failure: str, exit_code: int
+) -> None:
+    # Given: one actual subprocess or required artifact violates the native gate.
+    environment, calls = tools
+    # When: the CI-facing route executes the selected failure.
+    result = subprocess.run(
+        ["/bin/bash", str(RUNNER), "native-builds", "full"],
+        env={**environment, "FAIL_ON": failure},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    # Then: failures stop the gate before any iOS build can mask them.
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    assert not any("iphonesimulator" in call for call in _calls(calls))
+    if exit_code > 1:
+        receipt = Path(environment["CHECKS_OUTPUT_DIR"]) / "helper/commands.log"
+        assert receipt.read_text().endswith(f"exit: {exit_code}\n")
 
 
 @pytest.mark.parametrize("fail_on", ["", "pytest"])

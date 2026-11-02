@@ -99,6 +99,81 @@ run_python() {
   git diff --cached --check
 }
 
+helper_command() {
+  local log="$1" status
+  shift
+  { printf 'argv:'; printf ' %q' "$@"; printf '\n'; } >> "$output/helper/commands.log"
+  if "$@" 2>&1 | tee "$output/helper/$log"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf 'exit: %s\n' "$status" >> "$output/helper/commands.log"
+  return "$status"
+}
+
+run_helper() {
+  helper="$output/helper"
+  # This lane is runner-owned. Never accept a stale executable or build product.
+  rm -rf -- "$helper"
+  mkdir -p "$helper"
+  helper_sources=(
+    macos/HealthBridgeMailboxAckPublisher/main.swift
+    macos/HealthBridgeMailboxAckPublisher/Tests/NativePairingLocalFakeTests.swift
+    macos/HealthBridgeMailboxAckPublisher/Info.plist
+    macos/HealthBridgeMailboxAckPublisher/HealthBridgeMailboxAckPublisher.entitlements
+    macos/HealthBridgeMailboxAckPublisher/HealthBridgeMailboxAckPublisher.xcodeproj/project.pbxproj
+    scripts/run-checks.sh
+  )
+  shasum -a 256 "${helper_sources[@]}" > "$helper/sources-before.sha256"
+  helper_command compiler-version.log xcrun swiftc --version
+  helper_command xcode-version.log xcodebuild -version
+  helper_command sdk-version.log xcrun --sdk macosx --show-sdk-version
+  helper_command compile.log xcrun swiftc -D HEALTH_BRIDGE_ISOLATED_HELPER_TEST_HOST \
+    -module-cache-path "$helper/swift" \
+    macos/HealthBridgeMailboxAckPublisher/main.swift \
+    macos/HealthBridgeMailboxAckPublisher/Tests/NativePairingLocalFakeTests.swift \
+    -o "$helper/native-tests"
+  [[ -f "$helper/native-tests" && -x "$helper/native-tests" ]] || {
+    printf 'Missing executable native test host\n' >&2; exit 1;
+  }
+  xcrun lipo -archs "$helper/native-tests" > "$helper/architectures.log"
+  shasum -a 256 "$helper/native-tests" > "$helper/native-tests-before.sha256"
+  # Capture identity even when the host exits nonzero.
+  local test_status=0
+  helper_command test.log "$helper/native-tests" || test_status=$?
+  shasum -a 256 "$helper/native-tests" > "$helper/native-tests-after.sha256"
+  [[ "$test_status" -eq 0 ]] || return "$test_status"
+  cmp "$helper/native-tests-before.sha256" "$helper/native-tests-after.sha256"
+  awk '
+    /^CASES=[0-9]+ PASSED=[0-9]+ FAILED=[0-9]+ SKIPPED=[0-9]+$/ {
+      summaries++
+      split($1, cases, "="); split($2, passed, "=")
+      split($3, failed, "="); split($4, skipped, "=")
+      valid = cases[2] > 0 && passed[2] == cases[2] && failed[2] == 0 && skipped[2] == 0
+    }
+    END { exit !(summaries == 1 && valid) }
+  ' "$helper/test.log"
+  helper_command build.log xcodebuild \
+    -project macos/HealthBridgeMailboxAckPublisher/HealthBridgeMailboxAckPublisher.xcodeproj \
+    -target HealthBridgeMailboxAckPublisher -sdk macosx -configuration Release \
+    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ONLY_ACTIVE_ARCH=YES \
+    "CONFIGURATION_BUILD_DIR=$helper/build" \
+    "OBJROOT=$helper/objects" "SYMROOT=$helper/products" \
+    "SHARED_PRECOMPS_DIR=$helper/precompiled" \
+    "CLANG_MODULE_CACHE_PATH=$helper/clang" "SWIFT_MODULE_CACHE_PATH=$helper/swift" build
+  local app="$helper/build/HealthBridgeMailboxAckPublisher.app/Contents/MacOS/HealthBridgeMailboxAckPublisher"
+  [[ -f "$app" && -x "$app" ]] || {
+    printf 'Missing unsigned helper executable\n' >&2; exit 1;
+  }
+  shasum -a 256 "$app" > "$helper/app.sha256"
+  xcrun lipo -archs "$app" >> "$helper/architectures.log"
+  printf '%s\n' \
+    'isolated production logic: executed; see test.log' \
+    'unsigned production target: compiled only; see build.log' \
+    'signed-distribution qualification: NOT RUN' > "$helper/qualification.txt"
+}
+
 run_native() {
   case "$mode" in maintenance|python) return 0 ;; esac
   if [[ "$(uname -s)" != Darwin ]]; then
@@ -108,6 +183,7 @@ run_native() {
   if [[ "${1:-all}" == all ]]; then
     bash scripts/swift-analysis.sh
   fi
+  run_helper
   (
     cd ios/HealthBridgeCompanion
     build_paths=(
@@ -129,6 +205,8 @@ run_native() {
       -target HealthBridgeCompanionPublicDocumentsQA -sdk iphoneos -configuration Debug \
       CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO "${build_paths[@]}" build
   )
+  shasum -a 256 "${helper_sources[@]}" > "$helper/sources-after.sha256"
+  cmp "$helper/sources-before.sha256" "$helper/sources-after.sha256"
 }
 
 case "$1" in
