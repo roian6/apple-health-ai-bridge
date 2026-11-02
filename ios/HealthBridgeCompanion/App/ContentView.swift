@@ -504,6 +504,7 @@ private struct SectionHeader: View {
 }
 
 private struct PrimaryButton: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let title: String
     let subtitle: String
     let systemImage: String
@@ -521,7 +522,7 @@ private struct PrimaryButton: View {
                 if isLoading {
                     ProgressView()
                         .controlSize(.regular)
-                } else {
+                } else if !dynamicTypeSize.isAccessibilitySize {
                     Image(systemName: systemImage)
                 }
             }
@@ -555,6 +556,7 @@ struct InlineNotice: View {
 }
 
 private struct CardRow: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let title: String
     let subtitle: String
     let systemImage: String
@@ -563,12 +565,14 @@ private struct CardRow: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Image(systemName: systemImage)
-                .font(.headline)
-                .foregroundStyle(tint)
-                .frame(width: 38, height: 38)
-                .background(tint.opacity(0.13))
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            if !dynamicTypeSize.isAccessibilitySize {
+                Image(systemName: systemImage)
+                    .font(.headline)
+                    .foregroundStyle(tint)
+                    .frame(width: 38, height: 38)
+                    .background(tint.opacity(0.13))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.headline)
@@ -576,7 +580,7 @@ private struct CardRow: View {
                 Text(subtitle)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
             }
             Spacer(minLength: 0)
             if let accessory {
@@ -588,9 +592,11 @@ private struct CardRow: View {
                     .background(tint.opacity(0.10))
                     .clipShape(Capsule())
             }
-            Image(systemName: "chevron.right")
-                .font(.footnote.weight(.bold))
-                .foregroundStyle(.tertiary)
+            if !dynamicTypeSize.isAccessibilitySize {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.bold))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(16)
         .contentShape(Rectangle())
