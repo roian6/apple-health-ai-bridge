@@ -1,9 +1,9 @@
 import errno
 import hashlib
-import json
 import os
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from http.client import HTTPConnection
@@ -88,18 +88,42 @@ def open_completion(
 
 
 @pytest.mark.parametrize("response_loss", [False, True])
+@pytest.mark.parametrize("ipc", [False, True])
 def test_native_worker_pairs_then_authenticates_nonempty_health_and_normal_query(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     response_loss: bool,
+    ipc: bool,
 ) -> None:
     peer = LegacyPeer(tmp_path)
     descriptor, request = stage_native(peer)
     root = tmp_path / "provider"
     directory = root / "pairing" / descriptor.invitation_id
     publications: list[bytes] = []
+    publish_native = publish_completion
+    private_root = tmp_path / "protocol"
+    if ipc:
+        publisher = _native_pairing_publisher(tmp_path, directory)
+        publish_native = publisher.publish_pairing
+        original_open = os.open
+
+        def denied_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if Path(os.fsdecode(path)).is_relative_to(private_root):
+                raise PermissionError(errno.EACCES, "synthetic private storage")
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "open", denied_open)
+        with pytest.raises(PermissionError):
+            _ = os.open(private_root / "sentinel", os.O_RDONLY)
 
     def publish(directory: Path, content: bytes) -> None:
-        publish_completion(directory, content)
+        publish_native(directory, content)
         publications.append(content)
         if response_loss and len(publications) == 1:
             message = "synthetic lost publication confirmation"
@@ -150,6 +174,9 @@ def test_native_worker_pairs_then_authenticates_nonempty_health_and_normal_query
         SyncedMetricsResult.model_validate_json(queried.output).metrics[0].record_count
         == 1
     )
+    if ipc:
+        with pytest.raises(PermissionError):
+            _ = os.open(private_root / "sentinel", os.O_RDONLY)
 
 
 @pytest.mark.parametrize("boundary", ["root", "database"])
@@ -301,34 +328,56 @@ def test_bootstrap_blocking_io_defers_without_discovery(
     assert worker.health_error() is None
 
 
-def _native_pairing_publisher(
-    tmp_path: Path, directory: Path, monkeypatch: pytest.MonkeyPatch
-) -> NativeAckPublisher:
-    protocol = tmp_path / "protocol"
+def _native_pairing_publisher(tmp_path: Path, directory: Path) -> NativeAckPublisher:
     helper = tmp_path / "helper"
-    helper.touch(mode=0o700)
-    publisher = NativeAckPublisher(NativeAckPublisherConfig(helper, protocol))
+    _ = helper.write_text(
+        f"""#!{sys.executable}
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
 
-    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        if argv[1].startswith("--"):
-            return subprocess.CompletedProcess(
-                argv, 0, b"native-pairing-cancellation-v1:available"
-            )
-        request_id = argv[1].removeprefix("pairing:")
-        body = TypeAdapter(dict[str, str | int]).validate_json(
-            (protocol / "requests" / f"{request_id}.json").read_bytes()
-        )
-        payload = (protocol / "staging" / f"{request_id}.hbp").read_bytes()
-        publish_completion(directory, payload)
-        receipt = protocol / "receipts" / f"{request_id}.json"
-        _ = receipt.write_text(
-            json.dumps({**body, "published": True, "bootstrapVersion": 1})
-        )
-        receipt.chmod(0o600)
-        return subprocess.CompletedProcess(argv, 0)
-
-    monkeypatch.setattr(subprocess, "run", run)
-    return publisher
+if sys.argv[1] == "--publication-ipc-v1-capabilities":
+    sys.stdout.buffer.write(
+        b"publication-ipc-v1:ack,pairing,receiver_capabilities,storage_probe\\n"
+    )
+    sys.exit(0)
+assert sys.argv[1] == "--publication-ipc-v1"
+size = int.from_bytes(sys.stdin.buffer.read(4), "big")
+assert 1 <= size <= 8192
+body = json.loads(sys.stdin.buffer.read(size))
+assert body["operation"] == "pairing"
+assert 1 <= body["byteCount"] <= 65536
+payload = sys.stdin.buffer.read(body["byteCount"])
+assert sys.stdin.buffer.read(1) == b""
+assert body["byteCount"] == len(payload)
+assert body["sha256"] == hashlib.sha256(payload).hexdigest()
+fault_file = Path({str(tmp_path / "helper-fault")!r})
+fault = fault_file.read_text() if fault_file.exists() else ""
+if fault == "nonzero":
+    sys.exit(3)
+if fault in ("storage_access_denied", "storage_io_failed"):
+    response = {{**body, "status": "error", "code": fault}}
+    code = 3
+else:
+    directory = Path({str(directory)!r})
+    assert body["invitationID"] == directory.name
+    assert body["finalName"] == "completion.hbp"
+    (directory / body["finalName"]).write_bytes(
+        b"wrong-bytes" if fault == "mismatch" else payload
+    )
+    response = {{**body, "status": "ok", "published": True, "bootstrapVersion": 1}}
+    code = 0
+encoded = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+if fault == "receipt_invalid":
+    encoded = b"not-json"
+sys.stdout.buffer.write(struct.pack(">I", len(encoded)) + encoded)
+sys.exit(code)
+"""
+    )
+    helper.chmod(0o700)
+    return NativeAckPublisher(NativeAckPublisherConfig(helper))
 
 
 @contextmanager
@@ -405,16 +454,11 @@ def test_issue154_publication_failure_degrades_and_recovers(
     directory = root / "pairing" / descriptor.invitation_id
     directory.mkdir(parents=True)
     _ = publish_final(directory, "request.hbp", request)
-    publisher = _native_pairing_publisher(tmp_path, directory, monkeypatch)
-    denied = True
-    original = os.replace
-
-    def replace(source: Path, destination: Path) -> None:
-        if denied and destination.parent == tmp_path / "protocol/staging":
-            raise OSError(number, "synthetic-secret-private-path")
-        original(source, destination)
-
-    monkeypatch.setattr(os, "replace", replace)
+    publisher = _native_pairing_publisher(tmp_path, directory)
+    fault_file = tmp_path / "helper-fault"
+    _ = fault_file.write_text(
+        "storage_access_denied" if number == errno.EACCES else "storage_io_failed"
+    )
     worker = MailboxRuntimeWorker(
         db_path=peer.db,
         mailbox_root=root,
@@ -439,7 +483,7 @@ def test_issue154_publication_failure_degrades_and_recovers(
         release[0].set()
         assert completed[1].wait(5)
         assert capsys.readouterr().err == ""
-        denied = False
+        fault_file.unlink()
         release[1].set()
         assert completed[2].wait(5)
         assert worker.health_error() == expected
@@ -569,36 +613,27 @@ def test_issue154_nonprotocol_failures_do_not_fabricate_container_denial(
     directory = root / "pairing" / descriptor.invitation_id
     directory.mkdir(parents=True)
     _ = publish_final(directory, "request.hbp", request)
-    publisher = _native_pairing_publisher(tmp_path, directory, monkeypatch)
-    original = subprocess.run
+    publisher = _native_pairing_publisher(tmp_path, directory)
+    _ = (tmp_path / "helper-fault").write_text(fault)
+    popen = subprocess.Popen
 
-    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        capability = argv[1].startswith("--")
-        if (capability, fault) in {(True, "capability"), (False, "helper_spawn")}:
+    def spawn(argv: list[str], **kwargs: int | bool) -> subprocess.Popen[bytes]:
+        discovery = argv[1] == "--publication-ipc-v1-capabilities"
+        if (discovery, fault) in {
+            (True, "capability"),
+            (False, "helper_spawn"),
+        }:
             raise PermissionError(errno.EACCES, "synthetic-private-path")
-        if capability:
-            return subprocess.CompletedProcess(
-                argv, 0, b"native-pairing-cancellation-v1:available"
-            )
-        if fault == "timeout":
+        if not discovery and fault == "timeout":
             raise subprocess.TimeoutExpired(argv, 1)
-        if fault == "nonzero":
-            return subprocess.CompletedProcess(argv, 3)
-        result = original(
+        return popen(
             argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=1,
-            check=False,
+            stdin=kwargs["stdin"],
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+            close_fds=bool(kwargs["close_fds"]),
+            bufsize=int(kwargs["bufsize"]),
         )
-        if fault == "receipt_invalid":
-            request_id = argv[1].removeprefix("pairing:")
-            path = tmp_path / "protocol/receipts" / f"{request_id}.json"
-            _ = path.write_bytes(b"not-json")
-        if fault == "mismatch":
-            _ = (directory / "completion.hbp").write_bytes(b"wrong-bytes")
-        return result
 
     provider_errors = {
         "provider": PermissionError(errno.EACCES, "synthetic-private-path"),
@@ -610,7 +645,7 @@ def test_issue154_nonprotocol_failures_do_not_fabricate_container_denial(
             errno.EACCES, "synthetic-private-path"
         )
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
     if fault in {"provider", "provider_wrapped"}:
         monkeypatch.setattr(publication_module, "read_final", read)
     worker = MailboxRuntimeWorker(
