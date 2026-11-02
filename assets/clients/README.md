@@ -84,11 +84,10 @@ Final download URL: https://opencode.ai/opencode-brand-assets.zip
 Members: `OpenCode Brand Assets/Logo/opencode-logo-light.svg` and
 `OpenCode Brand Assets/Logo/opencode-logo-dark.svg`.
 
-The public brand page expressly offers brand resources with SVG download
-controls. Its official download handler at
-https://opencode.ai/_build/assets/index-C0pyOv_e.js
-identifies the archive and the matching light/dark SVGs. Archive originals were
-used, not PNG previews or a third-party recreation.
+The public brand page above provides the asset download controls and previews
+the light/dark variants. The archive URL above is the direct download source;
+use these stable links rather than a versioned site-script URL. Archive
+originals were used, not PNG previews or a third-party recreation.
 Use these unmodified for factual OpenCode identification. The page establishes
 an offered brand asset, not an additional catalog-specific trademark grant;
 do not infer trademark permission from the project's source-code license.
