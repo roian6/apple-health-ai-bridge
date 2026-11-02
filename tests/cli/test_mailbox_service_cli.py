@@ -24,12 +24,9 @@ from health_bridge.launchd.adapters import LaunchctlResult
 from health_bridge.launchd.models import LAUNCH_AGENT_LABEL
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.mailbox.helper_lifecycle import HelperResult, HelperStatusCode
-from health_bridge.mailbox.native_ack_publication import (
-    NativeAckPublisher,
-    NativeAckPublisherConfig,
-)
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
+from tests.cli.test_native_pairing_cli import ipc_publisher
 from tests.launchd.support import service_request
 
 ANSI_SGR_PATTERN: Final = re.compile(r"\x1b\[[0-9;]*m")
@@ -381,14 +378,7 @@ def test_receiver_start_loads_owned_service_config_into_supported_runtime(
         lambda: None,
     )
     monkeypatch.setattr(cli_receiver_module, "serve_receiver", fake_serve_receiver)
-    publisher = NativeAckPublisher(
-        NativeAckPublisherConfig(tmp_path / "synthetic-helper", tmp_path / "protocol")
-    )
-
-    def capability(_publisher: NativeAckPublisher) -> None:
-        pass
-
-    monkeypatch.setattr(NativeAckPublisher, "require_native_pairing", capability)
+    publisher, operations = ipc_publisher(tmp_path, monkeypatch)
     monkeypatch.setattr(
         cli_receiver_module, "default_native_ack_publisher", lambda: publisher
     )
@@ -405,6 +395,7 @@ def test_receiver_start_loads_owned_service_config_into_supported_runtime(
     )
 
     assert result.exit_code == 0, (result.output, result.exception)
+    assert operations == ["discovery", "storage_probe"]
     assert captured == {
         "db_path": request.db_path,
         "host": "127.0.0.1",

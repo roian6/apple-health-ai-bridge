@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
+import struct
 import time
 from contextlib import closing
 from threading import Event, Thread
@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
+from pydantic import TypeAdapter
 
 import health_bridge.receiver.mailbox_runtime as runtime_module
 import health_bridge.receiver.server as server_module
@@ -897,23 +898,29 @@ def _malformed_capability_helper(
     executable = tmp_path / "synthetic-helper"
     _ = executable.write_bytes(b"synthetic")
     executable.chmod(0o700)
-    protocol = tmp_path / "protocol"
-    publisher = NativeAckPublisher(NativeAckPublisherConfig(executable, protocol, 1))
+    publisher = NativeAckPublisher(NativeAckPublisherConfig(executable, 1))
     attempts: list[str] = []
 
     def helper(
-        argv: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[bytes]:
-        operation, request_id = argv[1].split(":")
-        assert operation == "capabilities"
-        assert (protocol / "staging" / f"{request_id}.json").is_file()
-        receipt = protocol / "receipts" / f"{request_id}.json"
-        _ = receipt.write_text("[" * 1500 + "]" * 1500)
-        receipt.chmod(0o600)
+        _publisher: NativeAckPublisher, flag: str, frame: bytes, _deadline: float
+    ) -> tuple[int, bytes]:
+        if flag == "--publication-ipc-v1-capabilities":
+            return (
+                0,
+                b"publication-ipc-v1:ack,pairing,receiver_capabilities,storage_probe\n",
+            )
+        assert flag == "--publication-ipc-v1"
+        size = int.from_bytes(frame[:4], "big")
+        body = TypeAdapter(dict[str, str | int]).validate_json(frame[4 : 4 + size])
+        assert body["operation"] == "receiver_capabilities"
+        assert body["byteCount"] == len(frame[4 + size :])
+        request_id = body["requestID"]
+        assert isinstance(request_id, str)
         attempts.append(request_id)
-        return subprocess.CompletedProcess(argv, 0)
+        encoded = b"[" * 1500 + b"]" * 1500
+        return 0, struct.pack(">I", len(encoded)) + encoded
 
-    monkeypatch.setattr(subprocess, "run", helper)
+    monkeypatch.setattr(NativeAckPublisher, "_exchange", helper)
     return publisher, attempts
 
 
@@ -981,5 +988,3 @@ def test_malformed_capability_receipt_keeps_worker_processing_deliveries(
     assert stopped
     assert worker.health_error() is None
     assert len(attempts) >= 2
-    for lane in ("requests", "staging", "receipts"):
-        assert not list((tmp_path / "protocol" / lane).iterdir())

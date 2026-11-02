@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import errno
 import re
 from typing import TYPE_CHECKING, Final
 
@@ -8,18 +7,12 @@ import pytest
 from typer.testing import CliRunner
 
 import health_bridge.cli_receiver as cli_receiver_module
-import health_bridge.mailbox.native_ack_publication as publication
 from health_bridge.cli import app
 from health_bridge.launchd import LaunchdServiceError, LaunchdServiceErrorCode
 from health_bridge.mailbox.connections import MailboxConnectionStore
-from health_bridge.mailbox.native_ack_publication import (
-    NativeAckPublicationError,
-    NativeAckPublisher,
-    NativeAckPublisherConfig,
-)
-from health_bridge.private_files import ensure_private_directory
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
+from tests.cli.test_native_pairing_cli import ipc_publisher
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -94,6 +87,9 @@ def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
         forbidden_store,
     )
     monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve_receiver)
+    monkeypatch.setattr(
+        cli_receiver_module, "default_native_ack_publisher", forbidden_store
+    )
 
     result = CliRunner().invoke(app, ["receiver", "start", "--db", str(database)])
 
@@ -221,29 +217,39 @@ def test_receiver_start_maps_keyboard_interrupt_to_clean_exit(
     )
 
 
-@pytest.mark.parametrize("access_denied", [False, True])
-def test_issue154_mailbox_start_checks_storage_without_native_pairing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access_denied: bool
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (None, None),
+        ("storage_access_denied", "helper_container_access_denied"),
+        ("upgrade", "native_helper_upgrade_required"),
+    ],
+)
+def test_issue154_mailbox_start_checks_ipc_before_stores_and_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+    expected: str | None,
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    publisher = NativeAckPublisher(
-        NativeAckPublisherConfig(tmp_path / "helper", tmp_path / "protocol")
-    )
+    publisher, operations = ipc_publisher(tmp_path, monkeypatch, failure=failure)
     monkeypatch.setattr(
         cli_receiver_module, "default_native_ack_publisher", lambda: publisher
     )
 
-    def capability(_publisher: NativeAckPublisher) -> None:
-        message = "native pairing helper capability unavailable"
-        raise NativeAckPublicationError(message)
-
     def selected(*_args: object, **_kwargs: object) -> ReceiverTransport:
         return ReceiverTransport.MAILBOX
 
-    monkeypatch.setattr(NativeAckPublisher, "require_native_pairing", capability)
     monkeypatch.setattr(cli_receiver_module, "_select_transport_or_exit", selected)
-    monkeypatch.setattr(MailboxKeyStore, "production", lambda: None)
-    monkeypatch.setattr(MailboxConnectionStore, "production", lambda: None)
+    stores: list[bool] = []
+
+    def store() -> None:
+        assert failure is None
+        assert operations == ["discovery", "storage_probe"]
+        stores.append(True)
+
+    monkeypatch.setattr(MailboxKeyStore, "production", store)
+    monkeypatch.setattr(MailboxConnectionStore, "production", store)
     bound: list[bool] = []
 
     def serve(**_kwargs: object) -> None:
@@ -251,14 +257,6 @@ def test_issue154_mailbox_start_checks_storage_without_native_pairing(
 
     monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve)
 
-    original = ensure_private_directory
-
-    def prepare(path: Path) -> None:
-        if access_denied:
-            raise PermissionError(errno.EPERM, "synthetic-secret-path")
-        original(path)
-
-    monkeypatch.setattr(publication, "ensure_private_directory", prepare)
     result = CliRunner().invoke(
         app,
         [
@@ -270,12 +268,13 @@ def test_issue154_mailbox_start_checks_storage_without_native_pairing(
             str(tmp_path / "mailbox"),
         ],
     )
-    if access_denied:
+    if failure:
         assert result.exit_code == 1
-        assert result.stderr.strip() == "helper_container_access_denied"
+        assert result.stderr.strip() == expected
         assert bound == []
+        assert stores == []
     else:
         assert result.exit_code == 0, result.output
         assert bound == [True]
         assert "receiver listening" in result.stderr
-        assert (tmp_path / "protocol/receipts").is_dir()
+        assert stores == [True, True]

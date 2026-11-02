@@ -3,6 +3,7 @@ import os
 import secrets
 import sqlite3
 import stat
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Final, Literal, TypeAlias, cast
@@ -995,22 +996,17 @@ def _pairing_receiver_url(
     transport: PublicReceiverTransport,
     legacy_v1: bool,
 ) -> str | None:
-    if not receiver_url:
-        if transport != "icloud-mailbox" or legacy_v1:
-            typer.echo(
-                "--receiver-url is required for Direct or legacy pairing.", err=True
-            )
-            raise typer.Exit(code=1)
-        _preflight_mailbox(native_pairing=True)
-        return None
+    if not receiver_url and (transport != "icloud-mailbox" or legacy_v1):
+        typer.echo("--receiver-url is required for Direct or legacy pairing.", err=True)
+        raise typer.Exit(code=1)
+    if transport == "icloud-mailbox" and sys.platform == "darwin":
+        _preflight_mailbox()
     return receiver_url
 
 
-def _preflight_mailbox(*, native_pairing: bool = False) -> None:
+def _preflight_mailbox() -> None:
     try:
         publisher = default_native_ack_publisher()
-        if native_pairing:
-            publisher.require_native_pairing()
         publisher.probe_protocol_storage()
     except NativePairingPublicationError as exc:
         typer.echo(exc.code.value, err=True)

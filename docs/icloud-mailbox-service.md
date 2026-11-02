@@ -24,15 +24,23 @@ that developer-no-access boundary remains true.
 
 ## Release availability
 
-These instructions target Receiver/CLI and helper `1.2.0`.
-Confirm that [receiver-v1.2.0](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0)
-and its complete asset set are available, then verify the release identity,
-provenance, and checksums below before installing anything. Do not substitute
-`main`, the retired unpublished `receiver-v1.1.4` tag, or an older helper.
+The published [Receiver/CLI 1.2.0 release](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0)
+uses the legacy file handoff; it does not contain the IPC boundary repair.
+The exact download inventory below identifies that published release, not an
+IPC-qualified upgrade.
+
+The IPC publication path requires a coordinated Receiver/CLI and signed helper
+update. This guide does not identify a released, qualified IPC build set.
+Use matching release artifacts whose compatibility and native qualification
+explicitly cover publication IPC v1; a version number or helper `ready` status
+alone is insufficient. Do not substitute `main` or an older helper.
 
 ## Install and verify the signed helper
-Use the Receiver/CLI `1.2.0` GitHub Release assets. Download these files with a
-browser into one private local directory; Health Bridge does not silently
+For the published 1.2.0 release, the asset inventory is listed below. For an IPC
+upgrade, first select a later matching release that explicitly qualifies IPC v1
+and use that release's exact versioned inventory instead. Do not use the 1.2.0
+helper with an IPC-required Receiver. Download the selected release's files with
+a browser into one private local directory; Health Bridge does not silently
 download them:
 
 - `apple_health_ai_bridge-1.2.0-py3-none-any.whl`;
@@ -81,9 +89,9 @@ immutable assets of the historical `1.1.2` release.
 The new files contain the original GitHub Actions Sigstore bundles, including
 signed in-toto/SLSA statements. No separate signature format is needed.
 
-For this `1.2.0` release, metadata schema `health_bridge.release.v4` binds the
+Metadata schema `health_bridge.release.v4` binds the
 build proof to `release.yml@refs/heads/release` and the final proof to
-`publish-release.yml@refs/tags/receiver-v1.2.0`. Both source and signer digests
+`publish-release.yml@refs/tags/receiver-v<version>`. Both source and signer digests
 must equal the independently verified signed tag's exact commit, not a later
 branch HEAD.
 
@@ -100,7 +108,7 @@ Keep all eight downloaded assets in a new directory. Obtain the expected commit
 by independently verifying the signed
 annotated tag, and check its tree against the source-bound release metadata and
 helper manifest. Do not choose the expected commit solely from the downloaded
-metadata. From the asset directory, set `tag` to `receiver-v1.2.0` and
+metadata. From the asset directory, set `tag` to the verified `receiver-v<version>` and
 `commit` to its verified 40-character target SHA, then run:
 
 ```bash
@@ -166,24 +174,24 @@ After every proof and checksum check succeeds, install the wheel, structurally
 validate the helper, and explicitly install it:
 
 ```bash
-uv tool install ./apple_health_ai_bridge-1.2.0-py3-none-any.whl
+: "${version:?Set the verified matching release version}"
+uv tool install "./apple_health_ai_bridge-${version}-py3-none-any.whl"
 health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
+  --archive "./HealthBridgeMailboxAckPublisher-${version}.zip" \
+  --manifest "./HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
   --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
+  --archive "./HealthBridgeMailboxAckPublisher-${version}.zip" \
+  --manifest "./HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
   --json
 health-bridge mailbox helper status --json
 ```
 
-Native URL-free pairing requires a specifically qualified matching Receiver/CLI
-`1.2.0`, helper `1.2.0`, and iOS Companion `1.2.0 (51)` build set. Check the
-release's compatibility and native qualification before using that path. The helper must
-be owned and ready, and it must implement the native cancellation capability
-described below. Do not infer native support from the helper version or a
-`ready` status alone.
+Native URL-free pairing requires a qualified compatible Companion and matching
+Receiver/CLI and helper artifacts. Check the release's compatibility and native
+qualification before using that path. The owned, ready helper must implement
+publication IPC v1, including completion and cancellation publication.
+No iPhone wire-format change is required by the IPC transport.
 
 ## Native URL-free pairing with matched builds
 
@@ -216,13 +224,31 @@ directory. Do not substitute an arbitrary or default container. The private
 database and HTML setup page belong in owner-only local directories, not in the
 iCloud mailbox.
 
-Native URL-free `receiver create-pairing` and Mailbox `receiver start` run a
-write preflight to check whether that receiver process can create and remove a
-file in the helper protocol root. A successful preflight does not guarantee
-later publication: access or storage can fail during a pairing attempt.
-`helper_container_access_denied` means an explicit protocol-root operation
-returned EPERM or EACCES. It identifies the failed operation, not whether the
-cause was macOS container protection, a file permission, or another policy.
+On supported Macs, every selected Mailbox `receiver create-pairing`, with or without
+`--receiver-url`, and every Mailbox `receiver start` runs a helper-owned storage
+self-test. Create preflights before transport setup or invitation mutation;
+start preflights before key/connection-store creation or server bind. Direct
+bypasses this helper check. URL-free create performs one discovery and one
+self-test, not a separate pairing-capability probe.
+
+The Receiver sends bounded requests through anonymous stdin/stdout pipes to the
+verified helper. Only the helper derives, stages, probes and cleans its private
+storage; the Receiver does not access that container or fall back to file
+handoff. The Receiver still needs access to its configured provider mailbox.
+The helper self-test does not resolve the provider and proves neither provider
+availability nor completed publication, cloud upload or iPhone receipt.
+
+The helper accepts one publication at a time. A concurrent call can fail
+retryably while that publication is active; the worker retains its request and
+retries on a later cycle. The CLI does not wait behind another publication. If
+a create-pairing preflight fails during that work, it has not created an
+invitation; retry the command after the active publication finishes. This is
+not a reason to reset an existing pairing or grant broader filesystem access.
+
+`helper_container_access_denied` means the helper returned a valid request-bound
+`storage_access_denied` result for its own private IO. It is not a TCC diagnosis.
+Provider denial, unsafe storage, process-launch failure, timeout and malformed
+responses remain publication failures, not helper-container permission claims.
 
 Pairing registration can be committed before the helper publishes its
 completion. If publication then fails, the receiver reports degraded health
@@ -235,27 +261,25 @@ receiver is running again, use **Retry Pairing** in the companion to retrieve
 the completion for the existing request. Don't delete the database or create a
 new pairing just because publication failed.
 
-Foreground Terminal access and a LaunchAgent's access are separate contexts.
-Permission available to Terminal does not prove that the helper or the
-separately launched receiver has the same access. Apple's documentation
-describes access to protected app containers and the role of code-signing
-identity for apps and helper tools, including launch agents:
-[Accessing files from the macOS App Sandbox](https://developer.apple.com/documentation/security/accessing-files-from-the-macos-app-sandbox.md)
-and [Protecting local app data using containers on macOS](https://developer.apple.com/documentation/xcode/protecting-local-app-data-using-containers.md).
-Those documents don't identify which executable is responsible for a particular
-denial in this setup. Diagnose the process and operation before changing
-access. One reporter said granting Terminal Full Disk Access and restarting
-fixed their macOS 27.0.1 case. That's a reported workaround, not a universal
-Apple requirement or a verified diagnosis of the responsible process.
-
 The helper status command must report `{"code": "ready"}`. Readiness verifies
-the installed helper generation and platform checks, but does not prove native
-pairing support. The URL-free `receiver create-pairing` command itself checks
-that the helper returns exit status 0 and the exact
-`native-pairing-cancellation-v1:available` capability response. If that check
-fails, the command does not create a native invitation. Use only a matched,
-qualified receiver/helper/companion build set that shares the authorized
-container; no released native-compatible set is identified by this guide.
+the installed generation and platform checks, not IPC support. New discovery
+requires exit 0 and the exact ASCII line
+`publication-ipc-v1:ack,pairing,receiver_capabilities,storage_probe` followed by
+a newline. Discovery alone does not touch storage. Each operation negotiates
+again; support is not cached across helper replacement.
+
+| Receiver / helper | Compatibility |
+| --- | --- |
+| New / new | Framed IPC and helper-owned private storage; requires native qualification. |
+| New / old trusted helper | Explicit `native_helper_upgrade_required`, before invitation mutation or server bind; no legacy fallback or Receiver container IO. |
+| Old / new | Native helper retains legacy file/cancellation entrypoints; old Receiver still requires its former container access. This does not provide the repaired boundary. |
+| Old / old | Legacy file handoff and its former access requirement. |
+| New / missing, foreign or drifted helper | Existing readiness refusal before IPC; no automatic repair. |
+
+Upgrade Receiver and helper together using [Replace the installed helper](#replace-the-installed-helper).
+Do not grant Terminal broader access as a substitute for the coordinated update.
+Foreground and LaunchAgent publication must each be qualified with the matching
+signed artifacts; local tests do not establish production or phone success.
 
 This command initializes the local database and writes a private, temporary
 single-use setup page. Open that page locally in a browser on a trusted screen,
@@ -421,32 +445,51 @@ installed Receiver/CLI version. Have the exact service executable, database,
 mailbox, and container values ready before removing the service configuration.
 Use the existing paths and identity unless you intend to reconfigure them.
 
-Verify the new helper assets before stopping the existing service:
-
-```bash
-health-bridge mailbox helper verify \
-  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
-  --json
-```
-
-Then stop and remove the owned service, confirm the current helper is ready,
-retire that exact owned helper generation to quarantine, and install the
-verified helper from the same Receiver/CLI release:
+Stop the foreground receiver before updating its CLI environment. For an owned
+service, stop and remove it using the currently installed CLI first:
 
 ```bash
 health-bridge mailbox service uninstall --json
+```
+
+Update the Receiver/CLI from the verified matching wheel before the first
+helper verification command:
+
+```bash
+: "${version:?Set the verified matching release version}"
+uv tool install --force "./apple_health_ai_bridge-${version}-py3-none-any.whl"
+```
+
+Only after that update succeeds, verify the new helper assets with the updated
+CLI. Verification rejects a helper whose release version differs from the
+installed CLI:
+
+```bash
+health-bridge mailbox helper verify \
+  --archive "./HealthBridgeMailboxAckPublisher-${version}.zip" \
+  --manifest "./HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
+  --json
+```
+
+After verification succeeds, confirm the current helper is ready, retire that
+exact owned helper generation to quarantine, and install the verified helper
+from the same Receiver/CLI release:
+
+```bash
 health-bridge mailbox helper status --json
 health-bridge mailbox helper uninstall --json
 health-bridge mailbox helper install \
-  --archive ./HealthBridgeMailboxAckPublisher-1.2.0.zip \
-  --manifest ./HealthBridgeMailboxAckPublisher-1.2.0.manifest.json \
+  --archive "./HealthBridgeMailboxAckPublisher-${version}.zip" \
+  --manifest "./HealthBridgeMailboxAckPublisher-${version}.manifest.json" \
   --json
 health-bridge mailbox helper status --json
 ```
 
+For a foreground receiver, check helper status before restarting the same
+command. No helper `upgrade` command exists.
 Continue only when helper status reports `{"code": "ready"}`. Then restore the
-service with the original or intentionally updated values:
+service with the original or intentionally updated values; startup must pass
+the IPC discovery and helper-owned self-test:
 
 ```bash
 health-bridge mailbox service install \
