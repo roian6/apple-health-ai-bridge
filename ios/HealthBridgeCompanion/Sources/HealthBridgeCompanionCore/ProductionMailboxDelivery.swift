@@ -216,6 +216,14 @@ public final class ProductionMailboxDelivery {
         }
         let deliveryCoordinator: OutboxDeliveryCoordinator
         do {
+            if item.deliveryState?.phase == .providerObserved,
+               try await providerObservedItemIDs(
+                   in: [item], components: components, generation: receiverGeneration
+               ).contains(item.id) {
+                return backgroundSummary(
+                    phase: .publishFIFOHead, attemptedCount: 1, waitingCount: items.count
+                )
+            }
             deliveryCoordinator = try await coordinator(components: components, itemID: item.id)
             var terminalCount = 0
             for _ in 0 ..< 4 {
@@ -487,7 +495,18 @@ public final class ProductionMailboxDelivery {
         }
         var terminalCount = 0
         do {
-            for item in items {
+            var observedItemIDs: Set<String> = []
+            for (index, item) in items.enumerated() {
+                try Task.checkCancellation()
+                if observedItemIDs.isEmpty, item.deliveryState?.phase == .providerObserved {
+                    observedItemIDs = try await providerObservedItemIDs(
+                        in: Array(items[index...]), components: components, generation: receiverGeneration
+                    )
+                }
+                if observedItemIDs.contains(item.id) { continue }
+                // Only skip no-op states in this uninterrupted actor turn.
+                // Discard the selection before any await or state transition.
+                observedItemIDs.removeAll(keepingCapacity: true)
                 let coordinator = try await coordinator(
                     components: components,
                     itemID: item.id
@@ -791,14 +810,14 @@ public final class ProductionMailboxDelivery {
         }
         let result: DeliveryTransportResult
         if let work = publication.work {
-            let pending = try outbox.pendingItems()
+            let freshness = try outbox.captureMailboxFreshness()
             let outcome = await Task.detached { try work.publish() }.result
             try await validatePublicationCompletion(
                 coordinator,
                 itemID: itemID,
                 components: components,
                 receiverGeneration: receiverGeneration,
-                pending: pending
+                freshness: freshness
             )
             result = try components.transport.publicationResult(outcome)
         } else {
@@ -817,7 +836,7 @@ public final class ProductionMailboxDelivery {
         itemID: String,
         components: ProductionMailboxComponents,
         receiverGeneration: String,
-        pending: [FileOutboxItem]
+        freshness: FileOutbox.MailboxFreshnessSnapshot
     ) async throws {
         do {
             try outbox.requireUploadAdmission()
@@ -826,16 +845,16 @@ public final class ProductionMailboxDelivery {
                   record.activation == .paired(activeTransport: .mailbox),
                   case .available(let identity) = record.mailboxIdentity,
                   identity == components.identity,
-                  record.localScope.bindingID == components.identity.opaqueBinding,
-                  try outbox.pendingItems() == pending else {
+                  record.localScope.bindingID == components.identity.opaqueBinding else {
                 throw CancellationError()
             }
+            try outbox.validateMailboxFreshness(freshness)
             let transition = try await sleepStore?.loadPendingForSync(validate: {
                 try self.validateSleepConnection(components: components, generation: receiverGeneration)
-                guard try self.outbox.pendingItems() == pending else { throw CancellationError() }
+                try self.outbox.validateMailboxFreshness(freshness)
             })
             try validateSleepConnection(components: components, generation: receiverGeneration)
-            guard try outbox.pendingItems() == pending else { throw CancellationError() }
+            try outbox.validateMailboxFreshness(freshness)
             let resetEpoch = transition?.outboxItemID == itemID
                 ? transition?.manifest.baselineResetEpoch : nil
             guard coordinator.ownership.receiverGeneration == receiverGeneration,
@@ -850,18 +869,53 @@ public final class ProductionMailboxDelivery {
     }
 
     @MainActor
+    private func providerObservedItemIDs(
+        in items: [FileOutboxItem], components: ProductionMailboxComponents, generation: String
+    ) async throws -> Set<String> {
+        let freshness = try outbox.captureMailboxFreshness(including: items)
+        let transition = try await sleepStore?.loadPendingForSync(validate: {
+            try self.validateSleepConnection(components: components, generation: generation)
+            try self.outbox.validateMailboxFreshness(freshness)
+        })
+        try validateSleepConnection(components: components, generation: generation)
+        // Authenticate artifacts again after the sleep read, once for this
+        // uninterrupted group rather than once for every no-op item.
+        guard try outbox.captureMailboxFreshness(including: items) == freshness else {
+            throw CancellationError()
+        }
+        var observed: Set<String> = []
+        for item in items where item.deliveryState?.phase == .providerObserved {
+            let coordinator = makeCoordinator(components: components, itemID: item.id, transition: transition)
+            try coordinator.validateCurrentOwnership()
+            if item.receiverIdentity == components.identity.opaqueBinding,
+               item.deliveryState?.ownership == coordinator.ownership {
+                observed.insert(item.id)
+            }
+        }
+        return observed
+    }
+
+    @MainActor
     private func coordinator(
         components: ProductionMailboxComponents,
         itemID: String
     ) async throws -> OutboxDeliveryCoordinator {
         let generation = settingsStore.receiverSettingsGenerationToken
-        let pending = try outbox.pendingItems()
+        let freshness = try outbox.captureMailboxFreshness()
         let transition = try await sleepStore?.loadPendingForSync(validate: {
             try self.validateSleepConnection(components: components, generation: generation)
-            guard try self.outbox.pendingItems() == pending else { throw CancellationError() }
+            try self.outbox.validateMailboxFreshness(freshness)
         })
         try validateSleepConnection(components: components, generation: generation)
-        guard try outbox.pendingItems() == pending else { throw CancellationError() }
+        try outbox.validateMailboxFreshness(freshness)
+        return makeCoordinator(components: components, itemID: itemID, transition: transition)
+    }
+
+    @MainActor
+    private func makeCoordinator(
+        components: ProductionMailboxComponents, itemID: String, transition: SleepSyncPendingTransition?
+    ) -> OutboxDeliveryCoordinator {
+        let generation = settingsStore.receiverSettingsGenerationToken
         let resetEpoch = transition?.outboxItemID == itemID
             ? transition?.manifest.baselineResetEpoch
             : nil

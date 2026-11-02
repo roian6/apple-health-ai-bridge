@@ -4,6 +4,216 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class FileOutboxTests: XCTestCase {
+    func testMailboxFreshnessRequiresSelectedItemsToBelongToCapture() throws {
+        let directory = temporaryOutboxDirectory()
+        let otherDirectory = temporaryOutboxDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: otherDirectory)
+        }
+        let outbox = try FileOutbox(directory: directory)
+        let other = try FileOutbox(directory: otherDirectory)
+        let selected = try other.enqueueForTesting(Data("synthetic-selected".utf8))
+
+        XCTAssertNoThrow(try other.captureMailboxFreshness(including: [selected]))
+        XCTAssertThrowsError(try outbox.captureMailboxFreshness(including: [selected])) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+    }
+
+    func testMailboxFreshnessReadsMetadataBytesRatherThanLengthOrModificationTime() throws {
+        for filename in [".fifo-sequence", ".enqueue-transaction"] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let outbox = try FileOutbox(directory: directory)
+            _ = try outbox.enqueueSequence(
+                [Data("synthetic".utf8)], receiverIdentity: "receiver-a",
+                cursorCheckpoint: FileOutboxCursorCheckpoint(
+                    receiverIdentity: "receiver-a", sourceKey: "source",
+                    cursorKind: "anchor", cursorValue: "value-a"
+                )
+            )
+            let snapshot = try outbox.captureMailboxFreshness()
+            let url = directory.appendingPathComponent(filename)
+            let bytes = try Data(contentsOf: url)
+            let modified = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate])
+            let changed = Data(String(decoding: bytes, as: UTF8.self)
+                .replacingOccurrences(of: "receiver-a", with: "receiver-b").utf8)
+            XCTAssertEqual(bytes.count, changed.count)
+            XCTAssertNotEqual(bytes, changed)
+            try changed.write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+
+            XCTAssertThrowsError(try outbox.validateMailboxFreshness(snapshot))
+
+            try bytes.write(to: url)
+            XCTAssertNoThrow(try outbox.validateMailboxFreshness(snapshot))
+        }
+    }
+
+    func testMailboxFreshnessRejectsNewNamespacesWithoutRecoveringOrDeletingThem() throws {
+        for name in ["new.json", "new.staged", "new.hbe", "new.hbe-staged", ".mailbox-envelope-intent"] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let outbox = try FileOutbox(directory: directory)
+            _ = try outbox.enqueueForTesting(Data("synthetic".utf8))
+            let snapshot = try outbox.captureMailboxFreshness()
+            let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+            let manifest = try Data(contentsOf: manifestURL)
+            let url = directory.appendingPathComponent(name)
+            let bytes = Data("synthetic-interrupted-write".utf8)
+            try bytes.write(to: url)
+
+            XCTAssertThrowsError(try outbox.validateMailboxFreshness(snapshot))
+
+            XCTAssertEqual(try Data(contentsOf: manifestURL), manifest)
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+        }
+    }
+
+    func testMailboxFreshnessRejectsAdmissionInstanceAndDirectoryChanges() throws {
+        for mutation in ["clear", "reset", "instance", "directory", "missing", "symlink", "hardlink", "nonregular"] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let outbox = try FileOutbox(directory: directory)
+            _ = try outbox.enqueueForTesting(Data("synthetic".utf8))
+            let snapshot = try outbox.captureMailboxFreshness()
+            let manifest = directory.appendingPathComponent(".fifo-sequence")
+            switch mutation {
+            case "clear":
+                try FileOutbox.beginDestructiveRecovery(directory: directory)
+            case "reset":
+                try FileOutbox.beginTerminalResetRequest(directory: directory)
+            case "instance":
+                let reopened = try FileOutbox(directory: directory)
+                XCTAssertThrowsError(try reopened.validateMailboxFreshness(snapshot))
+                continue
+            case "directory":
+                let displaced = directory.appendingPathExtension("displaced")
+                defer { try? FileManager.default.removeItem(at: displaced) }
+                try FileManager.default.moveItem(at: directory, to: displaced)
+                try FileManager.default.copyItem(at: displaced, to: directory)
+                XCTAssertThrowsError(try outbox.validateMailboxFreshness(snapshot))
+                continue
+            case "missing":
+                try FileManager.default.removeItem(at: manifest)
+            case "symlink", "hardlink":
+                let displaced = directory.appendingPathComponent("metadata-copy")
+                try FileManager.default.moveItem(at: manifest, to: displaced)
+                if mutation == "symlink" {
+                    try FileManager.default.createSymbolicLink(at: manifest, withDestinationURL: displaced)
+                } else {
+                    try FileManager.default.linkItem(at: displaced, to: manifest)
+                }
+            case "nonregular":
+                try FileManager.default.removeItem(at: manifest)
+                try FileManager.default.createDirectory(at: manifest, withIntermediateDirectories: false)
+            default: XCTFail("Unknown fixture mutation")
+            }
+
+            XCTAssertThrowsError(try outbox.validateMailboxFreshness(snapshot), mutation)
+            if mutation == "clear" || mutation == "reset" {
+                XCTAssertThrowsError(try outbox.captureMailboxFreshness())
+            }
+        }
+    }
+
+    func testMailboxFreshnessDoesNotAuthorizeSameNameArtifactTamperingAtFullStateGate() throws {
+        for artifact in ["payload", "envelope"] {
+            for replace in [false, true] {
+                let directory = temporaryOutboxDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let outbox = try FileOutbox(directory: directory)
+                let items = try outbox.enqueueSequence(
+                    [Data("synthetic-one".utf8), Data("synthetic-two".utf8)],
+                    receiverIdentity: "receiver-a"
+                )
+                for item in items {
+                    _ = try outbox.finalizeMailboxEnvelope(
+                        itemID: item.id, envelope: Data("synthetic-envelope".utf8),
+                        expectedPayloadSHA256: mailboxSHA256(try Data(contentsOf: item.fileURL))
+                    )
+                }
+                let snapshot = try outbox.captureMailboxFreshness()
+                let url = artifact == "payload" ? items[1].fileURL
+                    : directory.appendingPathComponent("\(items[1].id).hbe")
+                let original = try Data(contentsOf: url)
+                var changed = original
+                changed[0] ^= 1
+                let modified = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate])
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                try changed.write(to: url, options: replace ? [.atomic] : [])
+                try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+
+                // Freshness deliberately grants no artifact authority. An unrelated
+                // item's full gate must still authenticate every bound artifact.
+                XCTAssertNoThrow(try outbox.validateMailboxFreshness(snapshot))
+                XCTAssertThrowsError(try outbox.deliveryState(for: items[0].id))
+
+                try original.write(to: url, options: [.atomic])
+                XCTAssertEqual(try outbox.deliveryState(for: items[0].id)?.phase, .encrypted)
+                XCTAssertEqual(try outbox.pendingItems().map(\.id), items.map(\.id))
+            }
+        }
+    }
+
+    func testMailboxFreshnessPreservesRetainedIntentAndJournalUntilOrdinaryRecovery() throws {
+        let directory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outbox = try FileOutbox(directory: directory)
+        let disk = RecoveryDiskFixture(directory: directory)
+        try disk.writeManifest(entries: disk.entries, nextSequence: 4)
+        try disk.writeJournal(retained: [0, 1, 2])
+        for index in disk.ids.indices { try disk.payloads[index].write(to: disk.payloadURL(index)) }
+        _ = try outbox.finalizeMailboxEnvelopeForTesting(
+            itemID: disk.ids[0], envelope: Data("synthetic-envelope".utf8),
+            expectedPayloadSHA256: mailboxSHA256(disk.payloads[0]), through: .manifestBound
+        )
+        let intentURL = directory.appendingPathComponent(".mailbox-envelope-intent")
+        let intent = try Data(contentsOf: intentURL)
+        let journal = try Data(contentsOf: disk.journalURL)
+
+        let snapshot = try outbox.captureMailboxFreshness()
+        try outbox.validateMailboxFreshness(snapshot)
+
+        XCTAssertEqual(try Data(contentsOf: intentURL), intent)
+        XCTAssertEqual(try Data(contentsOf: disk.journalURL), journal)
+        let reopened = try FileOutbox(directory: directory)
+        XCTAssertEqual(try reopened.pendingItems().map(\.id), disk.ids)
+        XCTAssertEqual(try reopened.deliveryState(for: disk.ids[0])?.phase, .encrypted)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: intentURL.path))
+        XCTAssertEqual(try Data(contentsOf: disk.journalURL), journal)
+    }
+
+    func testMailboxFreshnessRejectsCaptureDisagreementAndAdmissionDuringComparison() throws {
+        let directory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manager = FreshnessMutationFileManager()
+        let outbox = try FileOutbox(directory: directory, fileManager: manager)
+        let payload = Data("synthetic".utf8)
+        let item = try outbox.enqueue(payload, receiverIdentity: "receiver-a")
+        _ = try outbox.finalizeMailboxEnvelope(
+            itemID: item.id, envelope: Data("synthetic-envelope".utf8),
+            expectedPayloadSHA256: mailboxSHA256(payload)
+        )
+        let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+        let original = try Data(contentsOf: manifestURL)
+        manager.afterHardening = {
+            let changed = Data(String(decoding: original, as: UTF8.self)
+                .replacingOccurrences(of: "receiver-a", with: "receiver-b").utf8)
+            try changed.write(to: manifestURL)
+        }
+
+        XCTAssertThrowsError(try outbox.captureMailboxFreshness())
+
+        try original.write(to: manifestURL)
+        let snapshot = try outbox.captureMailboxFreshness()
+        manager.afterEnumeration = { try FileOutbox.beginTerminalResetRequest(directory: directory) }
+        XCTAssertThrowsError(try outbox.validateMailboxFreshness(snapshot))
+        XCTAssertTrue(outbox.terminalResetRequestIsActive)
+        XCTAssertEqual(try Data(contentsOf: manifestURL), original)
+    }
+
     func testReceiverBoundEnqueueIfAbsentReusesCrashWindowPayload() throws {
         let directory = temporaryOutboxDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1992,6 +2202,31 @@ private final class RecoveryFaultFileManager: FileManager {
     override func removeItem(at url: URL) throws {
         if url == failingRemoval { throw CocoaError(.fileWriteUnknown) }
         try super.removeItem(at: url)
+    }
+}
+
+private final class FreshnessMutationFileManager: FileManager {
+    var afterHardening: (() throws -> Void)?
+    var afterEnumeration: (() throws -> Void)?
+
+    override func setAttributes(_ attributes: [FileAttributeKey: Any], ofItemAtPath path: String) throws {
+        try super.setAttributes(attributes, ofItemAtPath: path)
+        if URL(fileURLWithPath: path).pathExtension == "hbe", let action = afterHardening {
+            afterHardening = nil
+            try action()
+        }
+    }
+
+    override func contentsOfDirectory(
+        at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?,
+        options mask: FileManager.DirectoryEnumerationOptions = []
+    ) throws -> [URL] {
+        let files = try super.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: mask)
+        if let action = afterEnumeration {
+            afterEnumeration = nil
+            try action()
+        }
+        return files
     }
 }
 

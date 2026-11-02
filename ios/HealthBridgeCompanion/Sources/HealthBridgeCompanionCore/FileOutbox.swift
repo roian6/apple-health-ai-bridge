@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 #if canImport(Security)
 import Security
@@ -1155,6 +1156,94 @@ public final class FileOutbox {
 
     public func pendingItems() throws -> [FileOutboxItem] {
         try pendingItems(in: reconciledManifest())
+    }
+
+    // Operation-local freshness, not an integrity proof or a manifest for mutation.
+    // State, transport, CAS and finalization still perform their full validation.
+    struct MailboxFreshnessSnapshot: Equatable {
+        fileprivate let owner: ObjectIdentifier
+        fileprivate let directory: MailboxFreshnessDirectory
+        fileprivate let metadata: [Data?]
+        fileprivate let artifacts: Set<String>
+    }
+
+    fileprivate struct MailboxFreshnessDirectory: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let birthSeconds: Int
+        let birthNanoseconds: Int
+    }
+
+    func captureMailboxFreshness(including expectedItems: [FileOutboxItem] = []) throws -> MailboxFreshnessSnapshot {
+        try requireUploadAdmission()
+        let directoryIdentity = try mailboxFreshnessDirectory()
+        let manifest = try reconciledManifest()
+        if !expectedItems.isEmpty {
+            let current = Dictionary(uniqueKeysWithValues: try pendingItems(in: manifest).map { ($0.id, $0) })
+            guard expectedItems.allSatisfy({ current[$0.id] == $0 }) else { throw CancellationError() }
+        }
+        let snapshot = try readMailboxFreshness()
+        let capturedManifest = try snapshot.metadata[0].map {
+            try JSONDecoder().decode(SequenceManifest.self, from: $0)
+        } ?? .empty
+        guard snapshot.directory == directoryIdentity, capturedManifest == manifest else {
+            throw CancellationError()
+        }
+        return snapshot
+    }
+
+    func validateMailboxFreshness(_ snapshot: MailboxFreshnessSnapshot) throws {
+        do {
+            try requireUploadAdmission()
+            guard snapshot.owner == ObjectIdentifier(self),
+                  try readMailboxFreshness() == snapshot else {
+                throw CancellationError()
+            }
+        } catch {
+            // A failed fresh read cannot authorize accepting the suspended result.
+            throw CancellationError()
+        }
+    }
+
+    private func readMailboxFreshness() throws -> MailboxFreshnessSnapshot {
+        try requireUploadAdmission()
+        let identity = try mailboxFreshnessDirectory()
+        let artifacts = try mailboxFreshnessArtifacts()
+        let metadata = try [sequenceURL, enqueueTransactionURL, mailboxEnvelopeIntentURL].map { url -> Data? in
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else {
+                guard errno == ENOENT else { throw CancellationError() }
+                return nil
+            }
+            return try MailboxRegularFileReader.read(url, maximumBytes: 64 * 1024 * 1024)
+        }
+        guard try mailboxFreshnessArtifacts() == artifacts,
+              try mailboxFreshnessDirectory() == identity else {
+            throw CancellationError()
+        }
+        try requireUploadAdmission()
+        return MailboxFreshnessSnapshot(
+            owner: ObjectIdentifier(self), directory: identity,
+            metadata: metadata, artifacts: artifacts
+        )
+    }
+
+    private func mailboxFreshnessDirectory() throws -> MailboxFreshnessDirectory {
+        var info = stat()
+        guard lstat(directory.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else {
+            throw CancellationError()
+        }
+        return MailboxFreshnessDirectory(
+            device: info.st_dev, inode: info.st_ino,
+            birthSeconds: info.st_birthtimespec.tv_sec,
+            birthNanoseconds: info.st_birthtimespec.tv_nsec
+        )
+    }
+
+    private func mailboxFreshnessArtifacts() throws -> Set<String> {
+        Set(try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { ["json", "staged", "hbe", "hbe-staged"].contains($0.pathExtension) }
+            .map(\.lastPathComponent))
     }
 
     func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
