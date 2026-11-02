@@ -29,7 +29,7 @@ if [[ "$program" == uv && "${1:-}" == run && "${2:-}" == "${FAIL_ON:-}" ]]; then
   exit 23
 fi
 if [[ "$program" == xcodebuild && "${FAIL_ON:-}" == xcodebuild &&
-      " $* " == *" build "* ]]; then
+      " $* " == *" build "* && " $* " != *" -sdk macosx "* ]]; then
   exit 23
 fi
 if [[ "$program" == native-tests ]]; then
@@ -199,7 +199,7 @@ def test_native_runner_preserves_both_targets_and_unsigned_sdks(
 def test_native_build_failure_cannot_become_success(
     tools: tuple[Mapping[str, str], Path],
 ) -> None:
-    # Given: the first selected app configuration fails.
+    # Given: the first iOS configuration fails after the helper gates succeed.
     environment, calls = tools
     # When: the CI-facing native-build command runs.
     result = subprocess.run(
@@ -213,9 +213,13 @@ def test_native_build_failure_cannot_become_success(
     # Then: it stops with the compiler's nonzero status, not a later successful build.
     assert result.returncode == 23
     builds = [
-        call for call in _calls(calls) if call[0] == "xcodebuild" and "-target" in call
+        call
+        for call in _calls(calls)
+        if call[0] == "xcodebuild" and "-target" in call and "macosx" not in call
     ]
     assert len(builds) == 1
+    assert builds[0][builds[0].index("-target") + 1] == "HealthBridgeCompanion"
+    assert builds[0][builds[0].index("-sdk") + 1] == "iphonesimulator"
 
 
 @pytest.mark.parametrize(
