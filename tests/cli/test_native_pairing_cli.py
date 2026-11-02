@@ -1,12 +1,14 @@
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import TypeAdapter
 from typer.testing import CliRunner
 
 import health_bridge.cli_receiver as receiver_cli
+import health_bridge.receiver.transports as receiver_transports
 from health_bridge.cli import app
 from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublicationError,
@@ -22,6 +24,7 @@ def ipc_publisher(
     *,
     failure: str | None = None,
 ) -> tuple[NativeAckPublisher, list[str]]:
+    monkeypatch.setattr(receiver_cli, "sys", SimpleNamespace(platform="darwin"))
     helper = tmp_path / "synthetic-helper"
     helper.touch(mode=0o700)
     publisher = NativeAckPublisher(NativeAckPublisherConfig(helper))
@@ -52,6 +55,52 @@ def ipc_publisher(
 
     monkeypatch.setattr(NativeAckPublisher, "_exchange", exchange)
     return publisher, operations
+
+
+@pytest.mark.parametrize("with_url", [False, True])
+def test_mailbox_create_rejects_unsupported_host_before_helper_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_url: bool
+) -> None:
+    host = SimpleNamespace(platform="linux")
+    monkeypatch.setattr(receiver_cli, "sys", host)
+    monkeypatch.setattr(receiver_transports, "sys", host)
+
+    def unexpected_helper() -> NativeAckPublisher:
+        raise AssertionError
+
+    monkeypatch.setattr(receiver_cli, "default_native_ack_publisher", unexpected_helper)
+    db = tmp_path / "health.sqlite"
+    mailbox = tmp_path / "mailbox"
+    page = tmp_path / "pair.html"
+    result = CliRunner().invoke(
+        app,
+        [
+            "receiver",
+            "create-pairing",
+            "--db",
+            str(db),
+            "--label",
+            "synthetic",
+            *(
+                ["--receiver-url", "https://receiver.invalid/v1/batches"]
+                if with_url
+                else []
+            ),
+            "--transport",
+            "icloud-mailbox",
+            "--mailbox-root",
+            str(mailbox),
+            "--icloud-container-identifier",
+            "iCloud.com.example.synthetic",
+            "--setup-page",
+            str(page),
+        ],
+    )
+    assert result.exit_code == 1
+    assert receiver_transports.MAILBOX_HOST_UNAVAILABLE_ERROR in result.output
+    assert not db.exists()
+    assert not mailbox.exists()
+    assert not page.exists()
 
 
 @pytest.mark.parametrize("with_url", [False, True])

@@ -3,6 +3,7 @@ import os
 import secrets
 import sqlite3
 import stat
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Final, Literal, TypeAlias, cast
@@ -998,7 +999,7 @@ def _pairing_receiver_url(
     if not receiver_url and (transport != "icloud-mailbox" or legacy_v1):
         typer.echo("--receiver-url is required for Direct or legacy pairing.", err=True)
         raise typer.Exit(code=1)
-    if transport == "icloud-mailbox":
+    if transport == "icloud-mailbox" and sys.platform == "darwin":
         _preflight_mailbox()
     return receiver_url
 
