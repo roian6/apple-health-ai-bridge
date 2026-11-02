@@ -1938,7 +1938,7 @@ private struct RecoveryDiskFixture {
     }
 }
 
-private final class RecoveryFaultFileManager: FileManager, Sendable {
+private final class RecoveryFaultFileManager: FileManager {
     let failingMove: URL?
     let failingRemoval: URL?
 
