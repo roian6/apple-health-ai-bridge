@@ -1,6 +1,7 @@
 # ruff: noqa: EM101, S603, TRY003
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -11,10 +12,11 @@ import stat
 import subprocess  # nosec B404
 import sys
 import tempfile
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import Final, cast, final
+from typing import TYPE_CHECKING, Final, cast, final
 
 from health_bridge.contract._delivery_common import MAX_ENVELOPE_BYTES
 from health_bridge.contract._hbjcs1 import hbjcs1_decode
@@ -24,6 +26,7 @@ from health_bridge.contract.mailbox_capabilities import (
 )
 from health_bridge.mailbox.filesystem import (
     MailboxDirectoryHandle,
+    MailboxFileError,
     read_final,
     read_final_at,
 )
@@ -49,9 +52,44 @@ MAX_HELPER_INFO_BYTES: Final = 65_536
 MAX_BUNDLE_ID_LENGTH: Final = 255
 MIN_BUNDLE_ID_COMPONENTS: Final = 2
 
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
 
 class NativeAckPublicationError(OSError):
     """The signed native ACK helper failed or returned an invalid receipt."""
+
+
+class NativePairingPublicationErrorCode(StrEnum):
+    ACCESS_DENIED = "helper_container_access_denied"
+    PUBLICATION_FAILED = "native_pairing_publication_failed"
+
+
+class NativePairingPublicationError(NativeAckPublicationError):
+    """A fixed, privacy-safe failure at the native pairing publication boundary."""
+
+    def __init__(self, code: NativePairingPublicationErrorCode) -> None:
+        super().__init__(code.value)
+        self.code: NativePairingPublicationErrorCode = code
+
+
+@contextmanager
+def _protocol_io() -> Generator[None, None, None]:
+    """Classify explicit OS denials only within helper protocol storage IO."""
+    try:
+        yield
+    except (OSError, MailboxFileError) as exc:
+        cause: BaseException | None = exc
+        code = NativePairingPublicationErrorCode.PUBLICATION_FAILED
+        while cause is not None:
+            if isinstance(cause, OSError) and cause.errno in {
+                errno.EPERM,
+                errno.EACCES,
+            }:
+                code = NativePairingPublicationErrorCode.ACCESS_DENIED
+                break
+            cause = cause.__cause__
+        raise NativePairingPublicationError(code) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +158,20 @@ class NativeAckPublisher:
                 "native pairing helper capability unavailable"
             )
 
+    def probe_protocol_storage(self) -> None:
+        """Create, write and remove private synthetic bytes in every protocol lane."""
+        root = self._config.protocol_root
+        for lane in (root, root / "requests", root / "staging", root / "receipts"):
+            probe = lane / f".probe-{secrets.token_hex(16)}"
+            try:
+                with _protocol_io():
+                    ensure_private_directory(lane)
+                    _require_owner_private_directory(lane)
+                    _write_private_bytes(probe, b"health-bridge-protocol-probe")
+                    probe.unlink()
+            finally:
+                _unlink_protocol_file(probe)
+
     def publish_pairing(self, directory: Path, payload: bytes) -> None:
         self.require_native_pairing()
         invitation = directory.name
@@ -134,9 +186,6 @@ class NativeAckPublisher:
             final_name = "cancelled.hbp"
         request_id = secrets.token_hex(16)
         root = self._config.protocol_root
-        for lane in (root, root / "requests", root / "staging", root / "receipts"):
-            ensure_private_directory(lane)
-            _require_owner_private_directory(lane)
         source = root / "staging" / f"{request_id}.hbp"
         request_path = root / "requests" / f"{request_id}.json"
         receipt_path = root / "receipts" / f"{request_id}.json"
@@ -149,10 +198,19 @@ class NativeAckPublisher:
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
         try:
-            _write_private_bytes(source, payload)
-            write_private_text_file(
-                request_path, json.dumps(request, separators=(",", ":"))
-            )
+            with _protocol_io():
+                for lane in (
+                    root,
+                    root / "requests",
+                    root / "staging",
+                    root / "receipts",
+                ):
+                    ensure_private_directory(lane)
+                    _require_owner_private_directory(lane)
+                _write_private_bytes(source, payload)
+                write_private_text_file(
+                    request_path, json.dumps(request, separators=(",", ":"))
+                )
             try:
                 # Checked native helper; this request ID is generated locally.
                 result = subprocess.run(  # nosec B603
@@ -167,7 +225,11 @@ class NativeAckPublisher:
                 raise NativeAckPublicationError(
                     "native pairing helper timed out"
                 ) from exc
-            if result.returncode != 0 or _read_receipt(receipt_path) != {
+            if result.returncode != 0:
+                raise NativeAckPublicationError("native pairing publication failed")
+            with _protocol_io():
+                receipt = _read_receipt(receipt_path)
+            if receipt != {
                 **request,
                 "published": True,
                 "bootstrapVersion": 1,

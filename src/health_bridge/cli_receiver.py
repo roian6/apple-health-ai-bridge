@@ -23,7 +23,8 @@ from health_bridge.cli_receiver_start import (
 from health_bridge.launchd import load_runnable_launch_agent_request
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.mailbox.native_ack_publication import (
-    NativeAckPublicationError,
+    NativePairingPublicationError,
+    NativePairingPublicationErrorCode,
     default_native_ack_publisher,
 )
 from health_bridge.private_files import (
@@ -932,6 +933,7 @@ def start(  # noqa: PLR0913 -- Typer exposes six independent receiver options.
             select_transport=_select_transport_or_exit,
             create_key_store=MailboxKeyStore.production,
             create_connection_store=MailboxConnectionStore.production,
+            preflight_mailbox=_preflight_native_pairing,
             serve=serve_receiver,
         ),
     )
@@ -998,10 +1000,19 @@ def _pairing_receiver_url(
                 "--receiver-url is required for Direct or legacy pairing.", err=True
             )
             raise typer.Exit(code=1)
-        try:
-            default_native_ack_publisher().require_native_pairing()
-        except NativeAckPublicationError as exc:
-            typer.echo(str(exc), err=True)
-            raise typer.Exit(code=1) from exc
+        _preflight_native_pairing()
         return None
     return receiver_url
+
+
+def _preflight_native_pairing() -> None:
+    try:
+        publisher = default_native_ack_publisher()
+        publisher.require_native_pairing()
+        publisher.probe_protocol_storage()
+    except NativePairingPublicationError as exc:
+        typer.echo(exc.code.value, err=True)
+        raise typer.Exit(code=1) from None
+    except OSError:
+        typer.echo(NativePairingPublicationErrorCode.PUBLICATION_FAILED.value, err=True)
+        raise typer.Exit(code=1) from None

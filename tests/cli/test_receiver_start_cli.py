@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import re
 from typing import TYPE_CHECKING, Final
 
@@ -7,9 +8,14 @@ import pytest
 from typer.testing import CliRunner
 
 import health_bridge.cli_receiver as cli_receiver_module
+import health_bridge.mailbox.native_ack_publication as publication
 from health_bridge.cli import app
 from health_bridge.launchd import LaunchdServiceError, LaunchdServiceErrorCode
 from health_bridge.mailbox.connections import MailboxConnectionStore
+from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublisher,
+    NativeAckPublisherConfig,
+)
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
 
@@ -211,3 +217,51 @@ def test_receiver_start_maps_keyboard_interrupt_to_clean_exit(
     assert result.stderr.strip() == (
         "health-bridge receiver listening on http://127.0.0.1:8765"
     )
+
+
+def test_issue154_mailbox_start_denied_before_server_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    publisher = NativeAckPublisher(
+        NativeAckPublisherConfig(tmp_path / "helper", tmp_path / "protocol")
+    )
+    monkeypatch.setattr(
+        cli_receiver_module, "default_native_ack_publisher", lambda: publisher
+    )
+
+    def capability(_publisher: NativeAckPublisher) -> None:
+        pass
+
+    def selected(*_args: object, **_kwargs: object) -> ReceiverTransport:
+        return ReceiverTransport.MAILBOX
+
+    monkeypatch.setattr(NativeAckPublisher, "require_native_pairing", capability)
+    monkeypatch.setattr(cli_receiver_module, "_select_transport_or_exit", selected)
+    monkeypatch.setattr(MailboxKeyStore, "production", lambda: None)
+    monkeypatch.setattr(MailboxConnectionStore, "production", lambda: None)
+    bound: list[bool] = []
+
+    def serve(**_kwargs: object) -> None:
+        bound.append(True)
+
+    monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve)
+
+    def denied(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(errno.EPERM, "synthetic-secret-path")
+
+    monkeypatch.setattr(publication, "ensure_private_directory", denied)
+    result = CliRunner().invoke(
+        app,
+        [
+            "receiver",
+            "start",
+            "--db",
+            str(tmp_path / "health.sqlite"),
+            "--mailbox-root",
+            str(tmp_path / "mailbox"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert result.stderr.strip() == "helper_container_access_denied"
+    assert bound == []

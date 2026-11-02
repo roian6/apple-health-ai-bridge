@@ -1,9 +1,11 @@
+import errno
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 import health_bridge.cli_receiver as receiver_cli
+import health_bridge.mailbox.native_ack_publication as publication
 from health_bridge.cli import app
 from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublisher,
@@ -72,3 +74,48 @@ def test_explicit_native_pairing_cli_uses_existing_private_page(
     assert "Encrypted iCloud Mailbox" in page
     assert "Use a code instead" not in page
     assert "mailbox_bootstrap" not in result.output
+
+
+def test_issue154_native_pairing_denied_before_invitation_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    publisher = NativeAckPublisher(
+        NativeAckPublisherConfig(tmp_path / "helper", tmp_path / "protocol")
+    )
+    monkeypatch.setattr(receiver_cli, "default_native_ack_publisher", lambda: publisher)
+
+    def capability(_publisher: NativeAckPublisher) -> None:
+        pass
+
+    monkeypatch.setattr(NativeAckPublisher, "require_native_pairing", capability)
+
+    def denied(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(errno.EACCES, "synthetic-secret-path")
+
+    monkeypatch.setattr(publication, "ensure_private_directory", denied)
+
+    def forbidden_transport(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Denied protocol storage must stop before invitation setup.")
+
+    monkeypatch.setattr(receiver_cli, "_select_transport_or_exit", forbidden_transport)
+    database = tmp_path / "health.sqlite"
+    result = CliRunner().invoke(
+        app,
+        [
+            "receiver",
+            "create-pairing",
+            "--db",
+            str(database),
+            "--label",
+            "synthetic",
+            "--transport",
+            "icloud-mailbox",
+            "--setup-page",
+            str(tmp_path / "pair.html"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert result.stderr.strip() == "helper_container_access_denied"
+    assert not database.exists()
+    assert not (tmp_path / "pair.html").exists()
