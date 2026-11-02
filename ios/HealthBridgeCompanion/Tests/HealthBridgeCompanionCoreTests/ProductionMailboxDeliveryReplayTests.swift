@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 @testable import HealthBridgeCompanionCore
@@ -540,6 +541,300 @@ final class ProductionMailboxDeliveryReplayTests: XCTestCase {
         XCTAssertEqual(repeated.finalizedCount, 0)
         XCTAssertEqual(repeated.waitingCount, 0)
         try fixture.assertCompleted()
+    }
+}
+
+@MainActor
+final class ProductionMailboxPublishedRoutingTests: XCTestCase {
+    func testPublishedPassRetainsFourObservationsWithinValidationBudget() async throws {
+        for count in [2, 6] {
+            for fourthSucceeds in [false, true] {
+                let manager = ReplayValidationFileManager()
+                let fixture = try ForegroundReplayFixture(fileManager: manager)
+                defer { fixture.removeTemporaryStores() }
+                if count > 2 {
+                    _ = try fixture.outbox.enqueueSequence(
+                        Array(repeating: fixture.payload, count: count - 2),
+                        receiverIdentity: fixture.binding
+                    )
+                }
+                let items = try fixture.outbox.pendingItems()
+                try fixture.stage(items, through: .published)
+                let retained = try boundEnvelopes(
+                    in: fixture.outbox.pendingItems(), directory: fixture.outbox.directoryURL
+                )
+                var observations: [URL: Int] = [:]
+                fixture.observe = { url, _ in
+                    observations[url, default: 0] += 1
+                    return fourthSucceeds && observations[url] == 4
+                }
+                let delivery = try fixture.delivery()
+                manager.reset()
+
+                let summary = try await delivery.deliverPending()
+                let attributes = manager.outsidePayloadAttributes
+
+                // One routing read and one live transport read per slot, plus
+                // coordinator/preflight/final gates and successful-observation CAS.
+                let fullScanBudget = 3 + 9 * count + (fourthSucceeds ? count : 0)
+                XCTAssertLessThanOrEqual(attributes, count * fullScanBudget)
+                XCTAssertEqual(observations.count, count)
+                XCTAssertEqual(Array(observations.values).sorted(), Array(repeating: 4, count: count))
+                XCTAssertEqual(summary.waitingCount, count)
+                XCTAssertEqual(summary.finalizedCount, 0)
+                let remaining = try fixture.outbox.pendingItems()
+                XCTAssertEqual(remaining.map(\.deliveryState?.phase),
+                               Array(repeating: fourthSucceeds ? .providerObserved : .published, count: count))
+                XCTAssertEqual(try boundEnvelopes(in: remaining, directory: fixture.outbox.directoryURL), retained)
+                XCTAssertEqual(fixture.cursors.writes, [])
+                print("PUBLISHED_ROUTING count=\(count) fourthSucceeds=\(fourthSucceeds) attributes=\(attributes)")
+            }
+        }
+    }
+
+    func testMixedForegroundPassPreservesWorkWithinValidationBudget() async throws {
+        let manager = ReplayValidationFileManager()
+        let fixture = try ForegroundReplayFixture(fileManager: manager)
+        defer { fixture.removeTemporaryStores() }
+        try await fixture.publishPending()
+        _ = try fixture.publishAck(for: fixture.first)
+        _ = try await fixture.delivery().deliverPending()
+        _ = try fixture.outbox.enqueueSequence(
+            Array(repeating: fixture.payload, count: 298), receiverIdentity: fixture.binding
+        )
+        var phases: [OutboxDeliveryPhase] = []
+        for group in 0 ..< 23 {
+            phases += Array(repeating: .providerObserved, count: group == 22 ? 6 : 7)
+            if group < 22 { phases += Array(repeating: .published, count: group < 7 ? 3 : 2) }
+        }
+        phases += [.encrypted] + Array(repeating: .collected, count: 87)
+        let items = try fixture.outbox.pendingItems()
+        XCTAssertEqual(items.count, 299)
+        XCTAssertEqual(phases.count, items.count)
+        for (item, phase) in zip(items, phases) {
+            try fixture.stage([item], through: phase)
+        }
+        let retainedEnvelopes = try boundEnvelopes(
+            in: fixture.outbox.pendingItems(), directory: fixture.outbox.directoryURL
+        )
+        let payloads = try Dictionary(uniqueKeysWithValues: items.map { ($0.id, try Data(contentsOf: $0.fileURL)) })
+        var observations: [URL: Int] = [:]
+        fixture.observe = { url, _ in
+            observations[url, default: 0] += 1
+            return false
+        }
+        let delivery = try fixture.delivery()
+        manager.reset()
+        let start = ContinuousClock.now
+
+        let summary = try await delivery.deliverPending()
+        let elapsed = start.duration(to: .now)
+        let attributes = manager.outsidePayloadAttributes
+        let hardening = manager.outsideEnvelopeHardening
+
+        // Whole foreground opportunity, including every active tail item.
+        let fullScanBudget = 3 + 2 * 23 + 9 * 51 + 12 + 17 * 87
+        XCTAssertLessThanOrEqual(attributes, 299 * fullScanBudget)
+        XCTAssertEqual(summary.attemptedCount, 299)
+        XCTAssertEqual(summary.waitingCount, 299)
+        XCTAssertEqual(summary.finalizedCount, 0)
+        let remaining = try fixture.outbox.pendingItems()
+        XCTAssertEqual(remaining.map(\.id), items.map(\.id))
+        XCTAssertEqual(remaining.map(\.deliveryState?.phase),
+                       phases.map { $0 == .providerObserved ? .providerObserved : .published })
+        XCTAssertEqual(observations.count, 139)
+        XCTAssertEqual(observations.values.filter { $0 == 4 }.count, 51)
+        XCTAssertEqual(observations.values.filter { $0 == 3 }.count, 1)
+        XCTAssertEqual(observations.values.filter { $0 == 2 }.count, 87)
+        for item in remaining { XCTAssertEqual(try Data(contentsOf: item.fileURL), payloads[item.id]) }
+        let envelopes = try boundEnvelopes(in: remaining, directory: fixture.outbox.directoryURL)
+        XCTAssertEqual(envelopes.count, 299)
+        for (url, bytes) in retainedEnvelopes { XCTAssertEqual(envelopes[url], bytes) }
+        XCTAssertEqual(fixture.cursors.writes, [fixture.firstCheckpoint.cursorValue])
+        XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: .workouts, receiverBindingID: fixture.binding))
+        print("MIXED_ROUTING entries=300 live=299 groups=23 attributes=\(attributes) hardening=\(hardening) elapsed=\(elapsed)")
+    }
+
+    private func boundEnvelopes(in items: [FileOutboxItem], directory: URL) throws -> [URL: Data] {
+        try Dictionary(uniqueKeysWithValues: items.compactMap { item in
+            guard let binding = item.mailboxBinding else { return nil }
+            let url = directory.appendingPathComponent(binding.envelopeFilename)
+            return (url, try Data(contentsOf: url))
+        })
+    }
+}
+
+@MainActor
+final class ProductionMailboxPublishedValidationTests: XCTestCase {
+    private enum Observation: CaseIterable {
+        case waiting, observed, retryable
+    }
+
+    func testPublishedRoutingRejectsStaleOwnershipBeforeObservation() async throws {
+        let fixture = try ForegroundReplayFixture()
+        defer { fixture.removeTemporaryStores() }
+        try fixture.stage([fixture.first, fixture.second], through: .published)
+        let before = try fixture.outbox.pendingItems()
+        let retained = try fixture.encryptedLocalFiles()
+        try fixture.settings.invalidateReceiverSettingsGeneration()
+        var observations = 0
+        fixture.observe = { _, _ in
+            observations += 1
+            return true
+        }
+
+        do {
+            _ = try await fixture.delivery().deliverPending()
+            XCTFail("Stale ownership must not enter the published observation path")
+        } catch let error as ProductionMailboxDeliveryPhaseError {
+            XCTAssertEqual(error, .initialAdvance)
+        }
+
+        XCTAssertEqual(observations, 0)
+        XCTAssertEqual(try fixture.outbox.pendingItems(), before)
+        XCTAssertEqual(try fixture.encryptedLocalFiles(), retained)
+        XCTAssertEqual(fixture.cursors.writes, [])
+    }
+
+    func testPublishedObservationRejectsCallbackArtifactChangesBeforeAcceptance() async throws {
+        for outcome in Observation.allCases {
+            // Background's final false observation has no trailing full gate.
+            // The foreground return and all state writes do have one.
+            for background in outcome == .waiting ? [false] : [false, true] {
+                for selected in [false, true] {
+                    for envelope in [false, true] {
+                        for inPlace in [false, true] {
+                            let fixture = try ForegroundReplayFixture()
+                            defer { fixture.removeTemporaryStores() }
+                            try fixture.stage([fixture.first, fixture.second], through: .published)
+                            let items = try fixture.outbox.pendingItems()
+                            let observed = outcome == .waiting ? items[1] : items[0]
+                            let other = outcome == .waiting ? items[0] : items[1]
+                            let target = selected ? observed : other
+                            let observedDigest = try XCTUnwrap(observed.mailboxBinding).envelopeSHA256
+                            let url = envelope
+                                ? fixture.outbox.directoryURL.appendingPathComponent(
+                                    try XCTUnwrap(target.mailboxBinding).envelopeFilename
+                                ) : target.fileURL
+                            let original = try Data(contentsOf: url)
+                            var changed = original
+                            changed[changed.count - 1] ^= 1
+                            let retained = try fixture.encryptedLocalFiles()
+                            var observations = 0
+                            var mutated = false
+                            fixture.observe = { _, digest in
+                                guard digest == observedDigest else { return false }
+                                observations += 1
+                                if observations == (outcome == .waiting ? 4 : 1) {
+                                    try self.writeArtifact(changed, to: url, inPlace: inPlace)
+                                    mutated = true
+                                }
+                                switch outcome {
+                                case .waiting: return false
+                                case .observed: return true
+                                case .retryable: throw POSIXError(.EIO)
+                                }
+                            }
+                            let delivery = try fixture.delivery()
+                            do {
+                                if background { _ = try await delivery.publishPendingFIFOHead() }
+                                else { _ = try await delivery.deliverPending() }
+                                XCTFail("Changed artifacts must block the existing validation boundary")
+                            } catch let error as ProductionMailboxDeliveryPhaseError {
+                                XCTAssertEqual(error, outcome == .waiting ? .remainingCount : .initialAdvance)
+                            } catch is CancellationError {
+                                // The unchanged nutrition revision gate detects a
+                                // replaced payload inode before the remaining-count gate.
+                                XCTAssertTrue(outcome == .waiting && !envelope && !inPlace)
+                                XCTAssertFalse(Task.isCancelled)
+                            }
+
+                            XCTAssertTrue(mutated)
+                            try writeArtifact(original, to: url, inPlace: inPlace)
+                            XCTAssertEqual(try fixture.outbox.pendingItems(), items)
+                            XCTAssertEqual(try fixture.encryptedLocalFiles(), retained)
+                            XCTAssertEqual(fixture.cursors.writes, [])
+                            try fixture.reopenOutbox()
+                            fixture.observe = { _, _ in true }
+                            try await fixture.publishPending()
+                            XCTAssertEqual(try fixture.encryptedLocalFiles(), retained)
+                            _ = try fixture.publishAck(for: fixture.first)
+                            let firstCommit = try await fixture.delivery().deliverPending()
+                            XCTAssertEqual(firstCommit.finalizedCount, 1)
+                            _ = try fixture.publishAck(for: fixture.second)
+                            let secondCommit = try await fixture.delivery().deliverPending()
+                            XCTAssertEqual(secondCommit.finalizedCount, 1)
+                            try fixture.assertCompleted()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testPublishedObservationRetainsFullGateAfterStateWriteFault() throws {
+        for selected in [false, true] {
+            for envelope in [false, true] {
+                for inPlace in [false, true] {
+                    let fixture = try ForegroundReplayFixture()
+                    defer { fixture.removeTemporaryStores() }
+                    try fixture.stage([fixture.first, fixture.second], through: .published)
+                    let items = try fixture.outbox.pendingItems()
+                    let target = items[selected ? 0 : 1]
+                    let url = envelope
+                        ? fixture.outbox.directoryURL.appendingPathComponent(
+                            try XCTUnwrap(target.mailboxBinding).envelopeFilename
+                        ) : target.fileURL
+                    let original = try Data(contentsOf: url)
+                    var changed = original
+                    changed[changed.count - 1] ^= 1
+                    var reachedFault = false
+                    let coordinator = try fixture.coordinator { boundary in
+                        if boundary == .beforeStateWrite(.providerObserved) {
+                            try self.writeArtifact(changed, to: url, inPlace: inPlace)
+                            reachedFault = true
+                        }
+                    }
+
+                    XCTAssertThrowsError(try coordinator.preparePublicationAdvance(itemID: fixture.first.id)) {
+                        XCTAssertEqual($0 as? FileOutboxMailboxError, .finalizationConflict)
+                    }
+
+                    XCTAssertTrue(reachedFault)
+                    try writeArtifact(original, to: url, inPlace: inPlace)
+                    XCTAssertEqual(try fixture.outbox.pendingItems(), items)
+                    XCTAssertEqual(fixture.cursors.writes, [])
+                }
+            }
+        }
+    }
+
+    private func writeArtifact(_ bytes: Data, to url: URL, inPlace: Bool) throws {
+        let manager = FileManager.default
+        var before = stat()
+        XCTAssertEqual(lstat(url.path, &before), 0)
+        let attributes = try manager.attributesOfItem(atPath: url.path)
+        let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        if inPlace {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.write(contentsOf: bytes)
+        } else {
+            try bytes.write(to: url, options: [.atomic])
+        }
+        try manager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+        let times = [before.st_atimespec, before.st_mtimespec]
+        XCTAssertEqual(times.withUnsafeBufferPointer {
+            utimensat(AT_FDCWD, url.path, $0.baseAddress, 0)
+        }, 0)
+        var after = stat()
+        XCTAssertEqual(lstat(url.path, &after), 0)
+        XCTAssertEqual(after.st_size, before.st_size)
+        XCTAssertEqual(after.st_mtimespec.tv_sec, before.st_mtimespec.tv_sec)
+        XCTAssertEqual(after.st_mtimespec.tv_nsec, before.st_mtimespec.tv_nsec)
+        if inPlace { XCTAssertEqual(after.st_ino, before.st_ino) }
+        else { XCTAssertNotEqual(after.st_ino, before.st_ino) }
     }
 }
 
@@ -1312,6 +1607,9 @@ private final class ForegroundReplayFixture {
     private let envelopeIDs = ReplayEnvelopeIDs()
     private let publisher: any MailboxEnvelopePublishing
     private let isCancelled: () -> Bool
+    var observe: MailboxTransport.Observe = { url, digest in
+        mailboxSHA256(try Data(contentsOf: url)) == digest
+    }
 
     var binding: String { identity.opaqueBinding }
 
@@ -1458,9 +1756,7 @@ private final class ForegroundReplayFixture {
             envelopeID: { envelopeIDs.next() },
             nowMilliseconds: { 1_782_000_000_123 },
             isCancelled: isCancelled,
-            observe: { url, digest in
-                mailboxSHA256(try Data(contentsOf: url)) == digest
-            }
+            observe: observe
         )
         return ProductionMailboxComponents(
             identity: identity,
@@ -1484,6 +1780,35 @@ private final class ForegroundReplayFixture {
             keyStore: keyStore,
             componentsFactory: { components }
         )
+    }
+
+    func coordinator(
+        fault: @escaping OutboxDeliveryCoordinator.Fault = { _ in }
+    ) throws -> OutboxDeliveryCoordinator {
+        let components = try components()
+        return OutboxDeliveryCoordinator(
+            outbox: outbox, transport: components.transport, scanner: components.scanner,
+            ownership: OutboxDeliveryOwnershipV1(
+                receiverGeneration: settings.receiverSettingsGenerationToken,
+                resetEpoch: nil, ackContext: components.ackContext
+            ),
+            finalizer: OutboxDeliveryCursorFinalizer(
+                outbox: outbox, cursorStore: cursors, proofStore: proofs,
+                pendingGenerationStore: nil
+            ),
+            fault: fault
+        )
+    }
+
+    func stage(_ items: [FileOutboxItem], through phase: OutboxDeliveryPhase) throws {
+        let coordinator = try coordinator()
+        for item in items {
+            var state = try coordinator.ownedState(itemID: item.id)
+            for _ in 0 ..< 3 where state.phase != phase {
+                state = try coordinator.advance(itemID: item.id)
+            }
+            XCTAssertEqual(state.phase, phase)
+        }
     }
 
     func publishPending() async throws {
@@ -1696,11 +2021,14 @@ private final class ReplayTokenStore: ReceiverTokenStoring {
 }
 
 private final class ReplayEnvelopeIDs {
-    private var value: UInt8 = 0
+    private var value: UInt64 = 0
 
     func next() -> Data {
         value += 1
-        return Data(repeating: value, count: 16)
+        if value <= UInt64(UInt8.max) {
+            return Data(repeating: UInt8(value), count: 16)
+        }
+        return withUnsafeBytes(of: value.bigEndian) { Data($0) + Data(repeating: 0, count: 8) }
     }
 }
 

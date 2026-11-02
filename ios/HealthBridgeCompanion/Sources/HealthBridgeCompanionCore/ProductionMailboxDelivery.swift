@@ -805,29 +805,31 @@ public final class ProductionMailboxDelivery {
         receiverGeneration: String
     ) async throws -> FileOutboxDeliveryStateV1 {
         try Task.checkCancellation()
-        guard let publication = try coordinator.preparePublication(itemID: itemID) else {
-            return try coordinator.advance(itemID: itemID)
-        }
-        let result: DeliveryTransportResult
-        if let work = publication.work {
-            let freshness = try outbox.captureMailboxFreshness()
-            let outcome = await Task.detached { try work.publish() }.result
-            try await validatePublicationCompletion(
-                coordinator,
+        switch try coordinator.preparePublicationAdvance(itemID: itemID) {
+        case .advanced(let state):
+            return state
+        case .publication(let state, let work):
+            let result: DeliveryTransportResult
+            if let work {
+                let freshness = try outbox.captureMailboxFreshness()
+                let outcome = await Task.detached { try work.publish() }.result
+                try await validatePublicationCompletion(
+                    coordinator,
+                    itemID: itemID,
+                    components: components,
+                    receiverGeneration: receiverGeneration,
+                    freshness: freshness
+                )
+                result = try components.transport.publicationResult(outcome)
+            } else {
+                result = .retryable
+            }
+            return try coordinator.completePublication(
                 itemID: itemID,
-                components: components,
-                receiverGeneration: receiverGeneration,
-                freshness: freshness
+                current: state,
+                result: result
             )
-            result = try components.transport.publicationResult(outcome)
-        } else {
-            result = .retryable
         }
-        return try coordinator.completePublication(
-            itemID: itemID,
-            current: publication.state,
-            result: result
-        )
     }
 
     @MainActor

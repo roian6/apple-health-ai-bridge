@@ -1158,6 +1158,18 @@ public final class FileOutbox {
         try pendingItems(in: reconciledManifest())
     }
 
+    // Routing data for one synchronous operation, never authority for a mutation.
+    func readMailboxItem(
+        id: String
+    ) throws -> (state: FileOutboxDeliveryStateV1?, pendingItem: FileOutboxItem?) {
+        guard Self.isSafeItemID(id) else { return (nil, nil) }
+        let manifest = try reconciledManifest()
+        return (
+            manifest.entries.first(where: { $0.id == id })?.deliveryState,
+            try pendingItems(in: manifest).first(where: { $0.id == id })
+        )
+    }
+
     // Operation-local freshness, not an integrity proof or a manifest for mutation.
     // State, transport, CAS and finalization still perform their full validation.
     struct MailboxFreshnessSnapshot: Equatable {
