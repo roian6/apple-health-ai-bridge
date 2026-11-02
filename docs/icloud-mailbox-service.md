@@ -224,7 +224,7 @@ directory. Do not substitute an arbitrary or default container. The private
 database and HTML setup page belong in owner-only local directories, not in the
 iCloud mailbox.
 
-Every explicitly selected Mailbox `receiver create-pairing`, with or without
+On supported Macs, every selected Mailbox `receiver create-pairing`, with or without
 `--receiver-url`, and every Mailbox `receiver start` runs a helper-owned storage
 self-test. Create preflights before transport setup or invitation mutation;
 start preflights before key/connection-store creation or server bind. Direct
@@ -237,6 +237,13 @@ storage; the Receiver does not access that container or fall back to file
 handoff. The Receiver still needs access to its configured provider mailbox.
 The helper self-test does not resolve the provider and proves neither provider
 availability nor completed publication, cloud upload or iPhone receipt.
+
+The helper accepts one publication at a time. A concurrent call can fail
+retryably while that publication is active; the worker retains its request and
+retries on a later cycle. The CLI does not wait behind another publication. If
+a create-pairing preflight fails during that work, it has not created an
+invitation; retry the command after the active publication finishes. This is
+not a reason to reset an existing pairing or grant broader filesystem access.
 
 `helper_container_access_denied` means the helper returned a valid request-bound
 `storage_access_denied` result for its own private IO. It is not a TCC diagnosis.
@@ -438,7 +445,24 @@ installed Receiver/CLI version. Have the exact service executable, database,
 mailbox, and container values ready before removing the service configuration.
 Use the existing paths and identity unless you intend to reconfigure them.
 
-Verify the new helper assets before stopping the existing service:
+Stop the foreground receiver before updating its CLI environment. For an owned
+service, stop and remove it using the currently installed CLI first:
+
+```bash
+health-bridge mailbox service uninstall --json
+```
+
+Update the Receiver/CLI from the verified matching wheel before the first
+helper verification command:
+
+```bash
+: "${version:?Set the verified matching release version}"
+uv tool install --force "./apple_health_ai_bridge-${version}-py3-none-any.whl"
+```
+
+Only after that update succeeds, verify the new helper assets with the updated
+CLI. Verification rejects a helper whose release version differs from the
+installed CLI:
 
 ```bash
 health-bridge mailbox helper verify \
@@ -447,12 +471,11 @@ health-bridge mailbox helper verify \
   --json
 ```
 
-Then stop and remove the owned service, confirm the current helper is ready,
-retire that exact owned helper generation to quarantine, and install the
-verified helper from the same Receiver/CLI release:
+After verification succeeds, confirm the current helper is ready, retire that
+exact owned helper generation to quarantine, and install the verified helper
+from the same Receiver/CLI release:
 
 ```bash
-health-bridge mailbox service uninstall --json
 health-bridge mailbox helper status --json
 health-bridge mailbox helper uninstall --json
 health-bridge mailbox helper install \
@@ -462,10 +485,8 @@ health-bridge mailbox helper install \
 health-bridge mailbox helper status --json
 ```
 
-Update the Receiver/CLI to the matching verified release before helper
-verification and replacement. For a foreground receiver, stop it before
-`helper uninstall`, install the verified matching archive/manifest, check helper
-status, then restart the same command. No helper `upgrade` command exists.
+For a foreground receiver, check helper status before restarting the same
+command. No helper `upgrade` command exists.
 Continue only when helper status reports `{"code": "ready"}`. Then restore the
 service with the original or intentionally updated values; startup must pass
 the IPC discovery and helper-owned self-test:
