@@ -43,28 +43,59 @@ These versions use Batch Protocol `health_bridge.batch.v1` (1.0.0). Already usin
 
 Find your assistant's setup guide below.
 
+### AI chat apps
+
 <table width="100%">
 <tr>
-<td width="50%" align="center"><a href="docs/clients.md#antigravity-cli"><img src="assets/clients/antigravity.svg" alt="" width="24" height="24"><br>Antigravity CLI</a></td>
-<td width="50%" align="center"><a href="docs/clients.md#claude-code"><img src="assets/clients/claude-code-mark.svg" alt="" width="24" height="24"><br>Claude Code</a></td>
-</tr>
-<tr>
+<td width="50%" align="center"><a href="docs/clients.md#chatgpt-desktop"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"><br>ChatGPT Desktop</a></td>
 <td width="50%" align="center"><a href="docs/clients.md#claude-desktop"><img src="assets/clients/claude-desktop-mark.svg" alt="" width="24" height="24"><br>Claude Desktop</a></td>
-<td width="50%" align="center"><a href="docs/clients.md#codex-cli"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"><br>Codex CLI</a></td>
 </tr>
 <tr>
-<td width="50%" align="center"><a href="docs/clients.md#cursor"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/cursor-cube-2d-dark.svg"><img src="assets/clients/cursor-cube-2d-light.svg" alt="" width="21" height="24"></picture><br>Cursor</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#lm-studio"><img src="assets/clients/lm-studio.svg" alt="" width="24" height="24"><br>LM Studio</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#cherry-studio"><img src="assets/clients/cherry-studio.svg" alt="" height="24"><br>Cherry Studio</a></td>
+</tr>
+</table>
+
+### Agents & harnesses
+
+<table width="100%">
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#openclaw-manual-configuration"><img src="assets/clients/openclaw.svg" alt="" width="24" height="24"><br>OpenClaw</a></td>
 <td width="50%" align="center"><a href="docs/clients.md#hermes-agent"><img src="assets/clients/hermes-agent.svg" alt="" width="24" height="24"><br>Hermes Agent</a></td>
 </tr>
 <tr>
-<td width="50%" align="center"><a href="docs/clients.md#openclaw-manual-configuration"><img src="assets/clients/openclaw.svg" alt="" width="24" height="24"><br>OpenClaw</a></td>
-<td width="50%" align="center"><a href="docs/clients.md#opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/opencode-logo-dark.svg"><img src="assets/clients/opencode-logo-light.svg" alt="" width="19" height="24"></picture><br>OpenCode</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#goose"><img src="assets/clients/goose.svg" alt="" width="24" height="24"><br>Goose</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#pi"><img src="assets/clients/pi.svg" alt="" width="24" height="24"><br>Pi</a></td>
+</tr>
+</table>
+
+### Coding agents & developer tools
+
+<table width="100%">
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#claude-code"><img src="assets/clients/claude-code-mark.svg" alt="" width="24" height="24"><br>Claude Code</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#codex-cli"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"><br>Codex CLI</a></td>
+</tr>
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#github-copilot-cli"><img src="assets/clients/github-copilot.svg" alt="" width="24" height="24"><br>GitHub Copilot CLI</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#cursor"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/cursor-cube-2d-dark.svg"><img src="assets/clients/cursor-cube-2d-light.svg" alt="" width="21" height="24"></picture><br>Cursor</a></td>
 </tr>
 <tr>
 <td width="50%" align="center"><a href="docs/clients.md#vs-code-local-format"><img src="assets/clients/vscode.svg" alt="" width="24" height="24"><br>Visual Studio Code</a></td>
-<td width="50%" align="center"><a href="docs/setup.md#connect-an-mcp-client-intentionally">And more</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#warp"><img src="assets/clients/warp.svg" alt="" width="24" height="24"><br>Warp</a></td>
+</tr>
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#antigravity-cli"><img src="assets/clients/antigravity.svg" alt="" width="24" height="24"><br>Antigravity CLI</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/opencode-logo-dark.svg"><img src="assets/clients/opencode-logo-light.svg" alt="" width="19" height="24"></picture><br>OpenCode</a></td>
+</tr>
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#amp"><img src="assets/clients/amp.svg" alt="" width="24" height="24"><br>Amp</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#factory-droid"><img src="assets/clients/factory-droid.svg" alt="" width="24" height="24"><br>Factory Droid</a></td>
 </tr>
 </table>
+
+[Other local MCP clients](docs/setup.md#connect-an-mcp-client-intentionally) can
+use the same read-only server when their configuration supports local stdio.
 
 ## Supported data
 
