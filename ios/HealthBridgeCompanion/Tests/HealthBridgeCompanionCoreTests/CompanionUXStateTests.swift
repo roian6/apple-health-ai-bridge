@@ -126,7 +126,7 @@ final class CompanionUXStateTests: XCTestCase {
         )
         XCTAssertEqual(
             CompanionPrimaryStatusMessage.sanitized(from: "HealthKit returned no anchored step-count payload. Nothing sent.", isError: false),
-            "No new data to send"
+            "No readable records returned"
         )
         XCTAssertEqual(
             CompanionPrimaryStatusMessage.sanitized(from: "Opening Apple Health permissions...", isError: false),
@@ -188,14 +188,12 @@ final class CompanionUXStateTests: XCTestCase {
             CompanionPrimaryStatusMessage.sanitized(from: "Cleared 2 queued upload(s). This only removes unsent local retry data.", isError: false),
             "Cleared queued uploads. Only unsent local retry data was removed."
         )
-        XCTAssertEqual(
-            CompanionPrimaryStatusMessage.sanitized(from: "Queued uploads sent: 5. Remaining: 0.", isError: false),
-            "Queued uploads sent: 5. Remaining: 0."
+        let queuedUploadCopy = CompanionPrimaryStatusMessage.sanitized(
+            from: "Queued uploads sent: 5. Remaining: 0.",
+            isError: false
         )
-        XCTAssertNotEqual(
-            CompanionPrimaryStatusMessage.sanitized(from: "Queued uploads sent: 5. Remaining: 0.", isError: false),
-            "Queued uploads updated"
-        )
+        XCTAssertFalse(queuedUploadCopy.contains("5"))
+        XCTAssertFalse(queuedUploadCopy.contains("0"))
         XCTAssertEqual(
             CompanionPrimaryStatusMessage.sanitized(from: "Sync stopped: Health Bridge returned an error. | domain=ReceiverClientError | code=http_401 | HTTP 401", isError: true),
             "Connection key was rejected (HTTP 401). Reconnect from a fresh setup link."
@@ -216,6 +214,29 @@ final class CompanionUXStateTests: XCTestCase {
             CompanionPrimaryStatusMessage.sanitized(from: "Sync stopped: Sleep sync failed: HealthKit query failed unexpectedly", isError: true),
             "Apple Health Sleep sync failed. Review permissions or unlock this iPhone, then retry."
         )
+    }
+
+    func testQueuedUploadActivityDoesNotExposeAppendedConnectionDetails() {
+        let rawMessage = "Queued uploads sent: 5. Remaining: 0."
+        let privateDetails = [
+            "https://synthetic-receiver.invalid/private?token=synthetic-secret",
+            "synthetic-bearer-token",
+        ]
+        let adversarialMessage = rawMessage + " " + privateDetails.joined(separator: " ")
+
+        let sanitized = CompanionPrimaryStatusMessage.sanitized(
+            from: adversarialMessage,
+            isError: false
+        )
+
+        XCTAssertFalse(sanitized.isEmpty)
+        XCTAssertEqual(
+            sanitized,
+            CompanionPrimaryStatusMessage.sanitized(from: rawMessage, isError: false)
+        )
+        for detail in privateDetails {
+            XCTAssertFalse(sanitized.contains(detail))
+        }
     }
 
     func testMailboxPreflightStatusPreservesExactSecretFreeFailureClass() {

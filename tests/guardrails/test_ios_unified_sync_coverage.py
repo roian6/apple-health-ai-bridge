@@ -207,11 +207,12 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
 
 def test_ui_describes_one_supported_automatic_sync_scope() -> None:
     content = CONTENT_VIEW.read_text()
+    diagnostics = CONTENT_VIEW.with_name("ActivityDiagnosticsView.swift").read_text()
     ux_state = UX_STATE.read_text()
 
     assert "CompanionAutomaticSyncCoveragePresentation" in ux_state
     assert "viewModel.automaticSyncScopeSummary" in content
-    assert "viewModel.automaticSyncCoverageDetail" in content
+    assert "viewModel.automaticSyncCoverageDetail" in diagnostics
     assert "Best-effort only. iOS decides timing; use Sync Now" not in content
     assert "Sync Now only" not in content
 

@@ -12,6 +12,11 @@ final class NutritionReceiver: @unchecked Sendable {
     private var recordsValue: [String: HealthBridgeSample] = [:]
     private var workoutsValue: [String: HealthBridgeWorkout] = [:]
     private var credentialsValue: [String] = []
+    private var responseProbeValue: NutritionCodecProbe?
+    var responseProbe: NutritionCodecProbe? {
+        get { lock.withLock { responseProbeValue } }
+        set { lock.withLock { responseProbeValue = newValue } }
+    }
     var capability: Capability {
         get { lock.withLock { capabilityValue } }
         set { lock.withLock { capabilityValue = newValue } }
@@ -81,6 +86,7 @@ final class NutritionURLProtocol: URLProtocol, @unchecked Sendable {
             }
             let receiver = try XCTUnwrap(Self.receiver)
             let (status, data) = try receiver.respond(request, body: body)
+            if body != nil { receiver.responseProbe?.record() }
             let response = try XCTUnwrap(HTTPURLResponse(
                 url: try XCTUnwrap(request.url), statusCode: status, httpVersion: nil,
                 headerFields: ["Content-Type": "application/json", "Cache-Control": "no-store"]
@@ -108,6 +114,7 @@ final class NutritionFixture {
     let anchor: String
     var values: [String: Double] = ["weight": 70, "dietary_protein": 12]
     var reads: [String] = []
+    lazy var acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
     private var ids: [String: UUID] = [:]
 
     init(directPairing: Bool = true) throws {
@@ -151,6 +158,7 @@ final class NutritionFixture {
             historicalBackfillStateStore: HealthHistoricalBackfillStateStore(userDefaults: defaults),
             quantityObservationStore: QuantityObservationStore(userDefaults: defaults),
             coreLaneUploadProofStore: CoreLaneUploadProofStore(userDefaults: defaults),
+            acceptedTransferStore: acceptedTransferStore,
             outbox: outbox, outboxDirectoryURL: outbox.directoryURL,
             cursorStore: cursors, cursorStoreFileURL: cursors.fileURL,
             sleepManifestStore: try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json")),

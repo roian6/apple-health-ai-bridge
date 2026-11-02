@@ -26,6 +26,22 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     static let cancellationCompletionTimeout: TimeInterval = 5
     static let maximumResponseBodyBytes = 65_536
 
+    private let receiverSettingsStore: ReceiverSettingsStore
+    private let acceptedTransferStore: LastAcceptedTransferObservationStore
+
+    init(
+        receiverSettingsStore: ReceiverSettingsStore = ReceiverSettingsStore(),
+        acceptedTransferStore: LastAcceptedTransferObservationStore = LastAcceptedTransferObservationStore(),
+        taskOwnershipStore: FileBackgroundUploadTaskOwnershipStore? = nil
+    ) {
+        self.receiverSettingsStore = receiverSettingsStore
+        self.acceptedTransferStore = acceptedTransferStore
+        super.init()
+        if let taskOwnershipStore {
+            self.taskOwnershipStore = taskOwnershipStore
+        }
+    }
+
     private let stateLock = NSLock()
     private let cancellationBarrier = AsyncCompletionBarrier<Int>()
     private let legacyCancellationBarrier = AsyncCompletionBarrier<Int>()
@@ -940,7 +956,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         }
         do {
             let outbox = try FileOutbox(directory: outboxDirectory)
-            let settingsStore = ReceiverSettingsStore()
+            let settingsStore = receiverSettingsStore
             let receiverURL = settingsStore.receiverURLString
             let validate = { @MainActor in
                 try Task.checkCancellation()
@@ -951,6 +967,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     throw CancellationError()
                 }
             }
+            var newlyAccepted = false
             let outcome = try await DirectUploadFinalizer.finishForSync(
                 descriptor: descriptor,
                 completion: completion,
@@ -973,7 +990,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     )
                 },
                 retire: { itemID, receiverBindingID in
-                    _ = try await self.directCursorFinalizer(outbox: outbox)
+                    newlyAccepted = try await self.directCursorFinalizer(outbox: outbox)
                         .recordDirectReceiverAcceptanceForSync(
                             itemID: itemID,
                             receiverBindingID: receiverBindingID,
@@ -985,6 +1002,16 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             )
             if outcome == .retained {
                 outbox.noteDiagnosticDelivery(itemID: descriptor.itemID, outcome: .failed)
+            } else if outcome == .retired,
+                      newlyAccepted,
+                      settingsStore.receiverSettingsGenerationToken == descriptor.receiverGeneration,
+                      settingsStore.receiverBindingID == descriptor.receiverBindingID {
+                acceptedTransferStore.record(LastAcceptedTransferObservation(
+                    bindingID: descriptor.receiverBindingID,
+                    generation: descriptor.receiverGeneration,
+                    observedAt: Date(),
+                    evidenceKind: .directResponse
+                ))
             }
             return outcome
         } catch {
