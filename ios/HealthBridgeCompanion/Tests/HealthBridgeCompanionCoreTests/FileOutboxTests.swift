@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import XCTest
 @testable import HealthBridgeCompanionCore
 
@@ -50,25 +51,190 @@ final class FileOutboxTests: XCTestCase {
     }
 
     func testFullyStagedSequenceRecoversAllItemsAfterCrashWindow() throws {
+        for halfApplied in [false, true] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let interrupted = try FileOutbox(directory: directory)
+            let fixture = RecoveryDiskFixture(directory: directory)
+            try fixture.writeManifest(
+                entries: halfApplied ? [fixture.entries[0]] : [],
+                nextSequence: halfApplied ? 2 : 1
+            )
+            var binding: FileOutboxMailboxBindingV1?
+            if halfApplied {
+                try fixture.payloads[0].write(to: fixture.payloadURL(0))
+                binding = try interrupted.finalizeMailboxEnvelope(
+                    itemID: fixture.ids[0],
+                    envelope: Data("synthetic-half-applied-envelope".utf8),
+                    expectedPayloadSHA256: SHA256.hash(data: fixture.payloads[0])
+                        .map { String(format: "%02x", $0) }.joined()
+                )
+            }
+            try fixture.writeJournal(retained: [0, 2])
+            for index in fixture.entries.indices {
+                try fixture.payloads[index].write(to: fixture.payloadURL(
+                    index,
+                    staged: !halfApplied || index != 0
+                ))
+            }
+
+            let pending = try interrupted.pendingItems()
+
+            XCTAssertEqual(pending.map(\.id), fixture.ids)
+            XCTAssertEqual(try pending.map { try Data(contentsOf: $0.fileURL) }, fixture.payloads)
+            XCTAssertEqual(pending.map(\.receiverIdentity), Array(repeating: "receiver-a", count: 3))
+            XCTAssertEqual(pending[0].mailboxBinding, binding)
+            try fixture.assertProjectionMetadata()
+            for index in fixture.entries.indices {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.payloadURL(index, staged: true).path))
+            }
+            XCTAssertEqual(try fixture.journalTransactions().count, 2)
+            let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+            let manifestBytes = try Data(contentsOf: manifestURL)
+            let journalBytes = try Data(contentsOf: fixture.journalURL)
+            let heldManifest = try FileHandle(forReadingFrom: manifestURL)
+            defer { try? heldManifest.close() }
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            XCTAssertEqual(try interrupted.pendingItems().map(\.id), fixture.ids)
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+            let reopened = try FileOutbox(directory: directory)
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            XCTAssertEqual(try reopened.pendingItems().map(\.id), fixture.ids)
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+            let next = try reopened.enqueue(Data("four".utf8), receiverIdentity: "receiver-a")
+            XCTAssertTrue(next.id.hasPrefix("00000000000000000004-"))
+        }
+    }
+
+    func testAppliedRetainedTransactionsPreserveManifestIdentityAndFinalizationAcrossQueriesAndReopen() throws {
         let directory = temporaryOutboxDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let payloads = [Data("one".utf8), Data("two".utf8)]
-        let interrupted = try FileOutbox(directory: directory)
-        try interrupted.stageEnqueueSequenceForTesting(
-            payloads,
-            receiverIdentity: "receiver-a",
-            stagedPayloadCount: payloads.count
+        let outbox = try FileOutbox(directory: directory)
+        let fixture = RecoveryDiskFixture(directory: directory)
+        try fixture.writeManifest(entries: fixture.entries, nextSequence: 4)
+        try fixture.writeJournal(retained: [0, 1, 2])
+        for index in fixture.entries.indices {
+            try fixture.payloads[index].write(to: fixture.payloadURL(index))
+        }
+        // Mailbox state advances independently of the retained collection identity.
+        let binding = try outbox.finalizeMailboxEnvelope(
+            itemID: fixture.ids[1],
+            envelope: Data("synthetic-envelope".utf8),
+            expectedPayloadSHA256: SHA256.hash(data: fixture.payloads[1])
+                .map { String(format: "%02x", $0) }.joined()
         )
+        _ = try outbox.pendingItems()
+        let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+        let manifestBytes = try Data(contentsOf: manifestURL)
+        let journalBytes = try Data(contentsOf: fixture.journalURL)
+        let heldManifest = try FileHandle(forReadingFrom: manifestURL)
+        defer { try? heldManifest.close() }
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+        try fixture.assertProjectionMetadata()
 
-        let recovered = try FileOutbox(directory: directory)
-        let pending = try recovered.pendingItems()
+        for reopen in [false, false, true] {
+            let current = try reopen ? FileOutbox(directory: directory) : outbox
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            let pending = try current.pendingItems()
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            XCTAssertEqual(pending.map(\.id), fixture.ids)
+            XCTAssertEqual(try pending.map { try Data(contentsOf: $0.fileURL) }, fixture.payloads)
+            XCTAssertEqual(pending[1].mailboxBinding, binding)
+            XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+            XCTAssertEqual(try current.pendingCursorCheckpoint()?.cursorValue, "synthetic-anchor-1")
+            try assertManifestIdentity(heldManifest, at: manifestURL)
+            for generation in 1 ... 3 {
+                XCTAssertTrue(try current.hasPendingGenerationRetirement(typeCode: "heart_rate", generation: generation))
+                try assertManifestIdentity(heldManifest, at: manifestURL)
+            }
+            XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+        }
+    }
 
-        XCTAssertEqual(pending.count, 2)
-        XCTAssertEqual(
-            try pending.map { try Data(contentsOf: $0.fileURL) },
-            payloads
-        )
-        XCTAssertEqual(pending.map(\.receiverIdentity), ["receiver-a", "receiver-a"])
+    func testAppliedOrdinaryTransactionsPruneWithoutReplacingDurableManifest() throws {
+        let directory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outbox = try FileOutbox(directory: directory)
+        let fixture = RecoveryDiskFixture(directory: directory)
+        try fixture.writeManifest(entries: fixture.entries, nextSequence: 4)
+        try fixture.writeJournal(retained: [])
+        for index in fixture.entries.indices {
+            try fixture.payloads[index].write(to: fixture.payloadURL(index))
+        }
+        let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+        let manifestBytes = try Data(contentsOf: manifestURL)
+        let heldManifest = try FileHandle(forReadingFrom: manifestURL)
+        defer { try? heldManifest.close() }
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+
+        let pending = try outbox.pendingItems()
+
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+        XCTAssertEqual(pending.map(\.id), fixture.ids)
+        XCTAssertEqual(try pending.map { try Data(contentsOf: $0.fileURL) }, fixture.payloads)
+        XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.journalURL.path))
+        let reopened = try FileOutbox(directory: directory)
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+        XCTAssertEqual(try reopened.pendingItems().map(\.id), fixture.ids)
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+    }
+
+    func testRecoveryFileFailuresKeepJournalRetryableAndPruneAfterDurableManifest() throws {
+        for failMove in [true, false] {
+            for singleTransaction in [true, false] {
+                let directory = temporaryOutboxDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let fixture = RecoveryDiskFixture(directory: directory)
+                let manager = RecoveryFaultFileManager(
+                    failingMove: failMove ? fixture.payloadURL(1, staged: true) : nil,
+                    failingRemoval: failMove ? nil : fixture.journalURL
+                )
+                let outbox = try FileOutbox(directory: directory, fileManager: manager)
+                try fixture.writeManifest(entries: [], nextSequence: 1)
+                try fixture.writeJournal(retained: [], singleTransaction: singleTransaction)
+                for index in fixture.entries.indices {
+                    try fixture.payloads[index].write(to: fixture.payloadURL(index, staged: true))
+                }
+                let journalBytes = try Data(contentsOf: fixture.journalURL)
+                let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+                let initialManifest = try Data(contentsOf: manifestURL)
+
+                XCTAssertThrowsError(try outbox.pendingItems()) {
+                    XCTAssertEqual(($0 as? CocoaError)?.code, .fileWriteUnknown)
+                }
+
+                XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+                XCTAssertEqual(try Data(contentsOf: fixture.payloadURL(0)), fixture.payloads[0])
+                if failMove {
+                    XCTAssertEqual(try Data(contentsOf: manifestURL), initialManifest)
+                    XCTAssertEqual(try Data(contentsOf: fixture.payloadURL(1, staged: true)), fixture.payloads[1])
+                }
+                let durableManifest = try Data(contentsOf: manifestURL)
+                let heldManifest = try FileHandle(forReadingFrom: manifestURL)
+                defer { try? heldManifest.close() }
+                try assertManifestIdentity(heldManifest, at: manifestURL)
+                let reopened = try FileOutbox(directory: directory)
+                if !failMove {
+                    try assertManifestIdentity(heldManifest, at: manifestURL)
+                    XCTAssertEqual(try Data(contentsOf: manifestURL), durableManifest)
+                }
+                let pending = try reopened.pendingItems()
+                if !failMove { try assertManifestIdentity(heldManifest, at: manifestURL) }
+                XCTAssertEqual(pending.map(\.id), fixture.ids)
+                XCTAssertEqual(try pending.map { try Data(contentsOf: $0.fileURL) }, fixture.payloads)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.journalURL.path))
+                for index in fixture.entries.indices {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.payloadURL(index, staged: true).path))
+                }
+            }
+        }
     }
 
     func testDirectAcknowledgmentsSurviveRelaunchAndFinalizeCursorAfterWholeSequence() throws {
@@ -86,11 +252,14 @@ final class FileOutboxTests: XCTestCase {
             coreLaneUploadProof: .steps
         )
         let initial = try FileOutbox(directory: directory)
-        let items = try initial.enqueueSequence(
+        XCTAssertTrue(try initial.pendingItems().isEmpty)
+        let producer = try FileOutbox(directory: directory)
+        let items = try producer.enqueueSequence(
             [Data("one".utf8), Data("two".utf8)],
             receiverIdentity: "receiver-a",
             cursorCheckpoint: checkpoint
         )
+        XCTAssertEqual(try initial.pendingItems().map(\.id), items.map(\.id))
 
         let cursorStore = try FileSyncCursorStore(fileURL: cursorFile)
         let firstLaunch = try FileOutbox(directory: directory)
@@ -106,11 +275,19 @@ final class FileOutboxTests: XCTestCase {
             itemID: items[0].id,
             receiverBindingID: "receiver-a"
         ))
+        let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+        let heldManifest = try FileHandle(forReadingFrom: manifestURL)
+        defer { try? heldManifest.close() }
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+        XCTAssertEqual(try initial.pendingItems().map(\.id), [items[1].id])
+        try assertManifestIdentity(heldManifest, at: manifestURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: items[0].fileURL.path))
         XCTAssertEqual(
             try FileOutbox(directory: directory)
                 .uploadablePendingItems(for: "receiver-a").map(\.id),
             [items[1].id]
         )
+        try assertManifestIdentity(heldManifest, at: manifestURL)
 
         let secondLaunch = try FileOutbox(directory: directory)
         let secondFinalizer = OutboxDeliveryCursorFinalizer(
@@ -139,6 +316,8 @@ final class FileOutboxTests: XCTestCase {
         )
         XCTAssertNil(try readyLaunch.pendingCursorCheckpoint())
         XCTAssertTrue(try FileOutbox(directory: directory).pendingItems().isEmpty)
+        XCTAssertTrue(try initial.pendingItems().isEmpty)
+        XCTAssertNil(try initial.pendingCursorCheckpoint())
     }
 
     func testLegacySingleTransactionMigratesWithoutDiscardingItsCheckpoint() throws {
@@ -264,25 +443,58 @@ final class FileOutboxTests: XCTestCase {
     }
 
     func testPartiallyStagedSequenceRollsBackAllItemsAfterCrashWindow() throws {
-        let directory = temporaryOutboxDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let payloads = [Data("one".utf8), Data("two".utf8)]
-        let interrupted = try FileOutbox(directory: directory)
-        try interrupted.stageEnqueueSequenceForTesting(
-            payloads,
-            receiverIdentity: "receiver-a",
-            stagedPayloadCount: 1
-        )
+        for acceptance in ["none", "direct", "finalized"] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let interrupted = try FileOutbox(directory: directory)
+            let fixture = RecoveryDiskFixture(directory: directory)
+            try fixture.writeManifest(entries: [], nextSequence: 1)
+            if acceptance == "finalized" {
+                try fixture.writeCommittedManifest()
+            }
+            try fixture.writeJournal(
+                retained: [0], singleTransaction: true,
+                acknowledgedIDs: acceptance == "direct" ? [fixture.ids[0]] : []
+            )
+            if acceptance != "finalized" {
+                try fixture.payloads[0].write(to: fixture.payloadURL(0, staged: true))
+            }
+            let journalBytes = try Data(contentsOf: fixture.journalURL)
 
-        let recovered = try FileOutbox(directory: directory)
-        let children = try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        )
+            if acceptance != "none" {
+                XCTAssertThrowsError(try interrupted.pendingItems()) {
+                    XCTAssertEqual($0 as? FileOutboxCursorCheckpointError, .pendingCommit)
+                }
+                XCTAssertThrowsError(try FileOutbox(directory: directory)) {
+                    XCTAssertEqual($0 as? FileOutboxCursorCheckpointError, .pendingCommit)
+                }
+                XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+                if acceptance == "direct" {
+                    XCTAssertEqual(try Data(contentsOf: fixture.payloadURL(0, staged: true)), fixture.payloads[0])
+                } else {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.payloadURL(0).path))
+                    for index in 1 ... 2 {
+                        try fixture.payloads[index].write(to: fixture.payloadURL(index, staged: true))
+                    }
+                    let recovered = try FileOutbox(directory: directory)
+                    XCTAssertEqual(try recovered.pendingItems().map(\.id), Array(fixture.ids.dropFirst()))
+                    XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.payloadURL(0).path))
+                }
+            } else {
+                XCTAssertTrue(try interrupted.pendingItems().isEmpty)
+                let recovered = try FileOutbox(directory: directory)
+                XCTAssertTrue(try recovered.pendingItems().isEmpty)
+                let children = try FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: nil
+                )
 
-        XCTAssertTrue(try recovered.pendingItems().isEmpty)
-        XCTAssertFalse(children.contains { $0.pathExtension == "staged" })
-        XCTAssertFalse(children.contains { $0.lastPathComponent == ".enqueue-transaction" })
+                XCTAssertFalse(children.contains { $0.pathExtension == "staged" })
+                XCTAssertFalse(children.contains { $0.pathExtension == "json" })
+                XCTAssertFalse(children.contains { $0.lastPathComponent == ".enqueue-transaction" })
+            }
+        }
     }
 
     func testDurablePayloadAccountingStopsAfterPartialOrUninspectableEnqueue() {
@@ -436,6 +648,22 @@ final class FileOutboxTests: XCTestCase {
 
         XCTAssertThrowsError(try outbox.enqueueForTesting(Data("must-not-publish".utf8)))
         XCTAssertTrue(try payloadFileURLs(in: directory).isEmpty)
+
+        let collisionDirectory = temporaryOutboxDirectory()
+        defer { try? FileManager.default.removeItem(at: collisionDirectory) }
+        let collisionOutbox = try FileOutbox(directory: collisionDirectory)
+        let fixture = RecoveryDiskFixture(directory: collisionDirectory)
+        var existing = fixture.entries[0]
+        existing["id"] = "different-synthetic-id"
+        try fixture.writeManifest(entries: [existing], nextSequence: 2)
+        try fixture.payloads[0].write(to: collisionDirectory.appendingPathComponent("different-synthetic-id.json"))
+        try fixture.writeJournal(retained: [])
+        for index in fixture.entries.indices {
+            try fixture.payloads[index].write(to: fixture.payloadURL(index, staged: true))
+        }
+        let journal = try Data(contentsOf: fixture.journalURL)
+        XCTAssertThrowsError(try collisionOutbox.pendingItems())
+        XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journal)
     }
 
     func testVersionOneManifestMigratesToReceiverScopedVersionTwo() throws {
@@ -707,6 +935,20 @@ final class FileOutboxTests: XCTestCase {
         XCTAssertNoThrow(
             try restarted.enqueue(Data("new".utf8), receiverIdentity: receiverIdentity)
         )
+        _ = try restarted.clearPending()
+
+        let fixture = RecoveryDiskFixture(directory: directory)
+        try fixture.writeManifest(entries: fixture.entries, nextSequence: 4)
+        try fixture.writeJournal(retained: [0, 1, 2])
+        for index in fixture.entries.indices {
+            try fixture.payloads[index].write(to: fixture.payloadURL(index))
+        }
+        try restarted.beginClearIntent()
+        XCTAssertTrue(try restarted.pendingItems().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.journalURL.path))
+        XCTAssertTrue(restarted.clearIntentIsActive)
+        try restarted.finishClearIntent()
+        XCTAssertTrue(try FileOutbox(directory: directory).pendingItems().isEmpty)
     }
 
     func testClearPendingRemovesQueuedPayloads() throws {
@@ -1567,6 +1809,154 @@ private func temporaryOutboxDirectory() -> URL {
     FileManager.default.temporaryDirectory
         .appendingPathComponent("HealthBridgeOutboxTests")
         .appendingPathComponent(UUID().uuidString)
+}
+
+private func assertManifestIdentity(
+    _ handle: FileHandle,
+    at url: URL,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws {
+    var held = stat()
+    var current = stat()
+    XCTAssertEqual(fstat(handle.fileDescriptor, &held), 0, file: file, line: line)
+    XCTAssertEqual(lstat(url.path, &current), 0, file: file, line: line)
+    XCTAssertEqual(current.st_dev, held.st_dev, "Manifest device changed", file: file, line: line)
+    XCTAssertEqual(current.st_ino, held.st_ino, "Unchanged recovery atomically replaced the manifest", file: file, line: line)
+}
+
+private struct RecoveryDiskFixture {
+    let directory: URL
+    let payloads = ["one", "two", "three"].map { Data($0.utf8) }
+    let ids = (1 ... 3).map { String(format: "%020d-synthetic", $0) }
+
+    var entries: [[String: Any]] {
+        ids.enumerated().map {
+            ["id": $0.element, "sequence": $0.offset + 1,
+             "receiverIdentity": "receiver-a", "nutritionOrderingVersion": 1]
+        }
+    }
+
+    var journalURL: URL { directory.appendingPathComponent(".enqueue-transaction") }
+
+    func payloadURL(_ index: Int, staged: Bool = false) -> URL {
+        directory.appendingPathComponent(ids[index])
+            .appendingPathExtension(staged ? "staged" : "json")
+    }
+
+    var projectionMetadata: [String: Any] {
+        let interval: [String: Any] = ["start": 10, "end": 20]
+        let repair: [String: Any] = ["start": 30, "end": 40, "sequence": 1]
+        return [
+            "observationNamespace": "synthetic-namespace",
+            "projectionIntervals": ["synthetic-interval": interval],
+            "projectionHistory": ["synthetic-history": 50],
+            "projectionRepairs": ["synthetic-repair": [repair]],
+            "projectionCompleted": ["synthetic-completed": [repair]],
+        ]
+    }
+
+    func writeManifest(entries: [[String: Any]], nextSequence: Int) throws {
+        var manifest = projectionMetadata
+        manifest["version"] = 3
+        manifest["nextSequence"] = nextSequence
+        manifest["entries"] = entries
+        try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            .write(to: directory.appendingPathComponent(".fifo-sequence"))
+    }
+
+    func writeCommittedManifest() throws {
+        let digest = String(repeating: "a", count: 64)
+        let identifier = Data(repeating: 1, count: 16).base64EncodedString()
+        var entry = entries[0]
+        entry["mailboxBinding"] = [
+            "payloadSHA256": digest, "envelopeSHA256": digest,
+            "envelopeFilename": "\(ids[0]).hbe",
+        ]
+        entry["deliveryState"] = [
+            "version": 1, "phase": "committedFinalized",
+            "ownership": [
+                "receiverGeneration": "synthetic-generation", "receiverBindingID": "receiver-a",
+                "connectionGeneration": 1, "receiverID": identifier, "deviceID": identifier,
+                "deviceAgreementKeyID": "synthetic-agreement", "deviceSigningKeyID": "synthetic-signing",
+                "receiverAgreementKeyID": "synthetic-agreement", "receiverSigningKeyID": "synthetic-signing",
+            ],
+            "committedReceipt": [
+                "envelopeID": identifier, "payloadSHA256": digest, "receiptID": 1,
+                "datasetGeneration": 1, "committedAtMS": 1,
+            ],
+        ] as [String: Any]
+        var manifest = projectionMetadata
+        manifest["version"] = 4
+        manifest["nextSequence"] = 4
+        manifest["entries"] = [entry]
+        try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            .write(to: directory.appendingPathComponent(".fifo-sequence"))
+    }
+
+    func assertProjectionMetadata(file: StaticString = #filePath, line: UInt = #line) throws {
+        let manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(
+            contentsOf: directory.appendingPathComponent(".fifo-sequence")
+        )) as? [String: Any], file: file, line: line)
+        XCTAssertEqual(
+            try JSONSerialization.data(withJSONObject: manifest.filter { projectionMetadata.keys.contains($0.key) }, options: [.sortedKeys]),
+            try JSONSerialization.data(withJSONObject: projectionMetadata, options: [.sortedKeys]),
+            file: file, line: line
+        )
+    }
+
+    func writeJournal(
+        retained: Set<Int>,
+        singleTransaction: Bool = false,
+        acknowledgedIDs: [String] = []
+    ) throws {
+        let transactions: [[String: Any]] = entries.enumerated().compactMap { index, entry in
+            if singleTransaction && index > 0 { return nil }
+            var transaction: [String: Any] = ["version": 1, "entries": [entry]]
+            if singleTransaction { transaction["entries"] = entries }
+            if !acknowledgedIDs.isEmpty { transaction["directAcknowledgedItemIDs"] = acknowledgedIDs }
+            if retained.contains(index) {
+                transaction["cursorCheckpoint"] = [
+                    "receiverIdentity": "receiver-a", "sourceKey": "synthetic-source",
+                    "cursorKind": "synthetic-anchor", "cursorValue": "synthetic-anchor-\(index + 1)",
+                ]
+                transaction["pendingGenerationRetirements"] = ["heart_rate": index + 1]
+                transaction["stepsRawAndDailyCoverage"] = true
+            }
+            return transaction
+        }
+        try JSONSerialization.data(withJSONObject: [
+            "version": 2, "transactions": transactions,
+        ], options: [.sortedKeys]).write(to: journalURL)
+    }
+
+    func journalTransactions() throws -> [[String: Any]] {
+        let journal = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: journalURL)
+        ) as? [String: Any])
+        return try XCTUnwrap(journal["transactions"] as? [[String: Any]])
+    }
+}
+
+private final class RecoveryFaultFileManager: FileManager, Sendable {
+    let failingMove: URL?
+    let failingRemoval: URL?
+
+    init(failingMove: URL?, failingRemoval: URL?) {
+        self.failingMove = failingMove
+        self.failingRemoval = failingRemoval
+        super.init()
+    }
+
+    override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+        if srcURL == failingMove { throw CocoaError(.fileWriteUnknown) }
+        try super.moveItem(at: srcURL, to: dstURL)
+    }
+
+    override func removeItem(at url: URL) throws {
+        if url == failingRemoval { throw CocoaError(.fileWriteUnknown) }
+        try super.removeItem(at: url)
+    }
 }
 
 private func payloadFileURLs(in directory: URL) throws -> [URL] {
