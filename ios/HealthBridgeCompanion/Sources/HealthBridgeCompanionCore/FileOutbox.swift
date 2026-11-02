@@ -2591,8 +2591,6 @@ public final class FileOutbox {
     }
 
     private func recoverEnqueueTransactionsIfNeeded() throws {
-        // A terminal request closes admission without authorizing journal mutation.
-        guard !terminalResetRequestIsActive else { return }
         let transactions = try loadEnqueueTransactions()
         guard !transactions.isEmpty else { return }
         let loadedManifest = try loadManifest()
@@ -2728,6 +2726,10 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        // Hold all recovery, including orphan adoption, until terminal reset proceeds.
+        if terminalResetRequestIsActive {
+            return try loadManifest() ?? .empty
+        }
         try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()

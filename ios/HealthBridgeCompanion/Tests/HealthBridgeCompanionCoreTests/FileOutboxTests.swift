@@ -110,32 +110,39 @@ final class FileOutboxTests: XCTestCase {
         }
     }
 
-    func testTerminalResetRequestPreservesStagedJournalDuringPendingQuery() throws {
-        let directory = temporaryOutboxDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        _ = try FileOutbox(directory: directory)
-        let fixture = RecoveryDiskFixture(directory: directory)
-        try fixture.writeManifest(entries: [], nextSequence: 4)
-        try fixture.writeJournal(retained: [])
-        for index in fixture.entries.indices {
-            try fixture.payloads[index].write(to: fixture.payloadURL(index, staged: true))
-        }
-        let manifestURL = directory.appendingPathComponent(".fifo-sequence")
-        let manifestBytes = try Data(contentsOf: manifestURL)
-        let journalBytes = try Data(contentsOf: fixture.journalURL)
-        try FileOutbox.beginTerminalResetRequest(directory: directory)
-        let reopened = try FileOutbox(directory: directory)
+    func testTerminalResetRequestPreservesInterruptedJournalDuringPendingQuery() throws {
+        for firstPayloadIsFinal in [false, true] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            _ = try FileOutbox(directory: directory)
+            let fixture = RecoveryDiskFixture(directory: directory)
+            try fixture.writeManifest(entries: [], nextSequence: 4)
+            try fixture.writeJournal(retained: [])
+            for index in fixture.entries.indices {
+                try fixture.payloads[index].write(to: fixture.payloadURL(
+                    index, staged: index != 0 || !firstPayloadIsFinal
+                ))
+            }
+            let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+            let manifestBytes = try Data(contentsOf: manifestURL)
+            let journalBytes = try Data(contentsOf: fixture.journalURL)
+            try FileOutbox.beginTerminalResetRequest(directory: directory)
+            let reopened = try FileOutbox(directory: directory)
 
-        XCTAssertTrue(try reopened.pendingItems().isEmpty)
+            XCTAssertTrue(try reopened.pendingItems().isEmpty)
 
-        XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
-        XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
-        for index in fixture.entries.indices {
-            XCTAssertEqual(
-                try Data(contentsOf: fixture.payloadURL(index, staged: true)),
-                fixture.payloads[index]
-            )
-            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.payloadURL(index).path))
+            XCTAssertEqual(try Data(contentsOf: manifestURL), manifestBytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journalBytes)
+            for index in fixture.entries.indices {
+                let staged = index != 0 || !firstPayloadIsFinal
+                XCTAssertEqual(
+                    try Data(contentsOf: fixture.payloadURL(index, staged: staged)),
+                    fixture.payloads[index]
+                )
+                XCTAssertFalse(FileManager.default.fileExists(
+                    atPath: fixture.payloadURL(index, staged: !staged).path
+                ))
+            }
         }
     }
 
