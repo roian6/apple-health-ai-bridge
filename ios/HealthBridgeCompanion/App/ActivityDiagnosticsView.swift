@@ -17,15 +17,22 @@ struct ActivityDiagnosticsView: View {
                 nextAction
             }
 
-            Section {
-                DisclosureGroup("Recent activity") {
-                    if viewModel.activityLogMessages.isEmpty {
-                        Text("No recent activity yet.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(Array(viewModel.activityLogMessages.enumerated()), id: \.offset) { _, message in
+            Section("Recent activity") {
+                if viewModel.activityLogMessages.isEmpty {
+                    Text("No recent activity yet.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(viewModel.activityLogMessages.suffix(3).reversed().enumerated()), id: \.offset) { _, message in
+                        Text(message)
+                            .font(.subheadline)
+                            .textSelection(.enabled)
+                    }
+                }
+                if viewModel.activityLogMessages.count > 3 {
+                    DisclosureGroup("Earlier activity") {
+                        ForEach(Array(viewModel.activityLogMessages.dropLast(3).reversed().enumerated()), id: \.offset) { _, message in
                             Text(message)
-                                .font(.footnote)
+                                .font(.subheadline)
                                 .textSelection(.enabled)
                         }
                     }
@@ -34,30 +41,32 @@ struct ActivityDiagnosticsView: View {
 
             Section {
                 DisclosureGroup("Advanced", isExpanded: $showsAdvanced) {
-                    Text("Automatic sync is best-effort. These diagnostics do not confirm receiver delivery or Health read access.")
-                        .foregroundStyle(.secondary)
-                    Text(viewModel.backgroundSyncEnabled ? "Automatic sync is on." : "Automatic sync is off.")
-                    Text(viewModel.automaticSyncCoverageDetail)
-                    LabeledContent("Registration", value: viewModel.automaticSyncRegistrationLine)
-                    LabeledContent("Background request", value: viewModel.automaticSyncScheduleLine)
-                    LabeledContent("Last wake", value: viewModel.automaticSyncWakeLine)
-                    LabeledContent("Last run", value: viewModel.automaticSyncRunLine)
-                    Text(viewModel.automaticSyncLaneDiagnosticLine)
-                        .textSelection(.enabled)
-                    if !viewModel.historicalBackfillState.selectedTypeCodes.isEmpty {
-                        Text(viewModel.historicalBackfillSummary)
-                        LabeledContent(
-                            "History range",
-                            value: HealthHistoryDepthPresentation.summary(
-                                selected: viewModel.historicalBackfillState.historyDepth
+                    Group {
+                        Text("Automatic sync is best-effort. These diagnostics do not confirm receiver delivery or Health read access.")
+                            .foregroundStyle(.secondary)
+                        Text(viewModel.backgroundSyncEnabled ? "Automatic sync is on." : "Automatic sync is off.")
+                        Text(viewModel.automaticSyncCoverageDetail)
+                        LabeledContent("Registration", value: viewModel.automaticSyncRegistrationLine)
+                        LabeledContent("Background request", value: viewModel.automaticSyncScheduleLine)
+                        LabeledContent("Last wake", value: viewModel.automaticSyncWakeLine)
+                        LabeledContent("Last run", value: viewModel.automaticSyncRunLine)
+                        Text(viewModel.automaticSyncLaneDiagnosticLine)
+                            .textSelection(.enabled)
+                        if !viewModel.historicalBackfillState.selectedTypeCodes.isEmpty {
+                            Text(viewModel.historicalBackfillSummary)
+                            LabeledContent(
+                                "History range",
+                                value: HealthHistoryDepthPresentation.summary(
+                                    selected: viewModel.historicalBackfillState.historyDepth
+                                )
                             )
-                        )
+                        }
+                        if !viewModel.nutritionNotice.isEmpty {
+                            Text(viewModel.nutritionNotice)
+                        }
                     }
-                    if !viewModel.nutritionNotice.isEmpty {
-                        Text(viewModel.nutritionNotice)
-                    }
+                    .font(.subheadline)
                 }
-                .font(.footnote)
             }
         }
         .navigationTitle("Activity")

@@ -10,10 +10,6 @@ struct DataScopeView: View {
     var body: some View {
         Form {
             Section {
-                Text(viewModel.healthPermissionScopeSummary)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
                 Button {
                     Task { await viewModel.requestHealthPermissions() }
                 } label: {
@@ -28,17 +24,33 @@ struct DataScopeView: View {
 
                 if !viewModel.healthPermissionNotice.isEmpty {
                     InlineNotice(
-                        message: viewModel.healthPermissionNotice,
+                        message: viewModel.healthPermissionNoticeIsError
+                            ? viewModel.healthPermissionNotice
+                            : "Access request finished.",
                         systemImage: viewModel.healthPermissionNoticeIsError
                             ? "exclamationmark.triangle.fill"
                             : "info.circle.fill",
                         tint: viewModel.healthPermissionNoticeIsError ? .orange : .blue
                     )
                 }
+
+                DisclosureGroup("Access details") {
+                    Group {
+                        Text(viewModel.healthPermissionScopeSummary)
+                        if !viewModel.healthPermissionNotice.isEmpty
+                            && !viewModel.healthPermissionNoticeIsError {
+                            Text(viewModel.healthPermissionNotice)
+                        } else {
+                            Text("Review individual read access in Health > profile picture > Privacy > Apps > Health Bridge.")
+                        }
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Apple Health access")
             } footer: {
-                Text("A completed request does not reveal which read permissions you granted. Review Health Bridge access in the Health app.")
+                Text("A completed request does not confirm which read permissions you granted.")
             }
 
             Section {
@@ -51,15 +63,20 @@ struct DataScopeView: View {
                     }
                 }
 
-                if let selectedRow = viewModel.healthHistoryDepthRows.first(where: \.isSelected) {
-                    Text(selectedRow.detail)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                DisclosureGroup("Range details") {
+                    Group {
+                        if let selectedRow = viewModel.healthHistoryDepthRows.first(where: \.isSelected) {
+                            Text(selectedRow.detail)
+                        }
+                        Text("Limits vary by data type.")
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 }
             } header: {
                 Text("History")
             } footer: {
-                Text("Limits vary by data type. Changing this preference does not reset progress or resend older records.")
+                Text("Changing this range does not reset progress or resend older records.")
             }
         }
         .navigationTitle("Health Data")

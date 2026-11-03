@@ -45,6 +45,7 @@ struct ContentView: View {
                 .padding(.bottom, 40)
             }
             .scrollDismissesKeyboard(.interactively)
+            .clipped()
             .background(Color(.systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .onReceive(NotificationCenter.default.publisher(for: LastAcceptedTransferObservationStore.didChange)) { _ in
@@ -62,41 +63,48 @@ struct ContentView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Health Bridge")
-                .font(.system(size: 36, weight: .bold, design: .rounded))
-            Text("Send Apple Health data to a receiver you control.")
-                .font(.body)
-                .foregroundStyle(.secondary)
+                .font(.largeTitle.weight(.bold))
+                .fontDesign(.rounded)
+            if !dynamicTypeSize.isAccessibilitySize {
+                Text("Send Apple Health data to a receiver you control.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var statusCard: some View {
-        HStack(alignment: .center, spacing: 16) {
-            if !dynamicTypeSize.isAccessibilitySize {
-                statusGlyph
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Text(viewModel.syncPresentation.title)
-                    .font(.title2.weight(.bold))
-                Text(viewModel.syncPresentation.phase == .needsAttention
-                    ? (viewModel.pairingInputCorrection ?? viewModel.displayStatusMessage)
-                    : viewModel.syncPresentation.detail)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let observation = viewModel.lastAcceptedTransferObservation {
-                    Text("Last transfer confirmed")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 8)
-                    Text(observation.observedAt, format: .dateTime.year().month(.abbreviated).day().hour().minute())
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .center, spacing: 16) {
+                if !dynamicTypeSize.isAccessibilitySize {
+                    statusGlyph
                 }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(viewModel.syncPresentation.title)
+                        .font(.title2.weight(.bold))
+                    Text(viewModel.syncPresentation.phase == .needsAttention
+                        ? (viewModel.pairingInputCorrection ?? viewModel.displayStatusMessage)
+                        : viewModel.syncPresentation.detail)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+            if let observation = viewModel.lastAcceptedTransferObservation {
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Last transfer confirmed")
+                    Text(observation.observedAt, format: .dateTime.year().month(.abbreviated).day().hour().minute())
+                }
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .cardStyle(cornerRadius: 28)
+        .cardStyle()
     }
 
     private var pairingCard: some View {
@@ -166,7 +174,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             } label: {
                 Text("Connection options")
-                    .font(.subheadline)
+                    .font(.body)
                     .frame(minHeight: 44)
             }
         }
@@ -274,11 +282,6 @@ struct ContentView: View {
                 subtitle: "Choose what this iPhone may share. Health Bridge only reads your data."
             )
 
-            Text(viewModel.healthPermissionScopeSummary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
             PrimaryButton(
                 title: viewModel.healthPermissionsRequested ? "Review Permissions" : "Allow Health Access",
                 subtitle: "Opens Apple Health permission sheet",
@@ -296,6 +299,20 @@ struct ContentView: View {
                     systemImage: viewModel.healthPermissionNoticeIsError ? "exclamationmark.triangle.fill" : "info.circle.fill",
                     tint: viewModel.healthPermissionNoticeIsError ? .orange : .blue
                 )
+            }
+
+            Text("Completing the request does not confirm which read permissions you granted.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            DisclosureGroup {
+                Text(viewModel.healthPermissionScopeSummary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } label: {
+                Text("Access details")
+                    .frame(minHeight: 44)
             }
         }
         .cardStyle()
@@ -343,20 +360,31 @@ struct ContentView: View {
             Divider()
 
 
-            Toggle(isOn: Binding(
-                get: { viewModel.automaticSyncToggleIsOn },
-                set: { enabled in
-                    viewModel.requestBackgroundSyncEnabled(enabled)
-                }
-            )) {
+            let automaticSyncLayout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 12))
+                : AnyLayout(HStackLayout(alignment: .center, spacing: 12))
+            automaticSyncLayout {
                 SettingRowLabel(
                     title: "Automatic Sync",
-                    subtitle: viewModel.automaticSyncScopeSummary,
+                    subtitle: dynamicTypeSize.isAccessibilitySize
+                        ? "iOS decides background timing."
+                        : viewModel.automaticSyncScopeSummary,
                     systemImage: "arrow.triangle.2.circlepath",
                     tint: .green
                 )
+                Toggle("Automatic Sync", isOn: Binding(
+                    get: { viewModel.automaticSyncToggleIsOn },
+                    set: { enabled in
+                        viewModel.requestBackgroundSyncEnabled(enabled)
+                    }
+                ))
+                .labelsHidden()
+                .fixedSize()
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+                .accessibilityHint(viewModel.automaticSyncScopeSummary)
+                .disabled(!viewModel.canChangeAutomaticSyncSetting)
             }
-            .disabled(!viewModel.canChangeAutomaticSyncSetting)
         }
         .cardStyle()
     }
@@ -374,7 +402,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .background(Color(.secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     private var statusGlyph: some View {
@@ -433,13 +461,13 @@ private struct AppDetailsView: View {
                 } label: {
                     Label("Health Data", systemImage: "heart.text.square")
                 }
-            }
-            Section("Help") {
                 NavigationLink {
                     ActivityDiagnosticsView(viewModel: viewModel)
                 } label: {
                     Label("Activity", systemImage: "list.bullet.rectangle")
                 }
+            }
+            Section("Help") {
                 Link("Setup Guide", destination: Self.setupGuideURL)
                 Link("Support", destination: Self.supportURL)
             }
@@ -460,6 +488,7 @@ private struct AppDetailsView: View {
 
 
 private struct SettingRowLabel: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let title: String
     let subtitle: String
     let systemImage: String
@@ -467,16 +496,18 @@ private struct SettingRowLabel: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: systemImage)
-                .font(.headline)
-                .foregroundStyle(tint)
-                .frame(width: 28, height: 28)
+            if !dynamicTypeSize.isAccessibilitySize {
+                Image(systemName: systemImage)
+                    .font(.headline)
+                    .foregroundStyle(tint)
+                    .frame(width: 28, height: 28)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.headline)
                 if !subtitle.isEmpty {
                     Text(subtitle)
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -577,10 +608,12 @@ private struct CardRow: View {
                 Text(title)
                     .font(.headline)
                     .foregroundStyle(.primary)
-                Text(subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                if !dynamicTypeSize.isAccessibilitySize {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
             Spacer(minLength: 0)
             if let accessory {
@@ -598,7 +631,7 @@ private struct CardRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(16)
+        .padding(HealthBridgeSpacing.screen)
         .contentShape(Rectangle())
     }
 }
