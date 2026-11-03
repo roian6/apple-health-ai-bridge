@@ -3,6 +3,7 @@ import os
 import secrets
 import sqlite3
 import stat
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Final, Literal, TypeAlias, cast
@@ -24,6 +25,8 @@ from health_bridge.launchd import load_runnable_launch_agent_request
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublicationError,
+    NativePairingPublicationError,
+    NativePairingPublicationErrorCode,
     default_native_ack_publisher,
 )
 from health_bridge.private_files import (
@@ -932,6 +935,7 @@ def start(  # noqa: PLR0913 -- Typer exposes six independent receiver options.
             select_transport=_select_transport_or_exit,
             create_key_store=MailboxKeyStore.production,
             create_connection_store=MailboxConnectionStore.production,
+            preflight_mailbox=_preflight_mailbox,
             serve=serve_receiver,
         ),
     )
@@ -992,16 +996,24 @@ def _pairing_receiver_url(
     transport: PublicReceiverTransport,
     legacy_v1: bool,
 ) -> str | None:
-    if not receiver_url:
-        if transport != "icloud-mailbox" or legacy_v1:
-            typer.echo(
-                "--receiver-url is required for Direct or legacy pairing.", err=True
-            )
-            raise typer.Exit(code=1)
-        try:
-            default_native_ack_publisher().require_native_pairing()
-        except NativeAckPublicationError as exc:
-            typer.echo(str(exc), err=True)
-            raise typer.Exit(code=1) from exc
-        return None
+    if not receiver_url and (transport != "icloud-mailbox" or legacy_v1):
+        typer.echo("--receiver-url is required for Direct or legacy pairing.", err=True)
+        raise typer.Exit(code=1)
+    if transport == "icloud-mailbox" and sys.platform == "darwin":
+        _preflight_mailbox()
     return receiver_url
+
+
+def _preflight_mailbox() -> None:
+    try:
+        publisher = default_native_ack_publisher()
+        publisher.probe_protocol_storage()
+    except NativePairingPublicationError as exc:
+        typer.echo(exc.code.value, err=True)
+        raise typer.Exit(code=1) from None
+    except NativeAckPublicationError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from None
+    except OSError:
+        typer.echo(NativePairingPublicationErrorCode.PUBLICATION_FAILED.value, err=True)
+        raise typer.Exit(code=1) from None

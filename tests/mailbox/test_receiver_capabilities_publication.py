@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import subprocess
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -17,9 +14,8 @@ from health_bridge.mailbox.connections import (
 from health_bridge.mailbox.filesystem import MailboxFileError, open_mailbox_directory
 from health_bridge.mailbox.native_ack_publication import (
     NativeAckPublicationError,
-    NativeAckPublisher,
-    NativeAckPublisherConfig,
 )
+from tests.mailbox.test_native_ack_publication import native_publisher
 from tests.receiver.delivery_acceptance_support import connection
 
 if TYPE_CHECKING:
@@ -36,100 +32,40 @@ def _mailbox(root: Path) -> Path:
     return mailbox
 
 
-def _publisher(root: Path) -> NativeAckPublisher:
-    executable = root / "synthetic-helper"
-    _ = executable.write_bytes(b"synthetic")
-    executable.chmod(0o700)
-    return NativeAckPublisher(
-        NativeAckPublisherConfig(executable, root / "protocol", 1)
-    )
-
-
 @pytest.mark.parametrize(
     "failure",
     [
-        None,
-        "unsupported",
-        "timeout",
+        "ok",
         "digest",
         "identity",
         "operation",
-        "bytes",
+        "provider_bytes",
         "duplicate",
         "boolean",
         "nested",
         "nested_field",
         "float",
+        "flag_integer",
+        "noncanonical",
+        "wrong_exit",
+        "unbound",
     ],
 )
 def test_capability_ipc_binds_receipt_and_rereads_fixed_target(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str | None,
+    failure: str,
 ) -> None:
-    mailbox = _mailbox(tmp_path / "mailboxes")
-    publisher = _publisher(tmp_path)
+    mailbox = _mailbox(tmp_path)
+    publisher = native_publisher(tmp_path, failure)
     payload = b'{"synthetic":"signed metadata"}'
-
-    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        operation, request_id = argv[1].split(":")
-        assert operation == "capabilities"
-        root = tmp_path / "protocol"
-        request = cast(
-            "dict[str, object]",
-            json.loads((root / "requests" / f"{request_id}.json").read_text()),
-        )
-        assert request == {
-            "version": 1,
-            "operation": "receiver_capabilities",
-            "requestID": request_id,
-            "receiver": "02" * 16,
-            "device": "03" * 16,
-            "byteCount": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
-        assert (root / "staging" / f"{request_id}.json").read_bytes() == payload
-        if failure == "timeout":
-            raise subprocess.TimeoutExpired(argv, 1)
-        if failure == "unsupported":
-            return subprocess.CompletedProcess(argv, 1)
-        receipt = {**request, "stored": True, "exactBytes": True, "isUbiquitous": True}
-        mutations: dict[str, dict[str, object]] = {
-            "digest": {"sha256": "00" * 32},
-            "identity": {"device": "04" * 16},
-            "operation": {"operation": "ack"},
-            "boolean": {"stored": 1},
-            "float": {"version": 1.0},
-        }
-        receipt.update(mutations.get(failure or "", {}))
-        encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
-        if failure == "nested":
-            encoded = "[" * 1500 + "]" * 1500
-        if failure == "nested_field":
-            # Decoding succeeds; the scalar comparison must reject this value
-            # without traversing or serializing its nested contents.
-            encoded = encoded.replace(
-                '"stored":true', '"stored":' + "[" * 64 + "]" * 64
-            )
-        if failure == "duplicate":
-            encoded = encoded.replace('"stored":true', '"stored":false,"stored":true')
-        path = root / "receipts" / f"{request_id}.json"
-        _ = path.write_text(encoded)
-        path.chmod(0o600)
-        _ = (mailbox / "receiver-capabilities.json").write_bytes(
-            b"wrong" if failure == "bytes" else payload
-        )
-        return subprocess.CompletedProcess(argv, 0)
-
-    monkeypatch.setattr(subprocess, "run", run)
     with open_mailbox_directory(mailbox) as directory:
-        if failure is None:
+        if failure == "ok":
             publisher.publish_capabilities(directory, payload)
+            assert (mailbox / "receiver-capabilities.json").read_bytes() == payload
         else:
             with pytest.raises(NativeAckPublicationError):
                 publisher.publish_capabilities(directory, payload)
-    for lane in ("requests", "staging", "receipts"):
-        assert not list((tmp_path / "protocol" / lane).iterdir())
+    assert not (tmp_path / "protocol").exists()
 
 
 def test_publication_same_content_no_rewrite_changed_content_replaces(

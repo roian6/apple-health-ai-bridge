@@ -4,6 +4,24 @@
   "packaging": "Original artwork. Legacy archive SVGs use LF line endings; new files document their exact packaging individually.",
   "assets": [
     {
+      "file": "cursor-lockup-horizontal-2d-light.svg",
+      "product": "Cursor",
+      "finalDownloadURL": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+      "archiveMember": "General Logos/Lockup Horizontal/SVG/LOCKUP_HORIZONTAL_2D_LIGHT.svg",
+      "originalSHA256": "f7a384d3d6e1875196aa770d2c8df58ceb79b1219e97b86e522dee83d3d9c6ac",
+      "packagedSHA256": "690e7225c9c75de34051c80265b38a62e33bf4b88af8603578ad91ee62f91d8c",
+      "viewBox": "0 0 2238.7 532.09"
+    },
+    {
+      "file": "cursor-lockup-horizontal-2d-dark.svg",
+      "product": "Cursor",
+      "finalDownloadURL": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+      "archiveMember": "General Logos/Lockup Horizontal/SVG/LOCKUP_HORIZONTAL_2D_DARK.svg",
+      "originalSHA256": "e4e372a3f6954d7e015404e00595ee62d6b11f83410d4bf10264d99ee1e98b44",
+      "packagedSHA256": "ac1907e317d00ccbe6a4d878cabc1898a2b29e97d52dd909553ef91e948a1ad3",
+      "viewBox": "0 0 2238.7 532.09"
+    },
+    {
       "file": "cursor-cube-2d-light.svg",
       "product": "Cursor",
       "finalDownloadURL": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
@@ -38,6 +56,15 @@
       "originalSHA256": "5eeb3a5f14dbbccc03111296ecfd3cd05cc98844150d4f9d77ba921847953380",
       "packagedSHA256": "937ed3491969912299db5a8b85199ae51da29cc1a5e22f4e1e5b158cd3ed9202",
       "viewBox": "0 0 240 300"
+    },
+    {
+      "file": "vscode-white.svg",
+      "product": "Visual Studio Code",
+      "finalDownloadURL": "https://code.visualstudio.com/assets/branding/visual-studio-code-icons.zip",
+      "archiveMember": "visual-studio-code-icons/vscode-alt.svg",
+      "originalSHA256": "4ef4077d35718ae78184902b3b763281c97b0ff46f2b5a36c10c5c5189ed027f",
+      "packagedSHA256": "4ef4077d35718ae78184902b3b763281c97b0ff46f2b5a36c10c5c5189ed027f",
+      "viewBox": "0 0 100 100"
     },
     {
       "file": "vscode.svg",
@@ -94,7 +121,11 @@
       "viewBox": "0 0 385 385",
       "sourceRole": "OpenAI-published Codex extension artwork; shared OpenAI family mark, not a claimed unique Codex symbol.",
       "packaging": "Original 385 x 385 PNG bytes embedded in a self-contained SVG; original black square retained.",
-      "accessDate": "2026-10-24"
+      "accessDate": "2026-10-24",
+      "alsoIdentifies": [
+        "ChatGPT Desktop"
+      ],
+      "sharedUseNote": "ChatGPT Desktop reuses this shared OpenAI family mark with its own visible label; this source is the Codex extension icon, not an extracted ChatGPT Desktop app icon."
     },
     {
       "file": "hermes-agent.svg",
@@ -119,6 +150,126 @@
       "sourceRole": "Official static OpenClaw Linux app icon.",
       "packaging": "Unchanged original SVG, including original gradients and transparency.",
       "accessDate": "2026-10-24"
+    },
+    {
+      "file": "lm-studio.svg",
+      "product": "LM Studio",
+      "identityURL": "https://lmstudio.ai/",
+      "requestedDownloadURL": "https://lmstudio.ai/assets/marketing/logo-192x192.png",
+      "finalDownloadURL": "https://lmstudio.ai/assets/marketing/logo-192x192.png",
+      "originalSHA256": "e79ff2ac0fece5c0a76fcb8b20a29226794d11824ee7c7a2f521dcde0f88e12b",
+      "packagedSHA256": "f8f84fc1908dc826f1c66b33d83387e2ff2d5f0f199f37133ed2741f9707858b",
+      "viewBox": "0 0 192 192",
+      "sourceRole": "Official LM Studio product favicon and marketing logo.",
+      "packaging": "Original 192 x 192 PNG bytes embedded unchanged as data:image/png in a self-contained SVG; no resampling, cropping or background changes.",
+      "sourceContentType": "image/png",
+      "detectedFormat": "PNG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "cherry-studio.svg",
+      "product": "Cherry Studio",
+      "identityURL": "https://cherryai.com/",
+      "requestedDownloadURL": "https://cherryai.com/assets/favicon-BmbgeFTf.png",
+      "finalDownloadURL": "https://cherryai.com/assets/favicon-BmbgeFTf.png",
+      "originalSHA256": "5f742ba1de17aac360cffbc1ab77aac3cfa1632cf8be0abe66cc3f97dc719b8b",
+      "packagedSHA256": "628622ea1ce86d7e90ab1da3bba13b833f966403fa38b947d074e7e24125a4a6",
+      "viewBox": "0 0 167 171",
+      "sourceRole": "Official Cherry Studio product favicon.",
+      "packaging": "Original 167 x 171 PNG bytes embedded unchanged as data:image/png in a self-contained SVG; no resampling, cropping or background changes.",
+      "sourceContentType": "image/png",
+      "detectedFormat": "PNG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "goose.svg",
+      "product": "Goose",
+      "identityURL": "https://goose-docs.ai/",
+      "requestedDownloadURL": "https://goose-docs.ai/img/favicon.ico",
+      "finalDownloadURL": "https://goose-docs.ai/img/favicon.ico",
+      "originalSHA256": "902bebf8d1dddfaa1175e2c6a09dfe2c37c5c92f7b86b93ead83a789e43f09ff",
+      "packagedSHA256": "a10279da72f81d2e90347020cf35780e96d29e74bdd99f160f5cb4caaaece022",
+      "viewBox": "0 0 40 40",
+      "sourceRole": "Official Goose documentation favicon.",
+      "packaging": "Original 40 x 40 PNG bytes embedded unchanged as data:image/png in a self-contained SVG; no resampling, cropping or background changes.",
+      "sourceContentType": "image/vnd.microsoft.icon",
+      "detectedFormat": "PNG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "pi.svg",
+      "product": "Pi",
+      "identityURL": "https://pi.dev/",
+      "requestedDownloadURL": "https://pi.dev/favicon.svg",
+      "finalDownloadURL": "https://pi.dev/favicon.svg",
+      "originalSHA256": "d266b2c1d2c7bf169ca30d438963b176fba16fea6263b9ac30c8302f34ad7ce7",
+      "packagedSHA256": "d266b2c1d2c7bf169ca30d438963b176fba16fea6263b9ac30c8302f34ad7ce7",
+      "viewBox": "0 0 560 560",
+      "sourceRole": "Official Pi coding-agent product favicon; not the unrelated Inflection Pi assistant.",
+      "packaging": "Unchanged original SVG, including native styles, gradients, backgrounds and transparency.",
+      "sourceContentType": "image/svg+xml",
+      "detectedFormat": "SVG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "warp.svg",
+      "product": "Warp",
+      "identityURL": "https://warp.dev/",
+      "requestedDownloadURL": "https://warp.dev/favicon-96x96.png",
+      "finalDownloadURL": "https://www.warp.dev/favicon-96x96.png",
+      "originalSHA256": "2bb9539a0919077bf9f542a5be1c4d07ee73e9c8ce6f4019b43ec613476e7812",
+      "packagedSHA256": "7559592cee260d8448f22f566abf34bf0b74398dced76bf4761903aefb5f8078",
+      "viewBox": "0 0 96 96",
+      "sourceRole": "Official Warp product-family favicon; not a separate CLI-specific mark.",
+      "packaging": "Original 96 x 96 PNG bytes embedded unchanged as data:image/png in a self-contained SVG; no resampling, cropping or background changes.",
+      "sourceContentType": "image/png",
+      "detectedFormat": "PNG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "amp.svg",
+      "product": "Amp",
+      "identityURL": "https://ampcode.com/",
+      "requestedDownloadURL": "https://ampcode.com/app-icon.svg?v=4",
+      "finalDownloadURL": "https://ampcode.com/app-icon.svg?v=4",
+      "originalSHA256": "40c79d8c7baa04c2fee214cc1c66a9797eb6aa96bec6c5b20c7d12cd66490696",
+      "packagedSHA256": "40c79d8c7baa04c2fee214cc1c66a9797eb6aa96bec6c5b20c7d12cd66490696",
+      "viewBox": "0 0 1024 1024",
+      "sourceRole": "Official Amp product app icon, also published as the site favicon.",
+      "packaging": "Unchanged original SVG, including native styles, gradients, backgrounds and transparency.",
+      "sourceContentType": "image/svg+xml",
+      "detectedFormat": "SVG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "factory-droid.svg",
+      "product": "Factory Droid",
+      "identityURL": "https://factory.com/",
+      "requestedDownloadURL": "https://factory.com/favicon.svg",
+      "finalDownloadURL": "https://factory.com/favicon.svg",
+      "originalSHA256": "416ea4962d7b0b8be8bec7f7190c13c22d5f20fdcac401aa72886fd5c81d2fb2",
+      "packagedSHA256": "661300e6825cf9d2a98f855343b96f9acd91ab196604167c9e6cf343564457c9",
+      "viewBox": "0 0 508 508",
+      "sourceRole": "Shared Factory family favicon used to identify Factory Droid; not a unique Droid-specific symbol.",
+      "packaging": "Original SVG with a terminal newline added; all artwork, nested SVG, native styles and background retained.",
+      "sourceContentType": "image/svg+xml",
+      "detectedFormat": "SVG",
+      "accessDate": "2026-11-02"
+    },
+    {
+      "file": "github-copilot.svg",
+      "product": "GitHub Copilot",
+      "identityURL": "https://marketplace.visualstudio.com/items?itemName=GitHub.copilot",
+      "requestedDownloadURL": "https://GitHub.gallerycdn.vsassets.io/extensions/github/copilot/1.388.0/1761326434179/Microsoft.VisualStudio.Services.Icons.Default",
+      "finalDownloadURL": "https://github.gallerycdn.vsassets.io/extensions/github/copilot/1.388.0/1761326434179/Microsoft.VisualStudio.Services.Icons.Default",
+      "originalSHA256": "10812cc1baceeb1d932232e69e1121f290faedca3f400289c24293f1e8d57d0b",
+      "packagedSHA256": "9ed66378d5f43b7cf85083e6e847b42d9916e76a778659e814affbf3b1527ad6",
+      "viewBox": "0 0 256 256",
+      "sourceRole": "GitHub-published Copilot extension product icon; not the GitHub Octocat.",
+      "packaging": "Original 256 x 256 PNG bytes embedded unchanged as data:image/png in a self-contained SVG; no resampling, cropping or background changes.",
+      "sourceContentType": "image/png",
+      "detectedFormat": "PNG",
+      "accessDate": "2026-11-02"
     }
   ],
   "policyReads": [
@@ -153,5 +304,5 @@
       "httpStatus": 200
     }
   ],
-  "updatedDate": "2026-10-24"
+  "updatedDate": "2026-11-02"
 }

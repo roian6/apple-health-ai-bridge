@@ -1,32 +1,49 @@
+import errno
 import hashlib
 import os
 import sqlite3
-from collections.abc import Generator
+import subprocess
+import sys
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from http.client import HTTPConnection
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
+from uuid import UUID
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pydantic import TypeAdapter
 from typer.testing import CliRunner
 from typing_extensions import override
 
+import health_bridge.mailbox.native_ack_publication as publication_module
 import health_bridge.receiver.mailbox_runtime as runtime_module
 from health_bridge.cli import app
-from health_bridge.contract._delivery_common import b64decode, derive_key
+from health_bridge.contract._delivery_common import b64decode, b64encode, derive_key
 from health_bridge.contract._hbjcs1 import hbjcs1_decode
+from health_bridge.mailbox.filesystem import MailboxFileError, MailboxFileErrorCode
+from health_bridge.mailbox.native_ack_publication import (
+    NativeAckPublisher,
+    NativeAckPublisherConfig,
+)
 from health_bridge.mailbox.publication import publish_final
 from health_bridge.queries.models import SyncedMetricsResult
+from health_bridge.receiver import invitations as invitations_module
 from health_bridge.receiver.delivery_acceptance import DeliveryAcceptanceService
 from health_bridge.receiver.mailbox_bootstrap import (
     PAIRING_DOMAIN,
     BootstrapDescriptor,
+    NativePairingRequest,
     PairingCompletionEnvelope,
     canonical_model,
+    seal_pairing_request,
 )
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.mailbox_runtime import MailboxRuntimeWorker
+from health_bridge.receiver.pairing import create_receiver_pairing_invitation_bundle
+from health_bridge.receiver.server import build_receiver_server, server_port
 from health_bridge.storage.database import (
     connect_live_readonly_database,
     initialize_database,
@@ -71,18 +88,42 @@ def open_completion(
 
 
 @pytest.mark.parametrize("response_loss", [False, True])
+@pytest.mark.parametrize("ipc", [False, True])
 def test_native_worker_pairs_then_authenticates_nonempty_health_and_normal_query(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     response_loss: bool,
+    ipc: bool,
 ) -> None:
     peer = LegacyPeer(tmp_path)
     descriptor, request = stage_native(peer)
     root = tmp_path / "provider"
     directory = root / "pairing" / descriptor.invitation_id
     publications: list[bytes] = []
+    publish_native = publish_completion
+    private_root = tmp_path / "protocol"
+    if ipc:
+        publisher = _native_pairing_publisher(tmp_path, directory)
+        publish_native = publisher.publish_pairing
+        original_open = os.open
+
+        def denied_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if Path(os.fsdecode(path)).is_relative_to(private_root):
+                raise PermissionError(errno.EACCES, "synthetic private storage")
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "open", denied_open)
+        with pytest.raises(PermissionError):
+            _ = os.open(private_root / "sentinel", os.O_RDONLY)
 
     def publish(directory: Path, content: bytes) -> None:
-        publish_completion(directory, content)
+        publish_native(directory, content)
         publications.append(content)
         if response_loss and len(publications) == 1:
             message = "synthetic lost publication confirmation"
@@ -133,6 +174,9 @@ def test_native_worker_pairs_then_authenticates_nonempty_health_and_normal_query
         SyncedMetricsResult.model_validate_json(queried.output).metrics[0].record_count
         == 1
     )
+    if ipc:
+        with pytest.raises(PermissionError):
+            _ = os.open(private_root / "sentinel", os.O_RDONLY)
 
 
 @pytest.mark.parametrize("boundary", ["root", "database"])
@@ -282,3 +326,358 @@ def test_bootstrap_blocking_io_defers_without_discovery(
     worker.run_once()
 
     assert worker.health_error() is None
+
+
+def _native_pairing_publisher(tmp_path: Path, directory: Path) -> NativeAckPublisher:
+    helper = tmp_path / "helper"
+    _ = helper.write_text(
+        f"""#!{sys.executable}
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+if sys.argv[1] == "--publication-ipc-v1-capabilities":
+    sys.stdout.buffer.write(
+        b"publication-ipc-v1:ack,pairing,receiver_capabilities,storage_probe\\n"
+    )
+    sys.exit(0)
+assert sys.argv[1] == "--publication-ipc-v1"
+size = int.from_bytes(sys.stdin.buffer.read(4), "big")
+assert 1 <= size <= 8192
+body = json.loads(sys.stdin.buffer.read(size))
+assert body["operation"] == "pairing"
+assert 1 <= body["byteCount"] <= 65536
+payload = sys.stdin.buffer.read(body["byteCount"])
+assert sys.stdin.buffer.read(1) == b""
+assert body["byteCount"] == len(payload)
+assert body["sha256"] == hashlib.sha256(payload).hexdigest()
+fault_file = Path({str(tmp_path / "helper-fault")!r})
+fault = fault_file.read_text() if fault_file.exists() else ""
+if fault == "nonzero":
+    sys.exit(3)
+if fault in ("storage_access_denied", "storage_io_failed"):
+    response = {{**body, "status": "error", "code": fault}}
+    code = 3
+else:
+    directory = Path({str(directory)!r})
+    assert body["invitationID"] == directory.name
+    assert body["finalName"] == "completion.hbp"
+    (directory / body["finalName"]).write_bytes(
+        b"wrong-bytes" if fault == "mismatch" else payload
+    )
+    response = {{**body, "status": "ok", "published": True, "bootstrapVersion": 1}}
+    code = 0
+encoded = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+if fault == "receipt_invalid":
+    encoded = b"not-json"
+sys.stdout.buffer.write(struct.pack(">I", len(encoded)) + encoded)
+sys.exit(code)
+"""
+    )
+    helper.chmod(0o700)
+    return NativeAckPublisher(NativeAckPublisherConfig(helper))
+
+
+@contextmanager
+def _gated_worker_health(
+    worker: MailboxRuntimeWorker, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[
+    tuple[list[Event], list[Event], Callable[[], tuple[int, str]]], None, None
+]:
+    completed = [Event() for _ in range(4)]
+    release = [Event() for _ in range(4)]
+
+    class CycleGate(Event):
+        cycle: int = 0
+
+        @override
+        def wait(self, timeout: float | None = None) -> bool:
+            del timeout
+            cycle = self.cycle
+            self.cycle += 1
+            if cycle < len(completed):
+                completed[cycle].set()
+                assert release[cycle].wait(5), "cycle not released"
+            return self.is_set()
+
+    stop = CycleGate()
+    monkeypatch.setattr(worker, "_stop", stop)
+    server = build_receiver_server(db_path, host="127.0.0.1", port=0)
+    server.mailbox_worker = worker
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def health() -> tuple[int, str]:
+        connection = HTTPConnection("127.0.0.1", server_port(server), timeout=5)
+        try:
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            body = TypeAdapter(dict[str, str | bool]).validate_json(response.read())
+            status = body["status"]
+            assert isinstance(status, str)
+            return response.status, status
+        finally:
+            connection.close()
+
+    try:
+        worker.start()
+        yield completed, release, health
+    finally:
+        stop.set()
+        for event in release:
+            event.set()
+        assert worker.stop()
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+@pytest.mark.parametrize(
+    ("number", "expected"),
+    [
+        (errno.EACCES, "helper_container_access_denied"),
+        (errno.EIO, "native_pairing_publication_failed"),
+    ],
+)
+def test_issue154_publication_failure_degrades_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    number: int,
+    expected: str,
+) -> None:
+    peer = LegacyPeer(tmp_path)
+    descriptor, request = stage_native(peer)
+    root = tmp_path / "provider"
+    directory = root / "pairing" / descriptor.invitation_id
+    directory.mkdir(parents=True)
+    _ = publish_final(directory, "request.hbp", request)
+    publisher = _native_pairing_publisher(tmp_path, directory)
+    fault_file = tmp_path / "helper-fault"
+    _ = fault_file.write_text(
+        "storage_access_denied" if number == errno.EACCES else "storage_io_failed"
+    )
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publisher.publish_pairing,
+        capability_publisher=lambda _: None,
+    )
+    with _gated_worker_health(worker, peer.db, monkeypatch) as (
+        completed,
+        release,
+        health,
+    ):
+        assert completed[0].wait(5)
+        assert worker.is_alive()
+        assert not worker.terminal_error()
+        assert worker.health_error() == expected
+        assert health() == (503, "degraded")
+        assert not (directory / "completion.hbp").exists()
+        first_diagnostic = capsys.readouterr().err
+        assert first_diagnostic.strip() == expected
+        release[0].set()
+        assert completed[1].wait(5)
+        assert capsys.readouterr().err == ""
+        fault_file.unlink()
+        release[1].set()
+        assert completed[2].wait(5)
+        assert worker.health_error() == expected
+        release[2].set()
+        assert completed[3].wait(5)
+        assert worker.health_error() is None
+        assert health() == (200, "ok")
+        assert open_completion(
+            (directory / "completion.hbp").read_bytes(),
+            request,
+            descriptor,
+            peer.device,
+        )
+        with connect_live_readonly_database(peer.db) as database:
+            assert database.execute(
+                "select count(*) from receiver_devices"
+            ).fetchone() == (1,)
+            assert database.execute(
+                "select count(*) from receiver_tokens"
+            ).fetchone() == (1,)
+            assert database.execute(
+                "select count(*) from pairing_invitations where redeemed_at is not null"
+            ).fetchone() == (1,)
+
+
+def test_issue154_unrelated_invitation_cannot_mask_publication_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = LegacyPeer(tmp_path)
+    identifiers = iter(
+        [UUID(int=1), UUID(int=255), *(UUID(int=i) for i in range(2, 129))]
+    )
+    monkeypatch.setattr(invitations_module, "uuid4", lambda: next(identifiers))
+    invitations: list[tuple[BootstrapDescriptor, bytes]] = []
+    for number in (1, 2):
+        bundle = create_receiver_pairing_invitation_bundle(
+            peer.db,
+            label=f"synthetic-{number}",
+            receiver_url=None,
+            transport="mailbox",
+            mailbox_key_store=peer.receiver,
+        )
+        descriptor = bundle.mailbox_bootstrap
+        assert descriptor is not None
+        device = MailboxKeyStore.for_testing(
+            state_dir=tmp_path / f"device-{number}",
+            anchor_dir=tmp_path / f"anchor-{number}",
+        )
+        identity = device.load_or_create()
+        request = seal_pairing_request(
+            NativePairingRequest(
+                invitation_secret=bundle.invitation_secret,
+                installation_id=str(UUID(int=number, version=4)),
+                device_credential="hb_" + descriptor.invitation_id * 2,
+                platform="ios",
+                device_signing_public_key=b64encode(identity.signing_public_key),
+                device_agreement_public_key=b64encode(identity.agreement_public_key),
+            ),
+            descriptor,
+            device,
+        )
+        invitations.append((descriptor, request))
+    for number in range(127):
+        _ = invitations_module.create_pairing_invitation(
+            peer.db, label=f"unrelated-{number}", receiver_url=None, transport="mailbox"
+        )
+    root = tmp_path / "provider"
+    for descriptor, request in invitations:
+        directory = root / "pairing" / descriptor.invitation_id
+        directory.mkdir(parents=True)
+        _ = publish_final(directory, "request.hbp", request)
+    failed_id = invitations[0][0].invitation_id
+    denied = True
+
+    def publish(directory: Path, payload: bytes) -> None:
+        if denied and directory.name == failed_id:
+            raise OSError(errno.EIO, "synthetic")
+        publish_completion(directory, payload)
+
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publish,
+        capability_publisher=lambda _: None,
+    )
+    worker.run_once()
+    assert worker.health_error() == "native_pairing_publication_failed"
+    worker.run_once()
+    assert (
+        root / "pairing" / invitations[1][0].invitation_id / "completion.hbp"
+    ).exists()
+    assert worker.health_error() == "native_pairing_publication_failed"
+    denied = False
+    worker.run_once()
+    assert worker.health_error() == "native_pairing_publication_failed"
+    worker.run_once()
+    assert worker.health_error() == "native_pairing_publication_failed"
+    worker.run_once()
+    assert worker.health_error() is None
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "capability",
+        "helper_spawn",
+        "timeout",
+        "nonzero",
+        "provider",
+        "provider_wrapped",
+        "receipt_invalid",
+        "mismatch",
+    ],
+)
+def test_issue154_nonprotocol_failures_do_not_fabricate_container_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    peer = LegacyPeer(tmp_path)
+    descriptor, request = stage_native(peer)
+    root = tmp_path / "provider"
+    directory = root / "pairing" / descriptor.invitation_id
+    directory.mkdir(parents=True)
+    _ = publish_final(directory, "request.hbp", request)
+    publisher = _native_pairing_publisher(tmp_path, directory)
+    _ = (tmp_path / "helper-fault").write_text(fault)
+    popen = subprocess.Popen
+
+    def spawn(argv: list[str], **kwargs: int | bool) -> subprocess.Popen[bytes]:
+        discovery = argv[1] == "--publication-ipc-v1-capabilities"
+        if (discovery, fault) in {
+            (True, "capability"),
+            (False, "helper_spawn"),
+        }:
+            raise PermissionError(errno.EACCES, "synthetic-private-path")
+        if not discovery and fault == "timeout":
+            raise subprocess.TimeoutExpired(argv, 1)
+        return popen(
+            argv,
+            stdin=kwargs["stdin"],
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+            close_fds=bool(kwargs["close_fds"]),
+            bufsize=int(kwargs["bufsize"]),
+        )
+
+    provider_errors = {
+        "provider": PermissionError(errno.EACCES, "synthetic-private-path"),
+        "provider_wrapped": MailboxFileError(MailboxFileErrorCode.STORAGE_UNAVAILABLE),
+    }
+
+    def read(*_args: object, **_kwargs: object) -> None:
+        raise provider_errors[fault] from PermissionError(
+            errno.EACCES, "synthetic-private-path"
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    if fault in {"provider", "provider_wrapped"}:
+        monkeypatch.setattr(publication_module, "read_final", read)
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publisher.publish_pairing,
+        capability_publisher=lambda _: None,
+    )
+    worker.run_once()
+    assert worker.health_error() == "native_pairing_publication_failed"
+    assert not worker.terminal_error()
+    assert capsys.readouterr().err.strip() == "native_pairing_publication_failed"
+
+
+def test_issue154_malformed_request_remains_nonfatal(tmp_path: Path) -> None:
+    peer = LegacyPeer(tmp_path)
+    descriptor, _ = stage_native(peer)
+    root = tmp_path / "provider"
+    directory = root / "pairing" / descriptor.invitation_id
+    directory.mkdir(parents=True)
+    _ = publish_final(directory, "request.hbp", b"not-json")
+    worker = MailboxRuntimeWorker(
+        db_path=peer.db,
+        mailbox_root=root,
+        pairing_keys=peer.receiver,
+        pairing_connections=peer.connections,
+        pairing_publisher=publish_completion,
+        capability_publisher=lambda _: None,
+    )
+    worker.run_once()
+    assert worker.health_error() is None
+    assert not worker.terminal_error()
+    assert not (directory / "completion.hbp").exists()
