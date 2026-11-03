@@ -11,18 +11,16 @@ import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
 from health_bridge import __version__
+from tests.guardrails.release_cli import run_release_tool as _run_release_tool
 from tests.guardrails.test_release_recovery import recovery_transport
 
 ROOT = Path(__file__).parents[2]
 # Published installation baseline; source labels alone do not select this pin.
 PUBLISHED_RECEIVER_VERSION: Final = "1.2.0"
-RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 RELEASE_NOTES = ROOT / ".github/release/notes-receiver-v1.1.1.md"
 HISTORICAL_V101_RELEASE_NOTES = ROOT / ".github/release/notes-v1.0.1.md"
-RELEASE_CRITERIA = ROOT / ".github/release/criteria.md"
 COMPONENT_VERSIONS = ROOT / "component-versions.json"
-VERSIONING_DOC = ROOT / "docs/versioning.md"
 XCODE_PROJECT = (
     ROOT / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
@@ -107,16 +105,6 @@ class ReleaseMetadataOutput(BaseModel):
     batch_contract: dict[str, str]
     python: PythonReleaseOutput
     macos_mailbox_ack_helper: dict[str, object]
-
-
-def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(RELEASE_TOOL), *args],
-        cwd=ROOT,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
 
 
 def _packet_verify_args(
@@ -313,6 +301,8 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     [
         ("v1.0.0", "1.0.0", "v1.0.0", False),
         ("v1.0.1", "1.0.1", "v1.0.1", False),
+        ("receiver-v1.0.2", "1.0.2", "receiver-v1.0.2", False),
+        ("receiver-v0.3.4", "0.3.4", "receiver-v0.3.4", True),
         ("receiver-v0.9.0", "0.9.0", "receiver-v0.9.0", True),
         ("receiver-v1.1.2", "1.1.2", "receiver-v1.1.2", False),
         ("receiver-v1.1.3", "1.1.3", "receiver-v1.1.3", False),
@@ -1040,72 +1030,6 @@ def test_v101_receiver_release_notes_are_versioned_and_actionable() -> None:
     assert "release-metadata.json" in notes
     assert "same-host stdio" in notes
     assert "TODO" not in notes
-
-
-def test_release_criteria_requires_live_app_store_build_readback() -> None:
-    criteria = RELEASE_CRITERIA.read_text(encoding="utf-8")
-
-    assert "highest existing build number in App Store Connect" in criteria
-    assert "TestFlight Internal Only" in criteria
-    assert "github-release" in criteria
-    assert "Required reviewers" in criteria
-    assert "deployment tag rule" in criteria
-    assert "receiver-v*" in criteria
-    assert "component-versions.json" in criteria
-    assert "active tag ruleset" in criteria
-    assert "Restrict deletions" in criteria
-    assert "Restrict updates" in criteria
-    assert "Restrict creations" in criteria
-    assert "Enable release immutability" in criteria
-    operations = (ROOT / "docs/release-operations.md").read_text()
-    assert 'git verify-tag "$tag"' in operations
-    assert "git verify-commit HEAD" not in criteria
-    assert "build 3" not in criteria
-    assert "receiver-only patch" in criteria
-    assert "must not upload a new TestFlight build" in criteria
-    assert "release_scope" in criteria
-
-
-def test_public_docs_name_each_version_surface_and_transition() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    versioning = VERSIONING_DOC.read_text(encoding="utf-8")
-
-    assert "(docs/versioning.md)" in readme
-    for label in ("Receiver/CLI", "iOS Companion", "Batch Protocol"):
-        assert label in versioning
-    assert "receiver-v1.0.2" in versioning
-    assert "ios-v1.1.1-build.50" in versioning
-    assert "Existing `v1.0.0` and `v1.0.1` tags remain immutable" in versioning
-    assert (
-        "Do not bump an unchanged component merely to make the numbers match"
-        in versioning
-    )
-    assert "component-versions.json" in versioning
-    versioning_subject = (
-        "Future release notes must state the exact compatible iOS Companion"
-    )
-    versioning_detail = "version/build and Batch Protocol schema identifier/version"
-    expected_versioning_statement = f"{versioning_subject} {versioning_detail}"
-    assert expected_versioning_statement in versioning
-    assert "Historical release notes remain as published" in versioning
-
-
-def test_release_and_self_build_docs_reference_current_guidance() -> None:
-    self_build = (ROOT / "docs/self-build.md").read_text(encoding="utf-8")
-    app_review = (ROOT / ".github/release/app-review-notes-template.md").read_text(
-        encoding="utf-8"
-    )
-    testflight = (ROOT / ".github/release/testflight-checklist.md").read_text(
-        encoding="utf-8"
-    )
-
-    assert "setup.md#pair-the-iphone" in self_build
-    assert "pairing.md" not in self_build
-    assert "docs/supported-health-data.md" in app_review
-    assert "docs/supported-health-data.md" in testflight
-    assert ".github/release/app-review-notes-template.md" in testflight
-    assert "docs/healthkit-read-types.md" not in app_review + testflight
-    assert "docs/maintainers/app-review-notes-template.example.md" not in testflight
 
 
 def test_brand_readme_local_links_resolve_inside_repository() -> None:

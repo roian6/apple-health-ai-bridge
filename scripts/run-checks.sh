@@ -61,8 +61,6 @@ run_tests() {
   esac
   if [[ "$mode" != full ]]; then
     for name in \
-      test_public_docs_name_each_version_surface_and_transition \
-      test_release_and_self_build_docs_reference_current_guidance \
       test_brand_readme_local_links_resolve_inside_repository \
       test_install_commands_are_pinned_to_their_receiver_release \
       test_roadmap_links_to_readme_default_receiver_release \

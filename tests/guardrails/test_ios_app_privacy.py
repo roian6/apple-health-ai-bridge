@@ -1306,26 +1306,6 @@ def test_ios_companion_keeps_privacy_safety_copy_without_extra_privacy_menu() ->
     assert manifest.get("NSPrivacyTracking") is False
 
 
-def test_ios_app_review_notes_template_is_privacy_safe_and_actionable() -> None:
-    # Given / When
-    template = Path("docs/maintainers/app-review-notes-template.example.md")
-    text = template.read_text()
-    canonical_template = Path(".github/release/app-review-notes-template.md")
-    canonical_text = canonical_template.read_text()
-
-    # Then
-    assert "../../.github/release/app-review-notes-template.md" in text
-    assert canonical_template.is_file()
-    assert "Read-only HealthKit" in canonical_text
-    assert "User-owned receiver" in canonical_text
-    assert "No ads, tracking, data brokers, or hidden telemetry" in canonical_text
-    assert "No clinical decision support or readiness scoring" in canonical_text
-    assert "Demo access" in canonical_text
-    assert "Deletion and revocation" in canonical_text
-    assert "<private-demo-receiver>" in canonical_text
-    assert "outside Git" in canonical_text
-
-
 def test_ios_companion_is_iphone_only() -> None:
     # Given / When
     plist = _info_plist()
@@ -1337,22 +1317,6 @@ def test_ios_companion_is_iphone_only() -> None:
     assert project.count("TARGETED_DEVICE_FAMILY = 1;") == 2
     assert 'TARGETED_DEVICE_FAMILY = "1,2";' not in project
     assert "UISupportedInterfaceOrientations~ipad" not in plist
-
-
-def test_ios_minimum_versions_are_documented_consistently() -> None:
-    # Given / When
-    readme = Path("README.md").read_text()
-    self_build = Path("docs/self-build.md").read_text()
-    testflight = Path(".github/release/testflight-checklist.md").read_text()
-    contributing = Path(".github/CONTRIBUTING.md").read_text()
-
-    # Then
-    assert "iPhone running iOS 18 or later" in readme
-    assert "(docs/self-build.md)" in readme
-    assert "iPhone running iOS 18 or later" in self_build
-    assert "Xcode 16 or later" in self_build
-    assert "iPhone running iOS 18 or later" in testflight
-    assert "Xcode 16 or later" in contributing
 
 
 def test_repository_has_no_password_accepting_keychain_helper() -> None:

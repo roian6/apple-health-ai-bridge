@@ -176,21 +176,35 @@ def test_cancellation_revokes_exact_request_across_restart(
     assert counts(peer.db) == (0, 0, 0)
 
 
+@pytest.fixture(scope="module")
+def newer_invitations(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    database = tmp_path_factory.mktemp("newer-invitations") / "health.sqlite"
+    invitation_ids = iter(UUID(int=number, version=4) for number in range(1, 129))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(invitations, "uuid4", lambda: next(invitation_ids))
+        for _ in range(128):
+            _ = invitations.create_pairing_invitation(
+                database,
+                label="newer-synthetic",
+                receiver_url=None,
+                transport="mailbox",
+                now=datetime(2099, 1, 1, tzinfo=UTC),
+            )
+    return database
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("restarted", [False, True])
 def test_older_native_request_recovers_beyond_first_invitation_page(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    newer_invitations: Path,
     cancelled: bool,
     restarted: bool,
 ) -> None:
-    invitation_ids = iter(
-        [
-            UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
-            *(UUID(int=number, version=4) for number in range(1, 129)),
-        ]
+    monkeypatch.setattr(
+        invitations, "uuid4", lambda: UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
     )
-    monkeypatch.setattr(invitations, "uuid4", lambda: next(invitation_ids))
     peer = LegacyPeer(tmp_path)
     descriptor, request = stage_native(peer)
     root = tmp_path / "provider"
@@ -216,15 +230,11 @@ def test_older_native_request_recovers_beyond_first_invitation_page(
         (directory / "completion.hbp").read_bytes(), request, descriptor, peer.device
     )
     (directory / "completion.hbp").unlink()
-    for _ in range(128):
-        _ = invitations.create_pairing_invitation(
-            peer.db,
-            label="newer-synthetic",
-            receiver_url=None,
-            transport="mailbox",
-            now=datetime(2099, 1, 1, tzinfo=UTC),
-        )
     with connect_database(peer.db) as db:
+        _ = db.execute("attach database ? as newer", (str(newer_invitations),))
+        _ = db.execute(
+            "insert into pairing_invitations select * from newer.pairing_invitations"
+        )
         assert db.execute(
             "select count(*) from pairing_invitations where pairing_invitation_id < ?",
             (str(UUID(descriptor.invitation_id)),),

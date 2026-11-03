@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -45,7 +44,11 @@ from health_bridge.mailbox_qa.receiver_operations import (
     issue_receiver_receipts,
 )
 from health_bridge.mailbox_qa.scenario_issuance import ScenarioReceiptContextV1
+from tests.script_runner import run_script
 from tests.scripts.production_seal_support import write_synthetic_production_seal
+
+if TYPE_CHECKING:
+    import subprocess
 
 HEAD = "6eb12a4fb29543e691c7e930f385dc4f9964598f"
 RUN_ID = "10" * 16
@@ -559,27 +562,23 @@ def refresh_binding(fixture: M3Fixture, path: Path) -> None:
     write(fixture.manifest, manifest)
 
 
-def run(fixture: M3Fixture) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            "scripts/validate-mailbox-m3-v1.py",
-            "--strict",
-            "--commit",
-            HEAD,
-            "--manifest",
-            str(fixture.manifest),
-            "--m2-manifest",
-            str(fixture.m2_manifest),
-            "--anchor",
-            str(fixture.anchor),
-            "--production-seal",
-            str(fixture.production_seal),
-            "--production-seal-anchor-sha256",
-            fixture.production_seal_anchor_sha256,
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        check=False,
-        capture_output=True,
-        text=True,
+def run(
+    fixture: M3Fixture, *, process: bool = False
+) -> subprocess.CompletedProcess[str]:
+    return run_script(
+        Path("scripts/validate-mailbox-m3-v1.py"),
+        "--strict",
+        "--commit",
+        HEAD,
+        "--manifest",
+        str(fixture.manifest),
+        "--m2-manifest",
+        str(fixture.m2_manifest),
+        "--anchor",
+        str(fixture.anchor),
+        "--production-seal",
+        str(fixture.production_seal),
+        "--production-seal-anchor-sha256",
+        fixture.production_seal_anchor_sha256,
+        process=process,
     )

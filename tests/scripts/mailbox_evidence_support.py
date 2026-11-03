@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from health_bridge.contract._hbjcs1 import JsonValue, hbjcs1_decode, hbjcs1_encode
+from tests.script_runner import run_script
+
+if TYPE_CHECKING:
+    import subprocess
 
 COMMIT = "6eb12a4fb29543e691c7e930f385dc4f9964598f"
 RUN_ID = "10101010101010101010101010101010"
@@ -243,22 +246,18 @@ def build_synthetic_evidence(root: Path) -> SyntheticEvidence:
     )
 
 
-def run_validator(fixture: SyntheticEvidence) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            "scripts/validate-mailbox-device-evidence.py",
-            "--phase",
-            "delivery",
-            "--strict",
-            "--commit",
-            COMMIT,
-            str(fixture.directory),
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        check=False,
-        capture_output=True,
-        text=True,
+def run_validator(
+    fixture: SyntheticEvidence, *, process: bool = False
+) -> subprocess.CompletedProcess[str]:
+    return run_script(
+        Path("scripts/validate-mailbox-device-evidence.py"),
+        "--phase",
+        "delivery",
+        "--strict",
+        "--commit",
+        COMMIT,
+        str(fixture.directory),
+        process=process,
     )
 
 

@@ -1,63 +1,18 @@
 from pathlib import Path
-from subprocess import CompletedProcess, run
-from typing import ClassVar, TypeVar
+from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
+from typer.testing import CliRunner
 
+from health_bridge.cli import app
+from health_bridge.queries.models import DailySummaryResult, TimeseriesResult
+from health_bridge.timeseries_catalog import SupportedTimeseriesCatalog
 from tests.fixture_helpers import initialized_fixture_db
 
 
-class CliModel(BaseModel):
+class CommonQueryOutput(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, strict=True)
-
-
-class CommonQueryOutput(CliModel):
     missing_data_notes: tuple[str, ...]
-
-
-class TimeseriesPointOutput(CliModel):
-    type_code: str
-
-
-class TimeseriesOutput(CommonQueryOutput):
-    points: tuple[TimeseriesPointOutput, ...]
-
-
-class SupportedTimeseriesTypeOutput(CliModel):
-    type_code: str
-    category: str
-    aggregation: str
-
-
-class SupportedTimeseriesOutput(CommonQueryOutput):
-    total_type_count: int
-    types: tuple[SupportedTimeseriesTypeOutput, ...]
-
-
-class DailyObservationOutput(CliModel):
-    sample_totals: dict[str, float]
-    sample_total_semantics: dict[str, str]
-    daily_activity_totals: dict[str, float]
-
-
-class DailySummaryOutput(CommonQueryOutput):
-    days: tuple[DailyObservationOutput, ...]
-
-
-ModelT = TypeVar("ModelT", bound=BaseModel)
-
-
-def _run_health_bridge(args: list[str]) -> CompletedProcess[str]:
-    return run(
-        ["uv", "run", "health-bridge", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def _parse_output(result: CompletedProcess[str], model: type[ModelT]) -> ModelT:
-    return model.model_validate_json(result.stdout)
 
 
 def test_query_cli_outputs_json_for_documented_commands(tmp_path: Path) -> None:
@@ -112,14 +67,17 @@ def test_query_cli_outputs_json_for_documented_commands(tmp_path: Path) -> None:
         ],
         ["query", "explain-sources", "--db", str(db_path)],
     )
-    outputs = [_run_health_bridge(command) for command in commands]
-    common_outputs = [_parse_output(output, CommonQueryOutput) for output in outputs]
-    supported_output = _parse_output(outputs[1], SupportedTimeseriesOutput)
-    timeseries_output = _parse_output(outputs[2], TimeseriesOutput)
-    daily_output = _parse_output(outputs[5], DailySummaryOutput)
+    runner = CliRunner()
+    outputs = [runner.invoke(app, command) for command in commands]
+    common_outputs = [
+        CommonQueryOutput.model_validate_json(output.stdout) for output in outputs
+    ]
+    supported_output = SupportedTimeseriesCatalog.model_validate_json(outputs[1].stdout)
+    timeseries_output = TimeseriesResult.model_validate_json(outputs[2].stdout)
+    daily_output = DailySummaryResult.model_validate_json(outputs[5].stdout)
 
     # Then
-    assert [output.returncode for output in outputs] == [0, 0, 0, 0, 0, 0, 0]
+    assert [output.exit_code for output in outputs] == [0, 0, 0, 0, 0, 0, 0]
     assert all(output.stderr == "" for output in outputs)
     assert all(output.missing_data_notes != () for output in common_outputs)
     assert supported_output.total_type_count == 85
@@ -146,7 +104,8 @@ def test_query_cli_returns_missing_data_caveat_when_no_rows(tmp_path: Path) -> N
     db_path = initialized_fixture_db(tmp_path)
 
     # When
-    result = _run_health_bridge(
+    result = CliRunner().invoke(
+        app,
         [
             "query",
             "timeseries",
@@ -160,10 +119,10 @@ def test_query_cli_returns_missing_data_caveat_when_no_rows(tmp_path: Path) -> N
             "2026-06-21T00:00:00Z",
         ],
     )
-    output = _parse_output(result, TimeseriesOutput)
+    output = TimeseriesResult.model_validate_json(result.stdout)
 
     # Then
-    assert result.returncode == 0
+    assert result.exit_code == 0
     assert result.stderr == ""
     assert output.points == ()
     assert "availability is unknown" in output.missing_data_notes[0]
