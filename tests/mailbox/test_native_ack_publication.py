@@ -53,8 +53,9 @@ def native_publisher(
     tmp_path: Path, mode: str = "ok", *, timeout: float = 2
 ) -> NativeAckPublisher:
     helper = tmp_path / "helper"
+    # This stdlib-only stand-in models a native process, not Python site hooks.
     _ = helper.write_text(
-        f"#!{sys.executable}\nMODE = {mode!r}\n" + _HELPER,
+        f"#!{sys.executable} -S\nMODE = {mode!r}\n" + _HELPER,
         encoding="utf-8",
     )
     helper.chmod(0o700)

@@ -81,6 +81,26 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         case supportedQuantities
     }
 
+    private enum ConnectionIssue {
+        case invalidAddress
+        case offline
+        case unreachable
+        case secureConnection
+
+        var message: String {
+            switch self {
+            case .invalidAddress:
+                return "Review the receiver address in Connection settings."
+            case .offline:
+                return "This iPhone is offline. Reconnect to your network, then try again."
+            case .unreachable:
+                return "The receiver could not be reached. Keep it running and check the network or VPN."
+            case .secureConnection:
+                return "The secure connection could not be verified. Check the receiver's HTTPS certificate."
+            }
+        }
+    }
+
     @MainActor
     private final class ManualSyncProcessor {
         private unowned let viewModel: HealthBridgeCompanionViewModel
@@ -134,7 +154,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             viewModel.statusMessage = "Starting sync for allowed Apple Health data."
             await viewModel.checkReceiverHealth()
             guard !viewModel.statusIsError else {
+                let issue = viewModel.connectionIssue
                 viewModel.statusMessage = "Sync stopped: \(viewModel.statusMessage)"
+                viewModel.connectionIssue = issue
                 if !viewModel.taskUIPublicationIsSuppressed {
                     viewModel.isSyncing = false
                 }
@@ -216,6 +238,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var bearerToken: String
     @Published private(set) var receiverSettingsSaved: Bool
     @Published private var publishedStatusIsError = false
+    @Published private var connectionIssue: ConnectionIssue?
     var statusIsError: Bool {
         get { publishedStatusIsError }
         set {
@@ -230,10 +253,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         get { publishedStatusMessage }
         set {
             guard !taskUIPublicationIsSuppressed else { return }
+            pairingInputError = nil
+            connectionIssue = nil
             publishedStatusMessage = newValue
         }
     }
     var displayStatusMessage: String {
+        if let connectionIssue {
+            return connectionIssue.message
+        }
         let message = CompanionPrimaryStatusMessage.sanitized(
             from: statusMessage, isError: statusIsError
         )
@@ -250,11 +278,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     var usesMailboxTransport: Bool {
         settingsStore.activeTransport == .mailbox
     }
+    var savedReceiverDestination: String {
+        if usesMailboxTransport { return "Your Mac" }
+        guard let components = URLComponents(string: settingsStore.receiverURLString),
+              let host = components.host else { return "Saved receiver" }
+        let displayHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        return components.port.map { "\(displayHost):\($0)" } ?? displayHost
+    }
     @Published private(set) var hasPendingSleepTransition = false
     @Published private(set) var hasPendingOutboxDeletion = false
     @Published private(set) var hasPendingPrivateStorageRecovery = false
     @Published private(set) var hasTransientPrivateStorageFailure = false
     @Published var pairingImportText = ""
+    @Published var pairingInputError: ReceiverPairingBundleError?
+    var pairingInputCorrection: String? {
+        guard let pairingInputError else { return nil }
+        switch pairingInputError {
+        case .invalidJSON, .invalidDeepLink, .missingPayload:
+            return "Paste the complete private setup link from your receiver."
+        case .invalidReceiverURL:
+            return "Enter a complete server address beginning with http:// or https://."
+        case .invalidInvitationCode:
+            return "Enter all 15 letters and numbers from the invitation code."
+        case .unsupportedSchema, .unsupportedTransport:
+            return "Create a new setup link with the current receiver."
+        case .emptyBearerToken, .emptyInvitationSecret, .crossOriginRedeemURL:
+            return "This invitation is incomplete. Create a new link on your receiver."
+        }
+    }
     @Published var manualPairingServer = ""
     @Published var manualPairingCode = ""
     @Published var isPairing = false
@@ -393,6 +444,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let historicalBackfillStateStore: HealthHistoricalBackfillStateStore
     private let quantityObservationStore: QuantityObservationStore
     private let coreLaneUploadProofStore: CoreLaneUploadProofStore
+    private let acceptedTransferStore: LastAcceptedTransferObservationStore
     private var outbox: FileOutbox?
     private let outboxDirectoryURL: URL?
     private var cursorStore: FileSyncCursorStore?
@@ -448,6 +500,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         historicalBackfillStateStore: HealthHistoricalBackfillStateStore = HealthHistoricalBackfillStateStore(),
         quantityObservationStore: QuantityObservationStore = QuantityObservationStore(),
         coreLaneUploadProofStore: CoreLaneUploadProofStore = CoreLaneUploadProofStore(),
+        acceptedTransferStore: LastAcceptedTransferObservationStore = LastAcceptedTransferObservationStore(),
         outbox: FileOutbox? = HealthBridgeCompanionViewModel.makeDefaultOutbox(),
         outboxDirectoryURL: URL? = HealthBridgeCompanionViewModel.defaultOutboxDirectoryURL(),
         cursorStore: FileSyncCursorStore? = HealthBridgeCompanionViewModel.makeDefaultCursorStore(),
@@ -515,6 +568,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.historicalBackfillStateStore = historicalBackfillStateStore
         self.quantityObservationStore = quantityObservationStore
         self.coreLaneUploadProofStore = coreLaneUploadProofStore
+        self.acceptedTransferStore = acceptedTransferStore
         self.outbox = outbox
         #if !HEALTH_BRIDGE_MAILBOX_QA
         outbox?.automaticSyncDiagnosticStore = automaticSyncDiagnosticStore
@@ -821,6 +875,40 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         isSyncing || automaticSyncOwnerIsActive
     }
 
+    var syncPresentation: CompanionSyncPresentation {
+        CompanionSyncPresentation(
+            snapshot: setupSnapshot,
+            canSendConnectionTest: canSendConnectionTest,
+            isPairing: isPairing,
+            hasPendingPairing: hasPendingPairing,
+            hasPendingPrivateStorageRecovery: hasPendingPrivateStorageRecovery,
+            usesMailboxTransport: usesMailboxTransport
+        )
+    }
+
+    var lastAcceptedTransferObservation: LastAcceptedTransferObservation? {
+        guard receiverSettingsSaved, let bindingID = settingsStore.receiverBindingID else { return nil }
+        return acceptedTransferStore.load(
+            bindingID: bindingID,
+            generation: settingsStore.receiverSettingsGenerationToken
+        )
+    }
+
+    private func recordAcceptedTransfer(
+        bindingID: String,
+        generation: String,
+        evidenceKind: LastAcceptedTransferObservation.EvidenceKind
+    ) {
+        guard settingsStore.receiverBindingID == bindingID,
+              settingsStore.receiverSettingsGenerationToken == generation else { return }
+        acceptedTransferStore.record(LastAcceptedTransferObservation(
+            bindingID: bindingID,
+            generation: generation,
+            observedAt: Date(),
+            evidenceKind: evidenceKind
+        ))
+    }
+
     var setupStateDetail: String {
         switch setupState {
         case .unpaired:
@@ -1110,6 +1198,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard let url = URL(string: receiverURLString) else {
             statusIsError = true
             statusMessage = "Bridge URL is invalid."
+            connectionIssue = .invalidAddress
             return
         }
 
@@ -1122,6 +1211,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         } catch {
             statusIsError = true
             statusMessage = "Local bridge check failed: \(describe(error))"
+            if let networkError = error as? URLError {
+                switch networkError.code {
+                case .notConnectedToInternet:
+                    connectionIssue = .offline
+                case .cannotFindHost, .cannotConnectToHost, .timedOut, .networkConnectionLost:
+                    connectionIssue = .unreachable
+                case .secureConnectionFailed, .serverCertificateUntrusted,
+                     .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+                     .serverCertificateNotYetValid:
+                    connectionIssue = .secureConnection
+                default:
+                    break
+                }
+            }
         }
     }
 
@@ -1540,6 +1643,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             self.outbox = recovery.outbox
             let removedCount = recovery.removedPayloadCount
+            acceptedTransferStore.clear()
             outboxIdentityMigrationReady = true
             hasPendingPrivateStorageRecovery = false
             hasTransientPrivateStorageFailure = false
@@ -2470,6 +2574,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         automaticSyncRuntime?.activateIfReady(scheduleOutbox: scheduleOutbox)
     }
 
+    func dismissPairingInputError() {
+        guard pairingInputError != nil else { return }
+        statusIsError = false
+        statusMessage = "Enter a private setup link or an invitation code."
+    }
+
     func importPairingText() async {
         await runTrackedPairingOperation { [weak self] in
             await self?.performImportPairingText()
@@ -2488,6 +2598,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard !isPairing else { return }
         pairingFailurePresentation = nil
+        pairingInputError = nil
         let trimmed = pairingImportText.trimmingCharacters(in: .whitespacesAndNewlines)
         isPairing = true
         defer {
@@ -2508,6 +2619,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     func importPairingURL(_ url: URL) async {
         guard !taskUIPublicationIsSuppressed else { return }
         pairingFailurePresentation = nil
+        pairingInputError = nil
         let pendingPairingExists: Bool
         do {
             pendingPairingExists = try pairingCoordinator.hasPendingPairing()
@@ -2598,6 +2710,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard !isPairing else { return }
         pairingFailurePresentation = nil
+        pairingInputError = nil
         isPairing = true
         defer {
             if !taskUIPublicationIsSuppressed {
@@ -2727,6 +2840,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         usesMailbox: Bool = false
     ) {
         pairingFailurePresentation = nil
+        pairingInputError = nil
         receiverURLString = receiverURL
         bearerToken = token
         reloadCommittedReceiverSettings()
@@ -3507,6 +3621,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return .completed(pendingCount: pendingOutboxCount)
         }
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
+        let expectedBindingID = settingsStore.receiverBindingID
         do {
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(expectedGeneration)
@@ -3533,6 +3648,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 try backgroundSyncStore.persistMailboxAckScanCheckpoint(
                     checkpoint,
                     receiverGeneration: expectedGeneration
+                )
+            }
+            if summary.finalizedCount > 0, let expectedBindingID {
+                recordAcceptedTransfer(
+                    bindingID: expectedBindingID,
+                    generation: expectedGeneration,
+                    evidenceKind: .mailboxCommit
                 )
             }
             refreshPendingOutboxCount()
@@ -6498,6 +6620,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             do {
                 let summary = try await makeProductionMailboxDelivery().deliverPending()
                 try requireCurrentPayloadDeliveryTarget(target)
+                if summary.finalizedCount > 0 {
+                    recordAcceptedTransfer(
+                        bindingID: target.bindingID,
+                        generation: target.generation,
+                        evidenceKind: .mailboxCommit
+                    )
+                }
                 let flushSummary = FileOutboxFlushSummary(
                     attemptedCount: summary.attemptedCount,
                     uploadedCount: summary.finalizedCount,
@@ -6599,6 +6728,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 )
                 lastDirectAcceptance = (item.id, receiverIdentity, expectedGeneration, bootstrapRetryGeneration)
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .accepted)
+                recordAcceptedTransfer(
+                    bindingID: receiverIdentity,
+                    generation: expectedGeneration,
+                    evidenceKind: .directResponse
+                )
                 uploadedCount += 1
             } catch let cancellation as CancellationError {
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .cancelled)
@@ -7205,5 +7339,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func publishPairingFailure(_ prefix: String, error: Error) {
         publishPairingFailure("\(prefix): \(describePairingFailure(error))")
+        pairingInputError = error as? ReceiverPairingBundleError
     }
 }

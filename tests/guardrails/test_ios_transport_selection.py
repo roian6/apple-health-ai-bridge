@@ -41,19 +41,17 @@ def test_ios_pairing_stages_validated_transport_intent_before_capability_use() -
     assert "invitation.mailboxProtocolVersion" not in client
 
 
-def test_ios_setup_explains_transport_choices_without_instant_sync_claims() -> None:
+def test_ios_connection_ui_uses_committed_route_and_invitation_actions() -> None:
     content = CONTENT_VIEW.read_text(encoding="utf-8")
+    connection = CONTENT_VIEW.with_name("ConnectionSettingsView.swift").read_text(
+        encoding="utf-8"
+    )
 
-    for required in (
-        "Direct / Tailscale-compatible",
-        "Encrypted iCloud Mailbox (Beta)",
-        "No VPN required",
-        "Mac only",
-        "Best-effort, eventual delivery",
-        "Custom HTTPS",
-        "Advanced / Limited",
-    ):
-        assert required in content
+    assert "viewModel.savedReceiverDestination" in connection
+    assert "viewModel.usesMailboxTransport" in connection
+    assert "await viewModel.importPairingText()" in content
+    assert "await viewModel.redeemManualPairing()" in content
+    assert "viewModel.usesMailboxTransport =" not in content + connection
     assert "instant sync" not in content.lower()
 
 

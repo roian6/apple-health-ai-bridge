@@ -450,9 +450,9 @@ def test_round_one_sleep_state_is_migrated_before_pending_replay() -> None:
 
 def test_sleep_journal_is_visible_and_generation_is_rechecked_after_healthkit() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
-    content = (ROOT / "ios/HealthBridgeCompanion/App/ContentView.swift").read_text(
-        encoding="utf-8"
-    )
+    content = (
+        ROOT / "ios/HealthBridgeCompanion/App/ConnectionSettingsView.swift"
+    ).read_text(encoding="utf-8")
     sync_start = source.index("func syncRecentSleepSessions(")
     read = source.index(
         "try await HealthKitSleepReader().readAnchoredSleepChanges(", sync_start
@@ -619,9 +619,9 @@ def test_destructive_recovery_resets_all_progress_and_unreadable_connection() ->
 
 def test_transient_private_storage_failure_is_retryable_not_destructive() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
-    content_view = (ROOT / "ios/HealthBridgeCompanion/App/ContentView.swift").read_text(
-        encoding="utf-8"
-    )
+    content_view = (
+        ROOT / "ios/HealthBridgeCompanion/App/ConnectionSettingsView.swift"
+    ).read_text(encoding="utf-8")
 
     assert (
         "ReceiverConnectionRecordRecoveryPolicy.requiresDestructiveRecovery(error)"
@@ -629,7 +629,11 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
     )
     assert "catch FileSyncCursorStoreError.invalidData" in source
     assert "hasTransientPrivateStorageFailure = true" in source
-    assert 'Label("Retry Private Storage"' in content_view
+    retry_start = content_view.index("if viewModel.hasTransientPrivateStorageFailure {")
+    retry_end = content_view.index("if viewModel.pendingOutboxCount > 0", retry_start)
+    retry = content_view[retry_start:retry_end]
+    assert "await viewModel.retryPrivateStorage()" in retry
+    assert "role: .destructive" not in retry
 
 
 def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> None:

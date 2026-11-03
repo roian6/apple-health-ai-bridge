@@ -846,10 +846,7 @@ def test_ios_health_permissions_use_native_sheet_for_unified_scope() -> None:
     assert "Core access includes Steps, Workouts, and Sleep." not in content_view
     narrow_copy = "Additional health data stays off unless you choose it here."
     assert narrow_copy not in content_view
-    assert (
-        "requests read-only access for every supported type currently available"
-        in content_view
-    )
+    assert "viewModel.healthPermissionScopeSummary" in content_view
     optional_explicit_copy = (
         "Additional optional metrics require an explicit optional sync request"
     )
@@ -873,6 +870,10 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     ux_state = Path(
         "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionUXState.swift"
     ).read_text()
+    data_view = Path("ios/HealthBridgeCompanion/App/DataScopeView.swift").read_text()
+    diagnostics = Path(
+        "ios/HealthBridgeCompanion/App/ActivityDiagnosticsView.swift"
+    ).read_text()
 
     # Then
     assert "ProgressView()" in content_view
@@ -888,19 +889,17 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     assert "Queued uploads and sync status" not in content_view
     assert "AppDetailsView" in content_view
     assert "DeveloperDiagnosticsView" not in content_view
-    assert "Connection, sync status, and app details" in content_view
+    assert "ConnectionSettingsView(viewModel: viewModel)" in content_view
     assert 'title: "Settings"' in content_view
     assert "Permissions and app info" not in content_view
     assert "Permissions, troubleshooting, app info" not in content_view
-    assert (
-        "Apple Health can ask again when supported types become newly available"
-        in content_view
-    )
-    assert "Request Health Access Again" in content_view
+    assert "DataScopeView(viewModel: viewModel)" in content_view
+    assert "await viewModel.requestHealthPermissions()" in data_view
+    assert "viewModel.healthPermissionNotice" in data_view
     assert 'LabeledContent("Version"' in content_view
     assert "Open Source" not in content_view
     assert "Third-party libraries" not in content_view
-    assert "Diagnostics" not in content_view
+    assert 'DisclosureGroup("Advanced"' in diagnostics
     assert "receiverDiagnosticsSummary" not in content_view
     assert (
         "receiverDiagnosticsSummary"
@@ -908,10 +907,10 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
             "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
         ).read_text()
     )
-    assert 'Section("Automatic Sync")' in content_view
-    assert "viewModel.automaticSyncCoverageDetail" in content_view
-    assert "viewModel.backgroundSyncStatus" in content_view
-    assert "viewModel.automaticSyncLaneDiagnosticLine" in content_view
+    assert "ActivityDiagnosticsView(viewModel: viewModel)" in content_view
+    assert "viewModel.automaticSyncCoverageDetail" in diagnostics
+    assert "viewModel.backgroundSyncStatus" not in content_view + diagnostics
+    assert "viewModel.automaticSyncLaneDiagnosticLine" in diagnostics
     assert "Review Health permissions in Settings" not in ux_state
     assert "diagnosticCode(from:" in ux_state
     assert "NSURLErrorDomain -1004" in ux_state or "domain=([^|]+)" in ux_state
@@ -925,21 +924,21 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
 def test_ios_status_card_surfaces_queued_uploads_after_disconnect() -> None:
     # Given / When
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    presentation = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text()
 
     # Then
     queued_disconnected_condition = (
-        "if !viewModel.canSendConnectionTest && viewModel.pendingOutboxCount > 0"
+        "if !canSendConnectionTest && snapshot.pendingOutboxCount > 0"
     )
-    generic_disconnected_condition = "if !viewModel.canSendConnectionTest {"
-    assert queued_disconnected_condition in content_view
-    assert content_view.index(queued_disconnected_condition) < content_view.index(
+    generic_disconnected_condition = "if !canSendConnectionTest {"
+    assert queued_disconnected_condition in presentation
+    assert presentation.index(queued_disconnected_condition) < presentation.index(
         generic_disconnected_condition
     )
-    assert "Queued Uploads Waiting" in content_view
-    assert (
-        "Queued uploads remain on this iPhone. Reconnect from setup link to retry them."
-        in content_view
-    )
+    assert "phase = .connectionRequired" in presentation
+    assert "Text(viewModel.syncPresentation.title)" in content_view
     assert "or clear them" not in content_view
 
 
@@ -949,29 +948,16 @@ def test_ios_unpaired_connection_error_is_visible_and_retryable() -> None:
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
 
-    title_policy = content_view.split("private var statusTitle: String", maxsplit=1)[1]
-    title_policy = title_policy.split("private var statusSubtitle: String", maxsplit=1)[
-        0
-    ]
-    subtitle_policy = content_view.split(
-        "private var statusSubtitle: String", maxsplit=1
-    )[1]
-    subtitle_policy = subtitle_policy.split(
-        "private var syncErrorTitle: String", maxsplit=1
-    )[0]
-
-    error_condition = "if viewModel.statusIsError"
-    disconnected_title = (
-        'if !viewModel.canSendConnectionTest { return "Not Connected" }'
+    presentation = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text()
+    assert presentation.index("if snapshot.statusIsError") < presentation.index(
+        "if !canSendConnectionTest {"
     )
-    disconnected_subtitle = (
-        'if !viewModel.canSendConnectionTest { return "Connect this iPhone before '
-        'syncing." }'
-    )
-    assert title_policy.index(error_condition) < title_policy.index(disconnected_title)
-    assert subtitle_policy.index(error_condition) < subtitle_policy.index(
-        disconnected_subtitle
-    )
+    assert "phase = .needsAttention" in presentation
+    assert "viewModel.displayStatusMessage" in content_view
+    assert "viewModel.pairingInputCorrection" in content_view
+    assert "pairingInputError = error as? ReceiverPairingBundleError" in view_model
     assert 'Button("Retry Pairing")' in content_view
     cancel_action = content_view.index(
         "showPendingPairingCancellationConfirmation = true"
@@ -1030,6 +1016,7 @@ def test_different_setup_link_is_rejected_before_bootstrap_retry() -> None:
 def test_ios_companion_uses_simple_history_sync_copy() -> None:
     # Given / When
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    data_view = Path("ios/HealthBridgeCompanion/App/DataScopeView.swift").read_text()
     history_policy = Path(
         "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/HealthHistoryDepthPolicy.swift"
     ).read_text()
@@ -1045,12 +1032,13 @@ def test_ios_companion_uses_simple_history_sync_copy() -> None:
     assert simple_history_copy not in content_view
     assert stale_history_copy not in content_view
     assert "First sync range. Later syncs only send changes." not in content_view
-    assert 'title: "Sync Range"' in content_view
+    assert "viewModel.setHealthHistoryDepthOption($0)" in data_view
+    assert "viewModel.healthHistoryDepthRows" in data_view
     assert "viewModel.automaticSyncScopeSummary" in content_view
     assert "iOS decides background timing" in ux_state
     assert "On when iOS allows." not in content_view
     assert "Manual only." not in content_view
-    assert ".pickerStyle(.menu)" in content_view
+    assert "Picker(" in data_view
     assert 'title: "All"' in history_policy
     assert 'return "All"' in history_policy
     assert 'title: "1 year"' in history_policy
@@ -1127,10 +1115,7 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     assert "automaticQuantityTypeCodes: availableQuantityTypeCodes" in view_model
     assert 'Toggle("Include all supported health data"' not in content_view
     assert "Core access includes Steps, Workouts, and Sleep." not in content_view
-    assert (
-        "requests read-only access for every supported type currently available"
-        in content_view
-    )
+    assert "viewModel.healthPermissionScopeSummary" in content_view
     for public_copy in (healthkit_read_types, review_notes):
         assert "every runtime-available" in public_copy
         assert "Include all supported health data" not in public_copy
@@ -1188,6 +1173,9 @@ def test_ios_bootstrap_fails_closed_for_legacy_private_state() -> None:
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    presentation = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text()
 
     assert (
         view_model.count(
@@ -1206,19 +1194,15 @@ def test_ios_bootstrap_fails_closed_for_legacy_private_state() -> None:
     assert connection_recovery in view_model
     assert view_model.index(connection_recovery) < view_model.index(outbox_recovery)
     assert "must be reset and paired again before any upload" in view_model
-    status_title = content_view.split("private var statusTitle: String", 1)[1].split(
-        "private var statusSubtitle: String",
-        1,
-    )[0]
-    status_subtitle = content_view.split("private var statusSubtitle: String", 1)[
-        1
-    ].split(
-        "private var syncErrorTitle: String",
-        1,
-    )[0]
-    assert "viewModel.hasPendingPrivateStorageRecovery" in status_title
-    assert 'return "Recovery Required"' in status_title
-    assert "viewModel.hasPendingPrivateStorageRecovery" in status_subtitle
+    assert (
+        "hasPendingPrivateStorageRecovery: hasPendingPrivateStorageRecovery"
+        in view_model
+    )
+    assert presentation.index("if hasPendingPrivateStorageRecovery") < (
+        presentation.index("if !canSendConnectionTest")
+    )
+    assert "phase = .recoveryRequired" in presentation
+    assert "Text(viewModel.syncPresentation.title)" in content_view
 
 
 def test_ios_privacy_manifest_declares_required_reason_api_usage() -> None:
@@ -1252,7 +1236,9 @@ def test_ios_privacy_manifest_is_bundled_in_app_resources() -> None:
 
 def test_ios_companion_exposes_disconnect_receiver_control() -> None:
     # Given / When
-    content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    content_view = Path(
+        "ios/HealthBridgeCompanion/App/ConnectionSettingsView.swift"
+    ).read_text()
     view_model = Path(
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
@@ -1261,15 +1247,21 @@ def test_ios_companion_exposes_disconnect_receiver_control() -> None:
     ).read_text()
 
     # Then
-    assert 'Label("Disconnect from Server"' in content_view
-    assert "private var connectionStatusCard" in content_view
-    assert content_view.index('Label("Disconnect from Server"') > content_view.index(
-        "private var connectionStatusCard"
-    )
+    assert 'Button("Disconnect from Server", role: .destructive)' in content_view
+    assert "private var connectionSection" in content_view
+    assert content_view.index(
+        'Button("Disconnect from Server", role: .destructive)',
+        content_view.index("private var connectionSection"),
+    ) > content_view.index("private var connectionSection")
     assert "showDisconnectConfirmation = true" in content_view
     assert "if !viewModel.receiverSettingsSaved" in content_view
-    assert "isDisabled: !viewModel.canRedeemManualPairing" in content_view
-    assert "isDisabled: !viewModel.canSendConnectionTest" in content_view
+    assert ".disabled(!viewModel.canRedeemManualPairing || viewModel.isPairing)" in (
+        content_view
+    )
+    assert (
+        ".disabled(!viewModel.canSendConnectionTest || viewModel.isCheckingConnection)"
+        in content_view
+    )
     assert "viewModel.disconnectReceiver()" in content_view
     assert "func disconnectReceiver() async" in view_model
     assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in view_model
@@ -1285,17 +1277,17 @@ def test_ios_companion_keeps_privacy_safety_copy_without_extra_privacy_menu() ->
     # Then
     assert "Privacy & local data" not in content_view
     assert "PrivacyLocalDataView" not in content_view
-    assert (
-        "Use Apple Health's permission screen to choose what this iPhone can share"
-        in content_view
-    )
-    assert "the secret key stays on this iPhone" in content_view
+    assert "viewModel.healthPermissionScopeSummary" in content_view
+    assert 'Link("Privacy Policy", destination: Self.privacyPolicyURL)' in content_view
     assert "Delete pending sync queue" not in content_view
     assert "Retry pending syncs" not in content_view
-    assert "Activity Log" in content_view
+    assert "ActivityDiagnosticsView(viewModel: viewModel)" in content_view
     assert "Recent Activity" not in content_view
     assert "View All Logs" not in content_view
-    assert "View Logs" in content_view
+    diagnostics = Path(
+        "ios/HealthBridgeCompanion/App/ActivityDiagnosticsView.swift"
+    ).read_text()
+    assert "viewModel.activityLogMessages" in diagnostics
     assert (
         "activityLogMessages"
         in Path(
@@ -1419,11 +1411,11 @@ def test_ios_pairing_v2_stages_before_redeem_and_recovers_pending_state() -> Non
     assert "func importPairingURL(_ url: URL) async" in view_model
     assert "func redeemManualPairing() async" in view_model
 
-    assert 'TextField("Server address"' in content_view
-    assert 'TextField("Invitation code"' in content_view
+    assert '.accessibilityLabel("Server address")' in content_view
+    assert '.accessibilityLabel("Invitation code")' in content_view
     assert "viewModel.redeemManualPairing()" in content_view
     assert 'SecureField("Secret key"' not in content_view
-    assert "Task { await viewModel.importPairingText() }" in content_view
+    assert "await viewModel.importPairingText()" in content_view
 
     assert ".onContinueUserActivity(NSUserActivityTypeBrowsingWeb)" in app
     assert "await viewModel.importPairingURL(url)" in app
