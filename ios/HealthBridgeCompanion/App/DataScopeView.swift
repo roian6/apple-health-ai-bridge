@@ -34,7 +34,7 @@ struct DataScopeView: View {
                     )
                 }
 
-                DisclosureGroup("Access details") {
+                DisclosureGroup("About Health access") {
                     Group {
                         Text(viewModel.healthPermissionScopeSummary)
                         if !viewModel.healthPermissionNotice.isEmpty
@@ -63,16 +63,14 @@ struct DataScopeView: View {
                     }
                 }
 
-                DisclosureGroup("Range details") {
-                    Group {
-                        if let selectedRow = viewModel.healthHistoryDepthRows.first(where: \.isSelected) {
-                            Text(selectedRow.detail)
-                        }
-                        Text("Limits vary by data type.")
+                VStack(alignment: .leading, spacing: 4) {
+                    if let selectedRow = viewModel.healthHistoryDepthRows.first(where: \.isSelected) {
+                        Text(selectedRow.detail)
                     }
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    Text("Limits vary by data type.")
                 }
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
             } header: {
                 Text("History")
             } footer: {

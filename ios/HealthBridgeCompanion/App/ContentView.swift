@@ -94,9 +94,22 @@ struct ContentView: View {
             }
             if let observation = viewModel.lastAcceptedTransferObservation {
                 Divider()
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Last transfer confirmed")
-                    Text(observation.observedAt, format: .dateTime.year().month(.abbreviated).day().hour().minute())
+                let dateFormat = Date.FormatStyle.dateTime.month(.abbreviated).day().hour().minute()
+                let confirmationDate = Text(
+                    observation.observedAt,
+                    format: Calendar.current.isDate(observation.observedAt, equalTo: Date(), toGranularity: .year)
+                        ? dateFormat : dateFormat.year()
+                )
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("Last transfer confirmed")
+                        confirmationDate
+                    }
+                    .fixedSize()
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Last transfer confirmed")
+                        confirmationDate
+                    }
                 }
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -311,7 +324,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } label: {
-                Text("Access details")
+                Text("About Health access")
                     .frame(minHeight: 44)
             }
         }
@@ -395,7 +408,6 @@ struct ContentView: View {
         } label: {
             CardRow(
                 title: "Settings",
-                subtitle: "Connection, Health data, and help",
                 systemImage: "gearshape.fill",
                 tint: .orange
             )
@@ -589,7 +601,6 @@ struct InlineNotice: View {
 private struct CardRow: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let title: String
-    let subtitle: String
     let systemImage: String
     let tint: Color
     var accessory: String? = nil
@@ -604,17 +615,9 @@ private struct CardRow: View {
                     .background(tint.opacity(0.13))
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                if !dynamicTypeSize.isAccessibilitySize {
-                    Text(subtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(.primary)
             Spacer(minLength: 0)
             if let accessory {
                 Text(accessory)
