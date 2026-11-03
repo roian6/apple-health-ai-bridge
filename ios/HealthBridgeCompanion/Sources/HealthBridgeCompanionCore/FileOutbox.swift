@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 #if canImport(Security)
 import Security
@@ -1155,6 +1156,106 @@ public final class FileOutbox {
 
     public func pendingItems() throws -> [FileOutboxItem] {
         try pendingItems(in: reconciledManifest())
+    }
+
+    // Routing data for one synchronous operation, never authority for a mutation.
+    func readMailboxItem(
+        id: String
+    ) throws -> (state: FileOutboxDeliveryStateV1?, pendingItem: FileOutboxItem?) {
+        guard Self.isSafeItemID(id) else { return (nil, nil) }
+        let manifest = try reconciledManifest()
+        return (
+            manifest.entries.first(where: { $0.id == id })?.deliveryState,
+            try pendingItems(in: manifest).first(where: { $0.id == id })
+        )
+    }
+
+    // Operation-local freshness, not an integrity proof or a manifest for mutation.
+    // State, transport, CAS and finalization still perform their full validation.
+    struct MailboxFreshnessSnapshot: Equatable {
+        fileprivate let owner: ObjectIdentifier
+        fileprivate let directory: MailboxFreshnessDirectory
+        fileprivate let metadata: [Data?]
+        fileprivate let artifacts: Set<String>
+    }
+
+    fileprivate struct MailboxFreshnessDirectory: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let birthSeconds: Int
+        let birthNanoseconds: Int
+    }
+
+    func captureMailboxFreshness(including expectedItems: [FileOutboxItem] = []) throws -> MailboxFreshnessSnapshot {
+        try requireUploadAdmission()
+        let directoryIdentity = try mailboxFreshnessDirectory()
+        let manifest = try reconciledManifest()
+        if !expectedItems.isEmpty {
+            let current = Dictionary(uniqueKeysWithValues: try pendingItems(in: manifest).map { ($0.id, $0) })
+            guard expectedItems.allSatisfy({ current[$0.id] == $0 }) else { throw CancellationError() }
+        }
+        let snapshot = try readMailboxFreshness()
+        let capturedManifest = try snapshot.metadata[0].map {
+            try JSONDecoder().decode(SequenceManifest.self, from: $0)
+        } ?? .empty
+        guard snapshot.directory == directoryIdentity, capturedManifest == manifest else {
+            throw CancellationError()
+        }
+        return snapshot
+    }
+
+    func validateMailboxFreshness(_ snapshot: MailboxFreshnessSnapshot) throws {
+        do {
+            try requireUploadAdmission()
+            guard snapshot.owner == ObjectIdentifier(self),
+                  try readMailboxFreshness() == snapshot else {
+                throw CancellationError()
+            }
+        } catch {
+            // A failed fresh read cannot authorize accepting the suspended result.
+            throw CancellationError()
+        }
+    }
+
+    private func readMailboxFreshness() throws -> MailboxFreshnessSnapshot {
+        try requireUploadAdmission()
+        let identity = try mailboxFreshnessDirectory()
+        let artifacts = try mailboxFreshnessArtifacts()
+        let metadata = try [sequenceURL, enqueueTransactionURL, mailboxEnvelopeIntentURL].map { url -> Data? in
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else {
+                guard errno == ENOENT else { throw CancellationError() }
+                return nil
+            }
+            return try MailboxRegularFileReader.read(url, maximumBytes: 64 * 1024 * 1024)
+        }
+        guard try mailboxFreshnessArtifacts() == artifacts,
+              try mailboxFreshnessDirectory() == identity else {
+            throw CancellationError()
+        }
+        try requireUploadAdmission()
+        return MailboxFreshnessSnapshot(
+            owner: ObjectIdentifier(self), directory: identity,
+            metadata: metadata, artifacts: artifacts
+        )
+    }
+
+    private func mailboxFreshnessDirectory() throws -> MailboxFreshnessDirectory {
+        var info = stat()
+        guard lstat(directory.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else {
+            throw CancellationError()
+        }
+        return MailboxFreshnessDirectory(
+            device: info.st_dev, inode: info.st_ino,
+            birthSeconds: info.st_birthtimespec.tv_sec,
+            birthNanoseconds: info.st_birthtimespec.tv_nsec
+        )
+    }
+
+    private func mailboxFreshnessArtifacts() throws -> Set<String> {
+        Set(try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { ["json", "staged", "hbe", "hbe-staged"].contains($0.pathExtension) }
+            .map(\.lastPathComponent))
     }
 
     func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
@@ -2592,41 +2693,131 @@ public final class FileOutbox {
 
     private func recoverEnqueueTransactionsIfNeeded() throws {
         let transactions = try loadEnqueueTransactions()
+        guard !transactions.isEmpty else { return }
+        let loadedManifest = try loadManifest()
+        var manifest = loadedManifest ?? .empty
+        var manifestEntries = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
+        )
+        var sequenceOwners = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.sequence, $0.id) }
+        )
+        var removedIDs: Set<String> = []
+        var additions: [SequenceEntry] = []
+        var retainedTransactions: [EnqueueTransaction] = []
         for transaction in transactions {
-            let loadedManifest = try loadManifest()
-            var manifest = loadedManifest ?? .empty
-            try Self.validate(manifest)
-            let manifestEntries = Dictionary(
-                uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
-            )
-            let allPayloadsAreRecoverable = !clearIntentIsActive
-                && transaction.entries.allSatisfy { entry in
-                    transaction.directAcknowledgedIDs.contains(entry.id)
-                        || fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
-                        || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
-                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
+            let acknowledgedIDs = transaction.directAcknowledgedIDs
+            let payloads = transaction.entries.map { entry in
+                (
+                    entry: entry,
+                    staged: fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path),
+                    final: fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                )
+            }
+            let isApplied = !destructiveRecoveryIsRequested
+                && payloads.allSatisfy { payload in
+                    let entry = payload.entry
+                    guard manifest.nextSequence > entry.sequence, !payload.staged else {
+                        return false
+                    }
+                    if acknowledgedIDs.contains(entry.id) {
+                        return manifestEntries[entry.id] == nil && !payload.final
+                    }
+                    guard let current = manifestEntries[entry.id],
+                          Self.hasSameCollectionIdentity(current, entry) else {
+                        return false
+                    }
+                    return payload.final || current.deliveryState?.phase == .committedFinalized
                 }
-            if allPayloadsAreRecoverable {
-                _ = try commitEnqueueTransaction(transaction, manifest: manifest)
+            if isApplied {
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
                 continue
             }
-            if !transaction.directAcknowledgedIDs.isEmpty
+            let allPayloadsAreRecoverable = !clearIntentIsActive
+                && payloads.allSatisfy { payload in
+                    acknowledgedIDs.contains(payload.entry.id)
+                        || payload.staged || payload.final
+                        || manifestEntries[payload.entry.id]?.deliveryState?.phase == .committedFinalized
+                }
+            if allPayloadsAreRecoverable {
+                let additionsStart = additions.endIndex
+                for payload in payloads {
+                    let entry = payload.entry
+                    guard entry.sequence < UInt64.max else { throw SequenceError.exhausted }
+                    manifest.nextSequence = max(manifest.nextSequence, entry.sequence + 1)
+                    let stagedURL = stagedPayloadURL(for: entry.id)
+                    let finalURL = finalPayloadURL(for: entry.id)
+                    if acknowledgedIDs.contains(entry.id) {
+                        try removeIfExists(stagedURL)
+                        try removeIfExists(finalURL)
+                        if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                            sequenceOwners.removeValue(forKey: removed.sequence)
+                            removedIDs.insert(entry.id)
+                        }
+                        continue
+                    }
+                    if payload.staged {
+                        try Self.applySensitiveFileAttributes(to: stagedURL, fileManager: fileManager)
+                        if payload.final {
+                            try fileManager.removeItem(at: stagedURL)
+                        } else {
+                            try fileManager.moveItem(at: stagedURL, to: finalURL)
+                        }
+                    }
+                    let hasFinalPayload = fileManager.fileExists(atPath: finalURL.path)
+                    guard hasFinalPayload
+                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized else {
+                        throw SequenceError.invalidManifest
+                    }
+                    if hasFinalPayload {
+                        try Self.applySensitiveFileAttributes(to: finalURL, fileManager: fileManager)
+                    }
+                    if manifestEntries[entry.id] == nil {
+                        guard entry.sequence > 0, Self.isSafeItemID(entry.id) else {
+                            throw SequenceError.invalidManifest
+                        }
+                        manifestEntries[entry.id] = entry
+                        additions.append(entry)
+                    }
+                }
+                for entry in additions[additionsStart...] {
+                    guard sequenceOwners[entry.sequence] == nil else {
+                        throw SequenceError.invalidManifest
+                    }
+                    sequenceOwners[entry.sequence] = entry.id
+                }
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
+                continue
+            }
+            if !acknowledgedIDs.isEmpty
                 || transaction.entries.contains(where: {
                 manifestEntries[$0.id]?.deliveryState?.phase == .committedFinalized
             }) {
                 throw FileOutboxCursorCheckpointError.pendingCommit
             }
 
-            let transactionIDs = Set(transaction.entries.map(\.id))
             for entry in transaction.entries {
                 try removeIfExists(stagedPayloadURL(for: entry.id))
                 try removeIfExists(finalPayloadURL(for: entry.id))
+                if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                    sequenceOwners.removeValue(forKey: removed.sequence)
+                    removedIDs.insert(entry.id)
+                }
             }
-            manifest.entries.removeAll { transactionIDs.contains($0.id) }
-            if manifest != loadedManifest {
-                try persistManifest(manifest)
-            }
-            try removeEnqueueTransaction(transaction)
+        }
+        manifest.entries.removeAll { removedIDs.contains($0.id) }
+        manifest.entries.append(contentsOf: additions)
+        if manifest != loadedManifest {
+            try persistManifest(manifest)
+        }
+        // Journal pruning must follow the manifest durability boundary, including
+        // when a later transaction fails after earlier payloads have moved.
+        if retainedTransactions != transactions {
+            try persistEnqueueTransactions(retainedTransactions)
         }
     }
 
@@ -2636,6 +2827,10 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        // Hold all recovery, including orphan adoption, until terminal reset proceeds.
+        if terminalResetRequestIsActive {
+            return try loadManifest() ?? .empty
+        }
         try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
