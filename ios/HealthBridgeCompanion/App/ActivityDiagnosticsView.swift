@@ -93,7 +93,14 @@ struct ActivityDiagnosticsView: View {
             case .pairing, .syncing:
                 Text("Wait for the current action to finish.")
                     .foregroundStyle(.secondary)
-            case .permissionRequestNeeded:
+            case .needsAttention where viewModel.setupState == .unpaired:
+                NavigationLink("Open Connection") {
+                    ConnectionSettingsView(viewModel: viewModel)
+                }
+            case .permissionRequestNeeded,
+                 .directQueued where viewModel.setupState == .pairedNeedsHealthPermission,
+                 .mailboxConfirmationWaiting where viewModel.setupState == .pairedNeedsHealthPermission,
+                 .needsAttention where viewModel.setupState == .pairedNeedsHealthPermission:
                 Button("Review Health Access") {
                     Task { await viewModel.performPrimaryAction() }
                 }
