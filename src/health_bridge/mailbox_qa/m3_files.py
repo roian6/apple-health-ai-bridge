@@ -12,7 +12,6 @@ from health_bridge.contract._hbjcs1 import (
     HBJCS1Error,
     JsonValue,
     hbjcs1_decode,
-    hbjcs1_encode,
 )
 from health_bridge.mailbox_qa.m3_errors import M3FailureCode, M3ValidationError
 
@@ -36,13 +35,17 @@ def external_file(path: Path) -> tuple[Path, str]:
 
 def read_document(root: Path, relative_path: str) -> dict[str, JsonValue]:
     encoded = read_scoped_regular_file(root, relative_path)
+    return _decode_document(encoded)
+
+
+def _decode_document(encoded: bytes | None) -> dict[str, JsonValue]:
     if encoded is None or len(encoded) > MAX_DOCUMENT_BYTES:
         raise M3ValidationError(M3FailureCode.SCHEMA_INVALID)
     try:
         value = hbjcs1_decode(encoded)
     except HBJCS1Error as exc:
         raise M3ValidationError(M3FailureCode.SCHEMA_INVALID) from exc
-    if hbjcs1_encode(value) != encoded or not isinstance(value, dict):
+    if not isinstance(value, dict):
         raise M3ValidationError(M3FailureCode.SCHEMA_INVALID)
     return value
 
@@ -69,7 +72,7 @@ def bound_document(
     content = read_scoped_regular_file(root, binding.path)
     if content is None or hashlib.sha256(content).hexdigest() != binding.sha256:
         raise M3ValidationError(M3FailureCode.ARTIFACT_BINDING)
-    return read_document(root, binding.path)
+    return _decode_document(content)
 
 
 __all__ = [

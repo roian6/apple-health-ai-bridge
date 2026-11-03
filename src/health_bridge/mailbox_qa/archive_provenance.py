@@ -78,7 +78,7 @@ def load_archive_provenance(path: Path) -> QAArchiveProvenanceV1:
         document = hbjcs1_decode(encoded)
     except HBJCS1Error as exc:
         raise ArchiveProvenanceError from exc
-    if not isinstance(document, dict) or hbjcs1_encode(document) != encoded:
+    if not isinstance(document, dict):
         raise ArchiveProvenanceError
     try:
         return QAArchiveProvenanceV1.model_validate(document)
