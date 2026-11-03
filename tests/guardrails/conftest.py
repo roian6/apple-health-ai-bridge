@@ -8,6 +8,7 @@ from pydantic import TypeAdapter
 from tests.guardrails.release_version_fixtures import (
     ReleaseTree,
     commit_release_tree,
+    git_output,
     init_release_repo,
     write_release_tree,
 )
@@ -15,9 +16,9 @@ from tests.guardrails.release_version_fixtures import (
 ROOT = Path(__file__).parents[2]
 
 
-@pytest.fixture
-def receiver_release_repo(tmp_path: Path) -> Path:
-    repo = init_release_repo(tmp_path)
+@pytest.fixture(scope="session")
+def receiver_release_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    repo = init_release_repo(tmp_path_factory.mktemp("receiver-release-template"))
     write_release_tree(
         repo,
         ReleaseTree(
@@ -37,4 +38,12 @@ def receiver_release_repo(tmp_path: Path) -> Path:
     info["CFBundleShortVersionString"] = "1.1.1"
     _ = helper_info.write_bytes(plistlib.dumps(info))
     _ = commit_release_tree(repo, "synthetic receiver release")
+    return repo
+
+
+@pytest.fixture
+def receiver_release_repo(tmp_path: Path, receiver_release_template: Path) -> Path:
+    repo = tmp_path / "repo"
+    _ = shutil.copytree(receiver_release_template, repo)
+    _ = git_output(repo, "config", "core.hooksPath", str(repo / ".git/hooks"))
     return repo

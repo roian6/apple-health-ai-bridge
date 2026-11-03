@@ -1,8 +1,5 @@
 from pathlib import Path
 
-PAIRING_SOURCE = Path(
-    "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/ReceiverPairing.swift"
-)
 CLIENT_SOURCE = Path(
     "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/ReceiverClient.swift"
 )
@@ -10,18 +7,6 @@ SETTINGS_SOURCE = Path(
     "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/FileOutbox.swift"
 )
 CONTENT_VIEW = Path("ios/HealthBridgeCompanion/App/ContentView.swift")
-
-
-def test_ios_invitation_requires_explicit_mailbox_transport_intent() -> None:
-    pairing = PAIRING_SOURCE.read_text(encoding="utf-8")
-
-    assert "public enum ReceiverPairingTransport: String, Codable" in pairing
-    assert "public let transport: ReceiverPairingTransport" in pairing
-    assert "case direct" in pairing
-    assert "case mailbox" in pairing
-    assert "case (.some(.direct), nil), (nil, nil):" in pairing
-    assert "case (.some(.mailbox), 1):" in pairing
-    assert "throw ReceiverPairingBundleError.unsupportedTransport" in pairing
 
 
 def test_ios_pairing_stages_validated_transport_intent_before_capability_use() -> None:

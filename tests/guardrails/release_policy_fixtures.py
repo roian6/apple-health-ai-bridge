@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
-import sys
+import shlex
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,29 @@ class ReleaseGraph:
 
     def write(self, payload: dict[str, JsonValue]) -> None:
         _ = self.transport.write_text(json.dumps(payload))
+        responses = self.transport.with_suffix(".responses")
+        responses.mkdir(exist_ok=True)
+        commands = ['case "$2" in']
+        for index, (route, value) in enumerate(payload.items()):
+            response = responses / str(index)
+            if isinstance(value, dict) and "synthetic_binary" in value:
+                encoded = value["synthetic_binary"]
+                assert isinstance(encoded, str)
+                content = base64.b64decode(encoded)
+            else:
+                content = (json.dumps(value) + "\n").encode()
+            _ = response.write_bytes(content)
+            commands.append(
+                f"  {shlex.quote(route)}) exec cat {shlex.quote(str(response))} ;;"
+            )
+        commands.extend(
+            [
+                "esac",
+                """printf 'synthetic transport missing route: %s\\n' "$2" >&2""",
+                "exit 19",
+            ]
+        )
+        _ = self.transport.with_suffix(".sh").write_text("\n".join(commands) + "\n")
 
 
 def obj(value: JsonValue) -> dict[str, JsonValue]:
@@ -102,34 +126,13 @@ def replace_target(graph: ReleaseGraph, parents: tuple[str, ...]) -> ReleaseGrap
         .replace(graph.target, target)
         .replace(graph.tag_object, tag_object)
     )
-    _ = graph.transport.write_text(payload)
+    graph.write(TypeAdapter(dict[str, JsonValue]).validate_json(payload))
     return replace(graph, target=target, tag_object=tag_object)
 
 
 def install_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     executable = tmp_path / "gh"
-    _ = executable.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import base64, json, os, pathlib, sys",
-                "path = pathlib.Path(os.environ['SOURCE_TRANSPORT'])",
-                "payload = json.loads(path.read_text())",
-                "route = sys.argv[2]",
-                "if route not in payload:",
-                "    message = 'synthetic transport missing route: ' + route",
-                "    print(message, file=sys.stderr)",
-                "    sys.exit(19)",
-                "value = payload[route]",
-                "if isinstance(value, dict) and 'synthetic_binary' in value:",
-                "    raw = base64.b64decode(value['synthetic_binary'])",
-                "    sys.stdout.buffer.write(raw)",
-                "else:",
-                "    print(json.dumps(value))",
-                "",
-            ]
-        )
-    )
+    _ = executable.write_text('#!/bin/sh\n. "${SOURCE_TRANSPORT%.json}.sh"\n')
     executable.chmod(0o700)
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
 

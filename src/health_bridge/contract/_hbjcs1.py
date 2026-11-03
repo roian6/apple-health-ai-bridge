@@ -13,6 +13,7 @@ _WHITESPACE: Final = frozenset(" \t\r\n")
 _CONTROL_LIMIT: Final = 0x20
 _SURROGATE_MIN: Final = 0xD800
 _SURROGATE_MAX: Final = 0xDFFF
+_STRING_SPECIAL: Final = re.compile(r'["\\\x00-\x1f\ud800-\udfff]')
 
 
 class HBJCS1Error(Exception):
@@ -26,6 +27,8 @@ class HBJCS1Error(Exception):
 
 
 def _encode_string(value: str) -> bytes:
+    if _STRING_SPECIAL.search(value) is None:
+        return b'"' + value.encode("utf-8") + b'"'
     parts: list[str] = ['"']
     for character in value:
         codepoint = ord(character)
@@ -130,6 +133,11 @@ class _Parser:
 
     def _string(self) -> str:
         self.index += 1
+        closing = _STRING_SPECIAL.search(self.text, self.index)
+        if closing is not None and closing.group() == '"':
+            value = self.text[self.index : closing.start()]
+            self.index = closing.end()
+            return value
         result: list[str] = []
         while self.index < len(self.text):
             character = self.text[self.index]

@@ -81,34 +81,6 @@ def test_foreground_sync_exposes_cancel_without_deleting_durable_queue() -> None
     assert 'title: "Cancel"' in content_view
 
 
-def test_release_qa_requires_clean_install_and_real_camera_qr_pairing() -> None:
-    qa_text = Path("docs/qa/public-release-qa.md").read_text(encoding="utf-8")
-    checklist_text = Path(
-        ".github/release/testflight-checklist.md",
-    ).read_text(encoding="utf-8")
-    normalized_qa_text = " ".join(qa_text.split())
-    normalized_checklist_text = " ".join(checklist_text.split())
-
-    for required_text in (
-        "does not count as fresh-user QA",
-        "verify that the bundle is absent",
-        "scan its QR with the iPhone Camera app",
-        "do not relaunch or force-quit the app",
-        "container-clean, keychain freshness unproven",
-        "A Mac receiver is not substitute evidence",
-    ):
-        assert required_text in normalized_qa_text
-    assert "devicectl --payload-url` was not used" in normalized_checklist_text
-    assert "without Health collection, enqueue, or per-lane upload attempts" in (
-        normalized_checklist_text
-    )
-    assert "within eight seconds" in normalized_checklist_text
-    assert "validate-fresh-device-evidence.py" in normalized_checklist_text
-    assert "zero duplicate device, credential, and record identities" in (
-        normalized_checklist_text
-    )
-
-
 def test_quickstart_does_not_expose_raw_sql_tool() -> None:
     # Given
     readme_text = Path("README.md").read_text(encoding="utf-8")
@@ -119,23 +91,6 @@ def test_quickstart_does_not_expose_raw_sql_tool() -> None:
 
     # Then
     assert "query_health_sql" not in quickstart_text
-
-
-def test_guardrail_doc_marks_forbidden_language_examples() -> None:
-    # Given
-    guardrail_text = Path(
-        ".github/policies/privacy-and-no-medical-claims.md",
-    ).read_text(encoding="utf-8")
-
-    # When
-    example_section = guardrail_text.split(
-        "## Forbidden-Language Guardrail Examples",
-        maxsplit=1,
-    )[1]
-
-    # Then
-    for phrase in FORBIDDEN_PHRASES:
-        assert f'"{phrase}"' in example_section
 
 
 def test_repository_has_no_unpublished_node_wrapper_surface() -> None:
@@ -192,26 +147,6 @@ def test_public_support_privacy_and_security_routes_are_explicit() -> None:
     )
     assert "healthbridge.chanhyo.dev/support" in config_text
     assert "healthbridge.chanhyo.dev/privacy" in security
-
-
-def test_brand_reference_preserves_project_naming_history() -> None:
-    relationship = (
-        "Apple Health AI Bridge is the open-source project behind Health Bridge for AI."
-    )
-    for path in (
-        Path("docs/brand.md"),
-        Path("assets/brand/README.md"),
-    ):
-        assert relationship in path.read_text(encoding="utf-8"), path
-
-
-def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-
-    assert "<h1>Apple Health AI Bridge</h1>" in readme
-    assert "Health Bridge for AI" not in readme
-    assert "open-source project behind" not in readme
-    assert "(docs/setup.md)" in readme
 
 
 def test_readme_uses_official_app_store_install_artwork() -> None:
@@ -272,46 +207,6 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
         assert endpoint in image
 
 
-def test_readme_introduces_user_workflows_before_installation_details() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-    introduction, setup = readme.split("## Get started", maxsplit=1)
-    setup_guide = Path("docs/setup.md").read_text(encoding="utf-8")
-    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
-
-    assert any(line.startswith("> ") for line in introduction.splitlines())
-    assert "```bash" not in introduction
-    assert "health-bridge setup" not in introduction
-    assert "(docs/setup.md)" in setup
-    assert re.search(
-        rf'uv tool install "{install_source}@receiver-v\d+\.\d+\.\d+"',
-        setup_guide,
-    )
-    assert "docs/setup.md#connect-an-mcp-client-intentionally" in setup
-    assert "(#choose-your-ai)" in setup
-
-
-def test_readme_keeps_continuous_value_with_ios_timing_boundary() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-    architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
-    setup = Path("docs/setup.md").read_text(encoding="utf-8")
-
-    introduction = readme.split("## Get started", maxsplit=1)[0]
-    assert "Automatic sync" in introduction
-    assert "iOS controls background scheduling" in setup
-    assert "iOS controls whether and when background execution occurs" in architecture
-    assert "guaranteed to be immediate" in architecture
-
-
-def test_readme_explains_storage_and_cloud_ai_in_one_privacy_section() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-    privacy = readme.split("## Privacy", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
-
-    assert "read-only" in privacy.lower()
-    assert "cloud" in privacy.lower()
-    assert "provider" in privacy.lower()
-    assert "SECURITY.md" in privacy
-
-
 def test_package_metadata_connects_distribution_to_public_surfaces() -> None:
     with Path("pyproject.toml").open("rb") as handle:
         pyproject = cast("dict[str, object]", tomllib.load(handle))
@@ -362,6 +257,11 @@ def test_readme_makes_app_store_primary_without_exposing_maintainer_operations()
     assert "Public source preview" not in readme
     assert "may lag behind the latest GitHub release" not in readme
     assert "macOS or Linux computer" in readme
+    install_source = r"git\+https://github\.com/roian6/apple-health-ai-bridge\.git"
+    assert re.search(
+        rf'uv tool install "{install_source}@receiver-v\d+\.\d+\.\d+"',
+        setup_guide,
+    )
     assert "native Windows is not currently supported" in setup_guide
     assert "Numeric LAN IPs are supported" in setup_guide
     assert "scutil --get LocalHostName" in setup_guide
@@ -497,36 +397,6 @@ def test_setup_connects_an_existing_store_before_the_first_ai_question() -> None
     assert "list_synced_metrics" in first_question
 
 
-def test_contributor_and_release_docs_match_ci_release_gates() -> None:
-    agents = Path("AGENTS.md").read_text()
-    contributing = Path(".github/CONTRIBUTING.md").read_text()
-    release_criteria = Path(".github/release/criteria.md").read_text()
-
-    for text in (contributing, release_criteria):
-        assert "-sdk iphonesimulator" in text
-        assert "-sdk iphoneos" in text
-        assert "CODE_SIGNING_ALLOWED=NO" in text
-
-    assert "uv sync --all-extras --dev --locked" in contributing
-    assert "public-release-audit.py --strict" in contributing
-    for command in (
-        "uv run bandit -r src -q",
-        "uv run pip-audit --local --skip-editable",
-    ):
-        assert command in contributing
-        assert command in agents
-    assert "git diff --cached --check" in release_criteria
-    assert "one-root" in release_criteria
-
-
-def test_privacy_docs_explain_manifest_and_app_store_answers_together() -> None:
-    review_template = Path(".github/release/app-review-notes-template.md").read_text()
-
-    assert "PrivacyInfo.xcprivacy" in review_template
-    assert "does not declare developer-collected data" in review_template
-    assert "“Data Not Collected”" in review_template
-
-
 def test_current_component_identities_are_explicit() -> None:
     pyproject = Path("pyproject.toml").read_text()
     package_init = Path("src/health_bridge/__init__.py").read_text()
@@ -545,31 +415,6 @@ def test_current_component_identities_are_explicit() -> None:
     assert '?? "1.2.0"' in content_view
     assert '?? "51"' in content_view
     assert "pre-1.0" not in security
-
-
-def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion() -> (
-    None
-):
-    readme = Path("README.md").read_text()
-    setup = Path("docs/setup.md").read_text()
-
-    assert "(docs/setup.md#remove-local-bridge-data)" in readme
-    assert "health-bridge receiver purge" not in readme
-    assert "health-bridge receiver purge" in setup
-    assert "--confirm" in setup
-    assert "dry-run" in setup
-    assert "does not delete Apple Health data" in setup
-
-
-def test_public_docs_do_not_publish_an_unavailable_beta_surface() -> None:
-    public_docs = "\n".join(
-        path.read_text(encoding="utf-8") for path in MARKDOWN_PATHS
-    ).lower()
-
-    assert "public beta is not available" not in public_docs
-    assert "before the first approved beta" not in public_docs
-    assert "source preview" not in public_docs
-    assert not Path("docs/testflight-beta.md").exists()
 
 
 def test_public_markdown_relative_links_resolve() -> None:

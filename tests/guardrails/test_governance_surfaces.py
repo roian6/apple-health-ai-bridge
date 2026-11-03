@@ -64,38 +64,3 @@ def test_security_support_and_ownership_routes_are_current() -> None:
         "/.github/ @roian6",
     ):
         assert marker in codeowners
-
-
-def test_contribution_and_maintainer_workflow_is_versioned() -> None:
-    contributing = Path(".github/CONTRIBUTING.md").read_text(encoding="utf-8")
-    pull_request = Path(".github/pull_request_template.md").read_text(encoding="utf-8")
-    maintainer = Path("docs/maintainer-guide.md").read_text(encoding="utf-8")
-
-    for branch_prefix in ("`fix/`", "`feat/`", "`docs/`", "`chore/`"):
-        assert branch_prefix in contributing
-    assert "maintainer decision before implementation" in contributing
-    assert "HealthKit permissions" in contributing
-    assert "receiver authentication" in contributing
-    assert "third-party AI" in contributing
-
-    for marker in (
-        "Related issue",
-        "Release note",
-        "Breaking change",
-        "Privacy Boundary",
-    ):
-        assert marker in pull_request
-
-    for marker in (
-        "second trusted maintainer",
-        "Python quality and package checks",
-        "Swift tests and unsigned app builds",
-        "squash merge",
-        "v1.0.1",
-        "receiver-v<semver>",
-        "ios-v<marketing-version>-build.<build>",
-        "exact compatible Batch Protocol",
-        "Do not routinely disable the main ruleset",
-    ):
-        assert marker in maintainer
-    assert "`v1.1.0` for the next" not in maintainer

@@ -3,14 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import plistlib
-import subprocess
-import sys
 import zipfile
 from pathlib import Path
 from typing import cast
 
+from tests.guardrails.release_cli import run_release_tool as _run_release_tool
+
 ROOT = Path(__file__).parents[2]
-RELEASE_TOOL = ROOT / "scripts/release_tools.py"
 TAGGED_WORKFLOW = ROOT / ".github/workflows/release.yml"
 CONTINUATION_WORKFLOW = ROOT / ".github/workflows/publish-release.yml"
 STAGING_SCRIPT = ROOT / "scripts/stage-mailbox-helper-release.sh"
@@ -18,16 +17,6 @@ STAGING_SCRIPT = ROOT / "scripts/stage-mailbox-helper-release.sh"
 
 def _identity_value(*parts: str) -> str:
     return "".join(parts)
-
-
-def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(RELEASE_TOOL), *args],
-        cwd=ROOT,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
 
 
 def _helper_verification_args(
