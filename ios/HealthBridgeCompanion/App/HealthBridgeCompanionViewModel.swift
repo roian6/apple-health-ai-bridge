@@ -1331,6 +1331,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func runWithExclusiveDirectOutboxTransfer<Result>(
+        reschedulePendingUploads: Bool = true,
         _ operation: @escaping @MainActor () async -> Result
     ) async throws -> Result {
         directOutboxTransferRequestCount += 1
@@ -1338,7 +1339,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try await directOutboxTransferGate.acquire()
         } catch {
             directOutboxTransferRequestCount -= 1
-            if directOutboxTransferRequestCount == 0 {
+            if reschedulePendingUploads, directOutboxTransferRequestCount == 0 {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
             }
             throw error
@@ -1367,27 +1368,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             #endif
             let result = await operation()
-            await finishExclusiveDirectOutboxTransfer()
+            await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             return result
         } catch {
-            await finishExclusiveDirectOutboxTransfer()
+            await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             throw error
         }
     }
 
-    private func finishExclusiveDirectOutboxTransfer() async {
+    private func finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: Bool) async {
         await directOutboxTransferGate.release()
         directOutboxTransferRequestCount -= 1
-        if directOutboxTransferRequestCount == 0 {
+        if reschedulePendingUploads, directOutboxTransferRequestCount == 0 {
             schedulePendingBackgroundOutboxUploadsIfAllowed()
         }
     }
 
-    private func flushAutomaticPendingOutbox() async throws -> Bool {
+    private func flushAutomaticPendingOutbox(reschedulePendingUploads: Bool = true) async throws -> Bool {
         guard settingsStore.activeTransport == .directHTTP else {
             return await flushPendingOutbox(executionMode: .automatic)
         }
-        return try await runWithExclusiveDirectOutboxTransfer {
+        return try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads) {
             await self.flushPendingOutbox(executionMode: .automatic)
         }
     }
@@ -4296,7 +4297,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try requireCurrentConnectionGeneration(expectedGeneration)
             var canCollect = true
             if pendingOutbox > 0, settingsStore.activeTransport == .directHTTP {
-                _ = try await flushAutomaticPendingOutbox()
+                _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
                 try Task.checkCancellation()
                 try requireCurrentConnectionGeneration(expectedGeneration)
                 canCollect = trustedPendingOutboxCount() == 0

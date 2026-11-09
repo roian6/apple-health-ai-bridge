@@ -753,15 +753,17 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 cursorValue: fixture.currentAnchor
             )
         )
-        _ = try fixture.admit(["basal_energy"])
+        let pending = try fixture.admit(["basal_energy"])
+        let schedulesBeforeAttempt = fixture.declinedBackgroundSchedules
         if rejectUpload { fixture.recorder.setResponseStatusCode(500) }
         await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
         await runtime.viewModel.waitForBootstrapAndForegroundWork()
         if rejectUpload {
             XCTAssertTrue(fixture.quantityReadAnchors.isEmpty)
-            XCTAssertEqual(try outbox.pendingItems().map(\.id), retainedItems.map(\.id))
-            XCTAssertEqual(try fixture.pending().keys.sorted(), ["basal_energy"])
+            XCTAssertEqual(try outbox.pendingItems(), retainedItems)
+            XCTAssertEqual(try fixture.pending(), pending)
             XCTAssertEqual(fixture.recorder.invocationCount, 1)
+            XCTAssertEqual(fixture.declinedBackgroundSchedules, schedulesBeforeAttempt)
         } else {
             XCTAssertEqual(fixture.quantityReadAnchors, [fixture.currentAnchor])
         }
