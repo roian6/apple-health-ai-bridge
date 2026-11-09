@@ -303,7 +303,7 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
         "ios_build": _current_ios_build(),
         "ios_marketing_version": "1.2.0",
         "project_version": __version__,
-        "release_scope": "coordinated",
+        "release_scope": "receiver",
         "tag": f"receiver-v{__version__}",
     }
 
@@ -392,7 +392,7 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "release_tag": f"receiver-v{__version__}",
             "version": __version__,
         },
-        "release_scope": "coordinated",
+        "release_scope": "receiver",
         "schema_id": "health_bridge.component_versions.v1",
     }
 

@@ -14,7 +14,7 @@ def test_swift_analysis_is_required_in_existing_native_gate() -> None:
     assert "continue-on-error" not in workflow
     assert 'bash scripts/run-checks.sh native-builds "$MODE"' in workflow
     assert "swift test" in runner
-    assert runner.count("CODE_SIGNING_REQUIRED=NO") == 4
+    assert runner.count("CODE_SIGNING_REQUIRED=NO") == 5
 
 
 def test_swift_analysis_policy_covers_all_production_components() -> None:
