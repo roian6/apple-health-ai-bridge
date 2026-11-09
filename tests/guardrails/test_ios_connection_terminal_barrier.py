@@ -820,7 +820,7 @@ def test_background_upload_cancellation_is_bounded() -> None:
         "private func runWithExclusiveDirectOutboxTransfer<Result>("
     )
     transfer_end = source.index(
-        "private func finishExclusiveDirectOutboxTransfer()", transfer_start
+        "private func finishExclusiveDirectOutboxTransfer(", transfer_start
     )
     transfer_body = source[transfer_start:transfer_end]
     cancel = transfer_body.index("cancelPendingUploads()")

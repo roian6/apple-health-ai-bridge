@@ -1331,6 +1331,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func runWithExclusiveDirectOutboxTransfer<Result>(
+        reschedulePendingUploads: Bool = true,
         _ operation: @escaping @MainActor () async -> Result
     ) async throws -> Result {
         directOutboxTransferRequestCount += 1
@@ -1338,7 +1339,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try await directOutboxTransferGate.acquire()
         } catch {
             directOutboxTransferRequestCount -= 1
-            if directOutboxTransferRequestCount == 0 {
+            if reschedulePendingUploads, directOutboxTransferRequestCount == 0 {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
             }
             throw error
@@ -1367,27 +1368,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             #endif
             let result = await operation()
-            await finishExclusiveDirectOutboxTransfer()
+            await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             return result
         } catch {
-            await finishExclusiveDirectOutboxTransfer()
+            await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             throw error
         }
     }
 
-    private func finishExclusiveDirectOutboxTransfer() async {
+    private func finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: Bool) async {
         await directOutboxTransferGate.release()
         directOutboxTransferRequestCount -= 1
-        if directOutboxTransferRequestCount == 0 {
+        if reschedulePendingUploads, directOutboxTransferRequestCount == 0 {
             schedulePendingBackgroundOutboxUploadsIfAllowed()
         }
     }
 
-    private func flushAutomaticPendingOutbox() async throws -> Bool {
+    private func flushAutomaticPendingOutbox(reschedulePendingUploads: Bool = true) async throws -> Bool {
         guard settingsStore.activeTransport == .directHTTP else {
             return await flushPendingOutbox(executionMode: .automatic)
         }
-        return try await runWithExclusiveDirectOutboxTransfer {
+        return try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads) {
             await self.flushPendingOutbox(executionMode: .automatic)
         }
     }
@@ -4288,24 +4289,31 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             diagnostic.noteCompletion(.failed)
             return
         }
-        if pendingOutbox > 0 {
-            if settingsStore.activeTransport == .mailbox {
-                _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
-            } else {
-                schedulePendingBackgroundOutboxUploadsIfAllowed()
-            }
+        if pendingOutbox > 0, settingsStore.activeTransport == .mailbox {
+            _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
         }
         var processedAllPending: Bool?
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
-            try await preparePrivateStorageForUploadAdmission()
-            processedAllPending = try await processPendingTypes()
+            var canCollect = true
+            if pendingOutbox > 0, settingsStore.activeTransport == .directHTTP {
+                _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
+                try Task.checkCancellation()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                canCollect = trustedPendingOutboxCount() == 0
+            }
+            if canCollect {
+                try await preparePrivateStorageForUploadAdmission()
+                processedAllPending = try await processPendingTypes()
+            } else {
+                processedAllPending = false
+            }
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(expectedGeneration)
             guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
                 throw CancellationError()
             }
-            if (trustedPendingOutboxCount() ?? 0) > 0 {
+            if canCollect, (trustedPendingOutboxCount() ?? 0) > 0 {
                 if settingsStore.activeTransport == .mailbox {
                     _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
                 } else {

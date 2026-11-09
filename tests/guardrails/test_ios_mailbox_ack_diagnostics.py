@@ -199,7 +199,7 @@ def _assert_shared_engine_ack_backpressure(
     )
     automatic_flush = _region(
         source,
-        "private func flushAutomaticPendingOutbox()",
+        "private func flushAutomaticPendingOutbox(",
         "private func flushPendingOutbox(",
     )
     assert (
@@ -208,7 +208,7 @@ def _assert_shared_engine_ack_backpressure(
     assert automatic_flush.index(
         "return await flushPendingOutbox(executionMode: .automatic)"
     ) < (
-        automatic_flush.index("return try await runWithExclusiveDirectOutboxTransfer {")
+        automatic_flush.index("return try await runWithExclusiveDirectOutboxTransfer(")
     )
     assert "await self.flushPendingOutbox(executionMode: .automatic)" in automatic_flush
     assert "viewModel.flushPendingOutbox(executionMode: .foreground)" in source
