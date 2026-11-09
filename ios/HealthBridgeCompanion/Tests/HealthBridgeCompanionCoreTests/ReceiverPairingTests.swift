@@ -107,16 +107,22 @@ final class ReceiverPairingTests: XCTestCase {
         }
     }
 
-    func testMailboxTransportWithoutRequiredCapabilityIsRejected() {
+    func testMailboxTransportRejectsMissingOrUnsupportedCapability() {
         let missingCapability = mailboxInvitationJSON.replacingOccurrences(
             of: ",\n  \"mailbox_protocol_version\": 1",
             with: ""
         )
+        let unsupportedCapability = mailboxInvitationJSON.replacingOccurrences(
+            of: "\"mailbox_protocol_version\": 1",
+            with: "\"mailbox_protocol_version\": 2"
+        )
 
-        XCTAssertThrowsError(
-            try ReceiverPairingInvitation(jsonData: Data(missingCapability.utf8))
-        ) { error in
-            XCTAssertEqual(error as? ReceiverPairingBundleError, .unsupportedTransport)
+        for json in [missingCapability, unsupportedCapability] {
+            XCTAssertThrowsError(
+                try ReceiverPairingInvitation(jsonData: Data(json.utf8))
+            ) { error in
+                XCTAssertEqual(error as? ReceiverPairingBundleError, .unsupportedTransport)
+            }
         }
     }
 

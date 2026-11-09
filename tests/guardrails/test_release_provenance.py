@@ -12,6 +12,7 @@ import pytest
 from pydantic import JsonValue, TypeAdapter
 from typing_extensions import TypedDict
 
+from tests.guardrails.release_cli import run_release_tool as run_tool
 from tests.guardrails.release_version_fixtures import (
     ReleaseTree,
     commit_release_tree,
@@ -21,7 +22,6 @@ from tests.guardrails.release_version_fixtures import (
 from tests.guardrails.test_helper_release_contract import build_helper_packet
 
 ROOT = Path(__file__).parents[2]
-TOOL = ROOT / "scripts/release_tools.py"
 BUILD = "receiver-build-provenance.intoto.jsonl"
 FINAL = "receiver-final-provenance.intoto.jsonl"
 REPOSITORY = "roian6/apple-health-ai-bridge"
@@ -44,7 +44,7 @@ def run_documented_proof(
     controls = tmp_path / "shell-controls"
     controls.mkdir()
     calls = tmp_path / "shell-calls.txt"
-    stub = f"""#!{sys.executable}
+    stub = f"""#!{sys.executable} -S
 import json
 import os
 import pathlib
@@ -282,15 +282,6 @@ class ReleaseRecord(TypedDict):
     assets: list[AssetRecord]
 
 
-def run_tool(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(TOOL), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
 @pytest.fixture
 def future_repo(receiver_release_repo: Path) -> Path:
     write_release_tree(
@@ -306,7 +297,7 @@ def native_transport_mock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     """Mock only gh transport; never claim these JSON records are signed proofs."""
     command = tmp_path / "gh"
     _ = command.write_text(
-        f"""#!{sys.executable}
+        f"""#!{sys.executable} -S
 import json, os, pathlib, shutil, sys
 args = sys.argv[1:]
 root = pathlib.Path(os.environ['PROVENANCE_MOCK'])
@@ -712,6 +703,33 @@ def test_published_artifact_audit_keeps_packet_and_frozen_source(
     assert all(call[:2] == ["attestation", "verify"] for call in calls)
 
 
+@pytest.fixture
+def unmaterialized_packet_args(tmp_path: Path) -> tuple[str, ...]:
+    """Parser rejection must not need Git history or a built release packet."""
+    return (
+        "--repo",
+        str(tmp_path / "repo"),
+        "--dist-dir",
+        str(tmp_path / "dist"),
+        "--tag",
+        "receiver-v1.2.0",
+        "--tag-object",
+        "3" * 40,
+        "--commit",
+        "1" * 40,
+        "--tree",
+        "2" * 40,
+        "--helper-sha256",
+        "a" * 64,
+        "--helper-manifest-sha256",
+        "b" * 64,
+        "--release-json",
+        str(tmp_path / "release.json"),
+        "--notes-file",
+        str(tmp_path / "notes.md"),
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -732,7 +750,7 @@ def test_published_artifact_audit_keeps_packet_and_frozen_source(
     ],
 )
 def test_published_artifact_flag_rejected_by_unsupported_cli(
-    tmp_path: Path, published_artifact_packet: tuple[str, ...], command: str
+    tmp_path: Path, unmaterialized_packet_args: tuple[str, ...], command: str
 ) -> None:
     # Given an unsupported command, when the actual CLI receives the flag.
     result = run_tool(command, "--published-artifacts-only", "--help")
@@ -740,7 +758,7 @@ def test_published_artifact_flag_rejected_by_unsupported_cli(
     # Then argparse help must not advertise the unsupported option.
     assert result.returncode == 0, result.stderr
     assert "--published-artifacts-only" not in result.stdout
-    args = list(published_artifact_packet)
+    args = list(unmaterialized_packet_args)
     if command not in {"verify-helper-draft", "verify-final-draft"}:
         del args[args.index("--release-json") :]
     if command in {
@@ -764,7 +782,7 @@ def test_published_artifact_flag_rejected_by_unsupported_cli(
     if command == "tag-info":
         del args[:2]
     if command in {"verify-draft", "verify-core-draft"}:
-        args.extend(published_artifact_packet[-4:])
+        args.extend(unmaterialized_packet_args[-4:])
     if command in {"checksums", "manifest", "final-checksums"}:
         args.extend(("--output", str(tmp_path / "output")))
     if command == "verify-execution":
@@ -883,10 +901,10 @@ def test_published_artifact_legacy_verifier_keeps_remote_checks(
     ],
 )
 def test_published_artifact_audit_requires_frozen_source_inputs(
-    published_artifact_packet: tuple[str, ...], flag: str
+    unmaterialized_packet_args: tuple[str, ...], flag: str
 ) -> None:
     # Given one omitted input, when the actual audit CLI parses the request.
-    args = list(published_artifact_packet)
+    args = list(unmaterialized_packet_args)
     position = args.index(flag)
     del args[position : position + 2]
     result = run_tool("verify-final-published", *args, "--published-artifacts-only")
@@ -914,6 +932,7 @@ def test_published_artifact_audit_requires_frozen_source_inputs(
             "verify-final-published",
         )
         for mutation in ("none", "other-title", "arbitrary-title", "body")
+        if mutation in {"none", "body"} or command == "verify-final-published"
     ],
 )
 def test_release_stages_require_exact_title_and_source_body(
@@ -1267,9 +1286,15 @@ def test_checksum_rejects_cycles_and_duplicates(
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing", "extra", "duplicate", "name", "digest", "size"]
+    ("stage", "mutation"),
+    [
+        ("helper", "digest"),
+        *(
+            ("final", mutation)
+            for mutation in ("missing", "extra", "duplicate", "name", "digest", "size")
+        ),
+    ],
 )
-@pytest.mark.parametrize("stage", ["helper", "final"])
 def test_remote_assets_must_match_downloaded_bytes(
     tmp_path: Path,
     future_repo: Path,

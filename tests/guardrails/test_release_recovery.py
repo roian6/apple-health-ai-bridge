@@ -95,7 +95,7 @@ def recovery_transport(tmp_path: Path, failure: str) -> tuple[dict[str, str], Pa
             {"releases": [], "writes": [], "failed": False, "readback_failed": False}
         )
     )
-    _ = executable.write_text(f"""#!{sys.executable}
+    _ = executable.write_text(f"""#!{sys.executable} -S
 import base64, hashlib, json, os, pathlib, sys
 path = pathlib.Path(os.environ['RECOVERY_STATE'])
 state = json.loads(path.read_text())

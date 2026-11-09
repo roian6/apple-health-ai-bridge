@@ -203,14 +203,6 @@ def _stable_version_tuple(value: str, *, surface: str) -> tuple[int, int, int]:
     return parse_semantic_version(value, surface=surface).as_tuple()
 
 
-def _release_scope(versions: ReleaseVersions) -> str:
-    return versions.components.release_scope
-
-
-def _expected_receiver_tag(version: str) -> str:
-    return canonical_receiver_tag(version)
-
-
 def requires_provenance(tag: str) -> bool:
     return parse_receiver_release_tag(tag).version.as_tuple() >= (1, 1, 3)
 
@@ -278,7 +270,7 @@ def _validate_release_notes(
 
 def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
     versions = read_versions(repo)
-    expected = _expected_receiver_tag(versions.project_version)
+    expected = canonical_receiver_tag(versions.project_version)
     if tag != expected:
         message = f"receiver release tag must exactly match package version: {expected}"
         raise ReleaseError(message)
@@ -492,7 +484,7 @@ def _read_component_snapshot(raw: str, *, surface: str) -> ComponentSnapshot:
     if not ios_build.isdecimal() or int(ios_build) < 1:
         message = f"{surface} iOS build must be a positive integer"
         raise ReleaseError(message)
-    expected_tag = _expected_receiver_tag(receiver_version)
+    expected_tag = canonical_receiver_tag(receiver_version)
     if receiver_tag != expected_tag:
         message = f"{surface} Receiver/CLI tag must be {expected_tag}"
         raise ReleaseError(message)
@@ -812,7 +804,7 @@ def create_manifest(request: ManifestRequest) -> None:
             "requires_python": versions.requires_python,
             "version": versions.project_version,
         },
-        "release_scope": _release_scope(versions),
+        "release_scope": versions.components.release_scope,
         "release_version": versions.project_version,
         "schema_id": "health_bridge.release.v4"
         if request.candidate
@@ -915,7 +907,7 @@ def _validate_release_metadata(
     if (
         payload.get("schema_id")
         not in {"health_bridge.release.v3", "health_bridge.release.v4"}
-        or payload.get("release_scope") != _release_scope(versions)
+        or payload.get("release_scope") != versions.components.release_scope
         or payload.get("release_version") != versions.project_version
         or payload.get("batch_contract") != _batch_contract(repo)
         or payload.get("ios") != _expected_ios_metadata(repo, versions)
@@ -1676,7 +1668,7 @@ def main() -> int:  # noqa: C901, PLR0912
                         "ios_build": versions.ios_build,
                         "ios_marketing_version": versions.ios_marketing_version,
                         "project_version": versions.project_version,
-                        "release_scope": _release_scope(versions),
+                        "release_scope": versions.components.release_scope,
                         "tag": args.tag,
                     },
                     sort_keys=True,

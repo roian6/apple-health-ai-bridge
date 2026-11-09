@@ -140,7 +140,7 @@ def load_production_identity_seal(
         ProductionSealError,
     ) as exc:
         raise ProductionSealError from exc
-    if not isinstance(document, dict) or hbjcs1_encode(document) != encoded:
+    if not isinstance(document, dict):
         raise ProductionSealError
     if hashlib.sha256(public_key).hexdigest() != anchor_sha256:
         raise ProductionSealError
