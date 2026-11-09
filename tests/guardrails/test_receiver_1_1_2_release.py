@@ -45,14 +45,14 @@ def test_current_coordinated_receiver_matches_ios_1_2_0_build_51() -> None:
         / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
     ).read_text()
 
-    assert project["version"] == __version__ == "1.2.0"
+    assert project["version"] == __version__ == "1.2.1"
     assert f'__version__: Final = "{__version__}"' in package_init
     assert server["version"] == __version__
     assert receiver == {
         "release_tag": f"receiver-v{__version__}",
         "version": __version__,
     }
-    assert component_versions["release_scope"] == "coordinated"
+    assert component_versions["release_scope"] == "receiver"
     assert helper_info["CFBundleShortVersionString"] == __version__
     assert helper_info["CFBundleVersion"] == "1"
     assert ios == {"build": "51", "marketing_version": "1.2.0"}
@@ -61,7 +61,7 @@ def test_current_coordinated_receiver_matches_ios_1_2_0_build_51() -> None:
     notes = (ROOT / f".github/release/notes-receiver-v{__version__}.md").read_text(
         encoding="utf-8"
     )
-    assert "Coordinated release" in notes
+    assert "Receiver-only release" in notes
     assert "Compatible iOS Companion: `1.2.0 (51)`" in notes
     assert "Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`" in notes
     assert f"@receiver-v{__version__}" in notes

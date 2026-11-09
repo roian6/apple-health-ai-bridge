@@ -12,6 +12,7 @@ from health_bridge.launchd import LaunchdServiceError, LaunchdServiceErrorCode
 from health_bridge.mailbox.connections import MailboxConnectionStore
 from health_bridge.receiver.mailbox_keys import MailboxKeyStore
 from health_bridge.receiver.transports import PublicReceiverTransport, ReceiverTransport
+from tests.cli.test_native_pairing_cli import ipc_publisher
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -86,6 +87,9 @@ def test_receiver_start_preserves_direct_defaults_and_skips_mailbox_stores(
         forbidden_store,
     )
     monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve_receiver)
+    monkeypatch.setattr(
+        cli_receiver_module, "default_native_ack_publisher", forbidden_store
+    )
 
     result = CliRunner().invoke(app, ["receiver", "start", "--db", str(database)])
 
@@ -211,3 +215,66 @@ def test_receiver_start_maps_keyboard_interrupt_to_clean_exit(
     assert result.stderr.strip() == (
         "health-bridge receiver listening on http://127.0.0.1:8765"
     )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (None, None),
+        ("storage_access_denied", "helper_container_access_denied"),
+        ("upgrade", "native_helper_upgrade_required"),
+    ],
+)
+def test_issue154_mailbox_start_checks_ipc_before_stores_and_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+    expected: str | None,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    publisher, operations = ipc_publisher(tmp_path, monkeypatch, failure=failure)
+    monkeypatch.setattr(
+        cli_receiver_module, "default_native_ack_publisher", lambda: publisher
+    )
+
+    def selected(*_args: object, **_kwargs: object) -> ReceiverTransport:
+        return ReceiverTransport.MAILBOX
+
+    monkeypatch.setattr(cli_receiver_module, "_select_transport_or_exit", selected)
+    stores: list[bool] = []
+
+    def store() -> None:
+        assert failure is None
+        assert operations == ["discovery", "storage_probe"]
+        stores.append(True)
+
+    monkeypatch.setattr(MailboxKeyStore, "production", store)
+    monkeypatch.setattr(MailboxConnectionStore, "production", store)
+    bound: list[bool] = []
+
+    def serve(**_kwargs: object) -> None:
+        bound.append(True)
+
+    monkeypatch.setattr(cli_receiver_module, "serve_receiver", serve)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "receiver",
+            "start",
+            "--db",
+            str(tmp_path / "health.sqlite"),
+            "--mailbox-root",
+            str(tmp_path / "mailbox"),
+        ],
+    )
+    if failure:
+        assert result.exit_code == 1
+        assert result.stderr.strip() == expected
+        assert bound == []
+        assert stores == []
+    else:
+        assert result.exit_code == 0, result.output
+        assert bound == [True]
+        assert "receiver listening" in result.stderr
+        assert stores == [True, True]

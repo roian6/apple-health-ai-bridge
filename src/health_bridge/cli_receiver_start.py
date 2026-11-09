@@ -60,6 +60,7 @@ class ReceiverStartDependencies:
     select_transport: TransportSelector
     create_key_store: Callable[[], MailboxKeyStore]
     create_connection_store: Callable[[], MailboxConnectionStore]
+    preflight_mailbox: Callable[[], None]
     serve: ReceiverServer
 
 
@@ -103,6 +104,8 @@ def run_receiver_start(
         mailbox_root=mailbox_root,
         icloud_container_identifier=container_identifier,
     )
+    if selected_transport is ReceiverTransport.MAILBOX:
+        dependencies.preflight_mailbox()
     mailbox_key_store = (
         dependencies.create_key_store()
         if selected_transport is ReceiverTransport.MAILBOX

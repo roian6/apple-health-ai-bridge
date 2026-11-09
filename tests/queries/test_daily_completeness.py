@@ -170,10 +170,11 @@ def test_malformed_stored_marker_is_not_missing(
             "2018-11-05T02:00:00Z",
         ),
         (
-            "2026-11-01",
+            # Historical repeated midnight; Cuba canceled the 2026 fallback.
+            "2025-11-02",
             "America/Havana",
-            "2026-11-01T04:00:00Z",
-            "2026-11-02T05:00:00Z",
+            "2025-11-02T04:00:00Z",
+            "2025-11-03T05:00:00Z",
         ),
     ],
 )
