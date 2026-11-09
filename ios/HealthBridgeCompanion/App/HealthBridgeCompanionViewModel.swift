@@ -4288,24 +4288,31 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             diagnostic.noteCompletion(.failed)
             return
         }
-        if pendingOutbox > 0 {
-            if settingsStore.activeTransport == .mailbox {
-                _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
-            } else {
-                schedulePendingBackgroundOutboxUploadsIfAllowed()
-            }
+        if pendingOutbox > 0, settingsStore.activeTransport == .mailbox {
+            _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
         }
         var processedAllPending: Bool?
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
-            try await preparePrivateStorageForUploadAdmission()
-            processedAllPending = try await processPendingTypes()
+            var canCollect = true
+            if pendingOutbox > 0, settingsStore.activeTransport == .directHTTP {
+                _ = try await flushAutomaticPendingOutbox()
+                try Task.checkCancellation()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                canCollect = trustedPendingOutboxCount() == 0
+            }
+            if canCollect {
+                try await preparePrivateStorageForUploadAdmission()
+                processedAllPending = try await processPendingTypes()
+            } else {
+                processedAllPending = false
+            }
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(expectedGeneration)
             guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
                 throw CancellationError()
             }
-            if (trustedPendingOutboxCount() ?? 0) > 0 {
+            if canCollect, (trustedPendingOutboxCount() ?? 0) > 0 {
                 if settingsStore.activeTransport == .mailbox {
                     _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
                 } else {

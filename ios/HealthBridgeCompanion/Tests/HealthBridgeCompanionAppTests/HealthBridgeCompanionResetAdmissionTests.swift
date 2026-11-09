@@ -699,6 +699,75 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try await exerciseIssue83AutomaticReadOutcome(eligibleTypeCodes: ["steps"], failRawRead: true)
     }
 
+    func testAutomaticRetainedDirectCursorIsCommittedBeforeNextHealthRead() async throws {
+        try await exerciseRetainedDirectCursor(rejectUpload: false)
+    }
+
+    func testAutomaticRetainedDirectFailureDoesNotRecollectOrLosePendingWork() async throws {
+        try await exerciseRetainedDirectCursor(rejectUpload: true)
+    }
+
+    private func exerciseRetainedDirectCursor(rejectUpload: Bool) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Build the isolated App test host.")
+        #else
+        let fixture = try AutomaticStepsFaultFixture()
+        let previousRecorder = PayloadFenceURLProtocol.networkRecorder
+        addTeardownBlock { @MainActor in
+            fixture.cleanUp()
+            PayloadFenceURLProtocol.networkRecorder = previousRecorder
+        }
+        let runtime = try await makeStepsFaultRuntime(
+            fixture, eligibleTypeCodes: ["basal_energy"],
+            platformBackgroundPayloadDrain: { true }
+        )
+        addTeardownBlock { @MainActor in
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await runtime.viewModel.waitForBootstrapAndForegroundWork()
+        }
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+        let cursorKind = GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "basal_energy")
+        try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json"))
+            .saveCursorValue(
+                fixture.previousAnchor, receiverBindingID: fixture.receiverBindingID,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: cursorKind
+            )
+        let batch = try XCTUnwrap(GenericQuantitySyncBatchFactory.makeQuantityBatch(
+            samples: [HealthKitQuantitySampleSummary(
+                uuid: UUID(), typeCode: "basal_energy", start: fixture.sampleStart,
+                end: fixture.sampleStart.addingTimeInterval(60), value: 7
+            )],
+            selectedTypeCodes: ["basal_energy"], windowStart: fixture.sampleStart,
+            windowEnd: fixture.sampleStart.addingTimeInterval(120),
+            generatedAt: fixture.sampleStart.addingTimeInterval(120)
+        ))
+        let payload = try HealthBridgeBatchEncoder().encode(batch)
+        let outbox = try FileOutbox(directory: fixture.root.appendingPathComponent("outbox"))
+        let retainedItems = try outbox.enqueueSequence(
+            [payload], receiverIdentity: fixture.receiverBindingID,
+            cursorCheckpoint: FileOutboxCursorCheckpoint(
+                receiverIdentity: fixture.receiverBindingID,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: cursorKind,
+                cursorValue: fixture.currentAnchor
+            )
+        )
+        _ = try fixture.admit(["basal_energy"])
+        if rejectUpload { fixture.recorder.setResponseStatusCode(500) }
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+        if rejectUpload {
+            XCTAssertTrue(fixture.quantityReadAnchors.isEmpty)
+            XCTAssertEqual(try outbox.pendingItems().map(\.id), retainedItems.map(\.id))
+            XCTAssertEqual(try fixture.pending().keys.sorted(), ["basal_energy"])
+            XCTAssertEqual(fixture.recorder.invocationCount, 1)
+        } else {
+            XCTAssertEqual(fixture.quantityReadAnchors, [fixture.currentAnchor])
+        }
+        #endif
+    }
+
     func testIssue83AutomaticRetryableStepsThenSuccessfulBasalMustNotReportSuccess() async throws {
         try await exerciseIssue83AutomaticReadOutcome(
             eligibleTypeCodes: ["basal_energy", "steps"], failRawRead: true
@@ -1210,8 +1279,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 fixture.declineBackgroundScheduling()
             },
             platformBackgroundPayloadDrain: platformBackgroundPayloadDrain,
-            readAnchoredQuantityChanges: { typeCode, _, start, now in
-                HealthKitAnchoredQuantityChanges(
+            readAnchoredQuantityChanges: { typeCode, anchor, start, now in
+                fixture.quantityReadAnchors.append(anchor)
+                return HealthKitAnchoredQuantityChanges(
                     typeCode: typeCode, samples: [], deletedSamples: [],
                     anchorCursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 0)),
                     windowStart: start ?? now, windowEnd: now
@@ -4360,6 +4430,7 @@ private final class AutomaticStepsFaultFixture {
     var completedBasalEnergyValue: Double = 345
     private(set) var declinedBackgroundSchedules = 0
     private(set) var rawAnchors: [String] = []
+    var quantityReadAnchors: [String?] = []
     private(set) var dailyRequests: [[String]] = []
     private(set) var readEvents: [String] = []
     private(set) var completedStepsDay: HealthKitDailyActivityAggregate?
