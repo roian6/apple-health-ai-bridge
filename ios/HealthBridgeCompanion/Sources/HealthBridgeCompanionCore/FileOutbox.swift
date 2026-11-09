@@ -651,6 +651,7 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    private var decodedManifest: (bytes: Data, value: SequenceManifest)?
     var observeNutritionCodec: @Sendable () -> Void = {}
     var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
     var nutritionSplitFault: (NutritionSplitBoundary) throws -> Void = { _ in }
@@ -2725,12 +2726,16 @@ public final class FileOutbox {
 
     private func loadManifest() throws -> SequenceManifest? {
         guard fileManager.fileExists(atPath: sequenceURL.path) else { return nil }
-        let manifest = try JSONDecoder().decode(
-            SequenceManifest.self,
-            from: Data(contentsOf: sequenceURL)
-        )
+        let bytes = try Data(contentsOf: sequenceURL)
+        let manifest: SequenceManifest
+        if let decodedManifest, decodedManifest.bytes == bytes {
+            manifest = decodedManifest.value
+        } else {
+            manifest = try JSONDecoder().decode(SequenceManifest.self, from: bytes)
+        }
         try Self.validate(manifest)
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
         return manifest
     }
 
@@ -2738,8 +2743,10 @@ public final class FileOutbox {
         try Self.validate(manifest)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(manifest).write(to: sequenceURL, options: [.atomic])
+        let bytes = try encoder.encode(manifest)
+        try bytes.write(to: sequenceURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
     }
 
     private static func validate(_ manifest: SequenceManifest) throws {

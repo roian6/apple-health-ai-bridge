@@ -3,6 +3,29 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class DailyProjectionRepairTests: XCTestCase {
+    func testManifestReadObservesSameSizeReplacementAndRejectsInvalidBytes() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        var manifest = try fixture.manifest()
+        manifest["nextSequence"] = 100
+        try fixture.writeManifest(manifest)
+        XCTAssertEqual(try fixture.outbox.reserveDailyProjectionObservation().sequence, 100)
+        let url = fixture.directory.appendingPathComponent(".fifo-sequence")
+        let prior = try Data(contentsOf: url)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        manifest = try fixture.manifest()
+        manifest["nextSequence"] = 201
+        try fixture.writeManifest(manifest)
+        XCTAssertEqual(try Data(contentsOf: url).count, prior.count)
+        try FileManager.default.setAttributes(
+            [.modificationDate: try XCTUnwrap(attributes[.modificationDate])],
+            ofItemAtPath: url.path
+        )
+        XCTAssertEqual(try fixture.outbox.reserveDailyProjectionObservation().sequence, 201)
+        try Data("{".utf8).write(to: url)
+        XCTAssertThrowsError(try fixture.outbox.reserveDailyProjectionObservation())
+    }
+
     func testPartialWindowRetainsACKedMissingDayAcrossACKRestartAndStrictlyNewerCoverage() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
