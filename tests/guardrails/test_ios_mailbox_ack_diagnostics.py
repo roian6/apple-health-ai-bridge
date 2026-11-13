@@ -226,7 +226,7 @@ def _assert_shared_engine_ack_backpressure(
     daily_read = steps.index("let daily = await performDailyActivityAggregates(")
     assert re.search(r"case \.queued:\s*return \.blocked", steps[raw_read:daily_read])
     pending_result = _region(
-        background_sync, "switch result.disposition {", "if reason == .scheduledRefresh"
+        background_sync, "switch result.disposition {", "try Task.checkCancellation()"
     )
     assert re.search(r"case \.payloadEnqueued:\s*break", pending_result)
     assert re.search(r"case \.blocked:\s*return false", pending_result)

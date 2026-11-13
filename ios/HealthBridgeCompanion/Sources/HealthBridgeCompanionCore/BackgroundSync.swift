@@ -401,6 +401,14 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
         for typeCode in typeCodes where !handled.contains(typeCode) {
             try Task.checkCancellation()
             guard let generation = snapshot[typeCode] else { continue }
+            if reason == .scheduledRefresh || reason == .launchCatchUp {
+                // Retain this generation, but let the next opportunity reach
+                // other types if processing consumes the remaining lifetime.
+                try pendingStore.advanceAutomaticSyncContinuation(
+                    after: typeCode,
+                    in: typeCodes
+                )
+            }
             let result = try await processType(typeCode, snapshot)
             let coveredGenerations = (result.coveredGenerations ?? [typeCode: generation])
                 .filter { snapshot[$0.key] == $0.value }
@@ -419,12 +427,6 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
                 break
             case .blocked:
                 return false
-            }
-            if reason == .scheduledRefresh || reason == .launchCatchUp {
-                try pendingStore.advanceAutomaticSyncContinuation(
-                    after: typeCode,
-                    in: typeCodes
-                )
             }
             try Task.checkCancellation()
         }
