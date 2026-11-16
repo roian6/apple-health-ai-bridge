@@ -3141,6 +3141,122 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload, fixture.pending.payload])
     }
 
+    func testAutomaticDirectExpiryDuringQuantityDeliveryRetainsLaterSleepJournal() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.markPendingObserverTypeCodes(["heart_rate"])
+        let generations = try fixture.background.loadPendingObserverTypeCodeGenerations()
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let viewModel = try makeViewModel(
+            root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+            ),
+            outbox: fixture.outbox, receiverClient: ReceiverClient(session: fixture.session),
+            automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(
+                fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+            ),
+            sleepManifestStore: fixture.sleep,
+            readAnchoredSleepChanges: { anchor, _, now in
+                fixture.readAnchors.append(anchor)
+                return HealthKitAnchoredSleepChanges(
+                    addedSamples: [], deletedSamples: [],
+                    anchorCursorValue: fixture.nextAnchor, receivedAt: now
+                )
+            },
+            automaticSyncEligibleTypeCodesForTesting: ["heart_rate", "sleep_analysis"],
+            scheduleDirectBackgroundUploads: { 0 },
+            terminalBackgroundPayloadDrain: { true },
+            platformBackgroundPayloadDrain: { true },
+            readAnchoredQuantityChanges: { type, _, start, now in
+                HealthKitAnchoredQuantityChanges(
+                    typeCode: type,
+                    samples: [HealthKitQuantitySampleSummary(
+                        uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000171")),
+                        typeCode: type, start: now, end: now, value: 70
+                    )],
+                    deletedSamples: [],
+                    anchorCursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 171)),
+                    windowStart: start ?? now, windowEnd: now
+                )
+            }
+        )
+        await viewModel.bootstrap()
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(
+            healthDataAvailable: { false },
+            executeQuery: { _ in XCTFail("Only synthetic readers may run.") }, stopQuery: { _ in },
+            enableDelivery: { _, completion in completion(false, nil) }, disableDelivery: { _ in }
+        )
+        let platform = AutomaticSyncRuntime.Platform(
+            scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in },
+            beginBackgroundOwner: { expire in
+                fixture.recorder.setBeforeResponse { _, _ in expire() }
+                return {}
+            },
+            healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+        )
+        let runtime = HealthBridgeCompanionApplicationRuntime(
+            viewModel: viewModel, automaticSyncPlatform: platform
+        )
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(
+            reason: .observerBatch(typeCodes: ["heart_rate", "sleep_analysis"])
+        )
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        let pending = try XCTUnwrap(fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(pending.manifest.anchorCursorValue, fixture.nextAnchor)
+        XCTAssertEqual(pending.manifest.publishedSessions, fixture.initialManifest.publishedSessions)
+        let items = try fixture.outbox.pendingItems()
+        let queuedTypes = try items.flatMap {
+            try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: $0.fileURL))
+                .healthTypes.map(\.typeCode)
+        }
+        XCTAssertEqual(Set(queuedTypes), ["heart_rate", "sleep_analysis"])
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), generations)
+    }
+
+    func testReplayedSleepJournalDoesNotRetireAYoungerUnreadGeneration() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [],
+                anchorCursorValue: fixture.nextAnchor, receivedAt: Date()
+            ),
+            receiverSettingsGeneration: fixture.settings.receiverSettingsGenerationToken,
+            historyDepth: .allAvailable, historyStartDate: nil
+        ))
+        try fixture.sleep.savePendingTransition(SleepSyncPendingTransition(
+            payload: try HealthBridgeBatchEncoder().encode(transition.batch),
+            manifest: transition.manifest,
+            receiverBindingID: try XCTUnwrap(fixture.settings.receiverBindingID),
+            connectionGeneration: fixture.settings.receiverSettingsGenerationToken
+        ))
+        try fixture.background.markPendingObserverTypeCodes(["sleep_analysis"])
+        let younger = try fixture.background.loadPendingObserverTypeCodeGenerations()
+        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep)
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observer(typeCode: "sleep_analysis"))
+
+        XCTAssertTrue(fixture.readAnchors.isEmpty, "Replaying an old journal is not a fresh HealthKit query.")
+        XCTAssertEqual(try fixture.sleep.loadManifest(), transition.manifest)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), younger)
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observer(typeCode: "sleep_analysis"))
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        XCTAssertEqual(fixture.readAnchors, [fixture.nextAnchor])
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+    }
+
     func testAutomaticSleepColdOwnerCompletesAcceptedJournalBeforeNextRead() async throws {
         let fixture = try SleepStoreFaultFixture(point: .manifestSave)
         defer { fixture.cleanUp() }
@@ -3157,7 +3273,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertNil(try fixture.store.loadPendingTransition())
         XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
-        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertEqual(
+            try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations,
+            "Replaying an old journal does not prove a fresh query for the retained generation."
+        )
         XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload])
         runtime?.automaticSyncRuntime.stopAdmission()
         await runtime?.automaticSyncRuntime.cancelAndWait()
@@ -3169,6 +3288,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertTrue(reachedNewRead)
         XCTAssertNil(try fixture.store.loadPendingTransition())
         XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
         XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload])
         runtime?.automaticSyncRuntime.stopAdmission()
         await runtime?.automaticSyncRuntime.cancelAndWait()
