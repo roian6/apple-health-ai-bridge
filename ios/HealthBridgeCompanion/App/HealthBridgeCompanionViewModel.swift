@@ -5294,7 +5294,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             store: sleepManifestStore,
                             to: target,
                             executionMode: executionMode,
-                            pendingGenerationRetirements: pendingGenerationRetirements
+                            // This journal predates the current opportunity's read.
+                            // Existing FIFO tokens remain valid; a recreated item
+                            // cannot retire a newer generation it has not queried.
+                            pendingGenerationRetirements: [:]
                         )
                         try requireCurrentPayloadDeliveryTarget(target)
                         if executionMode != .automatic {
@@ -5983,6 +5986,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         to: target,
                         cursorCheckpoint: cursorCheckpoint,
                         executionMode: mode.executionMode,
+                        // Independent quantities must not spend the collection owner's
+                        // lifetime on HTTP before later selected lanes can journal.
+                        // Daily activity retains its raw-before-projection acceptance.
+                        deferDirectDelivery: mode == .background
+                            && !HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode),
                         // Nutrition has no separate daily-activity owner; its receipt retires this generation.
                         pendingGenerationRetirements: selectedEntries.first(where: { $0.typeCode == typeCode })?.aggregation == .sum
                             && !NutritionCompatibility.typeCodes.contains(typeCode)
@@ -6199,6 +6207,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         to target: PayloadDeliveryTarget,
         cursorCheckpoint: FileOutboxCursorCheckpoint? = nil,
         executionMode: HealthBridgeSyncExecutionMode = .foreground,
+        deferDirectDelivery: Bool = false,
         pendingGenerationRetirements: [String: Int] = [:],
         stepsRawAndDailyCoverage: Bool? = nil
     ) async throws -> PayloadDelivery {
@@ -6240,7 +6249,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
         }
 
-        if !executionMode.shouldAttemptInlineDirectDelivery {
+        if deferDirectDelivery || !executionMode.shouldAttemptInlineDirectDelivery {
             lastOutboxNotice = " Exact payload sequence is durably queued for background Direct delivery."
             schedulePendingBackgroundOutboxUploadsIfAllowed()
             return PayloadDelivery(

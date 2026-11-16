@@ -48,6 +48,59 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     @discardableResult
     @MainActor
     public func recordDirectReceiverAcceptanceForSync(
+        descriptor: DirectUploadCompletionDescriptor,
+        sleepStore: any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void
+    ) async throws -> Bool {
+        let revision = try sleepStore.revisionForSync()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try validate()
+            guard try sleepStore.revisionForSync() == revision else { throw CancellationError() }
+        }
+        if let pending = try await sleepStore.loadPendingForSync(validate: check) {
+            let item = try outbox.pendingItems().first { $0.id == descriptor.itemID }
+            let matches = try await SleepSyncValueWork.run {
+                guard let item else { return false }
+                return try Data(contentsOf: item.fileURL) == pending.payload
+            }
+            try check()
+            if pending.outboxItemID == descriptor.itemID, !matches {
+                throw OutboxDeliveryCoordinatorError.ownershipMismatch
+            }
+            if matches {
+                guard pending.receiverBindingID == descriptor.receiverBindingID,
+                      pending.connectionGeneration == descriptor.receiverGeneration,
+                      item?.receiverIdentity == descriptor.receiverBindingID else {
+                    throw OutboxDeliveryCoordinatorError.ownershipMismatch
+                }
+                // An ACK can arrive before the caller journals its assigned FIFO ID.
+                // Exact accepted bytes plus binding/generation still identify that transition.
+                let committedRevision = try await sleepStore.saveManifestForSync(
+                    pending.manifest, validate: check
+                )
+                let checkCommitted = { @MainActor in
+                    try Task.checkCancellation()
+                    try validate()
+                    guard try sleepStore.revisionForSync() == committedRevision else {
+                        throw CancellationError()
+                    }
+                }
+                _ = try await sleepStore.clearPendingForSync(id: pending.id, validate: checkCommitted)
+            }
+        }
+        try Task.checkCancellation()
+        try validate()
+        return try await recordDirectReceiverAcceptanceForSync(
+            itemID: descriptor.itemID,
+            receiverBindingID: descriptor.receiverBindingID,
+            validate: validate
+        )
+    }
+
+    @discardableResult
+    @MainActor
+    public func recordDirectReceiverAcceptanceForSync(
         itemID: String,
         receiverBindingID: String,
         validate: @MainActor () throws -> Void
