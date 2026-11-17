@@ -3149,6 +3149,197 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try await exerciseAutomaticDirectExpiry(retainedBacklog: true)
     }
 
+    func testControlOnlyProbeCannotBlockHealthCollection() async throws {
+        try await exerciseAutomaticDirectExpiry(retainedBacklog: true, controlProbeBacklog: true)
+    }
+
+    func testNutritionCapabilityCancellationCannotStarveIndependentSleep() async throws {
+        try await exerciseNutritionCapabilityCollection(support: nil, independentType: "sleep_analysis")
+    }
+
+    func testNutritionCapabilityCancellationCannotStarveIndependentQuantity() async throws {
+        try await exerciseNutritionCapabilityCollection(support: nil, independentType: "heart_rate")
+    }
+
+    func testNutritionOnlyCollectionStillRequiresFreshSupportedCapabilities() async throws {
+        try await exerciseNutritionCapabilityCollection(support: true, independentType: nil)
+    }
+
+    func testUnsupportedNutritionCollectionRetainsItsGenerationWithoutReading() async throws {
+        try await exerciseNutritionCapabilityCollection(support: false, independentType: nil)
+    }
+
+    func testCollectionCancelsStalledBackgroundCapabilityReadWithoutReceiverReply() async throws {
+        try await exerciseNutritionCapabilityCollection(
+            support: nil, independentType: "heart_rate", scheduledCapabilityRead: true
+        )
+    }
+
+    private func exerciseNutritionCapabilityCollection(
+        support: Bool?, independentType: String?, scheduledCapabilityRead: Bool = false
+    ) async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.markPendingObserverTypeCodes(["dietary_protein"])
+        if independentType != "sleep_analysis" {
+            try fixture.background.clearPendingObserverTypeCodes(
+                matching: fixture.generations, typeCodes: ["sleep_analysis"]
+            )
+        }
+        if let independentType, independentType != "sleep_analysis" {
+            try fixture.background.markPendingObserverTypeCodes([independentType])
+        }
+        let generations = try fixture.background.loadPendingObserverTypeCodeGenerations()
+        let recorder = fixture.recorder
+        var retainedNutritionPayload: Data?
+        if scheduledCapabilityRead {
+            let now = Date(timeIntervalSince1970: 1_700_000_000)
+            let batch = try XCTUnwrap(GenericQuantitySyncBatchFactory.makeQuantityBatch(
+                samples: [HealthKitQuantitySampleSummary(
+                    uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000174")),
+                    typeCode: "dietary_protein", start: now, end: now.addingTimeInterval(60), value: 1
+                )],
+                selectedTypeCodes: ["dietary_protein"], windowStart: now, windowEnd: now.addingTimeInterval(60)
+            ))
+            let payload = try HealthBridgeBatchEncoder().encode(batch)
+            retainedNutritionPayload = payload
+            _ = try fixture.outbox.enqueueSequence(
+                [payload], receiverIdentity: try XCTUnwrap(fixture.settings.receiverBindingID),
+                pendingGenerationRetirements: ["dietary_protein": try XCTUnwrap(generations["dietary_protein"])]
+            )
+        }
+        let schedulingStarted = scheduledCapabilityRead
+            ? expectation(description: "Background capability request started") : nil
+        if let schedulingStarted {
+            recorder.setHeldCapabilityHandler { schedulingStarted.fulfill() }
+        }
+        if let support { recorder.setCapabilitySupport(support) }
+        PayloadFenceURLProtocol.networkRecorder = recorder
+        var nutritionReads = 0
+        var independentQuantityReads = 0
+        let selected = ["dietary_protein"] + (independentType.map { [$0] } ?? [])
+        let client = ReceiverClient(session: fixture.session)
+        let receiverURL = try XCTUnwrap(URL(string: fixture.settings.receiverURLString))
+        let bearer = try fixture.settings.loadBearerToken()
+        let viewModel = try makeViewModel(
+            root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+            ),
+            outbox: fixture.outbox, receiverClient: client,
+            automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(
+                fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+            ),
+            sleepManifestStore: fixture.sleep,
+            readAnchoredSleepChanges: { anchor, _, now in
+                fixture.readAnchors.append(anchor)
+                return HealthKitAnchoredSleepChanges(
+                    addedSamples: [HealthKitSleepChildSample(
+                        uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000172")),
+                        stage: "core", start: now.addingTimeInterval(-3600), end: now
+                    )],
+                    deletedSamples: [], anchorCursorValue: fixture.nextAnchor, receivedAt: now
+                )
+            },
+            automaticSyncEligibleTypeCodesForTesting: selected,
+            scheduleDirectBackgroundUploads: {
+                if scheduledCapabilityRead {
+                    _ = await client.receiverCapabilities(forBatchURL: receiverURL, bearerToken: bearer)
+                    if Task.isCancelled { fixture.cancelledSchedulingCount += 1 }
+                    try Task.checkCancellation()
+                }
+                return 0
+            },
+            terminalBackgroundPayloadDrain: { true }, platformBackgroundPayloadDrain: { true },
+            readAnchoredQuantityChanges: { type, _, start, now in
+                if NutritionCompatibility.isNutrition(type) {
+                    nutritionReads += 1
+                    XCTAssertEqual(support, true, "Nutrition must not read before supported capabilities.")
+                    XCTAssertGreaterThan(recorder.capabilityRequestCount, 0)
+                } else {
+                    independentQuantityReads += 1
+                    XCTAssertEqual(type, independentType)
+                }
+                return HealthKitAnchoredQuantityChanges(
+                    typeCode: type,
+                    samples: [HealthKitQuantitySampleSummary(
+                        uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000173")),
+                        typeCode: type, start: now.addingTimeInterval(-60), end: now, value: 1
+                    )],
+                    deletedSamples: [],
+                    anchorCursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 173)),
+                    windowStart: start ?? now.addingTimeInterval(-60), windowEnd: now
+                )
+            }
+        )
+        await viewModel.bootstrap()
+        if let schedulingStarted {
+            viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
+            await fulfillment(of: [schedulingStarted], timeout: 10)
+        }
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(
+            healthDataAvailable: { false },
+            executeQuery: { _ in XCTFail("Only synthetic readers may run.") }, stopQuery: { _ in },
+            enableDelivery: { _, completion in completion(false, nil) }, disableDelivery: { _ in }
+        )
+        let platform = AutomaticSyncRuntime.Platform(
+            scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in },
+            beginBackgroundOwner: { expire in
+                if support == nil { recorder.setHeldCapabilityHandler { expire() } }
+                return {}
+            },
+            healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+        )
+        let runtime = HealthBridgeCompanionApplicationRuntime(
+            viewModel: viewModel, automaticSyncPlatform: platform
+        )
+        // Reverse the quantity case's request order; the engine still canonicalizes it.
+        let requested = independentType == "heart_rate" ? Array(selected.reversed()) : selected
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: requested))
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        await viewModel.waitForBootstrapAndForegroundWork()
+        XCTAssertGreaterThan(recorder.capabilityRequestCount, 0)
+        let remaining = try fixture.background.loadPendingObserverTypeCodeGenerations()
+        if let retainedNutritionPayload {
+            XCTAssertEqual(fixture.cancelledSchedulingCount, 1)
+            XCTAssertEqual(independentQuantityReads, 1)
+            XCTAssertEqual(nutritionReads, 0)
+            XCTAssertEqual(remaining, generations)
+            let items = try fixture.outbox.pendingItems()
+            XCTAssertEqual(items.count, 2)
+            XCTAssertEqual(try Data(contentsOf: XCTUnwrap(items.first).fileURL), retainedNutritionPayload)
+            XCTAssertTrue(recorder.acceptedPayloads.isEmpty)
+            return
+        } else if independentType == "sleep_analysis" {
+            XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+            XCTAssertEqual(try fixture.sleep.loadManifest()?.anchorCursorValue, fixture.nextAnchor)
+            XCTAssertEqual(try fixture.sleep.loadManifest()?.activeChildSamples.count, fixture.children.count + 1)
+            XCTAssertNil(try fixture.sleep.loadPendingTransition())
+            XCTAssertEqual(recorder.acceptedPayloads.count, 1)
+            XCTAssertEqual(remaining, ["dietary_protein": try XCTUnwrap(generations["dietary_protein"])])
+        } else if independentType == "heart_rate" {
+            XCTAssertEqual(independentQuantityReads, 1)
+            XCTAssertTrue(fixture.readAnchors.isEmpty)
+            XCTAssertEqual(recorder.acceptedPayloads.count, 1)
+            let payload = try XCTUnwrap(recorder.acceptedPayloads.first)
+            let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: payload)
+            XCTAssertEqual(batch.samples.map(\.typeCode), ["heart_rate"])
+            XCTAssertEqual(remaining, ["dietary_protein": try XCTUnwrap(generations["dietary_protein"])])
+        } else if support == true {
+            XCTAssertEqual(nutritionReads, 1)
+            XCTAssertEqual(recorder.acceptedPayloads.count, 1)
+            XCTAssertTrue(remaining.isEmpty)
+        } else {
+            XCTAssertEqual(recorder.acceptedPayloads.count, 0)
+            XCTAssertEqual(remaining, generations)
+        }
+        if support != true { XCTAssertEqual(nutritionReads, 0) }
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+    }
+
     func testCollectionAfterConcurrentDrainStillSchedulesItsNewPayload() async throws {
         let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }
@@ -3211,7 +3402,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
     }
 
     private func exerciseAutomaticDirectExpiry(
-        retainedBacklog: Bool, initiallyBlockedDrain: Bool = false
+        retainedBacklog: Bool, initiallyBlockedDrain: Bool = false, controlProbeBacklog: Bool = false
     ) async throws {
         let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }
@@ -3219,27 +3410,34 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         var retainedPayload: Data?
         if retainedBacklog {
             let now = Date(timeIntervalSince1970: 1_700_000_000)
-            let batch = try XCTUnwrap(GenericQuantitySyncBatchFactory.makeQuantityBatch(
-                samples: [HealthKitQuantitySampleSummary(
-                    uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000173")),
-                    typeCode: "heart_rate", start: now, end: now.addingTimeInterval(60), value: 71
-                )],
-                selectedTypeCodes: ["heart_rate"], windowStart: now, windowEnd: now.addingTimeInterval(120),
-                generatedAt: now
-            ))
+            let batch: HealthBridgeBatchV1
+            if controlProbeBacklog {
+                batch = ConnectionTestBatchFactory.make(now: now)
+            } else {
+                batch = try XCTUnwrap(GenericQuantitySyncBatchFactory.makeQuantityBatch(
+                    samples: [HealthKitQuantitySampleSummary(
+                        uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000173")),
+                        typeCode: "heart_rate", start: now, end: now.addingTimeInterval(60), value: 71
+                    )],
+                    selectedTypeCodes: ["heart_rate"], windowStart: now, windowEnd: now.addingTimeInterval(120),
+                    generatedAt: now
+                ))
+            }
             let payload = try HealthBridgeBatchEncoder().encode(batch)
             retainedPayload = payload
             let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
             _ = try fixture.outbox.enqueueSequence(
                 [payload], receiverIdentity: binding,
-                cursorCheckpoint: FileOutboxCursorCheckpoint(
+                cursorCheckpoint: controlProbeBacklog ? nil : FileOutboxCursorCheckpoint(
                     receiverIdentity: binding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
                     cursorKind: GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "heart_rate"),
                     cursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 173))
                 ),
-                pendingGenerationRetirements: ["heart_rate": 1]
+                pendingGenerationRetirements: controlProbeBacklog ? [:] : ["heart_rate": 1]
             )
-            try fixture.background.markPendingObserverTypeCodes(["heart_rate"])
+            if !controlProbeBacklog {
+                try fixture.background.markPendingObserverTypeCodes(["heart_rate"])
+            }
         }
         let generations = try fixture.background.loadPendingObserverTypeCodeGenerations()
         var quantityReadCount = 0
@@ -3328,20 +3526,25 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         await viewModel.waitForBootstrapAndForegroundWork()
 
         XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+        if controlProbeBacklog { XCTAssertEqual(quantityReadCount, 1) }
         XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
         let pending = try XCTUnwrap(fixture.sleep.loadPendingTransition())
         XCTAssertEqual(pending.manifest.anchorCursorValue, fixture.nextAnchor)
         XCTAssertEqual(pending.manifest.publishedSessions, fixture.initialManifest.publishedSessions)
         let items = try fixture.outbox.pendingItems()
-        let queuedTypes = try items.flatMap {
+        let healthItems = controlProbeBacklog ? Array(items.dropFirst()) : items
+        let queuedTypes = try healthItems.flatMap {
             try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: $0.fileURL))
                 .healthTypes.map(\.typeCode)
         }
         XCTAssertEqual(Set(queuedTypes), ["heart_rate", "sleep_analysis"])
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), generations)
         if let retainedPayload {
-            XCTAssertEqual(quantityReadCount, 0, "A retained cursor blocks its own lane, not unrelated Sleep.")
-            XCTAssertEqual(items.count, 2, "Repeated failed delivery must not duplicate either payload.")
+            if !controlProbeBacklog {
+                XCTAssertEqual(quantityReadCount, 0, "A retained cursor blocks its own lane, not unrelated Sleep.")
+            }
+            XCTAssertEqual(items.count, controlProbeBacklog ? 3 : 2,
+                "Repeated failed delivery must not duplicate any payload.")
             XCTAssertEqual(try Data(contentsOf: XCTUnwrap(items.first).fileURL), retainedPayload)
             XCTAssertTrue(fixture.recorder.acceptedPayloads.isEmpty)
             XCTAssertEqual(fixture.recorder.invocationCount, 2)
@@ -4391,6 +4594,7 @@ private final class DirectSleepPreparationFixture {
     let nextAnchor = "synthetic-issue96-next-anchor"
     var platformDrainReady = true
     var directScheduleCount = 0
+    var cancelledSchedulingCount = 0
     let recorder = PayloadFenceNetworkRecorder()
     let session: URLSession
     var readAnchors: [String?] = []
@@ -4984,6 +5188,9 @@ private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
     private var beforeResponse: (@Sendable (Data, Int) throws -> Void)?
     private var inspectionCount = 0
     private var forcedResponseStatusCode: Int?
+    private var capabilitySupport: Bool?
+    private var capabilityRequests = 0
+    private var heldCapabilityHandler: (@Sendable () -> Void)?
     private var heldResponseHandler: (@Sendable (@escaping @Sendable () -> Void) -> Bool)?
 
     func setHeldResponseHandler(
@@ -5011,6 +5218,44 @@ private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
         lock.lock()
         forcedResponseStatusCode = statusCode
         lock.unlock()
+    }
+
+    func setCapabilitySupport(_ supported: Bool) {
+        lock.lock()
+        capabilitySupport = supported
+        lock.unlock()
+    }
+
+    func setHeldCapabilityHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock()
+        heldCapabilityHandler = handler
+        lock.unlock()
+    }
+
+    var capabilityRequestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capabilityRequests
+    }
+
+    func holdCapabilityResponseIfRequested() -> Bool {
+        lock.lock()
+        capabilityRequests += 1
+        let handler = heldCapabilityHandler
+        lock.unlock()
+        guard let handler else { return false }
+        handler()
+        return true
+    }
+
+    var capabilityResponseBody: Data? {
+        lock.lock()
+        let supported = capabilitySupport
+        lock.unlock()
+        guard let supported else { return nil }
+        return Data("""
+        {"schema_id":"health_bridge.receiver_capabilities.v1","batch_schema_id":"health_bridge.batch.v1","nutrition_supported":\(supported)}
+        """.utf8)
     }
 
     func setBeforeResponse(_ inspect: @escaping @Sendable (Data, Int) throws -> Void) {
@@ -5142,6 +5387,8 @@ private final class PayloadFenceURLProtocol: URLProtocol, @unchecked Sendable {
             Self.networkRecorder?.recordPayload(body)
         }
         let responsePayload = payload
+        if request.url?.path == "/v1/capabilities",
+           Self.networkRecorder?.holdCapabilityResponseIfRequested() == true { return }
         if Self.networkRecorder?.holdResponseIfRequested(
             resume: { self.completeLoading(with: responsePayload) }
         ) == true { return }
@@ -5155,7 +5402,9 @@ private final class PayloadFenceURLProtocol: URLProtocol, @unchecked Sendable {
                   url: url,
                   statusCode: statusCode,
                   httpVersion: nil,
-                  headerFields: ["Content-Type": "application/json"]
+                  headerFields: url.path == "/v1/capabilities"
+                    ? ["Content-Type": "application/json", "Cache-Control": "no-store"]
+                    : ["Content-Type": "application/json"]
               ) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
@@ -5171,7 +5420,9 @@ private final class PayloadFenceURLProtocol: URLProtocol, @unchecked Sendable {
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let body = statusCode == 200 ? #"{"status":"ok"}"# : #"{"status":"synthetic_failure"}"#
-        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        let capabilityBody = statusCode == 200 && url.path == "/v1/capabilities"
+            ? Self.networkRecorder?.capabilityResponseBody : nil
+        client?.urlProtocol(self, didLoad: capabilityBody ?? Data(body.utf8))
         if statusCode == 200, let payload { Self.networkRecorder?.recordAcceptedPayload(payload) }
         client?.urlProtocolDidFinishLoading(self)
     }

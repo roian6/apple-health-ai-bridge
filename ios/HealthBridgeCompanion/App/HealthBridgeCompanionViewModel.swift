@@ -1408,10 +1408,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             let items = try outbox.pendingItems()
             let pendingTypes = try await SleepSyncValueWork.run {
-                Set(try items.flatMap { item in
+                Set(try items.flatMap { item -> [String] in
                     let batch = try JSONDecoder().decode(
                         HealthBridgeBatchV1.self, from: Data(contentsOf: item.fileURL)
                     )
+                    // Catalogue-only probes do not own any HealthKit read progress.
+                    guard !batch.samples.isEmpty || !batch.workouts.isEmpty
+                            || !batch.sleepSessions.isEmpty || !batch.deletedRecords.isEmpty
+                            || batch.sync.cursors.contains(where: { $0.cursorKind != "connection_test" })
+                    else { return [] }
                     return GenericQuantityCoveragePolicy.canonicalTypeCodes(
                         for: batch.healthTypes.map(\.typeCode)
                     )
@@ -3952,6 +3957,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard isRuntimeEligible else {
             return .noPayloadCovering(exactGeneration)
         }
+        if automaticDirectPendingTypes != nil, automaticDirectReentryTypes == nil,
+           NutritionCompatibility.isNutrition(typeCode) {
+            // Receiver admission is a dependency, not part of independent collection.
+            return deferAutomaticDirectTypes(exactGeneration)
+        }
         statusIsError = false
         backgroundAutomaticSyncFailure = nil
         backgroundAutomaticSyncQuerySucceeded = false
@@ -4375,10 +4385,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
                         throw CancellationError()
                     }
-                    guard (trustedPendingOutboxCount() ?? 0) > 0 else { break }
-                    _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
-                    try Task.checkCancellation()
-                    try requireCurrentConnectionGeneration(expectedGeneration)
+                    if (trustedPendingOutboxCount() ?? 0) > 0 {
+                        _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
+                        try Task.checkCancellation()
+                        try requireCurrentConnectionGeneration(expectedGeneration)
+                    }
                     if collection.deferredTypes.isEmpty || trustedPendingOutboxCount() != 0 { break }
                 }
                 if collectedNewPayloads || !statusIsError, (trustedPendingOutboxCount() ?? 0) > 0 {
