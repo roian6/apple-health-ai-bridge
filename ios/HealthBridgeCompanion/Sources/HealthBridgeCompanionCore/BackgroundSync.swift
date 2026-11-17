@@ -92,6 +92,7 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
         case retryableReadFailure
         case unknownAvailability
         case payloadEnqueued
+        case deferred
         case blocked
     }
 
@@ -123,6 +124,10 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
 
     public static func unknownAvailabilityCovering(_ generations: [String: Int]) -> Self {
         Self(disposition: .unknownAvailability, coveredGenerations: generations)
+    }
+
+    public static func deferredCovering(_ generations: [String: Int]) -> Self {
+        Self(disposition: .deferred, coveredGenerations: generations)
     }
 }
 
@@ -422,6 +427,8 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
             case .retryableReadFailure:
                 break
             case .unknownAvailability:
+                allAvailable = false
+            case .deferred:
                 allAvailable = false
             case .payloadEnqueued:
                 break

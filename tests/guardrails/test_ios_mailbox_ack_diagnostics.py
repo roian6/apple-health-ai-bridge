@@ -224,7 +224,17 @@ def _assert_shared_engine_ack_backpressure(
         steps[:raw_read],
     )
     daily_read = steps.index("let daily = await performDailyActivityAggregates(")
-    assert re.search(r"case \.queued:\s*return \.blocked", steps[raw_read:daily_read])
+    assert re.search(
+        str.join(
+            "",
+            (
+                r"case \.queued:\s*return automaticDirectPendingTypes == nil\s*",
+                r"\?\s*\.blocked\s*:\s*deferAutomaticDirectTypes\(",
+                r"pendingGenerationRetirements\)",
+            ),
+        ),
+        steps[raw_read:daily_read],
+    )
     pending_result = _region(
         background_sync, "switch result.disposition {", "try Task.checkCancellation()"
     )
