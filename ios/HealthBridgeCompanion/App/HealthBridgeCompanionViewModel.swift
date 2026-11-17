@@ -400,6 +400,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var backgroundOutboxSchedulingID: UUID?
     private var trackedSyncTasks: [UUID: Task<Void, Never>] = [:]
     private var directOutboxTransferRequestCount = 0
+    private var automaticDirectPendingTypes: Set<String>?
+    private var automaticDirectReentryTypes: Set<String>?
+    private var automaticDirectDeferredTypes: Set<String> = []
     private var bootstrapCompleted = false
     private var backgroundSyncPreferenceGeneration: UInt64 = 0
     private var automaticSyncPreferenceTask: Task<Void, Never>?
@@ -1332,7 +1335,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func runWithExclusiveDirectOutboxTransfer<Result>(
         reschedulePendingUploads: Bool = true,
-        _ operation: @escaping @MainActor () async -> Result
+        _ operation: @escaping @MainActor () async throws -> Result
     ) async throws -> Result {
         directOutboxTransferRequestCount += 1
         do {
@@ -1367,7 +1370,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 }
             }
             #endif
-            let result = await operation()
+            let result = try await operation()
             await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             return result
         } catch {
@@ -1391,6 +1394,49 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads) {
             await self.flushPendingOutbox(executionMode: .automatic)
         }
+    }
+
+    private func collectAutomaticDirectTypes(
+        _ processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes,
+        reentryTypes: Set<String>?
+    ) async throws -> (processedAllPending: Bool, deferredTypes: Set<String>) {
+        try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: false) {
+            try await self.preparePrivateStorageForUploadAdmission()
+            let target = try self.capturePayloadDeliveryTarget()
+            guard let outbox = self.outbox else {
+                throw CompanionPrivateStorageError.outboxUnavailable
+            }
+            let items = try outbox.pendingItems()
+            let pendingTypes = try await SleepSyncValueWork.run {
+                Set(try items.flatMap { item in
+                    let batch = try JSONDecoder().decode(
+                        HealthBridgeBatchV1.self, from: Data(contentsOf: item.fileURL)
+                    )
+                    return GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                        for: batch.healthTypes.map(\.typeCode)
+                    )
+                })
+            }
+            try self.requireCurrentPayloadDeliveryTarget(target)
+            guard self.outbox === outbox, try outbox.pendingItems() == items else {
+                throw CancellationError()
+            }
+            self.automaticDirectPendingTypes = pendingTypes
+            self.automaticDirectReentryTypes = reentryTypes
+            self.automaticDirectDeferredTypes = []
+            defer {
+                self.automaticDirectPendingTypes = nil
+                self.automaticDirectReentryTypes = nil
+                self.automaticDirectDeferredTypes = []
+            }
+            let processedAllPending = try await processPendingTypes()
+            return (processedAllPending, self.automaticDirectDeferredTypes)
+        }
+    }
+
+    private func deferAutomaticDirectTypes(_ generations: [String: Int]) -> AutomaticSyncTypeResult {
+        automaticDirectDeferredTypes.formUnion(generations.keys)
+        return .deferredCovering(generations)
     }
 
     private func flushPendingOutbox(executionMode: HealthBridgeSyncExecutionMode) async -> Bool {
@@ -3859,6 +3905,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return .noPayload
         }
         let exactGeneration = [typeCode: generation]
+        if let reentryTypes = automaticDirectReentryTypes, !reentryTypes.contains(typeCode) {
+            return .deferredCovering(exactGeneration)
+        }
         let retirementGenerations: [String: Int]
         if typeCode != HealthBridgeHealthType.steps.typeCode,
            HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode) {
@@ -3875,6 +3924,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         #endif
         let isRuntimeEligible = automaticSyncSelectedEligibleTypeCodes().contains(typeCode)
         do {
+            if let pendingTypes = automaticDirectPendingTypes,
+               pendingTypes.contains(typeCode),
+               typeCode == "steps" || !HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode) {
+                return deferAutomaticDirectTypes(exactGeneration)
+            }
             if try outbox.hasPendingGenerationRetirements(retirementGenerations) {
                 return .payloadEnqueued
             }
@@ -3954,6 +4008,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard !statusIsError else { return .blocked }
         let pendingAfter = trustedPendingOutboxCount()
+        if let pendingTypes = automaticDirectPendingTypes,
+           HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode),
+           !pendingTypes.isDisjoint(with: retirementGenerations.keys)
+                || (pendingAfter ?? 0) > (pendingBefore ?? 0) {
+            return deferAutomaticDirectTypes(retirementGenerations)
+        }
         do {
             if try outbox.hasPendingGenerationRetirements(retirementGenerations) {
                 return .payloadEnqueued
@@ -4027,7 +4087,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             case .noPayload, .accepted:
                 break
             case .queued:
-                return .blocked
+                return automaticDirectPendingTypes == nil
+                    ? .blocked : deferAutomaticDirectTypes(pendingGenerationRetirements)
             case .failed:
                 return automaticStepReadFailureResult(pendingGenerationRetirements)
             }
@@ -4035,7 +4096,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             // Reconcile older deliveries only after this lane reached a successful read.
             // A read failure must not consume another selected lane's pending transition.
             guard let pendingCount = trustedPendingOutboxCount() else { return .blocked }
-            if pendingCount > 0 {
+            if pendingCount > 0, automaticDirectPendingTypes == nil {
                 let flushed = try await flushAutomaticPendingOutbox()
                 try requireCurrentConnectionGeneration(expectedGeneration)
                 guard flushed, !statusIsError, trustedPendingOutboxCount() == 0 else {
@@ -4295,32 +4356,44 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         var processedAllPending: Bool?
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
-            var canCollect = true
-            if pendingOutbox > 0, settingsStore.activeTransport == .directHTTP {
-                _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
-                try Task.checkCancellation()
-                try requireCurrentConnectionGeneration(expectedGeneration)
-                canCollect = trustedPendingOutboxCount() == 0
-            }
-            if canCollect {
+            if settingsStore.activeTransport == .directHTTP {
+                var collectedNewPayloads = false
+                var reentryTypes: Set<String>?
+                // One collection pass is independent of receiver availability.
+                // One bounded reentry resolves raw-before-projection dependencies after ACK.
+                for _ in 0..<2 {
+                    let pendingBeforeCollection = trustedPendingOutboxCount() ?? 0
+                    let collection = try await collectAutomaticDirectTypes(
+                        processPendingTypes, reentryTypes: reentryTypes
+                    )
+                    processedAllPending = collection.processedAllPending
+                    reentryTypes = collection.deferredTypes
+                    collectedNewPayloads = collectedNewPayloads
+                        || (trustedPendingOutboxCount() ?? 0) > pendingBeforeCollection
+                    try Task.checkCancellation()
+                    try requireCurrentConnectionGeneration(expectedGeneration)
+                    guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
+                        throw CancellationError()
+                    }
+                    guard (trustedPendingOutboxCount() ?? 0) > 0 else { break }
+                    _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
+                    try Task.checkCancellation()
+                    try requireCurrentConnectionGeneration(expectedGeneration)
+                    if collection.deferredTypes.isEmpty || trustedPendingOutboxCount() != 0 { break }
+                }
+                if collectedNewPayloads || !statusIsError, (trustedPendingOutboxCount() ?? 0) > 0 {
+                    await schedulePendingBackgroundOutboxUploadsAndWaitIfAllowed()
+                }
+            } else {
                 try await preparePrivateStorageForUploadAdmission()
                 processedAllPending = try await processPendingTypes()
-            } else {
-                processedAllPending = false
-            }
-            try Task.checkCancellation()
-            try requireCurrentConnectionGeneration(expectedGeneration)
-            guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
-                throw CancellationError()
-            }
-            if canCollect, (trustedPendingOutboxCount() ?? 0) > 0 {
-                if settingsStore.activeTransport == .mailbox {
+                try Task.checkCancellation()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
+                    throw CancellationError()
+                }
+                if (trustedPendingOutboxCount() ?? 0) > 0 {
                     _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
-                } else {
-                    _ = try await flushAutomaticPendingOutbox()
-                    if (trustedPendingOutboxCount() ?? 0) > 0 {
-                        await schedulePendingBackgroundOutboxUploadsAndWaitIfAllowed()
-                    }
                 }
             }
         } catch {
@@ -4332,7 +4405,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         let pendingTypeCodes = (try? backgroundSyncStore
             .loadPendingObserverTypeCodeGenerations().keys.sorted()) ?? []
-        if processedAllPending == true, !statusIsError,
+        if !statusIsError,
            diagnostic.record.failure == nil,
            let readFailure = diagnostic.firstReadFailure {
             diagnostic.noteFailure(readFailure)
@@ -5846,6 +5919,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             var queuedAnyPayload = false
 
             for typeCode in selectedTypeCodes {
+                if automaticDirectPendingTypes?.contains(typeCode) == true { continue }
                 do {
                     failureStage = .store
                     try requireCurrentReceiverSyncProgressScope(progressScope)
@@ -6001,10 +6075,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         deliveryGeneration: deliveryResult.connectionGeneration
                     )
                     try requireCurrentPayloadDeliveryTarget(target)
-                    await reaggregateActivityIfNeeded(
-                        typeCode: typeCode, executionMode: mode.executionMode,
-                        retirements: pendingGenerationRetirements
-                    )
+                    if automaticDirectPendingTypes == nil || deliveryResult.directUpload != nil {
+                        await reaggregateActivityIfNeeded(
+                            typeCode: typeCode, executionMode: mode.executionMode,
+                            retirements: pendingGenerationRetirements
+                        )
+                    }
                     try requireCurrentReceiverSyncProgressScope(progressScope)
                     try requireCurrentPayloadDeliveryTarget(target)
                     if deliveryResult.directUpload == nil {
@@ -6249,7 +6325,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
         }
 
-        if deferDirectDelivery || !executionMode.shouldAttemptInlineDirectDelivery {
+        if automaticDirectPendingTypes != nil || deferDirectDelivery || !executionMode.shouldAttemptInlineDirectDelivery {
             lastOutboxNotice = " Exact payload sequence is durably queued for background Direct delivery."
             schedulePendingBackgroundOutboxUploadsIfAllowed()
             return PayloadDelivery(
