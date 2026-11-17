@@ -1399,7 +1399,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func collectAutomaticDirectTypes(
         _ processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes,
         reentryTypes: Set<String>?
-    ) async throws -> (processedAllPending: Bool, deferredTypes: Set<String>) {
+    ) async throws -> (processedAllPending: Bool, deferredTypes: Set<String>, enqueuedPayloads: Bool) {
         try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: false) {
             try await self.preparePrivateStorageForUploadAdmission()
             let target = try self.capturePayloadDeliveryTarget()
@@ -1430,7 +1430,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 self.automaticDirectDeferredTypes = []
             }
             let processedAllPending = try await processPendingTypes()
-            return (processedAllPending, self.automaticDirectDeferredTypes)
+            let previousIDs = Set(items.map(\.id))
+            let enqueuedPayloads = try outbox.pendingItems().contains { !previousIDs.contains($0.id) }
+            return (processedAllPending, self.automaticDirectDeferredTypes, enqueuedPayloads)
         }
     }
 
@@ -4362,14 +4364,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 // One collection pass is independent of receiver availability.
                 // One bounded reentry resolves raw-before-projection dependencies after ACK.
                 for _ in 0..<2 {
-                    let pendingBeforeCollection = trustedPendingOutboxCount() ?? 0
                     let collection = try await collectAutomaticDirectTypes(
                         processPendingTypes, reentryTypes: reentryTypes
                     )
                     processedAllPending = collection.processedAllPending
                     reentryTypes = collection.deferredTypes
-                    collectedNewPayloads = collectedNewPayloads
-                        || (trustedPendingOutboxCount() ?? 0) > pendingBeforeCollection
+                    collectedNewPayloads = collectedNewPayloads || collection.enqueuedPayloads
                     try Task.checkCancellation()
                     try requireCurrentConnectionGeneration(expectedGeneration)
                     guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {

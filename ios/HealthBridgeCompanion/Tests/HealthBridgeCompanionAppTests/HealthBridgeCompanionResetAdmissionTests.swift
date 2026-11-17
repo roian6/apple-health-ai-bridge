@@ -3149,6 +3149,57 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try await exerciseAutomaticDirectExpiry(retainedBacklog: true)
     }
 
+    func testCollectionAfterConcurrentDrainStillSchedulesItsNewPayload() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let olderProbe = try HealthBridgeBatchEncoder().encode(
+            ConnectionTestBatchFactory.make(now: Date(timeIntervalSince1970: 1_700_000_000))
+        )
+        _ = try fixture.outbox.enqueue(
+            olderProbe, receiverIdentity: try XCTUnwrap(fixture.settings.receiverBindingID)
+        )
+        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep)
+        let viewModel = runtime.viewModel
+        let responseGate = HeldFirstProtocolResponse()
+        defer { _ = responseGate.release() }
+        fixture.recorder.setHeldResponseHandler { responseGate.holdFirst($0) }
+        fixture.recorder.setFailedCursorKinds([SleepSyncBatchFactory.anchoredCursorKind])
+        let scheduledBefore = fixture.directScheduleCount
+        let automaticAdmitted = expectation(description: "Automatic work waits behind the connection test")
+        let diagnosticsURL = fixture.root.appendingPathComponent("diagnostics.json")
+        let subscription = viewModel.$automaticSyncLaneDiagnosticLine.sink { _ in
+            let record = AutomaticSyncDiagnosticStore(fileURL: diagnosticsURL).latestRecord
+            if record?.runOutcome == .accepted, responseGate.release() {
+                automaticAdmitted.fulfill()
+            }
+        }
+        defer { subscription.cancel() }
+
+        let connectionTest = Task { await viewModel.sendConnectionTestBatch() }
+        await fulfillment(of: [responseGate.held], timeout: 10)
+        XCTAssertEqual(try fixture.outbox.pendingItems().count, 2)
+        let automatic = Task {
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observer(typeCode: "sleep_analysis"))
+        }
+        await fulfillment(of: [automaticAdmitted], timeout: 10)
+        _ = responseGate.release()
+        await connectionTest.value
+        await automatic.value
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(fixture.recorder.acceptedPayloads.count, 2, "Only the two connection probes were accepted.")
+        XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        let pending = try XCTUnwrap(fixture.sleep.loadPendingTransition())
+        let items = try fixture.outbox.pendingItems()
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items.first?.id, pending.outboxItemID)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertGreaterThan(fixture.directScheduleCount, scheduledBefore,
+            "New payloads must be detected inside collection's gate, after the earlier owner drains its items.")
+    }
+
     func testIncompleteTransferCancellationRetainsWorkThenNextOpportunityCollectsSleep() async throws {
         try await exerciseAutomaticDirectExpiry(retainedBacklog: true, initiallyBlockedDrain: true)
     }
@@ -3241,7 +3292,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             setUploadAdmission: { _ in },
             beginBackgroundOwner: { expire in
                 if retainedBacklog {
-                    fixture.recorder.setHeldResponseHandler { expire() }
+                    fixture.recorder.setHeldResponseHandler { _ in
+                        expire()
+                        return true
+                    }
                 } else {
                     fixture.recorder.setBeforeResponse { _, _ in expire() }
                 }
@@ -3876,7 +3930,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 )
             },
             automaticSyncEligibleTypeCodesForTesting: ["sleep_analysis"],
-            scheduleDirectBackgroundUploads: { 0 },
+            scheduleDirectBackgroundUploads: {
+                fixture.directScheduleCount += 1
+                return 0
+            },
             terminalBackgroundPayloadDrain: terminalDrain, platformBackgroundPayloadDrain: { true }
         )
         beforeBootstrap(viewModel)
@@ -4333,6 +4390,7 @@ private final class DirectSleepPreparationFixture {
     let previousAnchor = "synthetic-issue96-previous-anchor"
     let nextAnchor = "synthetic-issue96-next-anchor"
     var platformDrainReady = true
+    var directScheduleCount = 0
     let recorder = PayloadFenceNetworkRecorder()
     let session: URLSession
     var readAnchors: [String?] = []
@@ -4886,30 +4944,67 @@ private struct ResetObservation {
     let clearIntentIsActive: Bool
 }
 
+private final class HeldFirstProtocolResponse: @unchecked Sendable {
+    let held = XCTestExpectation(description: "First real HTTP response is held")
+    private let lock = NSLock()
+    private var used = false
+    private var resume: (@Sendable () -> Void)?
+
+    func holdFirst(_ resume: @escaping @Sendable () -> Void) -> Bool {
+        lock.lock()
+        guard !used else {
+            lock.unlock()
+            return false
+        }
+        used = true
+        self.resume = resume
+        lock.unlock()
+        held.fulfill()
+        return true
+    }
+
+    @discardableResult
+    func release() -> Bool {
+        lock.lock()
+        let resume = self.resume
+        self.resume = nil
+        lock.unlock()
+        resume?()
+        return resume != nil
+    }
+}
+
 private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
     private var recordedPayloads: [Data] = []
     private var successfulPayloads: [Data] = []
     private var failedStepsSampleKinds: Set<String> = []
+    private var failedCursorKinds: Set<String> = []
     private var beforeResponse: (@Sendable (Data, Int) throws -> Void)?
     private var inspectionCount = 0
     private var forcedResponseStatusCode: Int?
-    private var heldResponseHandler: (@Sendable () -> Void)?
+    private var heldResponseHandler: (@Sendable (@escaping @Sendable () -> Void) -> Bool)?
 
-    func setHeldResponseHandler(_ handler: @escaping @Sendable () -> Void) {
+    func setHeldResponseHandler(
+        _ handler: @escaping @Sendable (@escaping @Sendable () -> Void) -> Bool
+    ) {
         lock.lock()
         heldResponseHandler = handler
         lock.unlock()
     }
 
-    func holdResponseIfRequested() -> Bool {
+    func holdResponseIfRequested(resume: @escaping @Sendable () -> Void) -> Bool {
         lock.lock()
         let handler = heldResponseHandler
         lock.unlock()
-        guard let handler else { return false }
-        handler()
-        return true
+        return handler?(resume) ?? false
+    }
+
+    func setFailedCursorKinds(_ kinds: Set<String>) {
+        lock.lock()
+        failedCursorKinds = kinds
+        lock.unlock()
     }
 
     func setResponseStatusCode(_ statusCode: Int) {
@@ -4948,14 +5043,16 @@ private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
     func responseStatusCode(for payload: Data?) -> Int {
         lock.lock()
         let failedKinds = failedStepsSampleKinds
+        let failedCursors = failedCursorKinds
         let forcedStatus = forcedResponseStatusCode
         lock.unlock()
         if let forcedStatus { return forcedStatus }
-        guard !failedKinds.isEmpty else { return 200 }
+        guard !failedKinds.isEmpty || !failedCursors.isEmpty else { return 200 }
         guard let payload,
               let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: payload) else {
             return 500
         }
+        if batch.sync.cursors.contains(where: { failedCursors.contains($0.cursorKind) }) { return 500 }
         return batch.samples.contains {
             $0.typeCode == "steps" && failedKinds.contains($0.metadata["sample_kind"] ?? "")
         } ? 500 : 200
@@ -5044,7 +5141,14 @@ private final class PayloadFenceURLProtocol: URLProtocol, @unchecked Sendable {
             payload = body
             Self.networkRecorder?.recordPayload(body)
         }
-        if Self.networkRecorder?.holdResponseIfRequested() == true { return }
+        let responsePayload = payload
+        if Self.networkRecorder?.holdResponseIfRequested(
+            resume: { self.completeLoading(with: responsePayload) }
+        ) == true { return }
+        completeLoading(with: payload)
+    }
+
+    private func completeLoading(with payload: Data?) {
         let statusCode = Self.networkRecorder?.responseStatusCode(for: payload) ?? 200
         guard let url = request.url,
               let response = HTTPURLResponse(

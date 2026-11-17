@@ -825,7 +825,7 @@ def test_background_upload_cancellation_is_bounded() -> None:
     transfer_body = source[transfer_start:transfer_end]
     cancel = transfer_body.index("cancelPendingUploads()")
     verify_empty = transfer_body.index("hasPendingUploadTasks()", cancel)
-    operation = transfer_body.index("let result = await operation()", verify_empty)
+    operation = transfer_body.index("let result = try await operation()", verify_empty)
     assert cancel < verify_empty < operation
     assert "throw CancellationError()" in transfer_body[verify_empty:operation]
 
