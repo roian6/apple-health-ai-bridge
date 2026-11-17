@@ -3407,6 +3407,12 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }
         try fixture.background.markPendingObserverTypeCodes(["heart_rate"])
+        let selectedTypes = controlProbeBacklog
+            ? ["heart_rate", "sleep_analysis", "steps"] : ["heart_rate", "sleep_analysis"]
+        if controlProbeBacklog { try fixture.background.markPendingObserverTypeCodes(["steps"]) }
+        let transferReached = controlProbeBacklog
+            ? expectation(description: "Collection releases its gate and reaches both probe transfers") : nil
+        transferReached?.expectedFulfillmentCount = 2
         var retainedPayload: Data?
         if retainedBacklog {
             let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -3441,6 +3447,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         }
         let generations = try fixture.background.loadPendingObserverTypeCodeGenerations()
         var quantityReadCount = 0
+        var stepReadCount = 0
         PayloadFenceURLProtocol.networkRecorder = fixture.recorder
         let viewModel = try makeViewModel(
             root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
@@ -3461,7 +3468,24 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                     anchorCursorValue: fixture.nextAnchor, receivedAt: now
                 )
             },
-            automaticSyncEligibleTypeCodesForTesting: ["heart_rate", "sleep_analysis"],
+            readAnchoredStepChanges: { anchor, _, now in
+                stepReadCount += 1
+                XCTAssertNil(anchor, "A connection probe cannot select a HealthKit anchor.")
+                return HealthKitAnchoredStepChanges(
+                    stepSamples: [HealthKitStepSampleSummary(
+                        uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000175")),
+                        start: now.addingTimeInterval(-60), end: now, count: 17
+                    )],
+                    deletedStepSamples: [],
+                    anchorCursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 175)),
+                    windowStart: now.addingTimeInterval(-60), windowEnd: now
+                )
+            },
+            automaticSyncEligibleTypeCodesForTesting: selectedTypes,
+            readDailyActivityAggregates: { _, _, _, _ in
+                XCTFail("Daily projection must wait for raw Steps acceptance.")
+                return []
+            },
             scheduleDirectBackgroundUploads: { 0 },
             terminalBackgroundPayloadDrain: { true },
             platformBackgroundPayloadDrain: { fixture.platformDrainReady },
@@ -3491,6 +3515,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             beginBackgroundOwner: { expire in
                 if retainedBacklog {
                     fixture.recorder.setHeldResponseHandler { _ in
+                        transferReached?.fulfill()
                         expire()
                         return true
                     }
@@ -3517,16 +3542,29 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), generations)
             fixture.platformDrainReady = true
         }
-        for _ in 0..<(retainedBacklog ? 2 : 1) {
-            await runtime.automaticSyncRuntime.runAutomaticSync(
-                reason: .observerBatch(typeCodes: ["heart_rate", "sleep_analysis"])
-            )
+        let runs = Task { @MainActor in
+            for _ in 0..<(retainedBacklog ? 2 : 1) {
+                guard !Task.isCancelled else { return }
+                await runtime.automaticSyncRuntime.runAutomaticSync(
+                    reason: .observerBatch(typeCodes: selectedTypes)
+                )
+            }
         }
+        if let transferReached {
+            // The timeout is only a deadlock circuit breaker; the transport event synchronizes.
+            await fulfillment(of: [transferReached], timeout: 10)
+            runs.cancel()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+        }
+        await runs.value
         await runtime.automaticSyncRuntime.cancelAndWait()
         await viewModel.waitForBootstrapAndForegroundWork()
 
         XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
-        if controlProbeBacklog { XCTAssertEqual(quantityReadCount, 1) }
+        if controlProbeBacklog {
+            XCTAssertEqual(quantityReadCount, 1)
+            XCTAssertEqual(stepReadCount, 1)
+        }
         XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
         let pending = try XCTUnwrap(fixture.sleep.loadPendingTransition())
         XCTAssertEqual(pending.manifest.anchorCursorValue, fixture.nextAnchor)
@@ -3537,13 +3575,13 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: $0.fileURL))
                 .healthTypes.map(\.typeCode)
         }
-        XCTAssertEqual(Set(queuedTypes), ["heart_rate", "sleep_analysis"])
+        XCTAssertEqual(Set(queuedTypes), Set(selectedTypes))
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), generations)
         if let retainedPayload {
             if !controlProbeBacklog {
                 XCTAssertEqual(quantityReadCount, 0, "A retained cursor blocks its own lane, not unrelated Sleep.")
             }
-            XCTAssertEqual(items.count, controlProbeBacklog ? 3 : 2,
+            XCTAssertEqual(items.count, controlProbeBacklog ? 4 : 2,
                 "Repeated failed delivery must not duplicate any payload.")
             XCTAssertEqual(try Data(contentsOf: XCTUnwrap(items.first).fileURL), retainedPayload)
             XCTAssertTrue(fixture.recorder.acceptedPayloads.isEmpty)

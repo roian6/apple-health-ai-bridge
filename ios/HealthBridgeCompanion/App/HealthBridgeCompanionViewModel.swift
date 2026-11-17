@@ -4069,7 +4069,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
         do {
             guard let pendingBeforeRead = trustedPendingOutboxCount() else { return .blocked }
-            if pendingBeforeRead > 0 {
+            // Collection already classified queued health dependencies under its held gate.
+            if pendingBeforeRead > 0, automaticDirectPendingTypes == nil {
                 guard let outbox else { return .blocked }
                 // Accept queued Steps before selecting its next anchor; leave other lanes alone
                 // until this lane has a successful read to deliver.
