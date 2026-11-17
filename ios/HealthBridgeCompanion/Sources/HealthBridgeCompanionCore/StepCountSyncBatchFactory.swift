@@ -739,6 +739,11 @@ public enum SleepSyncBatchFactory {
         generatedAt: Date = Date(),
         newManifestNamespace: UUID = UUID()
     ) -> AnchoredSleepSyncTransition? {
+        // This synchronous reconciliation owns its formatter; no shared mutable state.
+        let dateFormatter = HealthBridgeUTCFormatter.makeFormatter()
+        let formatDate = { (date: Date) in
+            HealthBridgeUTCFormatter.string(from: date, using: dateFormatter)
+        }
         let validAdditions = changes.addedSamples.filter {
             $0.start < $0.end && validSleepStages.contains($0.stage)
         }
@@ -759,11 +764,11 @@ public enum SleepSyncBatchFactory {
             let source = HealthBridgeAppleHealthSource.phone(sourceKey: resolvedSourceKey)
             let windowStart = resolvedHistoryStartDate ?? changes.receivedAt
             let window = HealthBridgeTimeWindow(
-                startTime: HealthBridgeUTCFormatter.string(from: windowStart),
-                endTime: HealthBridgeUTCFormatter.string(from: changes.receivedAt)
+                startTime: formatDate(windowStart),
+                endTime: formatDate(changes.receivedAt)
             )
             let batch = HealthBridgeBatchV1(
-                generatedAt: HealthBridgeUTCFormatter.string(from: generatedAt),
+                generatedAt: formatDate(generatedAt),
                 exportWindow: window,
                 sources: [source],
                 healthTypes: [.sleepAnalysis],
@@ -829,7 +834,8 @@ public enum SleepSyncBatchFactory {
             let shape = sleepSessionRecord(
                 from: groupedSession,
                 clientRecordID: "hk-sleep-shape",
-                sourceKey: resolvedSourceKey
+                sourceKey: resolvedSourceKey,
+                formatDate: formatDate
             )
             if let matchingIndex = unmatchedPrevious.firstIndex(where: {
                 sameSleepSessionShape($0, shape)
@@ -847,7 +853,8 @@ public enum SleepSyncBatchFactory {
                     namespace: identityNamespace,
                     sequence: nextSequence
                 ),
-                sourceKey: resolvedSourceKey
+                sourceKey: resolvedSourceKey,
+                formatDate: formatDate
             )
             nextSequence += 1
             currentPublished.append(revision)
@@ -864,17 +871,18 @@ public enum SleepSyncBatchFactory {
                     recordFamily: "sleep_session",
                     sourceKey: source.sourceKey,
                     clientRecordID: $0.clientRecordID,
-                    deletedAt: HealthBridgeUTCFormatter.string(from: changes.receivedAt)
+                    deletedAt: formatDate(changes.receivedAt)
                 )
             }
         let windowStart = sleepChangeWindowStart(
             activeSamples: activeSamples,
             retiredSessions: unmatchedPrevious,
-            receivedAt: changes.receivedAt
+            receivedAt: changes.receivedAt,
+            parseDate: dateFormatter.date(from:)
         )
         let window = HealthBridgeTimeWindow(
-            startTime: HealthBridgeUTCFormatter.string(from: windowStart),
-            endTime: HealthBridgeUTCFormatter.string(from: changes.receivedAt)
+            startTime: formatDate(windowStart),
+            endTime: formatDate(changes.receivedAt)
         )
         var cursors = [
             HealthBridgeSyncCursor(
@@ -893,7 +901,7 @@ public enum SleepSyncBatchFactory {
             )
         }
         let batch = HealthBridgeBatchV1(
-            generatedAt: HealthBridgeUTCFormatter.string(from: generatedAt),
+            generatedAt: formatDate(generatedAt),
             exportWindow: window,
             sources: [source],
             healthTypes: [.sleepAnalysis],
@@ -979,7 +987,8 @@ public enum SleepSyncBatchFactory {
     }
 
     private static func sleepStageIntervals(
-        from stageIntervals: [HealthKitSleepStageSummary]
+        from stageIntervals: [HealthKitSleepStageSummary],
+        formatDate: (Date) -> String = HealthBridgeUTCFormatter.string(from:)
     ) -> [HealthBridgeSleepStageInterval] {
         stageIntervals
             .filter { $0.start < $0.end }
@@ -992,8 +1001,8 @@ public enum SleepSyncBatchFactory {
             .map { interval in
                 HealthBridgeSleepStageInterval(
                     stage: interval.stage,
-                    startTime: HealthBridgeUTCFormatter.string(from: interval.start),
-                    endTime: HealthBridgeUTCFormatter.string(from: interval.end)
+                    startTime: formatDate(interval.start),
+                    endTime: formatDate(interval.end)
                 )
             }
     }
@@ -1069,14 +1078,15 @@ public enum SleepSyncBatchFactory {
     private static func sleepSessionRecord(
         from session: HealthKitSleepSessionSummary,
         clientRecordID: String,
-        sourceKey: String
+        sourceKey: String,
+        formatDate: (Date) -> String
     ) -> HealthBridgeSleepSession {
         HealthBridgeSleepSession(
             clientRecordID: clientRecordID,
             sourceKey: sourceKey,
-            startTime: HealthBridgeUTCFormatter.string(from: session.start),
-            endTime: HealthBridgeUTCFormatter.string(from: session.end),
-            stageIntervals: sleepStageIntervals(from: session.stageIntervals)
+            startTime: formatDate(session.start),
+            endTime: formatDate(session.end),
+            stageIntervals: sleepStageIntervals(from: session.stageIntervals, formatDate: formatDate)
         )
     }
 
@@ -1116,11 +1126,12 @@ public enum SleepSyncBatchFactory {
     private static func sleepChangeWindowStart(
         activeSamples: [HealthKitSleepChildSample],
         retiredSessions: [HealthBridgeSleepSession],
-        receivedAt: Date
+        receivedAt: Date,
+        parseDate: (String) -> Date?
     ) -> Date {
         let activeStarts = activeSamples.map(\.start)
         let retiredStarts = retiredSessions.compactMap {
-            HealthBridgeUTCFormatter.date(from: $0.startTime)
+            parseDate($0.startTime)
         }
         return (activeStarts + retiredStarts + [receivedAt]).min() ?? receivedAt
     }

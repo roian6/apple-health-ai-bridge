@@ -62,7 +62,21 @@ final class BatchEncodingTests: XCTestCase {
     }
 
     func testUTCFormatterUsesWholeSecondZuluTimestamps() {
-        XCTAssertEqual(HealthBridgeUTCFormatter.string(from: Date(timeIntervalSince1970: 0)), "1970-01-01T00:00:00Z")
-        XCTAssertEqual(HealthBridgeUTCFormatter.string(from: Date(timeIntervalSince1970: 1.9)), "1970-01-01T00:00:01Z")
+        let formatter = HealthBridgeUTCFormatter.makeFormatter()
+        let cases: [(Double, String)] = [
+            (0, "1970-01-01T00:00:00Z"),
+            (1.9, "1970-01-01T00:00:01Z"),
+            (-3600.875, "1969-12-31T22:59:59Z"),
+            (-0.125, "1969-12-31T23:59:59Z"),
+            (0.125, "1970-01-01T00:00:00Z"),
+            (1_710_053_999.875, "2024-03-10T06:59:59Z"),
+            (1_710_054_000.125, "2024-03-10T07:00:00Z"),
+        ]
+        for (epoch, expected) in cases {
+            let date = Date(timeIntervalSince1970: epoch)
+            XCTAssertEqual(HealthBridgeUTCFormatter.string(from: date), expected)
+            XCTAssertEqual(HealthBridgeUTCFormatter.string(from: date, using: formatter), expected)
+            XCTAssertEqual(formatter.date(from: expected)?.timeIntervalSince1970, floor(epoch))
+        }
     }
 }

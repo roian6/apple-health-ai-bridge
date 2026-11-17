@@ -49,6 +49,7 @@ def render_launch_agent_plist(request: LaunchdServiceRequest) -> bytes:
         "ExitTimeOut": EXIT_TIMEOUT_SECONDS,
         "Umask": 0o077,
         "ProcessType": "Background",
+        "MaterializeDatalessFiles": True,
         "StandardOutPath": str(request.paths.stdout_log),
         "StandardErrorPath": str(request.paths.stderr_log),
     }

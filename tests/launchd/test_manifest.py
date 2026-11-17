@@ -37,6 +37,7 @@ def test_rendered_launch_agent_uses_private_config_and_shell_free_argv(
     assert document["ThrottleInterval"] == 30
     assert document["ExitTimeOut"] == 10
     assert document["Umask"] == 0o077
+    assert document["MaterializeDatalessFiles"] is True
 
 
 def test_launchctl_timeout_exceeds_child_exit_timeout(tmp_path: Path) -> None:
