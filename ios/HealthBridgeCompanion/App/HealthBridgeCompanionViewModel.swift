@@ -5176,11 +5176,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 sourceKey: sourceKey,
                 cursorKind: AnchoredWorkoutSyncPolicy.bootstrapStartCursorKind
             )
+            let requestedHistoryStart: Date?
+            if executionMode == .foreground {
+                let depth = healthHistoryDepth.sanitized
+                requestedHistoryStart = depth == .allAvailable
+                    ? Date(timeIntervalSince1970: 0)
+                    : depth.lowerBoundDate(now: now, calendar: calendar)
+            } else {
+                requestedHistoryStart = nil
+            }
+            let storedHistoryBackfillStartValue = try cursorStore.cursorValue(
+                receiverBindingID: receiverBindingID,
+                sourceKey: sourceKey,
+                cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+            )
             let queryPlan = AnchoredWorkoutSyncPolicy.queryPlan(
                 anchorCursorValue: anchorCursorValue,
                 storedBootstrapStartValue: storedBootstrapStartValue,
                 bootstrapLookbackDays: executionMode.cursorlessFallbackDays ?? AnchoredWorkoutSyncPolicy.bootstrapLookbackDays,
                 clampStoredBootstrapToLookback: executionMode == .automatic,
+                requestedHistoryStart: requestedHistoryStart,
+                storedHistoryBackfillStartValue: storedHistoryBackfillStartValue,
                 now: now,
                 calendar: calendar
             )
@@ -5205,8 +5221,42 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 executionMode: executionMode
             )
             try requireCurrentPayloadDeliveryTarget(target)
+            var payloads: [Data] = []
+            var uploadedHistoricalWorkouts = false
+            var historicalBatch: HealthBridgeBatchV1?
+            var backfillCheckpoint: FileOutboxCursorCheckpoint?
+            if let backfillStart = queryPlan.historicalBackfillStart,
+               HealthKitAnchoredCursorPolicy.hasUsableCursorValue(anchorCursorValue) {
+                failureStage = .read
+                let historicalWorkouts = try await HealthKitWorkoutReader().readWorkouts(
+                    start: backfillStart,
+                    end: now
+                )
+                let backfillBatch = WorkoutSyncBatchFactory.makeWorkoutBatch(
+                    workouts: historicalWorkouts,
+                    windowStart: backfillStart,
+                    windowEnd: now,
+                    generatedAt: now,
+                    cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+                )
+                if !backfillBatch.workouts.isEmpty {
+                    failureStage = .encoding
+                    payloads.append(try encoder.encode(backfillBatch))
+                    uploadedHistoricalWorkouts = true
+                    historicalBatch = backfillBatch
+                    if shouldPersistSharedProgress {
+                        backfillCheckpoint = FileOutboxCursorCheckpoint(
+                            receiverIdentity: receiverBindingID,
+                            sourceKey: sourceKey,
+                            cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind,
+                            cursorValue: HealthBridgeUTCFormatter.string(from: backfillStart)
+                        )
+                    }
+                }
+            }
             guard !changes.workouts.isEmpty
                 || !changes.deletedWorkouts.isEmpty
+                || uploadedHistoricalWorkouts
                 || HealthKitAnchoredCursorPolicy.hasAdvanced(
                     from: anchorCursorValue,
                     to: changes.anchorCursorValue
@@ -5221,42 +5271,54 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             let uploadedRecords = !batch.workouts.isEmpty
 
-            guard ForegroundSyncUploadPolicy.shouldUpload(batch) else {
-                statusIsError = false
-                statusMessage = "HealthKit returned no anchored workout payload. Nothing sent."
-                return false
-            }
-            guard uploadedRecords || hasUploadedWorkoutRecords || !batch.deletedRecords.isEmpty else {
-                statusIsError = false
-                statusMessage = "HealthKit returned no readable Workout records. Workout cursor was not advanced so future Health permission changes can backfill history."
-                return false
+            if uploadedRecords || !batch.deletedRecords.isEmpty {
+                failureStage = .encoding
+                payloads.append(try encoder.encode(batch))
+            } else if !uploadedHistoricalWorkouts {
+                guard ForegroundSyncUploadPolicy.shouldUpload(batch) else {
+                    statusIsError = false
+                    statusMessage = "HealthKit returned no anchored workout payload. Nothing sent."
+                    return false
+                }
+                guard hasUploadedWorkoutRecords else {
+                    statusIsError = false
+                    statusMessage = "HealthKit returned no readable Workout records. Workout cursor was not advanced so future Health permission changes can backfill history."
+                    return false
+                }
+                failureStage = .encoding
+                payloads.append(try encoder.encode(batch))
             }
 
-            let uploadDescription = batch.workouts.isEmpty && batch.deletedRecords.isEmpty
-                ? "workout anchor cursor-only sync"
-                : "\(batch.workouts.count) workout add/update(s), \(batch.deletedRecords.count) workout deletion(s)"
+            let uploadDescription = uploadedHistoricalWorkouts
+                ? "workout history backfill and anchor sync"
+                : batch.workouts.isEmpty && batch.deletedRecords.isEmpty
+                    ? "workout anchor cursor-only sync"
+                    : "\(batch.workouts.count) workout add/update(s), \(batch.deletedRecords.count) workout deletion(s)"
             statusMessage = target.uploadStatus(uploadDescription)
-            failureStage = .encoding
-            let data = try encoder.encode(batch)
+            let anchorCountsAsUploaded = uploadedRecords || uploadedHistoricalWorkouts
             let shouldPersistAnchorCursor = shouldPersistSharedProgress
                 && CoreLaneSyncCursorPolicy.shouldPersistCursor(
-                    uploadedRecords: uploadedRecords,
+                    uploadedRecords: anchorCountsAsUploaded,
                     hasUploadedRecords: hasUploadedWorkoutRecords
                 )
-            let cursorCheckpoint = shouldPersistAnchorCursor
+            let anchorCheckpoint = shouldPersistAnchorCursor
                 ? FileOutboxCursorCheckpoint(
                     receiverIdentity: receiverBindingID,
                     sourceKey: sourceKey,
                     cursorKind: WorkoutSyncBatchFactory.anchoredCursorKind,
                     cursorValue: changes.anchorCursorValue,
-                    coreLaneUploadProof: uploadedRecords ? .workouts : nil
+                    coreLaneUploadProof: anchorCountsAsUploaded ? .workouts : nil
                 )
                 : nil
+            // The anchor checkpoint stays last so it keeps its existing
+            // finalization semantics; the backfill marker rides along only
+            // when a historical payload was actually queued.
+            let cursorCheckpoint = anchorCheckpoint ?? backfillCheckpoint
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
             try requireCurrentPayloadDeliveryTarget(target)
             let deliveryResult = try await uploadPayloadsWithOutbox(
-                [data],
+                payloads,
                 to: target,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
@@ -5269,16 +5331,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
             statusIsError = false
-            let resultDescription = batch.workouts.isEmpty && batch.deletedRecords.isEmpty
-                ? "Recorded workout anchor cursor"
-                : "Synced workout changes: added/updated \(batch.workouts.count), deleted \(batch.deletedRecords.count)"
+            let resultDescription = uploadedHistoricalWorkouts
+                ? "Synced workout history backfill (\(historicalBatch?.workouts.count ?? 0) record(s)) and anchor changes"
+                : batch.workouts.isEmpty && batch.deletedRecords.isEmpty
+                    ? "Recorded workout anchor cursor"
+                    : "Synced workout changes: added/updated \(batch.workouts.count), deleted \(batch.deletedRecords.count)"
             statusMessage = deliveryStatusMessage(
                 deliveryResult,
                 uploadedDescription: resultDescription,
                 queuedDescription: "Queued \(uploadDescription) behind earlier pending upload(s)",
                 outboxNotice: outboxNotice
             )
-            return uploadedRecords
+            return uploadedRecords || uploadedHistoricalWorkouts
         } catch {
             noteBackgroundAutomaticSyncFailure(
                 stage: failureStage,
