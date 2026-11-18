@@ -591,8 +591,10 @@ def test_path_replacement_after_open_is_detected_before_commit(
         fault_hook=fault_at(MailboxImportFaultPoint.AFTER_DELIVERY_OPEN, replace),
     )
 
-    assert result.quarantined == 1
+    assert result.retryable == 1
+    assert result.quarantined == 0
     assert database_counts(value) == (0, 0, 0)
+    assert list(value.acks.iterdir()) == []
 
 
 def test_provider_path_replacement_is_retried_once_when_opted_in(
