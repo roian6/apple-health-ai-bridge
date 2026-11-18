@@ -1260,6 +1260,45 @@ public enum WorkoutSyncBatchFactory {
     public static let foregroundCursorKind = "foreground_workout_sync"
     public static let anchoredCursorKind = "anchored_workout_sync"
 
+    /// Keep workout records ahead of their tombstones and publish the batch cursor only on the last part.
+    static func encodePayloads(
+        _ batch: HealthBridgeBatchV1,
+        using encoder: HealthBridgeBatchEncoder
+    ) throws -> [Data] {
+        let workoutCount = batch.workouts.count
+        let count = workoutCount + batch.deletedRecords.count
+        var payloads: [Data] = []
+        func append(_ range: Range<Int>) throws {
+            let workouts = min(range.lowerBound, workoutCount)..<min(range.upperBound, workoutCount)
+            let deletions = max(0, range.lowerBound - workoutCount)..<max(0, range.upperBound - workoutCount)
+            let part = HealthBridgeBatchV1(
+                generatedAt: batch.generatedAt,
+                exportWindow: batch.exportWindow,
+                sources: batch.sources,
+                healthTypes: batch.healthTypes,
+                samples: [],
+                workouts: Array(batch.workouts[workouts]),
+                sleepSessions: [],
+                deletedRecords: Array(batch.deletedRecords[deletions]),
+                sync: HealthBridgeSyncContext(
+                    syncWindow: batch.sync.syncWindow,
+                    cursors: range.upperBound == count ? batch.sync.cursors : []
+                )
+            )
+            let bytes = try encoder.encode(part)
+            if bytes.count <= DeliveryProtocolV1.maxPayloadBytes {
+                payloads.append(bytes)
+                return
+            }
+            guard range.count > 1 else { throw DeliveryProtocolV1Error.payloadOversize }
+            let middle = range.lowerBound + range.count / 2
+            try append(range.lowerBound..<middle)
+            try append(middle..<range.upperBound)
+        }
+        try append(0..<count)
+        return payloads
+    }
+
     public static func makeWorkoutBatch(
         workouts: [HealthKitWorkoutSummary],
         windowStart: Date,

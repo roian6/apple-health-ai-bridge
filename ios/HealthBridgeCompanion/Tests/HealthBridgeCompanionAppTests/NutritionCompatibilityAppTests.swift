@@ -7,6 +7,144 @@ import XCTest
 
 @MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
+    func testManualSyncDoesNotCollectBehindFailedRetainedWorkoutHistory() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let start = Date(timeIntervalSince1970: 1_600_000_000)
+        let end = start.addingTimeInterval(600)
+        let workout = HealthKitWorkoutSummary(
+            uuid: UUID(), workoutType: "running", start: start, end: end,
+            durationSeconds: 600, activeEnergyKcal: nil, distanceMeters: nil
+        )
+        let kind = AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+        let history = WorkoutSyncBatchFactory.makeWorkoutBatch(
+            workouts: [workout], windowStart: start, windowEnd: end, generatedAt: end,
+            cursorKind: kind
+        )
+        var freshReads = 0
+        let vm = try await fixture.makeViewModel(readAnchoredStepChanges: { _, _, _ in
+            freshReads += 1
+            throw CancellationError()
+        })
+        fixture.receiver.status = 503
+        let retained = try fixture.outbox.enqueue(JSONEncoder().encode(history), receiverIdentity: binding)
+        await vm.performManualSyncOpportunity { true }
+
+        _ = try XCTUnwrap(fixture.receiver.batches.first?.workouts.first, "Fixture did not reach Direct")
+        XCTAssertEqual(fixture.receiver.batches.flatMap(\.workouts).map(\.clientRecordID),
+                       history.workouts.map(\.clientRecordID))
+        XCTAssertEqual(try FileOutbox(directory: fixture.outbox.directoryURL).pendingItems().map(\.id),
+                       [retained.id])
+        print("WORKOUT_RED_PRECONDITION attemptedWorkoutBatches=\(fixture.receiver.batches.count) retained=\(retained.id)")
+        XCTAssertEqual(freshReads, 0, "Sync Now began fresh collection behind a rejected retained workout")
+    }
+
+    func testManualWorkoutHistoryCommitsCoverageOnlyAfterDurableRetry() async throws {
+        for existingAnchor in [true, false] {
+            let fixture = try NutritionFixture()
+            defer { fixture.cleanup() }
+            HealthHistoryDepthSelectionStore(userDefaults: fixture.defaults).saveHistoryDepth(.allAvailable)
+            let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+            let source = HealthBridgeAppleHealthSource.phone.sourceKey
+            let anchorKind = WorkoutSyncBatchFactory.anchoredCursorKind
+            let historyKind = AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+            let nextAnchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 43))
+            if existingAnchor {
+                try fixture.cursors.saveCursorValue(
+                    fixture.anchor, receiverBindingID: binding, sourceKey: source, cursorKind: anchorKind
+                )
+                CoreLaneUploadProofStore(userDefaults: fixture.defaults)
+                    .markUploadedRecords(lane: .workouts, receiverBindingID: binding)
+            }
+            let epoch = Date(timeIntervalSince1970: 0)
+            let begin = Date(timeIntervalSince1970: 1_600_000_000)
+            let end = begin.addingTimeInterval(600)
+            let history = (0..<6_000).map { _ in
+                HealthKitWorkoutSummary(
+                    uuid: UUID(), workoutType: "running", start: begin, end: end,
+                    durationSeconds: 600, activeEnergyKcal: 55, distanceMeters: 1_200
+                )
+            }
+            let delta = HealthKitWorkoutSummary(
+                uuid: UUID(), workoutType: "walking", start: begin, end: end,
+                durationSeconds: 600, activeEnergyKcal: nil, distanceMeters: nil
+            )
+            let expected = Set((existingAnchor ? history + [delta] : history).map {
+                "hk-workout-\($0.uuid.uuidString.lowercased())"
+            })
+            var anchoredReads = 0
+            var historyReads = 0
+            var bootstrapStart: Date?
+            func makeViewModel(reopen: Bool) async throws -> HealthBridgeCompanionViewModel {
+                try await fixture.makeViewModel(
+                    readAnchoredStepChanges: { _, start, now in
+                        HealthKitAnchoredStepChanges(
+                            stepSamples: [], deletedStepSamples: [], anchorCursorValue: fixture.anchor,
+                            windowStart: start ?? now, windowEnd: now
+                        )
+                    },
+                    readAnchoredWorkoutChanges: { previous, start, now in
+                        anchoredReads += 1
+                        if previous == nil { bootstrapStart = start }
+                        return HealthKitAnchoredWorkoutChanges(
+                            workouts: previous == nextAnchor ? [] : (existingAnchor ? [delta] : history),
+                            deletedWorkouts: [], anchorCursorValue: nextAnchor,
+                            windowStart: start ?? begin, windowEnd: now
+                        )
+                    },
+                    readWorkoutHistory: { _, _ in
+                        historyReads += 1
+                        return history
+                    },
+                    requestReadAuthorization: { codes in
+                        if codes == [HealthBridgeHealthType.sleepAnalysis.typeCode] { throw CancellationError() }
+                    },
+                    reopenStorage: reopen
+                )
+            }
+            func cursor(_ kind: String) throws -> String? {
+                try FileSyncCursorStore(fileURL: fixture.cursors.fileURL)
+                    .cursorValue(receiverBindingID: binding, sourceKey: source, cursorKind: kind)
+            }
+
+            let initial = try await makeViewModel(reopen: false)
+            fixture.receiver.rejectedCursorKind = anchorKind
+            await initial.performManualSyncOpportunity { true }
+
+            let retained = try FileOutbox(directory: fixture.outbox.directoryURL).pendingItems()
+            let rejected = try XCTUnwrap(retained.first)
+            let acceptedBeforeRetry = fixture.receiver.workouts.map(\.clientRecordID)
+            XCTAssertEqual(retained.map(\.id), [rejected.id])
+            XCTAssertGreaterThan(acceptedBeforeRetry.count, 0)
+            XCTAssertLessThan(acceptedBeforeRetry.count, expected.count)
+            XCTAssertNil(try cursor(historyKind))
+            XCTAssertEqual(try cursor(anchorKind), existingAnchor ? fixture.anchor : nil)
+            XCTAssertEqual(historyReads, existingAnchor ? 1 : 0)
+            XCTAssertEqual(bootstrapStart, existingAnchor ? nil : epoch)
+            XCTAssertGreaterThan(fixture.receiver.requestSizes.count, 1)
+            XCTAssertTrue(fixture.receiver.requestSizes.allSatisfy { $0 <= DeliveryProtocolV1.maxPayloadBytes })
+
+            let restarted = try await makeViewModel(reopen: true)
+            await restarted.performManualSyncOpportunity { true }
+            XCTAssertEqual(anchoredReads, 1, "Failed retained retry must not start a fresh anchored read")
+            XCTAssertEqual(try FileOutbox(directory: fixture.outbox.directoryURL).pendingItems().map(\.id),
+                           [rejected.id])
+            XCTAssertNil(try cursor(historyKind))
+
+            fixture.receiver.rejectedCursorKind = nil
+            await restarted.performManualSyncOpportunity { true }
+            XCTAssertEqual(try cursor(anchorKind), nextAnchor)
+            XCTAssertEqual(try cursor(historyKind), HealthBridgeUTCFormatter.string(from: epoch))
+            XCTAssertEqual(Set(fixture.receiver.workouts.map(\.clientRecordID)), expected)
+            XCTAssertEqual(historyReads, existingAnchor ? 1 : 0,
+                           "Same depth must not backfill after the retained work commits")
+            XCTAssertEqual(anchoredReads, 2)
+            XCTAssertTrue(try FileOutbox(directory: fixture.outbox.directoryURL).pendingItems().isEmpty)
+            print("WORKOUT_RETRY_VERIFIED existingAnchor=\(existingAnchor) accepted=\(expected.count) requests=\(fixture.receiver.requestSizes.count)")
+        }
+    }
+
     func testNutritionRefreshCancellationDoesNotReclassifyAcceptedUpload() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

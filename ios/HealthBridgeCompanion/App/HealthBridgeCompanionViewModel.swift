@@ -465,6 +465,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let readAnchoredStepChanges: (@MainActor (
         String?, Date?, Date
     ) async throws -> HealthKitAnchoredStepChanges)?
+    private let readAnchoredWorkoutChanges: (@MainActor (
+        String?, Date?, Date
+    ) async throws -> HealthKitAnchoredWorkoutChanges)?
+    private let readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])?
     private let automaticSyncEligibleTypeCodesForTesting: [String]?
     private let readDailyActivityAggregates: (@MainActor (
         [String], Date, Date, Calendar
@@ -522,6 +526,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         readAnchoredStepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredStepChanges)? = nil,
+        readAnchoredWorkoutChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredWorkoutChanges)? = nil,
+        readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])? = nil,
         automaticSyncEligibleTypeCodesForTesting: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
@@ -604,6 +612,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.sleepSyncPreparer = sleepSyncPreparer
         self.readAnchoredSleepChanges = readAnchoredSleepChanges
         self.readAnchoredStepChanges = readAnchoredStepChanges
+        self.readAnchoredWorkoutChanges = readAnchoredWorkoutChanges
+        self.readWorkoutHistory = readWorkoutHistory
         self.automaticSyncEligibleTypeCodesForTesting = automaticSyncEligibleTypeCodesForTesting
         self.readDailyActivityAggregates = readDailyActivityAggregates
         self.readAnchoredQuantityChanges = readAnchoredQuantityChanges
@@ -1492,6 +1502,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } else if summary.failedCount > 0 {
                 statusIsError = true
                 statusMessage = "Some queued uploads did not finish: attempted \(summary.attemptedCount), uploaded \(summary.uploadedCount), failed \(summary.failedCount). \(Self.firstFailureSentence(summary)) Queued uploads: \(pendingOutboxCount)."
+                if executionMode == .foreground, target.route != .mailbox { return false }
             } else {
                 statusIsError = false
                 statusMessage = "Queued uploads sent: \(summary.uploadedCount). Remaining: \(pendingOutboxCount)."
@@ -5144,7 +5155,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusIsError = false
             statusMessage = "Reading anchored workout changes from HealthKit..."
             if executionMode.shouldRequestReadAuthorization {
-                try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.workouts])
+                if let requestProjectionReadAuthorization {
+                    try await requestProjectionReadAuthorization([HealthBridgeHealthType.workouts.typeCode])
+                } else {
+                    try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.workouts])
+                }
             }
             let now = Date()
             let calendar = utcCalendar()
@@ -5210,11 +5225,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             failureStage = .read
             noteAutomaticSyncQueryStarted(executionMode: executionMode)
-            let changes = try await HealthKitWorkoutReader().readAnchoredWorkoutChanges(
-                anchorCursorValue: anchorCursorValue,
-                predicateStart: queryPlan.queryStart,
-                receivedAt: now
-            )
+            let workoutReader = HealthKitWorkoutReader()
+            let changes: HealthKitAnchoredWorkoutChanges
+            if let readAnchoredWorkoutChanges {
+                changes = try await readAnchoredWorkoutChanges(anchorCursorValue, queryPlan.queryStart, now)
+            } else {
+                changes = try await workoutReader.readAnchoredWorkoutChanges(
+                    anchorCursorValue: anchorCursorValue,
+                    predicateStart: queryPlan.queryStart,
+                    receivedAt: now
+                )
+            }
             noteAutomaticSyncQueryResult(
                 hasRecords: !changes.workouts.isEmpty || !changes.deletedWorkouts.isEmpty,
                 newestSampleEnd: changes.workouts.map(\.end).max(),
@@ -5222,16 +5243,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             try requireCurrentPayloadDeliveryTarget(target)
             var payloads: [Data] = []
-            var uploadedHistoricalWorkouts = false
-            var historicalBatch: HealthBridgeBatchV1?
-            var backfillCheckpoint: FileOutboxCursorCheckpoint?
+            var historicalWorkoutCount = 0
+            var acknowledgedCoverageCandidate: Date?
             if let backfillStart = queryPlan.historicalBackfillStart,
                HealthKitAnchoredCursorPolicy.hasUsableCursorValue(anchorCursorValue) {
                 failureStage = .read
-                let historicalWorkouts = try await HealthKitWorkoutReader().readWorkouts(
-                    start: backfillStart,
-                    end: now
-                )
+                let historicalWorkouts: [HealthKitWorkoutSummary]
+                if let readWorkoutHistory {
+                    historicalWorkouts = try await readWorkoutHistory(backfillStart, now)
+                } else {
+                    historicalWorkouts = try await workoutReader.readWorkouts(start: backfillStart, end: now)
+                }
                 let backfillBatch = WorkoutSyncBatchFactory.makeWorkoutBatch(
                     workouts: historicalWorkouts,
                     windowStart: backfillStart,
@@ -5241,19 +5263,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 )
                 if !backfillBatch.workouts.isEmpty {
                     failureStage = .encoding
-                    payloads.append(try encoder.encode(backfillBatch))
-                    uploadedHistoricalWorkouts = true
-                    historicalBatch = backfillBatch
-                    if shouldPersistSharedProgress {
-                        backfillCheckpoint = FileOutboxCursorCheckpoint(
-                            receiverIdentity: receiverBindingID,
-                            sourceKey: sourceKey,
-                            cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind,
-                            cursorValue: HealthBridgeUTCFormatter.string(from: backfillStart)
-                        )
-                    }
+                    payloads += try WorkoutSyncBatchFactory.encodePayloads(backfillBatch, using: encoder)
+                    historicalWorkoutCount = backfillBatch.workouts.count
+                    acknowledgedCoverageCandidate = backfillStart
                 }
             }
+            let uploadedHistoricalWorkouts = historicalWorkoutCount > 0
             guard !changes.workouts.isEmpty
                 || !changes.deletedWorkouts.isEmpty
                 || uploadedHistoricalWorkouts
@@ -5270,10 +5285,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 generatedAt: now
             )
             let uploadedRecords = !batch.workouts.isEmpty
+            if uploadedRecords, executionMode == .foreground, let bootstrapStart = queryPlan.queryStart {
+                acknowledgedCoverageCandidate = bootstrapStart
+            }
 
             if uploadedRecords || !batch.deletedRecords.isEmpty {
                 failureStage = .encoding
-                payloads.append(try encoder.encode(batch))
+                payloads += try WorkoutSyncBatchFactory.encodePayloads(batch, using: encoder)
             } else if !uploadedHistoricalWorkouts {
                 guard ForegroundSyncUploadPolicy.shouldUpload(batch) else {
                     statusIsError = false
@@ -5286,7 +5304,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     return false
                 }
                 failureStage = .encoding
-                payloads.append(try encoder.encode(batch))
+                payloads += try WorkoutSyncBatchFactory.encodePayloads(batch, using: encoder)
             }
 
             let uploadDescription = uploadedHistoricalWorkouts
@@ -5301,19 +5319,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     uploadedRecords: anchorCountsAsUploaded,
                     hasUploadedRecords: hasUploadedWorkoutRecords
                 )
-            let anchorCheckpoint = shouldPersistAnchorCursor
+            let cursorCheckpoint = shouldPersistAnchorCursor
                 ? FileOutboxCursorCheckpoint(
                     receiverIdentity: receiverBindingID,
                     sourceKey: sourceKey,
                     cursorKind: WorkoutSyncBatchFactory.anchoredCursorKind,
                     cursorValue: changes.anchorCursorValue,
-                    coreLaneUploadProof: anchorCountsAsUploaded ? .workouts : nil
+                    coreLaneUploadProof: anchorCountsAsUploaded ? .workouts : nil,
+                    workoutHistoryStart: acknowledgedCoverageCandidate
                 )
                 : nil
-            // The anchor checkpoint stays last so it keeps its existing
-            // finalization semantics; the backfill marker rides along only
-            // when a historical payload was actually queued.
-            let cursorCheckpoint = anchorCheckpoint ?? backfillCheckpoint
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
             try requireCurrentPayloadDeliveryTarget(target)
@@ -5332,7 +5347,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let outboxNotice = lastOutboxNotice
             statusIsError = false
             let resultDescription = uploadedHistoricalWorkouts
-                ? "Synced workout history backfill (\(historicalBatch?.workouts.count ?? 0) record(s)) and anchor changes"
+                ? "Synced workout history backfill (\(historicalWorkoutCount) record(s)) and anchor changes"
                 : batch.workouts.isEmpty && batch.deletedRecords.isEmpty
                     ? "Recorded workout anchor cursor"
                     : "Synced workout changes: added/updated \(batch.workouts.count), deleted \(batch.deletedRecords.count)"
@@ -5480,7 +5495,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusIsError = false
             statusMessage = "Reading anchored Sleep Analysis changes from HealthKit..."
             if executionMode.shouldRequestReadAuthorization {
-                try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.sleepAnalysis])
+                if let requestProjectionReadAuthorization {
+                    try await requestProjectionReadAuthorization([HealthBridgeHealthType.sleepAnalysis.typeCode])
+                } else {
+                    try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.sleepAnalysis])
+                }
             }
             try requireCurrentPayloadDeliveryTarget(target)
             let now = Date()

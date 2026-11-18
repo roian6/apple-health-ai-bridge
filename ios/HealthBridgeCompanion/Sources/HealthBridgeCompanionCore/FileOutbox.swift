@@ -349,19 +349,23 @@ public struct FileOutboxCursorCheckpoint: Codable, Equatable, Sendable {
     public let cursorKind: String
     public let cursorValue: String
     public let coreLaneUploadProof: FileOutboxCoreLaneUploadProof?
+    /// Coverage associated with this workout anchor, earned by the same transaction.
+    public let workoutHistoryStart: Date?
 
     public init(
         receiverIdentity: String,
         sourceKey: String,
         cursorKind: String,
         cursorValue: String,
-        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil
+        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil,
+        workoutHistoryStart: Date? = nil
     ) {
         self.receiverIdentity = receiverIdentity
         self.sourceKey = sourceKey
         self.cursorKind = cursorKind
         self.cursorValue = cursorValue
         self.coreLaneUploadProof = coreLaneUploadProof
+        self.workoutHistoryStart = workoutHistoryStart
     }
 }
 
