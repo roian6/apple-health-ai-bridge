@@ -1211,23 +1211,18 @@ public enum AnchoredWorkoutSyncPolicy {
             to: startOfToday
         ) ?? now.addingTimeInterval(TimeInterval(-lookbackDays * 24 * 60 * 60))
 
-        if let storedBootstrapStart = storedBootstrapStartValue.flatMap(HealthBridgeUTCFormatter.date(from:)) {
-            let boundedStoredStart = clampStoredBootstrapToLookback
+        let bootstrapStart: Date
+        if let requestedHistoryStart {
+            // A failed or cancelled query can leave a bound from an older selection.
+            // Durable payload retries are handled by the outbox before a manual read.
+            bootstrapStart = min(requestedHistoryStart, boundedBootstrapStart)
+        } else if let storedBootstrapStart = storedBootstrapStartValue.flatMap(HealthBridgeUTCFormatter.date(from:)) {
+            bootstrapStart = clampStoredBootstrapToLookback
                 ? max(storedBootstrapStart, boundedBootstrapStart)
                 : storedBootstrapStart
-            let queryStart = requestedHistoryStart.map {
-                min($0, boundedStoredStart)
-            } ?? boundedStoredStart
-            return AnchoredWorkoutQueryPlan(
-                queryStart: queryStart,
-                bootstrapStartToPersist: queryStart,
-                historicalBackfillStart: backfillStart
-            )
+        } else {
+            bootstrapStart = boundedBootstrapStart
         }
-
-        let bootstrapStart = requestedHistoryStart.map {
-            min($0, boundedBootstrapStart)
-        } ?? boundedBootstrapStart
         return AnchoredWorkoutQueryPlan(
             queryStart: bootstrapStart,
             bootstrapStartToPersist: bootstrapStart,

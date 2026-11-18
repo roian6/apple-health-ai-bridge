@@ -130,6 +130,35 @@ final class AnchoredWorkoutSyncPolicyTests: XCTestCase {
         XCTAssertEqual(plan.queryStart, try date("2026-03-17T00:00:00Z"))
     }
 
+    func testNarrowerManualDepthReplacesUnacceptedWiderBootstrap() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+        let firstAttempt = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: nil,
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: Date(timeIntervalSince1970: 0),
+            now: now,
+            calendar: calendar
+        )
+        let savedQueryStart = HealthBridgeUTCFormatter.string(from: try XCTUnwrap(firstAttempt.bootstrapStartToPersist))
+
+        // The first attempt saved its query bound, then failed before accepting any payload.
+        for (newSelection, expectedStart) in [
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            ("2026-06-01T00:00:00Z", "2026-03-17T00:00:00Z")
+        ] {
+            let retry = AnchoredWorkoutSyncPolicy.queryPlan(
+                anchorCursorValue: nil,
+                storedBootstrapStartValue: savedQueryStart,
+                requestedHistoryStart: try date(newSelection),
+                now: now,
+                calendar: calendar
+            )
+            XCTAssertEqual(retry.queryStart, try date(expectedStart))
+            XCTAssertEqual(retry.bootstrapStartToPersist, try date(expectedStart))
+        }
+    }
+
     func testStoredBackfillMarkerSuppressesSameDepthRepeat() throws {
         let calendar = utcCalendar()
         let now = try date("2026-06-15T12:00:00Z")
