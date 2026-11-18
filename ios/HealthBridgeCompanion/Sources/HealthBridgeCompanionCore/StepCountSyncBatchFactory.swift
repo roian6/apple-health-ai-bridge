@@ -1162,27 +1162,45 @@ public struct HealthKitAnchoredWorkoutChanges: Equatable, Sendable {
 public struct AnchoredWorkoutQueryPlan: Equatable, Sendable {
     public let queryStart: Date?
     public let bootstrapStartToPersist: Date?
+    public let historicalBackfillStart: Date?
 
-    public init(queryStart: Date?, bootstrapStartToPersist: Date?) {
+    public init(
+        queryStart: Date?,
+        bootstrapStartToPersist: Date?,
+        historicalBackfillStart: Date? = nil
+    ) {
         self.queryStart = queryStart
         self.bootstrapStartToPersist = bootstrapStartToPersist
+        self.historicalBackfillStart = historicalBackfillStart
     }
 }
 
 public enum AnchoredWorkoutSyncPolicy {
     public static let bootstrapLookbackDays = 90
     public static let bootstrapStartCursorKind = "anchored_workout_bootstrap_start"
+    public static let historicalBackfillCursorKind = "workout_history_backfill_start"
 
     public static func queryPlan(
         anchorCursorValue: String?,
         storedBootstrapStartValue: String?,
         bootstrapLookbackDays: Int = AnchoredWorkoutSyncPolicy.bootstrapLookbackDays,
         clampStoredBootstrapToLookback: Bool = false,
+        requestedHistoryStart: Date? = nil,
+        storedHistoryBackfillStartValue: String? = nil,
         now: Date,
         calendar: Calendar
     ) -> AnchoredWorkoutQueryPlan {
+        let backfillStart = historicalBackfillStart(
+            requestedHistoryStart: requestedHistoryStart,
+            storedHistoryBackfillStartValue: storedHistoryBackfillStartValue,
+            now: now
+        )
         if HealthKitAnchoredCursorPolicy.hasUsableCursorValue(anchorCursorValue) {
-            return AnchoredWorkoutQueryPlan(queryStart: nil, bootstrapStartToPersist: nil)
+            return AnchoredWorkoutQueryPlan(
+                queryStart: nil,
+                bootstrapStartToPersist: nil,
+                historicalBackfillStart: backfillStart
+            )
         }
 
         let lookbackDays = max(1, bootstrapLookbackDays)
@@ -1193,20 +1211,43 @@ public enum AnchoredWorkoutSyncPolicy {
             to: startOfToday
         ) ?? now.addingTimeInterval(TimeInterval(-lookbackDays * 24 * 60 * 60))
 
-        if let storedBootstrapStart = storedBootstrapStartValue.flatMap(HealthBridgeUTCFormatter.date(from:)) {
-            let queryStart = clampStoredBootstrapToLookback
+        let bootstrapStart: Date
+        if let requestedHistoryStart {
+            // A failed or cancelled query can leave a bound from an older selection.
+            // Durable payload retries are handled by the outbox before a manual read.
+            bootstrapStart = min(requestedHistoryStart, boundedBootstrapStart)
+        } else if let storedBootstrapStart = storedBootstrapStartValue.flatMap(HealthBridgeUTCFormatter.date(from:)) {
+            bootstrapStart = clampStoredBootstrapToLookback
                 ? max(storedBootstrapStart, boundedBootstrapStart)
                 : storedBootstrapStart
-            return AnchoredWorkoutQueryPlan(
-                queryStart: queryStart,
-                bootstrapStartToPersist: queryStart
-            )
+        } else {
+            bootstrapStart = boundedBootstrapStart
         }
-
         return AnchoredWorkoutQueryPlan(
-            queryStart: boundedBootstrapStart,
-            bootstrapStartToPersist: boundedBootstrapStart
+            queryStart: bootstrapStart,
+            bootstrapStartToPersist: bootstrapStart,
+            historicalBackfillStart: backfillStart
         )
+    }
+
+    /// A manual history request widens coverage beyond the anchored bootstrap
+    /// window. With a usable anchor the anchored query stays incremental and a
+    /// separate bounded window read backfills older workouts. Without an anchor
+    /// the bootstrap itself starts at the requested depth, so no separate
+    /// backfill is needed. A stored marker prevents repeating the same backfill
+    /// on every sync; a deeper request re-arms it.
+    public static func historicalBackfillStart(
+        requestedHistoryStart: Date?,
+        storedHistoryBackfillStartValue: String?,
+        now: Date
+    ) -> Date? {
+        guard let requestedHistoryStart, requestedHistoryStart < now else { return nil }
+        guard let storedValue = storedHistoryBackfillStartValue,
+              let storedStart = HealthBridgeUTCFormatter.date(from: storedValue)
+        else {
+            return requestedHistoryStart
+        }
+        return requestedHistoryStart < storedStart ? requestedHistoryStart : nil
     }
 }
 
@@ -1214,11 +1255,51 @@ public enum WorkoutSyncBatchFactory {
     public static let foregroundCursorKind = "foreground_workout_sync"
     public static let anchoredCursorKind = "anchored_workout_sync"
 
+    /// Keep workout records ahead of their tombstones and publish the batch cursor only on the last part.
+    static func encodePayloads(
+        _ batch: HealthBridgeBatchV1,
+        using encoder: HealthBridgeBatchEncoder
+    ) throws -> [Data] {
+        let workoutCount = batch.workouts.count
+        let count = workoutCount + batch.deletedRecords.count
+        var payloads: [Data] = []
+        func append(_ range: Range<Int>) throws {
+            let workouts = min(range.lowerBound, workoutCount)..<min(range.upperBound, workoutCount)
+            let deletions = max(0, range.lowerBound - workoutCount)..<max(0, range.upperBound - workoutCount)
+            let part = HealthBridgeBatchV1(
+                generatedAt: batch.generatedAt,
+                exportWindow: batch.exportWindow,
+                sources: batch.sources,
+                healthTypes: batch.healthTypes,
+                samples: [],
+                workouts: Array(batch.workouts[workouts]),
+                sleepSessions: [],
+                deletedRecords: Array(batch.deletedRecords[deletions]),
+                sync: HealthBridgeSyncContext(
+                    syncWindow: batch.sync.syncWindow,
+                    cursors: range.upperBound == count ? batch.sync.cursors : []
+                )
+            )
+            let bytes = try encoder.encode(part)
+            if bytes.count <= DeliveryProtocolV1.maxPayloadBytes {
+                payloads.append(bytes)
+                return
+            }
+            guard range.count > 1 else { throw DeliveryProtocolV1Error.payloadOversize }
+            let middle = range.lowerBound + range.count / 2
+            try append(range.lowerBound..<middle)
+            try append(middle..<range.upperBound)
+        }
+        try append(0..<count)
+        return payloads
+    }
+
     public static func makeWorkoutBatch(
         workouts: [HealthKitWorkoutSummary],
         windowStart: Date,
         windowEnd: Date,
-        generatedAt: Date = Date()
+        generatedAt: Date = Date(),
+        cursorKind: String = foregroundCursorKind
     ) -> HealthBridgeBatchV1 {
         let source = HealthBridgeAppleHealthSource.phone
         let window = HealthBridgeTimeWindow(
@@ -1240,7 +1321,7 @@ public enum WorkoutSyncBatchFactory {
                 cursors: [
                     HealthBridgeSyncCursor(
                         sourceKey: source.sourceKey,
-                        cursorKind: foregroundCursorKind,
+                        cursorKind: cursorKind,
                         cursorValue: HealthBridgeUTCFormatter.string(from: windowEnd)
                     )
                 ]

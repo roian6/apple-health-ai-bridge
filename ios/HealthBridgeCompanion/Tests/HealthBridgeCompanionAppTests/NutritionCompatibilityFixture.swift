@@ -8,6 +8,8 @@ final class NutritionReceiver: @unchecked Sendable {
     private let lock = NSLock()
     private var capabilityValue = Capability.supported
     private var statusValue = 202
+    private var rejectedCursorKindValue: String?
+    private var requestSizesValue: [Int] = []
     private var batchesValue: [HealthBridgeBatchV1] = []
     private var recordsValue: [String: HealthBridgeSample] = [:]
     private var workoutsValue: [String: HealthBridgeWorkout] = [:]
@@ -26,6 +28,11 @@ final class NutritionReceiver: @unchecked Sendable {
         set { lock.withLock { statusValue = newValue } }
     }
     var batches: [HealthBridgeBatchV1] { lock.withLock { batchesValue } }
+    var requestSizes: [Int] { lock.withLock { requestSizesValue } }
+    var rejectedCursorKind: String? {
+        get { lock.withLock { rejectedCursorKindValue } }
+        set { lock.withLock { rejectedCursorKindValue = newValue } }
+    }
     var records: [HealthBridgeSample] { lock.withLock { Array(recordsValue.values) } }
     var workouts: [HealthBridgeWorkout] { lock.withLock { Array(workoutsValue.values) } }
     var credentials: [String] { lock.withLock { credentialsValue } }
@@ -50,6 +57,11 @@ final class NutritionReceiver: @unchecked Sendable {
             guard let body else { return (200, Data(#"{"status":"ok"}"#.utf8)) }
             let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: body)
             batchesValue.append(batch)
+            requestSizesValue.append(body.count)
+            if let rejectedCursorKindValue,
+               batch.sync.cursors.contains(where: { $0.cursorKind == rejectedCursorKindValue }) {
+                return (503, Data())
+            }
             if capabilityValue != .supported && NutritionCompatibility.containsNutrition(batch) {
                 return (422, Data())
             }
@@ -143,8 +155,19 @@ final class NutritionFixture {
         eligibleTypeCodes: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
-        ) async throws -> [HealthKitDailyActivityAggregate])? = nil
+        ) async throws -> [HealthKitDailyActivityAggregate])? = nil,
+        readAnchoredStepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredStepChanges)? = nil,
+        readAnchoredWorkoutChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredWorkoutChanges)? = nil,
+        readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])? = nil,
+        requestReadAuthorization: @escaping @MainActor ([String]) async throws -> Void = { _ in },
+        reopenStorage: Bool = false
     ) async throws -> HealthBridgeCompanionViewModel {
+        let deliveryOutbox = reopenStorage ? try FileOutbox(directory: outbox.directoryURL) : outbox
+        let deliveryCursors = reopenStorage ? try FileSyncCursorStore(fileURL: cursors.fileURL) : cursors
         let vm = HealthBridgeCompanionViewModel(
             receiverClient: client, settingsStore: settings,
             pairingStateStore: ReceiverPairingStateStore(
@@ -159,12 +182,15 @@ final class NutritionFixture {
             quantityObservationStore: QuantityObservationStore(userDefaults: defaults),
             coreLaneUploadProofStore: CoreLaneUploadProofStore(userDefaults: defaults),
             acceptedTransferStore: acceptedTransferStore,
-            outbox: outbox, outboxDirectoryURL: outbox.directoryURL,
-            cursorStore: cursors, cursorStoreFileURL: cursors.fileURL,
+            outbox: deliveryOutbox, outboxDirectoryURL: outbox.directoryURL,
+            cursorStore: deliveryCursors, cursorStoreFileURL: cursors.fileURL,
             sleepManifestStore: try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json")),
             sleepManifestFileURL: root.appendingPathComponent("sleep.json"),
             sleepResetEpochStore: SleepResetEpochStore(tokenStore: NutritionTokenStore(), epochFloorProvider: { 1 }),
             mailboxKeyStore: mailbox?.keys ?? MailboxKeyStore(service: suite, keychain: NutritionKeychain()),
+            readAnchoredStepChanges: readAnchoredStepChanges,
+            readAnchoredWorkoutChanges: readAnchoredWorkoutChanges,
+            readWorkoutHistory: readWorkoutHistory,
             automaticSyncEligibleTypeCodesForTesting: eligibleTypeCodes,
             readDailyActivityAggregates: readDailyActivityAggregates ?? { _, _, _, _ in [] },
             scheduleDirectBackgroundUploads: { 0 },
@@ -191,7 +217,7 @@ final class NutritionFixture {
                     windowStart: start ?? now, windowEnd: now
                 )
             },
-            requestProjectionReadAuthorization: { _ in }
+            requestProjectionReadAuthorization: requestReadAuthorization
         )
         await vm.bootstrap()
         return vm

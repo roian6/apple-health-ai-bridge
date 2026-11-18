@@ -142,6 +142,22 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     private func finalize(_ record: FileOutboxFinalizationRecord) throws {
         if let checkpoint = record.cursorCheckpoint {
             try finalizeCursor(checkpoint)
+            if let start = checkpoint.workoutHistoryStart {
+                let kind = AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+                let previous = try cursorStore.cursorValue(
+                    receiverBindingID: checkpoint.receiverIdentity,
+                    sourceKey: checkpoint.sourceKey,
+                    cursorKind: kind
+                ).flatMap(HealthBridgeUTCFormatter.date(from:))
+                if previous.map({ start < $0 }) ?? true {
+                    try cursorStore.saveCursorValue(
+                        HealthBridgeUTCFormatter.string(from: start),
+                        receiverBindingID: checkpoint.receiverIdentity,
+                        sourceKey: checkpoint.sourceKey,
+                        cursorKind: kind
+                    )
+                }
+            }
         }
         let retirements = record.eligiblePendingGenerationRetirements
         if !retirements.isEmpty {
