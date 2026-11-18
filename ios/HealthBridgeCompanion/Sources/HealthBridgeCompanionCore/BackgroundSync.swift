@@ -1226,7 +1226,7 @@ public final class BackgroundSyncSettingsStore {
         let ordered = GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
         guard let continuation = userDefaults.string(
             forKey: Key.automaticSyncContinuationTypeCode
-        ), let index = ordered.firstIndex(of: continuation) else {
+        ), let index = ordered.firstIndex(where: { $0 >= continuation }) else {
             return ordered
         }
         return Array(ordered[index...] + ordered[..<index])
