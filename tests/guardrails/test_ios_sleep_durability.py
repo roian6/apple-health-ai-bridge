@@ -630,9 +630,9 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
     assert "catch FileSyncCursorStoreError.invalidData" in source
     assert "hasTransientPrivateStorageFailure = true" in source
     retry_start = content_view.index("if viewModel.hasTransientPrivateStorageFailure {")
+    mailbox_condition = "if (viewModel.usesMailboxTransport"
     retry_end = content_view.index(
-        "if (viewModel.usesMailboxTransport "
-        "&& viewModel.mailboxKeyDiagnosticState == .lost)",
+        f"{mailbox_condition} && viewModel.mailboxKeyDiagnosticState == .lost)",
         retry_start,
     )
     retry = content_view[retry_start:retry_end]
