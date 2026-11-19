@@ -401,11 +401,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var foregroundCatchUpTask: Task<Void, Never>?
     private var foregroundMailboxOpportunityConsumed = false
     private var foregroundMailboxSceneIsActive = false
-    private var bootstrapTask: Task<Void, Never>?
+    @Published private var bootstrapTask: Task<Void, Never>?
     private var bootstrapAttemptID: UUID?
     private var bootstrapWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var bootstrapRetryGeneration: UInt64 = 0
-    private var terminalRecoveryRequestIsActive = false
+    @Published private var terminalRecoveryRequestIsActive = false
     private var pairingTask: Task<Void, Never>?
     private var pairingAttemptID: UUID?
     private var pairingOperationKind: PairingOperationCategory?
