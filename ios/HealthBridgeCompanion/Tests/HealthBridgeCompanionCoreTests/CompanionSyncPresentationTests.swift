@@ -79,18 +79,26 @@ final class CompanionSyncPresentationTests: XCTestCase {
     }
 
     func testQueuedRouteOutranksPermissionRequestAndNeverReportsReady() {
-        let cases: [(Bool, CompanionSyncPresentation.Phase)] = [
-            (false, .directQueued),
-            (true, .mailboxConfirmationWaiting),
+        let cases: [(Bool, Bool, CompanionSyncPresentation.Phase)] = [
+            (false, false, .directQueued),
+            (true, false, .mailboxQueued),
+            (true, true, .mailboxConfirmationWaiting),
         ]
-        for (mailbox, expected) in cases {
+        for (mailbox, published, expected) in cases {
             let presentation = makePresentation(
-                permissionsRequested: false, pending: 2, mailbox: mailbox
+                permissionsRequested: false, pending: 2, mailbox: mailbox, published: published
             )
 
             XCTAssertEqual(presentation.phase, expected)
             XCTAssertEqual(presentation.tone, .attention)
         }
+    }
+
+    func testAutomaticDirectQueueDescribesBestEffortRetry() {
+        let presentation = makePresentation(pending: 1, automatic: true)
+
+        XCTAssertEqual(presentation.phase, .directQueued)
+        XCTAssertTrue(presentation.detail.contains("Automatic Sync can retry"))
     }
 
     func testPermissionRequestNeededForBothSavedRoutes() {
@@ -121,6 +129,8 @@ final class CompanionSyncPresentationTests: XCTestCase {
         pendingPairing: Bool = false,
         recovery: Bool = false,
         mailbox: Bool = false,
+        published: Bool = false,
+        automatic: Bool = false,
         canSend: Bool? = nil
     ) -> CompanionSyncPresentation {
         CompanionSyncPresentation(
@@ -137,7 +147,9 @@ final class CompanionSyncPresentationTests: XCTestCase {
             isPairing: pairing,
             hasPendingPairing: pendingPairing,
             hasPendingPrivateStorageRecovery: recovery,
-            usesMailboxTransport: mailbox
+            usesMailboxTransport: mailbox,
+            backgroundSyncEnabled: automatic,
+            hasPublishedMailboxItem: published
         )
     }
 }

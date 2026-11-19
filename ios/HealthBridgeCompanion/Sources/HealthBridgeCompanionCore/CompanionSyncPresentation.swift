@@ -8,6 +8,7 @@ public struct CompanionSyncPresentation: Equatable, Sendable {
         case permissionRequestNeeded
         case syncing
         case directQueued
+        case mailboxQueued
         case mailboxConfirmationWaiting
         case needsAttention
         case ready
@@ -32,7 +33,9 @@ public struct CompanionSyncPresentation: Equatable, Sendable {
         isPairing: Bool,
         hasPendingPairing: Bool,
         hasPendingPrivateStorageRecovery: Bool,
-        usesMailboxTransport: Bool
+        usesMailboxTransport: Bool,
+        backgroundSyncEnabled: Bool,
+        hasPublishedMailboxItem: Bool
     ) {
         if hasPendingPrivateStorageRecovery {
             phase = .recoveryRequired
@@ -48,8 +51,10 @@ public struct CompanionSyncPresentation: Equatable, Sendable {
             phase = .needsAttention
         } else if !canSendConnectionTest {
             phase = snapshot.hasCompleteReceiverSettings ? .connectionRequired : .unpaired
+        } else if snapshot.pendingOutboxCount > 0 && usesMailboxTransport {
+            phase = hasPublishedMailboxItem ? .mailboxConfirmationWaiting : .mailboxQueued
         } else if snapshot.pendingOutboxCount > 0 {
-            phase = usesMailboxTransport ? .mailboxConfirmationWaiting : .directQueued
+            phase = .directQueued
         } else if !snapshot.healthPermissionsRequested {
             phase = .permissionRequestNeeded
         } else {
@@ -102,13 +107,21 @@ public struct CompanionSyncPresentation: Equatable, Sendable {
         case .directQueued:
             (title, detail, symbol, tone) = (
                 "Waiting to send",
-                "\(snapshot.pendingOutboxCount) queued upload(s) will retry when Health Bridge is reachable.",
+                backgroundSyncEnabled
+                    ? "Automatic Sync can retry queued uploads when Health Bridge is reachable."
+                    : "When Health Bridge is reachable, tap Sync Now to retry queued uploads.",
+                "clock.arrow.circlepath", .attention
+            )
+        case .mailboxQueued:
+            (title, detail, symbol, tone) = (
+                "Queued for secure delivery",
+                "\(snapshot.pendingOutboxCount) upload(s) are queued on this iPhone for secure delivery.",
                 "clock.arrow.circlepath", .attention
             )
         case .mailboxConfirmationWaiting:
             (title, detail, symbol, tone) = (
                 "Waiting for receiver confirmation",
-                "\(snapshot.pendingOutboxCount) secure delivery item(s) are awaiting receiver confirmation.",
+                "A published upload is waiting for Health Bridge to confirm delivery.",
                 "clock.arrow.circlepath", .attention
             )
         case .needsAttention:

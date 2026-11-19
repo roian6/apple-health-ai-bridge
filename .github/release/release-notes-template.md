@@ -30,7 +30,7 @@ Compatible iOS Companion: `<ios_version> (<build>)`
 
 ## Install or upgrade
 
-[Link the applicable setup guide. For existing users, explain stopping the Receiver, backing up, installing the verified package, initializing the same database if required, and restarting the existing service. State whether pairing and credentials are preserved.]
+[Link the applicable setup guide and include the exact installation reference `@receiver-v<receiver_version>` in the notes body, replacing `<receiver_version>` with the released version. For existing users, explain stopping the Receiver, backing up, installing the verified package, initializing the same database if required, and restarting the existing service. State whether pairing and credentials are preserved.]
 
 [Explain signed-helper replacement separately from service reconfiguration. Include migration, downgrade and pending-queue restrictions that affect the user's decision.]
 

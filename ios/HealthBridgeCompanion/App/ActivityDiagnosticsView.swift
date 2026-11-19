@@ -99,13 +99,14 @@ struct ActivityDiagnosticsView: View {
                 }
             case .permissionRequestNeeded,
                  .directQueued where viewModel.setupState == .pairedNeedsHealthPermission,
+                 .mailboxQueued where viewModel.setupState == .pairedNeedsHealthPermission,
                  .mailboxConfirmationWaiting where viewModel.setupState == .pairedNeedsHealthPermission,
                  .needsAttention where viewModel.setupState == .pairedNeedsHealthPermission:
                 Button("Review Health Access") {
                     Task { await viewModel.performPrimaryAction() }
                 }
                 .disabled(!viewModel.canRunPrimaryAction || viewModel.isRequestingHealthPermissions)
-            case .directQueued, .mailboxConfirmationWaiting, .needsAttention, .ready:
+            case .directQueued, .mailboxQueued, .mailboxConfirmationWaiting, .needsAttention, .ready:
                 Button("Sync Now") {
                     Task { await viewModel.performPrimaryAction() }
                 }

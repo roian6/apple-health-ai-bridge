@@ -377,10 +377,17 @@ def test_production_mailbox_ui_is_truthful_about_readiness_and_holds() -> None:
     assert "Receiver rejected" in view_model
     assert "signed ACK" not in view_model
     assert 'viewModel.usesMailboxTransport ? "Check Mailbox Folder"' in content
-    assert (
-        "usesMailboxTransport ? .mailboxConfirmationWaiting : .directQueued"
-        in presentation
+    mailbox_queue = presentation.index(
+        "snapshot.pendingOutboxCount > 0 && usesMailboxTransport"
     )
+    direct_queue = presentation.index(
+        "else if snapshot.pendingOutboxCount > 0", mailbox_queue
+    )
+    assert (
+        "hasPublishedMailboxItem ? .mailboxConfirmationWaiting : .mailboxQueued"
+        in presentation[mailbox_queue:direct_queue]
+    )
+    assert "phase = .directQueued" in presentation[direct_queue:]
 
 
 def test_public_documents_entitlements_are_cloud_documents_only() -> None:

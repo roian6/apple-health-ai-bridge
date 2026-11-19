@@ -1,9 +1,167 @@
 import Foundation
+import HealthKit
+import SwiftUI
+import Vision
 import XCTest
 @testable import HealthBridgeCompanion
 
 @MainActor
 final class CompanionSyncPresentationAppTests: XCTestCase {
+    func testHealthAuthorizationNoticesKeepOpeningStateUntilRequestFinishes() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let viewModel = try await fixture.makeViewModel()
+        // The Sync card is visible during a repeat permission request.
+        viewModel.healthPermissionsRequested = true
+
+        for (state, notice, requesting, isError, expected) in [
+            ("pending", "Opening Apple Health permissions...", true, false, "opening apple health permissions"),
+            ("finished", "Apple Health permission request completed.", false, false, "access request finished"),
+            ("error", "Apple Health permission failed.", false, true, "apple health permission failed"),
+        ] {
+            viewModel.healthPermissionNotice = notice
+            viewModel.isRequestingHealthPermissions = requesting
+            viewModel.healthPermissionNoticeIsError = isError
+
+            let scope = try await renderedText(
+                NavigationStack { DataScopeView(viewModel: viewModel) }, name: "health-data-\(state)"
+            )
+            let home = try await renderedText(ContentView(viewModel: viewModel), name: "sync-card-\(state)")
+            XCTAssertTrue(scope.contains(expected), "Health Data \(state): \(scope)")
+            XCTAssertTrue(home.contains(expected), "Sync card \(state): \(home)")
+            if requesting {
+                XCTAssertFalse(scope.contains("request finished"), scope)
+                XCTAssertFalse(home.contains("request finished"), home)
+            }
+        }
+    }
+
+    func testDirectQueueWithAutomaticSyncOffTellsUserToTapSyncNow() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let item = try fixture.enqueueMixed()
+        let viewModel = try await fixture.makeViewModel(
+            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) }
+        )
+        let runtime = HealthBridgeCompanionApplicationRuntime(
+            viewModel: viewModel, automaticSyncPlatform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        viewModel.healthPermissionsRequested = true
+
+        await viewModel.checkConnection()
+
+        XCTAssertFalse(viewModel.statusIsError)
+        XCTAssertFalse(viewModel.backgroundSyncEnabled)
+        XCTAssertTrue(fixture.receiver.batches.isEmpty)
+        XCTAssertEqual(viewModel.syncPresentation.phase, .directQueued)
+        XCTAssertTrue(viewModel.syncPresentation.detail.contains("Sync Now"), viewModel.syncPresentation.detail)
+
+        await runtime.viewModel.performPrimaryAction()
+
+        XCTAssertNil(try fixture.outbox.pendingItem(id: item.id))
+        XCTAssertEqual(Set(fixture.receiver.records.map(\.typeCode)), ["weight", "dietary_protein"])
+    }
+
+    func testMailboxSeparatesUnpublishedQueueFromPublishedFIFOHead() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        try BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults).setEnabledDurably(true)
+        let head = try fixture.base.enqueueMixed()
+        let tail = try fixture.base.enqueueMixed(workoutEnergy: 20)
+        let viewModel = try await fixture.base.makeViewModel(mailbox: fixture)
+        viewModel.healthPermissionsRequested = true
+        let queue = try fixture.base.outbox.pendingItems()
+        XCTAssertEqual(queue.map(\.id), [head.id, tail.id])
+        XCTAssertTrue(queue.allSatisfy { $0.deliveryState == nil })
+        XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxQueued)
+        XCTAssertFalse(viewModel.syncPresentation.title.contains("receiver confirmation"), viewModel.syncPresentation.title)
+        XCTAssertTrue(viewModel.syncPresentation.detail.contains("queued"), viewModel.syncPresentation.detail)
+
+        viewModel.runForegroundMailboxReconciliationIfNeeded()
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(try fixture.base.outbox.pendingItem(id: head.id)?.deliveryState?.phase, .providerObserved)
+        let unpublishedTail = try XCTUnwrap(fixture.base.outbox.pendingItem(id: tail.id))
+        XCTAssertEqual(unpublishedTail.deliveryState?.phase, .collected)
+        XCTAssertNil(unpublishedTail.deliveryState?.ownership)
+        XCTAssertNil(unpublishedTail.mailboxBinding)
+        XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxConfirmationWaiting)
+        XCTAssertTrue(viewModel.syncPresentation.detail.contains("A published upload"), viewModel.syncPresentation.detail)
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+    }
+
+    func testHeldNutritionDoesNotLogACompletedUpload() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let now = Date(timeIntervalSince1970: 1_790_000_000)
+        let batch = try XCTUnwrap(GenericQuantitySyncBatchFactory.makeAnchoredQuantityBatches(
+            changes: HealthKitAnchoredQuantityChanges(
+                typeCode: "dietary_protein",
+                samples: [HealthKitQuantitySampleSummary(
+                    uuid: UUID(), typeCode: "dietary_protein", start: now,
+                    end: now.addingTimeInterval(60), value: 12
+                )],
+                deletedSamples: [], anchorCursorValue: fixture.anchor,
+                windowStart: now, windowEnd: now.addingTimeInterval(60)
+            ), generatedAt: now
+        ).first)
+        let item = try fixture.outbox.enqueue(
+            JSONEncoder().encode(batch), receiverIdentity: XCTUnwrap(fixture.settings.receiverBindingID)
+        )
+        fixture.receiver.capability = .unsupported
+        // Stop at the next lane so this witness only observes the manual queue flush.
+        let viewModel = try await fixture.makeViewModel(
+            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) }
+        )
+
+        await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
+
+        XCTAssertTrue(fixture.receiver.batches.isEmpty)
+        XCTAssertNotNil(try fixture.outbox.pendingItem(id: item.id))
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+        XCTAssertFalse(viewModel.activityLogMessages.contains { $0.hasSuffix("Queued uploads sent") })
+        XCTAssertTrue(viewModel.activityLogMessages.contains {
+            $0.hasSuffix("Nothing was sent. Uploads are still queued.")
+        }, "\(viewModel.activityLogMessages)")
+
+        fixture.receiver.capability = .supported
+        await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
+
+        XCTAssertEqual(fixture.receiver.batches.count, 1)
+        XCTAssertNil(try fixture.outbox.pendingItem(id: item.id))
+        XCTAssertTrue(viewModel.activityLogMessages.contains { $0.hasSuffix("Queued uploads sent") })
+    }
+
+    private func renderedText<Screen: View>(_ screen: Screen, name: String) async throws -> String {
+        let appeared = expectation(description: "\(name) appeared")
+        let host = UIHostingController(rootView: screen.onAppear { appeared.fulfill() })
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let previousKey = scene.keyWindow
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            previousKey?.makeKey()
+        }
+        await fulfillment(of: [appeared], timeout: 5)
+        host.view.layoutIfNeeded()
+        let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+            XCTAssertTrue(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let request = VNRecognizeTextRequest()
+        try VNImageRequestHandler(cgImage: XCTUnwrap(image.cgImage)).perform([request])
+        return try XCTUnwrap(request.results)
+            .compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: " ")
+            .lowercased()
+    }
+
     func testConnectionCheckDoesNotInventAcceptedTransfer() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
@@ -113,6 +271,50 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertNil(viewModel.lastAcceptedTransferObservation)
     }
 
+    func testMailboxActivityReflectsDurablePublicationWhenProviderLookupFails() async throws {
+        for reconcileInForeground in [false, true] {
+            for failurePhase: OutboxDeliveryPhase in [.encrypted, .published] {
+                let fixture = try NutritionMailboxFixture(nativePairing: true)
+                defer { fixture.base.cleanup() }
+                try fixture.writeCapabilities()
+                try BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults).setEnabledDurably(true)
+                CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+                    runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                        forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+                    )
+                )
+                let item = try fixture.base.enqueueMixed()
+                let outbox = fixture.base.outbox
+                var lookupFailed = false
+                fixture.beforeTransportLocate = {
+                    if try outbox.pendingItem(id: item.id)?.deliveryState?.phase == failurePhase {
+                        lookupFailed = true
+                        throw MailboxLocatorError.symbolicLink
+                    }
+                }
+                let viewModel = try await fixture.base.makeViewModel(mailbox: fixture)
+                XCTAssertTrue(viewModel.automaticSyncRuntimeIsReady)
+                XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxQueued)
+
+                if reconcileInForeground {
+                    viewModel.runForegroundMailboxReconciliationIfNeeded()
+                } else {
+                    viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
+                }
+                await viewModel.waitForBootstrapAndForegroundWork()
+
+                let context = "foreground=\(reconcileInForeground), failurePhase=\(failurePhase)"
+                XCTAssertTrue(lookupFailed, context)
+                XCTAssertEqual(try outbox.pendingItems().map(\.id), [item.id], context)
+                XCTAssertEqual(try outbox.pendingItem(id: item.id)?.deliveryState?.phase, failurePhase, context)
+                XCTAssertEqual(viewModel.syncPresentation.phase,
+                               failurePhase == .published ? .mailboxConfirmationWaiting : .mailboxQueued, context)
+                XCTAssertNil(viewModel.lastAcceptedTransferObservation, context)
+                XCTAssertNil(try fixture.base.cursor("dietary_protein"), context)
+            }
+        }
+    }
+
     func testAuthenticatedMailboxCommitRecordsAcceptedTransfer() async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
@@ -165,7 +367,9 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
         let defaults = try XCTUnwrap(UnavailableObservationDefaults(suiteName: fixture.suite + ".unavailable"))
-        fixture.acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        fixture.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.acceptedTransferResetEpochURL
+        )
         let viewModel = try await fixture.makeViewModel()
 
         await viewModel.syncSupportedQuantityMetrics()
@@ -188,7 +392,9 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         try fixture.writeCapabilities()
         _ = try fixture.base.enqueueMixed()
         let defaults = try XCTUnwrap(UnavailableObservationDefaults(suiteName: fixture.base.suite + ".unavailable"))
-        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
         let viewModel = try await fixture.base.makeViewModel(mailbox: fixture)
         await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
         let pending = try XCTUnwrap(fixture.base.outbox.pendingItems().first {
