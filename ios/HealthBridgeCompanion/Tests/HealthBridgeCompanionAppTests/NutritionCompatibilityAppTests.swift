@@ -157,35 +157,50 @@ final class NutritionCompatibilityAppTests: XCTestCase {
             )
         )
         let vm = try await fixture.makeViewModel(eligibleTypeCodes: ["dietary_protein"])
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
         _ = try fixture.enqueueMixed()
+        let laterPayload = try JSONEncoder().encode(fixture.mixedBatch())
         var newlyQueued: FileOutboxItem?
         fixture.outbox.nutritionSplitFault = { boundary in
             guard case .acceptancePersisted = boundary, newlyQueued == nil else { return }
-            newlyQueued = try fixture.enqueueMixed()
+            // A new FIFO identity after acceptance has no prepared nutrition snapshot.
+            newlyQueued = try fixture.outbox.enqueue(laterPayload, receiverIdentity: binding)
         }
+        var diagnostic: AutomaticSyncDiagnosticRecord?
         let engine = AutomaticSyncEngine(
             pendingStore: background,
-            processType: { _, _ in .blocked },
+            processType: { typeCode, pendingGenerations in
+                await vm.processAutomaticSyncType(typeCode, pendingGenerations: pendingGenerations)
+            },
             performOpportunity: { opportunity, processPendingTypes in
-                _ = await vm.performAutomaticSyncOpportunity(
+                let draft = await vm.performAutomaticSyncOpportunity(
                     opportunity: opportunity,
                     processPendingTypes: processPendingTypes
                 )
+                diagnostic = draft.record
             }
         )
 
+        // The observer admits its generation before it requests an engine run.
+        try background.markPendingObserverTypeCodes(["dietary_protein"])
         try await engine.requestRun(reason: .observerBatch(typeCodes: ["dietary_protein"]))
 
         XCTAssertEqual(fixture.receiver.batches.count, 1)
         XCTAssertFalse(NutritionCompatibility.containsNutrition(
             try XCTUnwrap(fixture.receiver.batches.first)
         ))
+        XCTAssertEqual(fixture.receiver.records.map(\.typeCode), ["weight"])
+        XCTAssertEqual(vm.lastAcceptedTransferObservation?.evidenceKind, .directResponse)
         let pending = try XCTUnwrap(newlyQueued)
         XCTAssertNotNil(try fixture.outbox.pendingItem(id: pending.id))
-        let failure = Mirror(reflecting: vm).children.first {
-            $0.label == "backgroundAutomaticSyncFailure"
-        }?.value as? AutomaticSyncDiagnosticFailure
-        XCTAssertNil(failure, "Refreshing later queued work must not reclassify the accepted transport")
+        let cancellation = CancellationError() as NSError
+        XCTAssertTrue(vm.statusIsError, "A normal empty refresh is not a failed retry")
+        XCTAssertTrue(vm.statusMessage.contains("domain=\(cancellation.domain) | code=\(cancellation.code)"),
+                      "The later retry must fail with CancellationError: \(vm.statusMessage)")
+        let lane = try XCTUnwrap(diagnostic?.causalChain?.lanes.first { $0.typeCode == "dietary_protein" })
+        XCTAssertTrue(lane.attempted)
+        XCTAssertNotEqual(lane.delivery, .cancelled,
+                          "Refreshing later queued work must not reclassify the accepted transport")
     }
 
     func testDiscreteActivityRawACKRetiresGenerationWithoutDailyStatistics() async throws {
