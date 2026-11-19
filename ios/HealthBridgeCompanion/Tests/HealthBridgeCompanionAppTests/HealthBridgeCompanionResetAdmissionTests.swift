@@ -1353,7 +1353,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 try fixture.readDaily(types: types, start: start, end: end, calendar: calendar)
             },
             scheduleDirectBackgroundUploads: {
-                fixture.declineBackgroundScheduling()
+                await fixture.beforeBackgroundSchedule?()
+                return fixture.declineBackgroundScheduling()
             },
             platformBackgroundPayloadDrain: platformBackgroundPayloadDrain,
             readAnchoredQuantityChanges: { typeCode, anchor, start, now in
@@ -3539,6 +3540,62 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertFalse(responseGate.release(), "The callback must not be retained or resumed twice.")
     }
 
+    func testExpiredAutomaticCollectionFinishesWhileSchedulingIsSuspended() async throws {
+        let fixture = try AutomaticStepsFaultFixture()
+        defer { fixture.cleanUp() }
+        let runtime = try await makeStepsFaultRuntime(fixture, platformBackgroundPayloadDrain: { true })
+        let viewModel = runtime.viewModel
+        await viewModel.waitForBootstrapAndForegroundWork()
+        let pending = try fixture.admit(["steps"])
+        let outbox = try FileOutbox(directory: fixture.root.appendingPathComponent("outbox"))
+        let schedulingEntered = expectation(description: "Independent retry reached the scheduler")
+        let ownerFinished = expectation(description: "Expired owner finished before the retry was released")
+        let (release, gate) = AsyncStream<Void>.makeStream()
+        fixture.beforeBackgroundSchedule = {
+            schedulingEntered.fulfill()
+            var iterator = release.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        var expire: AutomaticSyncEngine.CancelOwner?
+        let engine = AutomaticSyncEngine(
+            pendingStore: BackgroundSyncSettingsStore(
+                userDefaults: try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
+            ),
+            processType: { type, generations in
+                await viewModel.processAutomaticSyncType(type, pendingGenerations: generations)
+            },
+            performOpportunity: { opportunity, processPendingTypes in
+                let diagnostic = await viewModel.performAutomaticSyncOpportunity(opportunity: opportunity) {
+                    _ = try await processPendingTypes()
+                    XCTAssertEqual(try outbox.pendingItems().count, 1)
+                    try XCTUnwrap(expire)()
+                    try Task.checkCancellation()
+                    return true
+                }
+                XCTAssertEqual(diagnostic.record.runOutcome, .interrupted)
+            },
+            startOwner: { cancel in
+                expire = cancel
+                return { ownerFinished.fulfill() }
+            }
+        )
+
+        let run = Task { try await engine.requestRun(reason: .observerBatch(typeCodes: ["steps"])) }
+        await fulfillment(of: [schedulingEntered, ownerFinished], timeout: 5)
+        gate.finish()
+        try await run.value
+        await viewModel.waitForBootstrapAndForegroundWork()
+        let items = try outbox.pendingItems()
+        XCTAssertEqual(items.count, 1)
+        let raw = try JSONDecoder().decode(
+            HealthBridgeBatchV1.self, from: Data(contentsOf: XCTUnwrap(items.first).fileURL)
+        )
+        XCTAssertEqual(raw.samples.map(\.value), [17])
+        XCTAssertEqual(try fixture.pending(), pending)
+        XCTAssertEqual(try fixture.stepCursor(), fixture.previousAnchor)
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+    }
+
     func testIncompleteTransferCancellationRetainsWorkThenNextOpportunityCollectsSleep() async throws {
         try await exerciseAutomaticDirectExpiry(retainedBacklog: true, initiallyBlockedDrain: true)
     }
@@ -5097,6 +5154,7 @@ private final class AutomaticStepsFaultFixture {
     var completedStepsValue: Double = 4_321
     var completedBasalEnergyValue: Double = 345
     private(set) var declinedBackgroundSchedules = 0
+    var beforeBackgroundSchedule: (@MainActor () async -> Void)?
     private(set) var rawAnchors: [String] = []
     private(set) var rawReadStarts: [Date?] = []
     var quantityReadAnchors: [String?] = []

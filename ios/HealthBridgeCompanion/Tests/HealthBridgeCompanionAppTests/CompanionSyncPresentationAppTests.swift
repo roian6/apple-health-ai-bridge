@@ -1,4 +1,5 @@
 import Foundation
+import HealthKit
 import SwiftUI
 import Vision
 import XCTest
@@ -268,6 +269,50 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         })
         XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxConfirmationWaiting)
         XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+    }
+
+    func testMailboxActivityReflectsDurablePublicationWhenProviderLookupFails() async throws {
+        for reconcileInForeground in [false, true] {
+            for failurePhase: OutboxDeliveryPhase in [.encrypted, .published] {
+                let fixture = try NutritionMailboxFixture(nativePairing: true)
+                defer { fixture.base.cleanup() }
+                try fixture.writeCapabilities()
+                try BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults).setEnabledDurably(true)
+                CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+                    runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                        forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+                    )
+                )
+                let item = try fixture.base.enqueueMixed()
+                let outbox = fixture.base.outbox
+                var lookupFailed = false
+                fixture.beforeTransportLocate = {
+                    if try outbox.pendingItem(id: item.id)?.deliveryState?.phase == failurePhase {
+                        lookupFailed = true
+                        throw MailboxLocatorError.symbolicLink
+                    }
+                }
+                let viewModel = try await fixture.base.makeViewModel(mailbox: fixture)
+                XCTAssertTrue(viewModel.automaticSyncRuntimeIsReady)
+                XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxQueued)
+
+                if reconcileInForeground {
+                    viewModel.runForegroundMailboxReconciliationIfNeeded()
+                } else {
+                    viewModel.schedulePendingBackgroundOutboxUploadsIfAllowed()
+                }
+                await viewModel.waitForBootstrapAndForegroundWork()
+
+                let context = "foreground=\(reconcileInForeground), failurePhase=\(failurePhase)"
+                XCTAssertTrue(lookupFailed, context)
+                XCTAssertEqual(try outbox.pendingItems().map(\.id), [item.id], context)
+                XCTAssertEqual(try outbox.pendingItem(id: item.id)?.deliveryState?.phase, failurePhase, context)
+                XCTAssertEqual(viewModel.syncPresentation.phase,
+                               failurePhase == .published ? .mailboxConfirmationWaiting : .mailboxQueued, context)
+                XCTAssertNil(viewModel.lastAcceptedTransferObservation, context)
+                XCTAssertNil(try fixture.base.cursor("dietary_protein"), context)
+            }
+        }
     }
 
     func testAuthenticatedMailboxCommitRecordsAcceptedTransfer() async throws {

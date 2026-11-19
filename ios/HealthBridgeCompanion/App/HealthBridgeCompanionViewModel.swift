@@ -3406,7 +3406,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               directOutboxTransferRequestCount == 0 else { return }
         #if os(iOS)
         startBackgroundOutboxScheduling(cancelExistingUploads: false)
-        await backgroundOutboxSchedulingTask?.value
+        if !Task.isCancelled {
+            await backgroundOutboxSchedulingTask?.value
+        }
         #endif
     }
 
@@ -3542,6 +3544,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 } catch {
                     return
                 }
+                refreshPendingOutboxCount()
                 let description = describe(error)
                 mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
                 backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed: \(description)"
@@ -3799,6 +3802,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } catch {
                 return .cancelled
             }
+            refreshPendingOutboxCount()
             mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
             backgroundSyncStatus = "Encrypted iCloud mailbox reconciliation failed: \(describe(error))"
             return .failed
