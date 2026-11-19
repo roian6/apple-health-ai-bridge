@@ -74,7 +74,7 @@ struct DataScopeView: View {
             } header: {
                 Text("History")
             } footer: {
-                Text("Changing this range does not reset progress or resend older records.")
+                Text("After you widen this range, a sync can send older records.")
             }
         }
         .navigationTitle("Health Data")

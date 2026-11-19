@@ -967,7 +967,6 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     throw CancellationError()
                 }
             }
-            var newlyAccepted = false
             let outcome = try await DirectUploadFinalizer.finishForSync(
                 descriptor: descriptor,
                 completion: completion,
@@ -990,15 +989,24 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     )
                 },
                 retire: { itemID, receiverBindingID in
-                    let sleepStore = try FileSleepSyncManifestStore(
-                        fileURL: outboxDirectory.deletingLastPathComponent()
-                            .appendingPathComponent("sleep-sync-manifest-v1.json")
-                    )
-                    newlyAccepted = try await self.directCursorFinalizer(outbox: outbox)
+                    try await self.directCursorFinalizer(outbox: outbox)
                         .recordDirectReceiverAcceptanceForSync(
                             descriptor: descriptor,
-                            sleepStore: sleepStore,
-                            validate: validate
+                            sleepStore: try FileSleepSyncManifestStore(
+                                fileURL: outboxDirectory.deletingLastPathComponent()
+                                    .appendingPathComponent("sleep-sync-manifest-v1.json")
+                            ),
+                            validate: validate,
+                            onNewAcceptance: {
+                                guard settingsStore.receiverSettingsGenerationToken == descriptor.receiverGeneration,
+                                      settingsStore.receiverBindingID == descriptor.receiverBindingID else { return }
+                                self.acceptedTransferStore.record(LastAcceptedTransferObservation(
+                                    bindingID: descriptor.receiverBindingID,
+                                    generation: descriptor.receiverGeneration,
+                                    observedAt: Date(),
+                                    evidenceKind: .directResponse
+                                ))
+                            }
                         )
                     // A replayed successful callback may follow durable payload retirement.
                     outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)
@@ -1006,16 +1014,6 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             )
             if outcome == .retained {
                 outbox.noteDiagnosticDelivery(itemID: descriptor.itemID, outcome: .failed)
-            } else if outcome == .retired,
-                      newlyAccepted,
-                      settingsStore.receiverSettingsGenerationToken == descriptor.receiverGeneration,
-                      settingsStore.receiverBindingID == descriptor.receiverBindingID {
-                acceptedTransferStore.record(LastAcceptedTransferObservation(
-                    bindingID: descriptor.receiverBindingID,
-                    generation: descriptor.receiverGeneration,
-                    observedAt: Date(),
-                    evidenceKind: .directResponse
-                ))
             }
             return outcome
         } catch {

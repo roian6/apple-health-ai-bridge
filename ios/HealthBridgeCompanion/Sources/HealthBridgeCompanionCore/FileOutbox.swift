@@ -1318,14 +1318,23 @@ public final class FileOutbox {
         itemID: String,
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
+        try recordDirectUploadAcceptance(
+            itemID: itemID, receiverIdentity: receiverIdentity
+        ).finalizationRecord
+    }
+
+    func recordDirectUploadAcceptance(
+        itemID: String,
+        receiverIdentity: String
+    ) throws -> (newlyAccepted: Bool, finalizationRecord: FileOutboxFinalizationRecord?) {
         try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
         }
         if try nutritionCollectionOwner(itemID) != itemID {
             try requireDirectRetirementAllowed(itemID: itemID)
-            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
-            return try directFinalizationRecordReady(receiverIdentity: receiverIdentity)
+            let newlyAccepted = try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
+            return (newlyAccepted, try directFinalizationRecordReady(receiverIdentity: receiverIdentity))
         }
         var transactions = try loadEnqueueTransactions()
         if let transactionIndex = transactions.firstIndex(where: {
@@ -1348,7 +1357,8 @@ public final class FileOutbox {
             try acknowledgeProjectionPayload(itemID: itemID, receiverBindingID: receiverIdentity)
             #endif
             let updated = transaction.recordingDirectAcknowledgment(for: itemID)
-            if updated != transaction {
+            let newlyAccepted = updated != transaction
+            if newlyAccepted {
                 transactions[transactionIndex] = updated
                 try persistEnqueueTransactions(transactions)
             }
@@ -1358,19 +1368,19 @@ public final class FileOutbox {
                       updated.directAcknowledgedIDs.contains($0.id)
                           || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: false)
                   }) else {
-                return nil
+                return (newlyAccepted, nil)
             }
-            return finalizationRecord
+            return (newlyAccepted, finalizationRecord)
         }
         guard let item = try pendingItem(id: itemID) else {
             // A replayed successful callback may follow durable local retirement.
-            return nil
+            return (false, nil)
         }
         guard item.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
         try markUploaded(item)
-        return nil
+        return (true, nil)
     }
 
     public func directFinalizationRecordReady(
@@ -1502,12 +1512,14 @@ public final class FileOutbox {
         try recoverNutritionSplits()
         preparedNutritionPayloads[split.supportedID] = PreparedNutritionPayload(
             revision: try NutritionPayloadRevision(finalPayloadURL(for: split.supportedID)),
-            containsNutrition: false, permitsSupported: true, projection: nil,
+            containsNutrition: false, mayContainSleep: prepared.mayContainSleep,
+            permitsSupported: true, projection: nil,
             remainder: nil, cursors: []
         )
         preparedNutritionPayloads[split.remainderID] = PreparedNutritionPayload(
             revision: try NutritionPayloadRevision(finalPayloadURL(for: split.remainderID)),
-            containsNutrition: true, permitsSupported: prepared.permitsSupported,
+            containsNutrition: true, mayContainSleep: prepared.mayContainSleep,
+            permitsSupported: prepared.permitsSupported,
             projection: nil, remainder: nil, cursors: prepared.cursors
         )
     }
@@ -1567,26 +1579,31 @@ public final class FileOutbox {
             && accepted(split.remainderID, recorded: split.remainderAccepted)
     }
 
+    @discardableResult
     private func recordNutritionChildAcceptance(
         itemID: String, receiverIdentity: String
-    ) throws {
+    ) throws -> Bool {
         guard var manifest = try loadManifest(),
               let index = manifest.nutritionSplits?.firstIndex(where: {
                   $0.supportedID == itemID || $0.remainderID == itemID
               }),
-              var splits = manifest.nutritionSplits else { return }
+               var splits = manifest.nutritionSplits else { return false }
         guard splits[index].receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
+        let alreadyAccepted: Bool
         if splits[index].supportedID == itemID {
+            alreadyAccepted = splits[index].supportedAccepted
             splits[index].supportedAccepted = true
         } else {
+            alreadyAccepted = splits[index].remainderAccepted
             splits[index].remainderAccepted = true
         }
         manifest.nutritionSplits = splits
         try persistManifest(manifest)
         try nutritionSplitFault(.acceptancePersisted)
         try recoverNutritionSplits()
+        return !alreadyAccepted
     }
 
     private func recoverNutritionSplits() throws {
