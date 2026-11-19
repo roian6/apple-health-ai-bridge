@@ -1396,8 +1396,7 @@ public final class FileOutbox {
         guard item.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        try markUploaded(item)
-        onNewAcceptance()
+        try markUploaded(item, onPayloadRemoved: onNewAcceptance)
         return nil
     }
 
@@ -1710,6 +1709,10 @@ public final class FileOutbox {
     }
 
     public func markUploaded(_ item: FileOutboxItem) throws {
+        try markUploaded(item, onPayloadRemoved: {})
+    }
+
+    private func markUploaded(_ item: FileOutboxItem, onPayloadRemoved: () -> Void) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
         if let identity = item.receiverIdentity {
             try recordNutritionChildAcceptance(itemID: item.id, receiverIdentity: identity)
@@ -1721,6 +1724,7 @@ public final class FileOutbox {
         #endif
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
+            onPayloadRemoved()
         }
         _ = try reconciledManifest()
     }
