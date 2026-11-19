@@ -24,7 +24,7 @@ struct DataScopeView: View {
 
                 if !viewModel.healthPermissionNotice.isEmpty {
                     InlineNotice(
-                        message: viewModel.healthPermissionNoticeIsError
+                        message: viewModel.isRequestingHealthPermissions || viewModel.healthPermissionNoticeIsError
                             ? viewModel.healthPermissionNotice
                             : "Access request finished.",
                         systemImage: viewModel.healthPermissionNoticeIsError

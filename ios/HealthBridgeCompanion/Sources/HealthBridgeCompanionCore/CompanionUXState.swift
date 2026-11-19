@@ -255,6 +255,9 @@ public enum CompanionPrimaryStatusMessage {
         if message.contains("cleared") && message.contains("queued upload") {
             return "Cleared queued uploads. Only unsent local retry data was removed."
         }
+        if message.contains("nothing was sent. queued uploads remaining:") {
+            return "Nothing was sent. Uploads are still queued."
+        }
         if message.contains("queued uploads sent") {
             return "Queued uploads sent"
         }

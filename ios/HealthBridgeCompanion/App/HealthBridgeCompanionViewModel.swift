@@ -268,6 +268,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return message + (nutritionNotice.isEmpty ? "" : " " + nutritionNotice)
     }
     @Published private var publishedPendingOutboxCount = 0
+    @Published private var hasPublishedMailboxItem = false
     var pendingOutboxCount: Int {
         get { publishedPendingOutboxCount }
         set {
@@ -895,7 +896,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             isPairing: isPairing,
             hasPendingPairing: hasPendingPairing,
             hasPendingPrivateStorageRecovery: hasPendingPrivateStorageRecovery,
-            usesMailboxTransport: usesMailboxTransport
+            usesMailboxTransport: usesMailboxTransport,
+            backgroundSyncEnabled: backgroundSyncEnabled,
+            hasPublishedMailboxItem: hasPublishedMailboxItem
         )
     }
 
@@ -1505,7 +1508,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 if executionMode == .foreground, target.route != .mailbox { return false }
             } else {
                 statusIsError = false
-                statusMessage = "Queued uploads sent: \(summary.uploadedCount). Remaining: \(pendingOutboxCount)."
+                if summary.uploadedCount > 0 {
+                    statusMessage = "Queued uploads sent: \(summary.uploadedCount). Remaining: \(pendingOutboxCount)."
+                } else if pendingOutboxCount > 0 {
+                    statusMessage = "Nothing was sent. Queued uploads remaining: \(pendingOutboxCount)."
+                }
             }
             return true
         } catch let conflict as RejectedSleepBaselineOutboxItem {
@@ -7111,10 +7118,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func refreshPendingOutboxCount() {
         guard !taskUIPublicationIsSuppressed else { return }
         do {
-            pendingOutboxCount = try outbox?.pendingItems().count ?? 0
+            let items = try outbox?.pendingItems() ?? []
+            let generation = settingsStore.receiverSettingsGenerationToken
+            hasPublishedMailboxItem = usesMailboxTransport && items.contains { item in
+                guard let state = item.deliveryState, state.ownership?.receiverGeneration == generation else {
+                    return false
+                }
+                return state.phase == .published || state.phase == .providerObserved
+            }
+            pendingOutboxCount = items.count
         } catch {
             outbox = nil
             privateStorageAdmissionReady = false
+            hasPublishedMailboxItem = false
             pendingOutboxCount = 0
             hasPendingSleepTransition = sleepStorageMayNeedRecovery()
             hasPendingOutboxDeletion = true
