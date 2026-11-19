@@ -127,17 +127,30 @@ public final class OutboxDeliveryCoordinator: MailboxAckDurableFinalizationVerif
         }
     }
 
-    func preparePublication(
+    enum PublicationAdvance {
+        case advanced(FileOutboxDeliveryStateV1)
+        case publication(state: FileOutboxDeliveryStateV1, work: MailboxPublicationWork?)
+    }
+
+    func preparePublicationAdvance(
         itemID: String
-    ) throws -> (state: FileOutboxDeliveryStateV1, work: MailboxPublicationWork?)? {
+    ) throws -> PublicationAdvance {
         try validateCurrentOwnership()
-        guard let current = try state(itemID: itemID),
+        let route = try outbox.readMailboxPublicationRoute(itemID: itemID)
+        if let current = route.state,
+           current.phase == .published,
+           current.ownership == ownership,
+           route.pendingItem?.receiverIdentity == ownership.receiverBindingID {
+            // Observation reads live artifacts and persists through the existing CAS.
+            return .advanced(try observe(itemID: itemID, current: current))
+        }
+        guard let current = route.state,
               current.phase == .encrypted
                 || (current.phase == .retryableFailure && current.retryFrom == .encrypted) else {
-            return nil
+            return .advanced(try advance(itemID: itemID))
         }
         let owned = try ownedState(itemID: itemID)
-        return (owned, try transport.preparePublication(itemID: itemID))
+        return .publication(state: owned, work: try transport.preparePublication(itemID: itemID))
     }
 
     private func publish(

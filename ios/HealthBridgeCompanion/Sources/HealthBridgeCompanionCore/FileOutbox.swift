@@ -1162,6 +1162,19 @@ public final class FileOutbox {
         try pendingItems(in: reconciledManifest())
     }
 
+    // Route this synchronous operation from one reconciled manifest.
+    func readMailboxPublicationRoute(
+        itemID: String
+    ) throws -> (state: FileOutboxDeliveryStateV1?, pendingItem: FileOutboxItem?) {
+        guard Self.isSafeItemID(itemID) else { return (nil, nil) }
+        let manifest = try reconciledManifest()
+        let state = manifest.entries.first(where: { $0.id == itemID })?.deliveryState
+        let pending = state?.phase == .published
+            ? try pendingItems(in: manifest).first(where: { $0.id == itemID })
+            : nil
+        return (state, pending)
+    }
+
     func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
         try requireUploadAdmission()
         guard let manifest = try loadManifest() else { throw CancellationError() }
