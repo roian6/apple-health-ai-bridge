@@ -1412,7 +1412,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func collectAutomaticDirectTypes(
         _ processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes,
         reentryTypes: Set<String>?
-    ) async throws -> (processedAllPending: Bool, deferredTypes: Set<String>, enqueuedPayloads: Bool) {
+    ) async throws -> (processing: Result<Bool, Error>, deferredTypes: Set<String>, enqueuedPayloads: Bool) {
         try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: false) {
             try await self.preparePrivateStorageForUploadAdmission()
             let target = try self.capturePayloadDeliveryTarget()
@@ -1447,10 +1447,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 self.automaticDirectReentryTypes = nil
                 self.automaticDirectDeferredTypes = []
             }
-            let processedAllPending = try await processPendingTypes()
+            let processing: Result<Bool, Error>
+            do {
+                processing = .success(try await processPendingTypes())
+            } catch {
+                processing = .failure(error)
+            }
+            // Account for durable work inside the gate even if a later lane throws.
             let previousIDs = Set(items.map(\.id))
-            let enqueuedPayloads = try outbox.pendingItems().contains { !previousIDs.contains($0.id) }
-            return (processedAllPending, self.automaticDirectDeferredTypes, enqueuedPayloads)
+            let enqueuedPayloads = Result {
+                try outbox.pendingItems().contains { !previousIDs.contains($0.id) }
+            }
+            return (
+                processing.flatMap { processed in enqueuedPayloads.map { _ in processed } },
+                self.automaticDirectDeferredTypes,
+                (try? enqueuedPayloads.get()) == true
+            )
         }
     }
 
@@ -4071,13 +4083,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private enum QuantitySyncOutcome {
         case noPayload
         case accepted(hasRecords: Bool)
-        case queued(hasRecords: Bool)
+        case queued(hasRecords: Bool, canProjectBehindRaw: Bool = false)
         case failed
 
         var hasRecords: Bool {
             switch self {
             case .noPayload, .failed: return false
-            case .accepted(let hasRecords), .queued(let hasRecords): return hasRecords
+            case .accepted(let hasRecords), .queued(let hasRecords, _): return hasRecords
             }
         }
     }
@@ -4118,9 +4130,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             switch raw {
             case .noPayload, .accepted:
                 break
-            case .queued:
-                return automaticDirectPendingTypes == nil
-                    ? .blocked : deferAutomaticDirectTypes(pendingGenerationRetirements)
+            case .queued(_, let canProjectBehindRaw):
+                guard automaticDirectPendingTypes != nil else { return .blocked }
+                if !canProjectBehindRaw {
+                    return deferAutomaticDirectTypes(pendingGenerationRetirements)
+                }
             case .failed:
                 return automaticStepReadFailureResult(pendingGenerationRetirements)
             }
@@ -4137,8 +4151,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
 
-            // A durable daily retirement marker is created only after raw work is complete.
-            // If interrupted before this enqueue, the generation remains pending for fresh reads.
+            // The daily retirement follows the raw read. In the bounded Direct
+            // fallback, FIFO ensures the queued raw payload is accepted first.
             let daily = await performDailyActivityAggregates(
                 typeCodes: [HealthBridgeHealthType.steps.typeCode],
                 executionMode: .automatic,
@@ -4386,10 +4400,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
         }
         var processedAllPending: Bool?
+        var collectedNewPayloads = false
+        var finishedDirectCollection = false
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
             if settingsStore.activeTransport == .directHTTP {
-                var collectedNewPayloads = false
                 var reentryTypes: Set<String>?
                 // One collection pass is independent of receiver availability.
                 // One bounded reentry resolves raw-before-projection dependencies after ACK.
@@ -4397,9 +4412,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     let collection = try await collectAutomaticDirectTypes(
                         processPendingTypes, reentryTypes: reentryTypes
                     )
-                    processedAllPending = collection.processedAllPending
-                    reentryTypes = collection.deferredTypes
                     collectedNewPayloads = collectedNewPayloads || collection.enqueuedPayloads
+                    processedAllPending = try collection.processing.get()
+                    reentryTypes = collection.deferredTypes
                     try Task.checkCancellation()
                     try requireCurrentConnectionGeneration(expectedGeneration)
                     guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
@@ -4412,9 +4427,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     }
                     if collection.deferredTypes.isEmpty || trustedPendingOutboxCount() != 0 { break }
                 }
-                if collectedNewPayloads || !statusIsError, (trustedPendingOutboxCount() ?? 0) > 0 {
-                    await schedulePendingBackgroundOutboxUploadsAndWaitIfAllowed()
-                }
+                finishedDirectCollection = true
             } else {
                 try await preparePrivateStorageForUploadAdmission()
                 processedAllPending = try await processPendingTypes()
@@ -4433,6 +4446,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 stage: cancelled ? .unknown : .store,
                 isCancellation: cancelled
             ))
+        }
+        if collectedNewPayloads || (finishedDirectCollection && !statusIsError),
+           settingsStore.receiverSettingsGenerationToken == expectedGeneration,
+           (trustedPendingOutboxCount() ?? 0) > 0 {
+            await schedulePendingBackgroundOutboxUploadsAndWaitIfAllowed()
         }
         let pendingTypeCodes = (try? backgroundSyncStore
             .loadPendingObserverTypeCodeGenerations().keys.sorted()) ?? []
@@ -4684,15 +4702,26 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 sourceKey: sourceKey,
                 cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
             )
-            let anchorCursorValue = CoreLaneSyncCursorPolicy.effectiveCursorValue(
+            let sharedAnchor = CoreLaneSyncCursorPolicy.effectiveCursorValue(
                 storedCursorValue: storedAnchorCursorValue,
                 hasUploadedRecords: hasUploadedStepRecords
             )
             let shouldPersistSharedProgress = executionMode.shouldPersistSharedProgress(
                 hadUsableCursor: HealthKitAnchoredCursorPolicy.hasUsableCursorValue(
-                    anchorCursorValue
+                    sharedAnchor
                 )
             )
+            // A bounded automatic read must not establish the wider foreground checkpoint.
+            let usesAutomaticFallback = !shouldPersistSharedProgress && target.route != .mailbox
+            let checkpointKind = usesAutomaticFallback
+                ? GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps")
+                : StepCountSyncBatchFactory.anchoredCursorKind
+            let anchorCursorValue = usesAutomaticFallback ? try cursorStore.cursorValue(
+                receiverBindingID: receiverBindingID, sourceKey: sourceKey, cursorKind: checkpointKind
+            ) : sharedAnchor
+            let hasAnchorProgress = usesAutomaticFallback
+                ? HealthKitAnchoredCursorPolicy.hasUsableCursorValue(anchorCursorValue)
+                : hasUploadedStepRecords
             let storedBootstrapStartValue = try cursorStore.cursorValue(
                 receiverBindingID: receiverBindingID,
                 sourceKey: sourceKey,
@@ -4766,7 +4795,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 statusMessage = "HealthKit returned no anchored step-count payload. Nothing sent."
                 return .noPayload
             }
-            guard uploadedRecords || hasUploadedStepRecords || !changes.deletedStepSamples.isEmpty else {
+            guard uploadedRecords || hasAnchorProgress || !changes.deletedStepSamples.isEmpty else {
                 statusIsError = false
                 statusMessage = "HealthKit returned no readable Step Count records. Step cursor was not advanced so future Health permission changes can backfill history."
                 return .noPayload
@@ -4778,18 +4807,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusMessage = target.uploadStatus(uploadDescription)
             failureStage = .encoding
             let data = try encoder.encode(batch)
-            let shouldPersistAnchorCursor = shouldPersistSharedProgress
+            let shouldPersistAnchorCursor = (shouldPersistSharedProgress || usesAutomaticFallback)
                 && CoreLaneSyncCursorPolicy.shouldPersistCursor(
                     uploadedRecords: uploadedRecords,
-                    hasUploadedRecords: hasUploadedStepRecords
+                    hasUploadedRecords: hasAnchorProgress
                 )
             let cursorCheckpoint = shouldPersistAnchorCursor
                 ? FileOutboxCursorCheckpoint(
                     receiverIdentity: receiverBindingID,
                     sourceKey: sourceKey,
-                    cursorKind: StepCountSyncBatchFactory.anchoredCursorKind,
+                    cursorKind: checkpointKind,
                     cursorValue: changes.anchorCursorValue,
-                    coreLaneUploadProof: uploadedRecords ? .steps : nil
+                    coreLaneUploadProof: shouldPersistSharedProgress && uploadedRecords ? .steps : nil
                 )
                 : nil
             failureStage = .transport
@@ -4819,7 +4848,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 outboxNotice: outboxNotice
             )
             return deliveryResult.directUpload == nil
-                ? .queued(hasRecords: uploadedRecords)
+                ? .queued(hasRecords: uploadedRecords, canProjectBehindRaw: usesAutomaticFallback)
                 : .accepted(hasRecords: uploadedRecords)
         } catch {
             noteBackgroundAutomaticSyncFailure(
