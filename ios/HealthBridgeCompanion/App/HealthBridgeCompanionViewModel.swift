@@ -237,6 +237,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var receiverURLString: String
     @Published var bearerToken: String
     @Published private(set) var receiverSettingsSaved: Bool
+    struct ConnectionCheckNotice {
+        let message: String
+        let isError: Bool
+        fileprivate let generation: String
+    }
+    @Published private var lastConnectionCheck: ConnectionCheckNotice?
+    var connectionCheckNotice: ConnectionCheckNotice? {
+        guard let lastConnectionCheck,
+              lastConnectionCheck.generation == settingsStore.receiverSettingsGenerationToken else {
+            return nil
+        }
+        return lastConnectionCheck
+    }
     @Published private var publishedStatusIsError = false
     @Published private var connectionIssue: ConnectionIssue?
     var statusIsError: Bool {
@@ -1199,7 +1212,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
-    private func checkReceiverHealth() async {
+    private func checkReceiverHealth(recordingResultFor generation: String? = nil) async {
+        defer {
+            // Capture the probe's result before another main-actor task can update Activity.
+            if let generation, !Task.isCancelled, !taskUIPublicationIsSuppressed,
+               generation == settingsStore.receiverSettingsGenerationToken {
+                lastConnectionCheck = ConnectionCheckNotice(
+                    message: connectionIssue?.message ?? CompanionPrimaryStatusMessage.sanitized(
+                        from: statusMessage, isError: statusIsError
+                    ),
+                    isError: statusIsError,
+                    generation: generation
+                )
+            }
+        }
         if settingsStore.activeTransport == .mailbox {
             do {
                 statusIsError = false
@@ -1303,7 +1329,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
         }
 
-        await checkReceiverHealth()
+        await checkReceiverHealth(recordingResultFor: settingsStore.receiverSettingsGenerationToken)
     }
 
     func performPrimaryAction() async {

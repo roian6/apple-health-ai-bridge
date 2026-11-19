@@ -8,7 +8,6 @@ struct ConnectionSettingsView: View {
     @State private var showPrivateResetConfirmation = false
     @State private var showMailboxKeyResetConfirmation = false
     @State private var showPendingPairingCancellationConfirmation = false
-    @State private var hasCheckedConnection = false
     @FocusState private var inputFocus: InputField?
 
     private enum InputField: Hashable {
@@ -155,7 +154,6 @@ struct ConnectionSettingsView: View {
 
             if viewModel.receiverSettingsSaved {
                 Button {
-                    hasCheckedConnection = true
                     Task { await viewModel.checkConnection() }
                 } label: {
                     if viewModel.isCheckingConnection {
@@ -172,12 +170,12 @@ struct ConnectionSettingsView: View {
                 .disabled(!viewModel.canSendConnectionTest || viewModel.isCheckingConnection)
             }
 
-            if viewModel.receiverSettingsSaved && !viewModel.hasPendingPairing
-                && (hasCheckedConnection || viewModel.statusIsError || !viewModel.nutritionNotice.isEmpty) {
+            if viewModel.receiverSettingsSaved, !viewModel.hasPendingPairing,
+               let notice = viewModel.connectionCheckNotice {
                 InlineNotice(
-                    message: viewModel.displayStatusMessage,
-                    systemImage: viewModel.statusIsError ? "exclamationmark.triangle" : "info.circle",
-                    tint: viewModel.statusIsError ? .orange : .blue
+                    message: notice.message,
+                    systemImage: notice.isError ? "exclamationmark.triangle" : "info.circle",
+                    tint: notice.isError ? .orange : .blue
                 )
             }
 
