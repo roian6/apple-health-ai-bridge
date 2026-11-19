@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 import XCTest
@@ -139,6 +140,80 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertNil(vm.lastAcceptedTransferObservation)
     }
 
+    func testDurableBackgroundAcceptanceConfirmsEvenWhenCursorWriteFails() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let vm = try await fixture.makeViewModel()
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: "synthetic_collection", cursorValue: fixture.anchor
+        )
+        let item = try XCTUnwrap(fixture.outbox.enqueueSequence(
+            [try stepsPayload()], receiverIdentity: binding, cursorCheckpoint: checkpoint
+        ).first)
+        let cursorURL = fixture.root.appendingPathComponent("sync-cursors.json")
+        _ = try FileSyncCursorStore(fileURL: cursorURL)
+        // The existing cursor remains readable and accepts metadata changes.
+        // An append-only flag on that file alone rejects atomic replacement.
+        defer { _ = chflags(cursorURL.path, 0) }
+        XCTAssertNil(vm.lastAcceptedTransferObservation)
+        let acknowledged = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !FileManager.default.fileExists(atPath: item.fileURL.path)
+        }, object: nil)
+        let completion = try await receiveBackgroundCallback(
+            item, fixture: fixture, expectRetainedOwnership: true, reconcileRetainedCompletion: false
+        ) {
+            guard chflags(cursorURL.path, UInt32(UF_APPEND)) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            let readableCursor = try FileSyncCursorStore(fileURL: cursorURL)
+            XCTAssertThrowsError(try readableCursor.saveCursorValue(
+                checkpoint.cursorValue, receiverBindingID: binding,
+                sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+            ))
+        }
+        await fulfillment(of: [acknowledged], timeout: 8)
+
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let ready = try XCTUnwrap(reopened.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertEqual(ready.cursorCheckpoint, checkpoint)
+        let ownership = try FileBackgroundUploadTaskOwnershipStore(
+            fileURL: fixture.root.appendingPathComponent("background-tasks.json")
+        )
+        let retained = try XCTUnwrap(ownership.records().first)
+        XCTAssertEqual(retained.itemID, item.id)
+        XCTAssertEqual(retained.completion, completion)
+        XCTAssertEqual(completion?.statusCode, 202)
+        XCTAssertEqual(completion?.hadTransportError, false)
+        let cursors = try FileSyncCursorStore(fileURL: cursorURL)
+        XCTAssertNil(try cursors.cursorValue(
+            receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        ))
+        let observed = vm.lastAcceptedTransferObservation
+        XCTAssertEqual(observed?.evidenceKind, .directResponse,
+                       "The first durable ACK must confirm while cursor finalization is still failing")
+
+        guard chflags(cursorURL.path, 0) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let restarted = BackgroundURLSessionOutboxUploader(
+            receiverSettingsStore: fixture.settings, acceptedTransferStore: fixture.acceptedTransferStore,
+            taskOwnershipStore: ownership
+        )
+        await recoverWithoutScheduling(restarted, fixture: fixture)
+
+        XCTAssertTrue(try ownership.records().isEmpty)
+        XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertEqual(try cursors.cursorValue(
+            receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        ), checkpoint.cursorValue)
+        XCTAssertEqual(vm.lastAcceptedTransferObservation, observed,
+                       "Replaying the durable ACK must not record it a second time")
+        XCTAssertEqual(vm.lastAcceptedTransferObservation?.evidenceKind, .directResponse,
+                       "Successful cursor replay must leave the original confirmation visible")
+    }
+
     func testPersistedCompletionReplayPreservesAcceptedObservation() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
@@ -238,6 +313,7 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         fixture: NutritionFixture,
         status: Int = 202,
         expectRetainedOwnership: Bool = false,
+        reconcileRetainedCompletion: Bool = true,
         beforeResume: () throws -> Void = {}
     ) async throws -> BackgroundUploadTaskCompletion? {
         let payload = try Data(contentsOf: item.fileURL)
@@ -297,7 +373,7 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         await fulfillment(of: [received], timeout: 15)
         let waited = await XCTWaiter.fulfillment(of: [callback], timeout: 8)
         XCTAssertEqual(waited, .completed, "HTTP \(status) callback did not reach expected durable ownership state")
-        if expectRetainedOwnership {
+        if expectRetainedOwnership && reconcileRetainedCompletion {
             // Join the production reconciler before reading negative postconditions.
             await recoverWithoutScheduling(uploader, fixture: fixture)
         }
