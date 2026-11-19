@@ -336,6 +336,14 @@ unknown sums are not confirmed daily activity. Empty days have empty maps and
 zero session counts, which do not establish zero activity. Sources are not
 deduplicated into a single clinical or activity judgment.
 
+Calendar boundaries use the IANA rules available to the receiver's Python
+`zoneinfo`: system timezone data first, then the `tzdata` package if installed
+and the system has no matching zone. The receiver does not bundle or pin an
+IANA release. Keep the receiver's timezone data current; rule changes can alter
+whether an interval matches a complete local day. Regression fixtures use
+historical transitions for unusual boundaries such as repeated midnight,
+rather than assuming a future daylight-saving schedule will remain unchanged.
+
 ### `get_sleep_report`
 
 Recommended daily briefing query. Required `timezone` is an available IANA key.
