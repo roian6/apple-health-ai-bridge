@@ -404,6 +404,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var automaticDirectPendingTypes: Set<String>?
     private var automaticDirectReentryTypes: Set<String>?
     private var automaticDirectDeferredTypes: Set<String> = []
+    private var automaticDirectRawStepsGeneration: Int?
     private var bootstrapCompleted = false
     private var backgroundSyncPreferenceGeneration: UInt64 = 0
     private var automaticSyncPreferenceTask: Task<Void, Never>?
@@ -1411,8 +1412,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func collectAutomaticDirectTypes(
         _ processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes,
-        reentryTypes: Set<String>?
-    ) async throws -> (processing: Result<Bool, Error>, deferredTypes: Set<String>, enqueuedPayloads: Bool) {
+        reentryTypes: Set<String>?,
+        acknowledgedRawStepsGeneration: Int?
+    ) async throws -> (
+        processing: Result<Bool, Error>,
+        deferredTypes: Set<String>,
+        enqueuedPayloads: Bool,
+        rawStepsGeneration: Int?
+    ) {
         try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: false) {
             try await self.preparePrivateStorageForUploadAdmission()
             let target = try self.capturePayloadDeliveryTarget()
@@ -1442,10 +1449,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             self.automaticDirectPendingTypes = pendingTypes
             self.automaticDirectReentryTypes = reentryTypes
             self.automaticDirectDeferredTypes = []
+            self.automaticDirectRawStepsGeneration = acknowledgedRawStepsGeneration
             defer {
                 self.automaticDirectPendingTypes = nil
                 self.automaticDirectReentryTypes = nil
                 self.automaticDirectDeferredTypes = []
+                self.automaticDirectRawStepsGeneration = nil
             }
             let processing: Result<Bool, Error>
             do {
@@ -1461,7 +1470,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return (
                 processing.flatMap { processed in enqueuedPayloads.map { _ in processed } },
                 self.automaticDirectDeferredTypes,
-                (try? enqueuedPayloads.get()) == true
+                (try? enqueuedPayloads.get()) == true,
+                self.automaticDirectRawStepsGeneration
             )
         }
     }
@@ -4000,9 +4010,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let pendingBefore = trustedPendingOutboxCount()
         switch typeCode {
         case HealthBridgeHealthType.steps.typeCode:
-            return await processAutomaticStepRepresentations(
-                pendingGenerationRetirements: retirementGenerations
-            )
+            return await processAutomaticStepRepresentations(pendingGeneration: generation)
         case HealthBridgeHealthType.workouts.typeCode:
             _ = await syncAnchoredWorkoutChanges(
                 executionMode: .automatic,
@@ -4095,9 +4103,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func processAutomaticStepRepresentations(
-        pendingGenerationRetirements: [String: Int]
+        pendingGeneration: Int
     ) async -> AutomaticSyncTypeResult {
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
+        let pendingGenerationRetirements = [HealthBridgeHealthType.steps.typeCode: pendingGeneration]
         do {
             guard let pendingBeforeRead = trustedPendingOutboxCount() else { return .blocked }
             // Collection already classified queued health dependencies under its held gate.
@@ -4124,19 +4133,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
 
-            // Raw acceptance checkpoints its own cursor, but cannot retire the daily obligation.
-            let raw = await performRecentStepCounts(executionMode: .automatic)
-            try requireCurrentConnectionGeneration(expectedGeneration)
-            switch raw {
-            case .noPayload, .accepted:
-                break
-            case .queued(_, let canProjectBehindRaw):
-                guard automaticDirectPendingTypes != nil else { return .blocked }
-                if !canProjectBehindRaw {
-                    return deferAutomaticDirectTypes(pendingGenerationRetirements)
+            // A raw ACK from this opportunity covers only the generation that produced it.
+            if automaticDirectRawStepsGeneration != pendingGeneration {
+                let raw = await performRecentStepCounts(executionMode: .automatic)
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                switch raw {
+                case .noPayload, .accepted:
+                    break
+                case .queued(_, let canProjectBehindRaw):
+                    guard automaticDirectPendingTypes != nil else { return .blocked }
+                    if !canProjectBehindRaw {
+                        automaticDirectRawStepsGeneration = pendingGeneration
+                        return deferAutomaticDirectTypes(pendingGenerationRetirements)
+                    }
+                case .failed:
+                    return automaticStepReadFailureResult(pendingGenerationRetirements)
                 }
-            case .failed:
-                return automaticStepReadFailureResult(pendingGenerationRetirements)
             }
 
             // Reconcile older deliveries only after this lane reached a successful read.
@@ -4406,11 +4418,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try requireCurrentConnectionGeneration(expectedGeneration)
             if settingsStore.activeTransport == .directHTTP {
                 var reentryTypes: Set<String>?
+                var acknowledgedRawStepsGeneration: Int?
                 // One collection pass is independent of receiver availability.
                 // One bounded reentry resolves raw-before-projection dependencies after ACK.
                 for _ in 0..<2 {
                     let collection = try await collectAutomaticDirectTypes(
-                        processPendingTypes, reentryTypes: reentryTypes
+                        processPendingTypes, reentryTypes: reentryTypes,
+                        acknowledgedRawStepsGeneration: acknowledgedRawStepsGeneration
                     )
                     collectedNewPayloads = collectedNewPayloads || collection.enqueuedPayloads
                     processedAllPending = try collection.processing.get()
@@ -4421,9 +4435,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         throw CancellationError()
                     }
                     if (trustedPendingOutboxCount() ?? 0) > 0 {
-                        _ = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
+                        let flushed = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
                         try Task.checkCancellation()
                         try requireCurrentConnectionGeneration(expectedGeneration)
+                        if flushed, !statusIsError, trustedPendingOutboxCount() == 0 {
+                            acknowledgedRawStepsGeneration = collection.rawStepsGeneration
+                        }
                     }
                     if collection.deferredTypes.isEmpty || trustedPendingOutboxCount() != 0 { break }
                 }
