@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from typing import ClassVar, Final, Literal, Self
 
@@ -24,6 +25,9 @@ from health_bridge.timeseries_catalog import (
 )
 
 OBSERVATION_PREFIX: Final = "daily_projection_observation:"
+RAW_STEP_ID: Final = re.compile(
+    r"hk-step-sample-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+)
 ProjectionStatus = Literal["current", "last_known", "unknown"]
 
 
@@ -559,6 +563,7 @@ def _delete(
     connection: sqlite3.Connection,
     item: DeletedRecord,
     observations: dict[tuple[str, str], Observation],
+    legacy_bounds: tuple[tuple[str, str], ...],
 ) -> bool:
     if item.record_family != "sample":
         return True
@@ -568,8 +573,16 @@ def _delete(
     scoped = {
         code: obs for (key, code), obs in observations.items() if key == item.source_key
     }
+    # Same-ID raw observation evidence takes precedence over the legacy pairing.
+    if legacy_bounds and any(
+        interval.client_record_id == item.client_record_id
+        for observation in scoped.values()
+        for interval in observation.raw_intervals
+    ):
+        legacy_bounds = ()
     codes = (
         {row.type_code for row in previous}
+        or ({"steps"} if legacy_bounds else set())
         or set(scoped)
         or {
             row[0]
@@ -587,9 +600,12 @@ def _delete(
         observation = scoped.get(code)
         comparable = _comparable(connection, owner, code, observation)
         old = next((row for row in previous if row.type_code == code), None)
+        paired_bounds = legacy_bounds if code == "steps" else ()
         if not _admit(old, observation, comparable):
             if observation is None or not comparable:
-                _fence(connection, (owner, code, fingerprint), observation, ())
+                _fence(
+                    connection, (owner, code, fingerprint), observation, paired_bounds
+                )
             continue
         bounds = tuple(
             (row.start_time, row.end_time)
@@ -602,7 +618,9 @@ def _delete(
                 for interval in observation.raw_intervals
                 if interval.client_record_id == item.client_record_id
             )
-        _fence(connection, (owner, code, fingerprint), observation, bounds)
+        _fence(
+            connection, (owner, code, fingerprint), observation, bounds or paired_bounds
+        )
         _save(
             connection,
             owner,
@@ -621,6 +639,24 @@ def _delete(
         admitted = True
     _remember(connection, owner, fingerprint)
     return admitted or not codes
+
+
+def _legacy_step_intervals(
+    samples: tuple[Sample, ...],
+) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    """Identify legacy UTC day IDs using the raw Steps that generated them."""
+    intervals: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for sample in samples:
+        if (
+            sample.type_code == "steps"
+            and sample.metadata.get("sample_kind") == "raw_quantity"
+            and not is_projection(sample)
+            and RAW_STEP_ID.fullmatch(sample.client_record_id)
+        ):
+            day = sample.start_time[:10].replace("-", "")
+            key = (sample.source_key, f"hk-steps-{day}")
+            intervals.setdefault(key, []).append((sample.start_time, sample.end_time))
+    return intervals
 
 
 def prepare_batch(
@@ -657,8 +693,20 @@ def prepare_batch(
         else item
         for item in batch.deleted_records
     )
+    legacy_step_intervals = _legacy_step_intervals(batch.samples)
     deleted = tuple(
-        item for item in deletions if _delete(connection, item, observations)
+        item
+        for item in deletions
+        if _delete(
+            connection,
+            item,
+            observations,
+            tuple(
+                legacy_step_intervals.get((item.source_key, item.client_record_id), ())
+            )
+            if item.deleted_at == batch.generated_at
+            else (),
+        )
     )
     _unknown_windows(connection, batch, observations)
     return batch.model_copy(

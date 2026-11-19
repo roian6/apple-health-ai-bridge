@@ -202,7 +202,7 @@ public enum StepCountSyncBatchFactory {
             .sorted { $0.dayStart < $1.dayStart }
             .map { count in
                 HealthBridgeSample(
-                    clientRecordID: "hk-steps-\(recordDateString(from: count.dayStart))",
+                    clientRecordID: legacyDailyStepRecordID(for: count.dayStart),
                     sourceKey: source.sourceKey,
                     typeCode: HealthBridgeHealthType.steps.typeCode,
                     startTime: HealthBridgeUTCFormatter.string(from: count.dayStart),
@@ -337,13 +337,13 @@ public enum StepCountSyncBatchFactory {
         )
     }
 
-    private static func recordDateString(from date: Date) -> String {
+    static func legacyDailyStepRecordID(for date: Date) -> String {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd"
-        return formatter.string(from: date)
+        return "hk-steps-\(formatter.string(from: date))"
     }
 
     private static func stepSampleClientRecordID(for uuid: UUID) -> String {
@@ -355,7 +355,7 @@ public enum StepCountSyncBatchFactory {
         source: HealthBridgeSource,
         deletedAt: Date
     ) -> [HealthBridgeDeletedRecord] {
-        let touchedDayRecordIDs = Set(samples.map { "hk-steps-\(recordDateString(from: $0.start))" })
+        let touchedDayRecordIDs = Set(samples.map { legacyDailyStepRecordID(for: $0.start) })
         return touchedDayRecordIDs
             .sorted()
             .map { clientRecordID in
