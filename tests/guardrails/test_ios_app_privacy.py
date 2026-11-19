@@ -1596,9 +1596,16 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     check_start = view_model.index("func checkConnection() async")
     check_end = view_model.index("func performPrimaryAction() async", check_start)
     check_body = view_model[check_start:check_end]
-    assert "trackedSyncTasks[taskID] = task" in check_body
-    assert "await task.value" in check_body
-    assert "await checkReceiverHealth()" in check_body
+    assert (
+        check_body.index("guard terminalPayloadActionAdmissionIsOpen")
+        < check_body.index("await self.performCheckConnection()")
+        < check_body.index("trackedSyncTasks[taskID] = task")
+        < check_body.index("await task.value")
+        < check_body.index("trackedSyncTasks.removeValue(forKey: taskID)")
+    )
+    assert check_body.index(
+        "guard canSendConnectionTest, !Task.isCancelled"
+    ) < check_body.index("await checkReceiverHealth()")
     assert "sendConnectionTestBatch" not in check_body
     assert check_body.count("canSendConnectionTest") >= 1
     assert check_body.count("!Task.isCancelled") >= 1

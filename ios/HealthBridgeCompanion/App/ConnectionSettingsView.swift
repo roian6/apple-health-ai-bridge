@@ -4,6 +4,7 @@ struct ConnectionSettingsView: View {
     @ObservedObject var viewModel: HealthBridgeCompanionViewModel
     @State private var showDisconnectConfirmation = false
     @State private var showDisconnectFailureAlert = false
+    @State private var disconnectAlertTitle = ""
     @State private var disconnectFailureMessage = ""
     @State private var showPrivateResetConfirmation = false
     @State private var showMailboxKeyResetConfirmation = false
@@ -75,27 +76,28 @@ struct ConnectionSettingsView: View {
                     let outcome = await viewModel.disconnectReceiver()
                     switch outcome {
                     case .disconnected:
-                        break
+                        return
+                    case .disconnectedWithRecoveryRequired:
+                        disconnectAlertTitle = "Disconnected: Recovery Required"
+                        disconnectFailureMessage = "Private sync storage must recover before uploads can resume. Open Recovery in Settings."
                     case .rejected(let message, let pendingOutboxCount, let connectionPreserved):
+                        disconnectAlertTitle = "Can’t Disconnect Yet"
                         if connectionPreserved, let pendingOutboxCount, pendingOutboxCount > 0 {
                             disconnectFailureMessage = "Queued uploads are waiting on this iPhone. Bring the server back and tap Sync Now to send them, or use Reset Private Sync State in Settings to discard them and rebuild local sync history before disconnecting."
                         } else if connectionPreserved, pendingOutboxCount == nil {
                             disconnectFailureMessage = "Health Bridge couldn’t verify whether queued uploads remain. Your saved server connection was not removed. Reopen Settings and try again after private storage is available."
                         } else {
-                            disconnectFailureMessage = CompanionPrimaryStatusMessage.sanitized(
-                                from: message,
-                                isError: true
-                            )
+                            disconnectFailureMessage = message
                         }
-                        showDisconnectFailureAlert = true
                     }
+                    showDisconnectFailureAlert = true
                 }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This removes the saved server connection from this iPhone. It does not delete Apple Health data.")
         }
-        .alert("Can’t Disconnect Yet", isPresented: $showDisconnectFailureAlert) {
+        .alert(disconnectAlertTitle, isPresented: $showDisconnectFailureAlert) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(disconnectFailureMessage)

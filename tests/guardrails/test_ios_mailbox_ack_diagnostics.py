@@ -228,9 +228,13 @@ def _assert_shared_engine_ack_backpressure(
         str.join(
             "",
             (
-                r"case \.queued:\s*return automaticDirectPendingTypes == nil\s*",
-                r"\?\s*\.blocked\s*:\s*deferAutomaticDirectTypes\(",
-                r"pendingGenerationRetirements\)",
+                r"case \.queued\(_, let canProjectBehindRaw\):\s*",
+                r"guard automaticDirectPendingTypes != nil else ",
+                r"\{ return \.blocked \}\s*",
+                r"if !canProjectBehindRaw \{\s*",
+                r"automaticDirectRawStepsGeneration = pendingGeneration\s*",
+                r"return deferAutomaticDirectTypes\(pendingGenerationRetirements\)",
+                r"\s*\}",
             ),
         ),
         steps[raw_read:daily_read],

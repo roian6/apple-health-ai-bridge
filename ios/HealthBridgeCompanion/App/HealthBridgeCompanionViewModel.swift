@@ -64,6 +64,7 @@ private final class TerminalBackgroundPayloadDrainResult {
 
 enum DisconnectReceiverOutcome: Equatable {
     case disconnected(pendingOutboxCount: Int?)
+    case disconnectedWithRecoveryRequired
     case rejected(
         message: String,
         pendingOutboxCount: Int?,
@@ -86,6 +87,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         case offline
         case unreachable
         case secureConnection
+        case mailboxUnavailable
 
         var message: String {
             switch self {
@@ -97,8 +99,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 return "The receiver could not be reached. Keep it running and check the network or VPN."
             case .secureConnection:
                 return "The secure connection could not be verified. Check the receiver's HTTPS certificate."
+            case .mailboxUnavailable:
+                return "The encrypted iCloud mailbox is unavailable on this iPhone. Check iCloud Drive, then retry."
             }
         }
+    }
+
+    private enum ConnectionProbeResult {
+        case reachable(String)
+        case failed(String, issue: ConnectionIssue? = nil)
     }
 
     @MainActor
@@ -152,17 +161,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             viewModel.isSyncing = true
             viewModel.statusIsError = false
             viewModel.statusMessage = "Starting sync for allowed Apple Health data."
-            await viewModel.checkReceiverHealth()
-            guard !viewModel.statusIsError else {
-                let issue = viewModel.connectionIssue
-                viewModel.statusMessage = "Sync stopped: \(viewModel.statusMessage)"
+            let result = await viewModel.checkReceiverHealth()
+            guard !Task.isCancelled, !viewModel.taskUIPublicationIsSuppressed else { return false }
+            switch result {
+            case .reachable:
+                return true
+            case .failed(let message, let issue):
+                viewModel.statusIsError = true
+                viewModel.statusMessage = "Sync stopped: \(message)"
                 viewModel.connectionIssue = issue
-                if !viewModel.taskUIPublicationIsSuppressed {
-                    viewModel.isSyncing = false
-                }
                 return false
             }
-            return true
         }
 
         private func performManualSync() async {
@@ -1186,13 +1195,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             if cancellationCleanupRecoveryRequired || transition.postCommitRecoveryRequired {
                 statusIsError = true
                 statusMessage = "Disconnected and turned automatic sync off. Private sync storage must recover before uploads can resume."
+                return .disconnectedWithRecoveryRequired
+            }
+            statusIsError = false
+            if let trustedPendingOutboxCount {
+                statusMessage = "Disconnected and turned automatic sync off. Queued uploads: \(trustedPendingOutboxCount)."
             } else {
-                statusIsError = false
-                if let trustedPendingOutboxCount {
-                    statusMessage = "Disconnected and turned automatic sync off. Queued uploads: \(trustedPendingOutboxCount)."
-                } else {
-                    statusMessage = "Disconnected and turned automatic sync off. Queued-upload status is unavailable."
-                }
+                statusMessage = "Disconnected and turned automatic sync off. Queued-upload status is unavailable."
             }
             return .disconnected(pendingOutboxCount: trustedPendingOutboxCount)
         } catch {
@@ -1204,70 +1213,52 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let failureMessage = "Disconnect failed: \(describe(error))"
             statusIsError = true
             statusMessage = failureMessage
+            let notice = if error as? ReceiverConnectionTerminalBarrierError
+                == .backgroundPayloadCancellationNotFinalized {
+                "Background uploads haven’t finished stopping. Wait for cleanup, then try disconnecting again."
+            } else if connectionPreserved {
+                "Your saved server connection was not removed. Review Recovery in Settings, then try disconnecting again."
+            } else {
+                "Health Bridge couldn’t finish disconnecting. Review the saved connection and Recovery in Settings."
+            }
             return .rejected(
-                message: failureMessage,
+                message: notice,
                 pendingOutboxCount: trustedPendingOutboxCount,
                 connectionPreserved: connectionPreserved
             )
         }
     }
 
-    private func checkReceiverHealth(recordingResultFor generation: String? = nil) async {
-        defer {
-            // Capture the probe's result before another main-actor task can update Activity.
-            if let generation, !Task.isCancelled, !taskUIPublicationIsSuppressed,
-               generation == settingsStore.receiverSettingsGenerationToken {
-                lastConnectionCheck = ConnectionCheckNotice(
-                    message: connectionIssue?.message ?? CompanionPrimaryStatusMessage.sanitized(
-                        from: statusMessage, isError: statusIsError
-                    ),
-                    isError: statusIsError,
-                    generation: generation
+    private func checkReceiverHealth() async -> ConnectionProbeResult {
+        if settingsStore.activeTransport == .mailbox {
+            do {
+                try makeProductionMailboxDelivery().validateAvailability()
+                return .reachable("Mailbox folder is ready on this iPhone. Receiver delivery has not been verified.")
+            } catch {
+                return .failed(
+                    "Encrypted iCloud mailbox check failed: \(describe(error))", issue: .mailboxUnavailable
                 )
             }
         }
-        if settingsStore.activeTransport == .mailbox {
-            do {
-                statusIsError = false
-                statusMessage = "Checking encrypted iCloud mailbox..."
-                try makeProductionMailboxDelivery().validateAvailability()
-                statusMessage = "Mailbox folder is ready on this iPhone. Receiver delivery has not been verified."
-            } catch {
-                statusIsError = true
-                statusMessage = "Encrypted iCloud mailbox check failed: \(describe(error))"
-            }
-            return
-        }
         guard let url = URL(string: receiverURLString) else {
-            statusIsError = true
-            statusMessage = "Bridge URL is invalid."
-            connectionIssue = .invalidAddress
-            return
+            return .failed("Bridge URL is invalid.", issue: .invalidAddress)
         }
 
         do {
-            statusIsError = false
-            statusMessage = "Checking connection..."
-            let result = try await receiverClient.healthCheck(forBatchURL: url)
-            statusIsError = false
-            statusMessage = "Connection check passed with HTTP \(result.statusCode)."
+            _ = try await receiverClient.healthCheck(forBatchURL: url)
+            return .reachable("Health Bridge connected")
         } catch {
-            statusIsError = true
-            statusMessage = "Local bridge check failed: \(describe(error))"
-            if let networkError = error as? URLError {
-                switch networkError.code {
-                case .notConnectedToInternet:
-                    connectionIssue = .offline
-                case .cannotFindHost, .cannotConnectToHost, .timedOut, .networkConnectionLost:
-                    connectionIssue = .unreachable
-                case .secureConnectionFailed, .serverCertificateUntrusted,
-                     .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
-                     .serverCertificateNotYetValid:
-                    connectionIssue = .secureConnection
-                default:
-                    break
-                }
+            let issue: ConnectionIssue? = switch (error as? URLError)?.code {
+            case .notConnectedToInternet: .offline
+            case .cannotFindHost, .cannotConnectToHost, .timedOut, .networkConnectionLost:
+                .unreachable
+            case .secureConnectionFailed, .serverCertificateUntrusted,
+                 .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+                 .serverCertificateNotYetValid:
+                .secureConnection
+            default: nil
             }
+            return .failed("Local bridge check failed: \(describe(error))", issue: issue)
         }
     }
 
@@ -1315,21 +1306,30 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func performCheckConnection() async {
         guard !isCheckingConnection else { return }
-        guard canSendConnectionTest, !Task.isCancelled else {
-            statusIsError = true
-            statusMessage = "Connection test is paused while pairing recovery is in progress."
-            return
-        }
+        guard canSendConnectionTest, !Task.isCancelled else { return }
+        let generation = settingsStore.receiverSettingsGenerationToken
         isCheckingConnection = true
-        statusIsError = false
-        statusMessage = "Checking connection..."
+        pairingInputError = nil
         defer {
             if !taskUIPublicationIsSuppressed {
                 isCheckingConnection = false
             }
         }
 
-        await checkReceiverHealth(recordingResultFor: settingsStore.receiverSettingsGenerationToken)
+        let result = await checkReceiverHealth()
+        guard !Task.isCancelled, !taskUIPublicationIsSuppressed,
+              generation == settingsStore.receiverSettingsGenerationToken else { return }
+        switch result {
+        case .reachable(let message):
+            lastConnectionCheck = ConnectionCheckNotice(
+                message: message, isError: false, generation: generation
+            )
+        case .failed(let message, let issue):
+            lastConnectionCheck = ConnectionCheckNotice(
+                message: issue?.message ?? CompanionPrimaryStatusMessage.sanitized(from: message, isError: true),
+                isError: true, generation: generation
+            )
+        }
     }
 
     func performPrimaryAction() async {

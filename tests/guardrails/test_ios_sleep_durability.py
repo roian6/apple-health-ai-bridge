@@ -630,10 +630,18 @@ def test_transient_private_storage_failure_is_retryable_not_destructive() -> Non
     assert "catch FileSyncCursorStoreError.invalidData" in source
     assert "hasTransientPrivateStorageFailure = true" in source
     retry_start = content_view.index("if viewModel.hasTransientPrivateStorageFailure {")
-    retry_end = content_view.index("if viewModel.pendingOutboxCount > 0", retry_start)
+    retry_end = content_view.index(
+        "if (viewModel.usesMailboxTransport "
+        "&& viewModel.mailboxKeyDiagnosticState == .lost)",
+        retry_start,
+    )
     retry = content_view[retry_start:retry_end]
     assert "await viewModel.retryPrivateStorage()" in retry
     assert "role: .destructive" not in retry
+    reset_end = content_view.index(
+        "if viewModel.mailboxKeyDiagnosticState == .lost", retry_end
+    )
+    assert "hasTransientPrivateStorageFailure" not in content_view[retry_end:reset_end]
 
 
 def test_bg_task_cancellation_propagates_to_bootstrap_and_sync_children() -> None:
