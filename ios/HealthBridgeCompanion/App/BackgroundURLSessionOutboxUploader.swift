@@ -990,15 +990,15 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     )
                 },
                 retire: { itemID, receiverBindingID in
-                    let sleepStore = try FileSleepSyncManifestStore(
-                        fileURL: outboxDirectory.deletingLastPathComponent()
-                            .appendingPathComponent("sleep-sync-manifest-v1.json")
-                    )
-                    newlyAccepted = try await self.directCursorFinalizer(outbox: outbox)
+                    try await self.directCursorFinalizer(outbox: outbox)
                         .recordDirectReceiverAcceptanceForSync(
                             descriptor: descriptor,
-                            sleepStore: sleepStore,
-                            validate: validate
+                            sleepStore: try FileSleepSyncManifestStore(
+                                fileURL: outboxDirectory.deletingLastPathComponent()
+                                    .appendingPathComponent("sleep-sync-manifest-v1.json")
+                            ),
+                            validate: validate,
+                            onNewAcceptance: { newlyAccepted = true }
                         )
                     // A replayed successful callback may follow durable payload retirement.
                     outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)

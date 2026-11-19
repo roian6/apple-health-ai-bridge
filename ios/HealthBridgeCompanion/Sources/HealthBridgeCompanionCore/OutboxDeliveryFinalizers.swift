@@ -49,9 +49,46 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     @MainActor
     public func recordDirectReceiverAcceptanceForSync(
         descriptor: DirectUploadCompletionDescriptor,
+        sleepStore: @autoclosure () throws -> any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void,
+        onNewAcceptance: @MainActor () -> Void = {}
+    ) async throws -> Bool {
+        try await outbox.prepareNutritionCompatibility(validate: validate)
+        let item = try outbox.pendingItem(id: descriptor.itemID)
+        if let item, item.receiverIdentity != descriptor.receiverBindingID {
+            throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+        }
+        let prepared = try item.flatMap { try outbox.preparedNutritionPayload(for: $0) }
+        // A missing payload on replay cannot prove this was unrelated to Sleep.
+        if prepared?.mayContainSleep != false {
+            try await commitDirectSleepIfPending(
+                descriptor: descriptor, item: item, sleepStore: sleepStore(),
+                validate: {
+                    try validate()
+                    guard try self.outbox.pendingItem(id: descriptor.itemID) == item else {
+                        throw CancellationError()
+                    }
+                    if let item { _ = try self.outbox.preparedNutritionPayload(for: item) }
+                }
+            )
+        }
+        try Task.checkCancellation()
+        try validate()
+        let acceptance = try outbox.recordDirectUploadAcceptance(
+            itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID
+        )
+        if let record = acceptance.finalizationRecord { try finalize(record) }
+        if acceptance.newlyAccepted { onNewAcceptance() }
+        return acceptance.finalizationRecord != nil
+    }
+
+    @MainActor
+    private func commitDirectSleepIfPending(
+        descriptor: DirectUploadCompletionDescriptor,
+        item: FileOutboxItem?,
         sleepStore: any SleepSyncManifestStoring,
         validate: @escaping @MainActor () throws -> Void
-    ) async throws -> Bool {
+    ) async throws {
         let revision = try sleepStore.revisionForSync()
         let check = { @MainActor in
             try Task.checkCancellation()
@@ -59,7 +96,6 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             guard try sleepStore.revisionForSync() == revision else { throw CancellationError() }
         }
         if let pending = try await sleepStore.loadPendingForSync(validate: check) {
-            let item = try outbox.pendingItems().first { $0.id == descriptor.itemID }
             let matches = try await SleepSyncValueWork.run {
                 guard let item else { return false }
                 return try Data(contentsOf: item.fileURL) == pending.payload
@@ -91,11 +127,6 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         }
         try Task.checkCancellation()
         try validate()
-        return try await recordDirectReceiverAcceptanceForSync(
-            itemID: descriptor.itemID,
-            receiverBindingID: descriptor.receiverBindingID,
-            validate: validate
-        )
     }
 
     @discardableResult
