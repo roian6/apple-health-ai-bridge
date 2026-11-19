@@ -127,15 +127,21 @@ final class CompanionConnectionPresentationAppTests: XCTestCase {
         defer { fixture.cleanup() }
         let queued = try fixture.enqueueMixed()
         let viewModel = try await fixture.makeViewModel()
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
 
         let rejection = await viewModel.disconnectReceiver()
 
-        guard case .rejected(_, let pendingOutboxCount, let connectionPreserved) = rejection else {
+        guard case .rejected(let message, let pendingOutboxCount, let connectionPreserved) = rejection else {
             return XCTFail("Expected queued work to block disconnect, got \(rejection)")
         }
+        XCTAssertTrue(message.contains("Sync Now"))
+        XCTAssertTrue(message.contains("Reset Private Sync State"))
         XCTAssertEqual(pendingOutboxCount, 1)
         XCTAssertTrue(connectionPreserved)
         XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
         XCTAssertNotNil(try fixture.outbox.pendingItem(id: queued.id))
 
         try fixture.outbox.markUploaded(queued)

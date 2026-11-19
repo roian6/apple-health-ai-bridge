@@ -72,10 +72,24 @@ def test_final_read_rejects_identity_changes_during_read(
                     assert path.stat().st_mtime_ns != before.st_mtime_ns
                     return chunk
                 case "ctime":
-                    path.chmod(0o400)
-                    after = path.stat()
-                    assert after.st_mtime_ns == before.st_mtime_ns
-                    assert after.st_ctime_ns != before.st_ctime_ns
+                    original_fstat = os.fstat
+                    opened = original_fstat(descriptor)
+                    # Change only ctime in the reader's final descriptor snapshot.
+                    after = os.stat_result(
+                        tuple(opened),
+                        {
+                            "st_atime_ns": opened.st_atime_ns,
+                            "st_mtime_ns": opened.st_mtime_ns,
+                            "st_ctime_ns": opened.st_ctime_ns + 1,
+                        },
+                    )
+                    assert after.st_mtime_ns == opened.st_mtime_ns
+                    assert after.st_ctime_ns != opened.st_ctime_ns
+
+                    def fstat_after_read(fd: int) -> os.stat_result:
+                        return after if fd == descriptor else original_fstat(fd)
+
+                    monkeypatch.setattr(os, "fstat", fstat_after_read)
                     return chunk
             assert_never(mutation)
         return chunk

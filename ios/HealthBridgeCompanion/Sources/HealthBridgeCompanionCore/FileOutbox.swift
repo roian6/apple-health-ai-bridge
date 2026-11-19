@@ -847,6 +847,7 @@ public final class FileOutbox {
             }
         }
         for batch in batches {
+            var legacyStepRecordIDs: Set<String> = []
             for sample in batch.samples {
                 guard let start = HealthBridgeUTCFormatter.date(from: sample.startTime),
                       let end = HealthBridgeUTCFormatter.date(from: sample.endTime) else {
@@ -858,8 +859,18 @@ public final class FileOutbox {
                 note(interval)
                 if tracksDaily { index[identity] = interval }
                 evidence[sample.clientRecordID] = .init(clientRecordID: sample.clientRecordID, start: start, end: end)
+                if typeCode == "steps", sample.typeCode == typeCode, sample.sourceKey == source,
+                   sample.metadata["sample_kind"] == "raw_quantity" {
+                    legacyStepRecordIDs.insert(StepCountSyncBatchFactory.legacyDailyStepRecordID(for: start))
+                }
             }
             for deletion in batch.deletedRecords where deletion.recordFamily == "sample" {
+                // Keep the paired legacy aggregate tombstone on the wire. Its raw
+                // sample already provides repair evidence; it is not a raw deletion.
+                if deletion.sourceKey == source, deletion.deletedAt == batch.generatedAt,
+                   legacyStepRecordIDs.contains(deletion.clientRecordID) {
+                    continue
+                }
                 let identity = key + "\n" + deletion.clientRecordID
                 if let previous = index[identity] {
                     note(previous)

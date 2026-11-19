@@ -866,9 +866,7 @@ def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
     assert "showDisconnectFailureAlert = true" in body
     assert '"Can\u2019t Disconnect Yet"' in body
     assert ".alert(disconnectAlertTitle" in body
-    assert (
-        "if connectionPreserved, let pendingOutboxCount, pendingOutboxCount > 0" in body
-    )
+    assert "if connectionPreserved, pendingOutboxCount == nil" in body
     task_start = body.index("let outcome = await viewModel.disconnectReceiver()")
     task_end = body.index("showDisconnectFailureAlert = true", task_start)
     task_body = body[task_start:task_end]
@@ -876,11 +874,7 @@ def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
     assert "viewModel.canSendConnectionTest" not in task_body
     assert "viewModel.pendingOutboxCount" not in task_body
     assert "viewModel.statusMessage" not in task_body
-    assert (
-        "Queued uploads are waiting on this iPhone. Bring the server back and tap "
-        "Sync Now to send them, or use Reset Private Sync State in Settings to "
-        "discard them and rebuild local sync history before disconnecting."
-    ) in body
+    assert "disconnectFailureMessage = message" in task_body
     assert (
         '"Reset Private Sync State (\\(viewModel.pendingOutboxCount) queued)"' in body
     )

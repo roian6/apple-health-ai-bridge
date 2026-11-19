@@ -1219,6 +1219,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let notice = if error as? ReceiverConnectionTerminalBarrierError
                 == .backgroundPayloadCancellationNotFinalized {
                 "Background uploads haven’t finished stopping. Wait for cleanup, then try disconnecting again."
+            } else if connectionPreserved,
+                      error as? ReceiverOutboxIdentityError == .receiverTransitionRequiresEmptyOutbox,
+                      outboxIdentityMigrationReady, outbox?.destructiveRecoveryIsRequested == false,
+                      let trustedPendingOutboxCount, trustedPendingOutboxCount > 0 {
+                "Queued uploads are waiting on this iPhone. Bring the server back and tap Sync Now to send them, or use Reset Private Sync State in Settings to discard them and rebuild local sync history before disconnecting."
             } else if connectionPreserved {
                 "Your saved server connection was not removed. Review Recovery in Settings, then try disconnecting again."
             } else {
@@ -1456,6 +1461,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 throw CompanionPrivateStorageError.outboxUnavailable
             }
             let items = try outbox.pendingItems()
+            // Unknown payload types cannot establish that a HealthKit lane is independent.
+            // Fail before collection rather than reading against an unknown retained cursor.
             let pendingTypes = try await SleepSyncValueWork.run {
                 Set(try items.flatMap { item -> [String] in
                     let batch = try JSONDecoder().decode(
@@ -4470,9 +4477,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         let flushed = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
                         try Task.checkCancellation()
                         try requireCurrentConnectionGeneration(expectedGeneration)
-                        if flushed, !statusIsError, trustedPendingOutboxCount() == 0 {
-                            acknowledgedRawStepsGeneration = collection.rawStepsGeneration
-                        }
+                        guard flushed, !statusIsError, trustedPendingOutboxCount() == 0 else { break }
+                        acknowledgedRawStepsGeneration = collection.rawStepsGeneration
                     }
                     if collection.deferredTypes.isEmpty || trustedPendingOutboxCount() != 0 { break }
                 }
