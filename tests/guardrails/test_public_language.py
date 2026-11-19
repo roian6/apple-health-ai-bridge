@@ -65,6 +65,15 @@ def test_connection_check_is_reachability_only_and_does_not_enqueue_a_test_batch
 
     assert "await checkReceiverHealth()" in check_body
     assert "sendConnectionTestBatch" not in check_body
+    probe = view_model.split("private func checkReceiverHealth(", maxsplit=1)[1].split(
+        "private func refreshNutritionSupport()", maxsplit=1
+    )[0]
+    assert "receiverClient.healthCheck(forBatchURL:" in probe
+    assert "makeProductionMailboxDelivery().validateAvailability()" in probe
+    assert "sendConnectionTestBatch" not in probe
+    for body in (check_body, probe):
+        assert "statusIsError =" not in body
+        assert "statusMessage =" not in body
 
 
 def test_foreground_sync_exposes_cancel_without_deleting_durable_queue() -> None:

@@ -126,7 +126,12 @@ final class NutritionFixture {
     let anchor: String
     var values: [String: Double] = ["weight": 70, "dietary_protein": 12]
     var reads: [String] = []
-    lazy var acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
+    var acceptedTransferResetEpochURL: URL {
+        root.appendingPathComponent("accepted-transfer").appendingPathComponent("reset-epoch")
+    }
+    lazy var acceptedTransferStore = LastAcceptedTransferObservationStore(
+        userDefaults: defaults, resetEpochURL: acceptedTransferResetEpochURL
+    )
     private var ids: [String: UUID] = [:]
 
     init(directPairing: Bool = true) throws {

@@ -338,7 +338,7 @@ struct ContentView: View {
 
             if !viewModel.healthPermissionNotice.isEmpty {
                 InlineNotice(
-                    message: viewModel.healthPermissionNoticeIsError
+                    message: viewModel.isRequestingHealthPermissions || viewModel.healthPermissionNoticeIsError
                         ? viewModel.healthPermissionNotice
                         : "Access request finished. Only data you allow in Apple Health can sync.",
                     systemImage: viewModel.healthPermissionNoticeIsError

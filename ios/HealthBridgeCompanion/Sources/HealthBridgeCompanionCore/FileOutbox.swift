@@ -1162,6 +1162,19 @@ public final class FileOutbox {
         try pendingItems(in: reconciledManifest())
     }
 
+    // Route this synchronous operation from one reconciled manifest.
+    func readMailboxPublicationRoute(
+        itemID: String
+    ) throws -> (state: FileOutboxDeliveryStateV1?, pendingItem: FileOutboxItem?) {
+        guard Self.isSafeItemID(itemID) else { return (nil, nil) }
+        let manifest = try reconciledManifest()
+        let state = manifest.entries.first(where: { $0.id == itemID })?.deliveryState
+        let pending = state?.phase == .published
+            ? try pendingItems(in: manifest).first(where: { $0.id == itemID })
+            : nil
+        return (state, pending)
+    }
+
     func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
         try requireUploadAdmission()
         guard let manifest = try loadManifest() else { throw CancellationError() }
@@ -1319,22 +1332,26 @@ public final class FileOutbox {
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
         try recordDirectUploadAcceptance(
-            itemID: itemID, receiverIdentity: receiverIdentity
-        ).finalizationRecord
+            itemID: itemID, receiverIdentity: receiverIdentity, onNewAcceptance: {}
+        )
     }
 
+    // A new durable ACK is observable even if this call later throws during cleanup.
     func recordDirectUploadAcceptance(
         itemID: String,
-        receiverIdentity: String
-    ) throws -> (newlyAccepted: Bool, finalizationRecord: FileOutboxFinalizationRecord?) {
+        receiverIdentity: String,
+        onNewAcceptance: () -> Void
+    ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
         }
         if try nutritionCollectionOwner(itemID) != itemID {
             try requireDirectRetirementAllowed(itemID: itemID)
-            let newlyAccepted = try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
-            return (newlyAccepted, try directFinalizationRecordReady(receiverIdentity: receiverIdentity))
+            try recordNutritionChildAcceptance(
+                itemID: itemID, receiverIdentity: receiverIdentity, onNewAcceptance: onNewAcceptance
+            )
+            return try directFinalizationRecordReady(receiverIdentity: receiverIdentity)
         }
         var transactions = try loadEnqueueTransactions()
         if let transactionIndex = transactions.firstIndex(where: {
@@ -1357,10 +1374,10 @@ public final class FileOutbox {
             try acknowledgeProjectionPayload(itemID: itemID, receiverBindingID: receiverIdentity)
             #endif
             let updated = transaction.recordingDirectAcknowledgment(for: itemID)
-            let newlyAccepted = updated != transaction
-            if newlyAccepted {
+            if updated != transaction {
                 transactions[transactionIndex] = updated
                 try persistEnqueueTransactions(transactions)
+                onNewAcceptance()
             }
             let manifest = try reconciledManifest()
             guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
@@ -1368,19 +1385,19 @@ public final class FileOutbox {
                       updated.directAcknowledgedIDs.contains($0.id)
                           || nutritionCollectionAccepted($0.id, in: manifest, includingVerifiedACK: false)
                   }) else {
-                return (newlyAccepted, nil)
+                return nil
             }
-            return (newlyAccepted, finalizationRecord)
+            return finalizationRecord
         }
         guard let item = try pendingItem(id: itemID) else {
             // A replayed successful callback may follow durable local retirement.
-            return (false, nil)
+            return nil
         }
         guard item.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        try markUploaded(item)
-        return (true, nil)
+        try markUploaded(item, onPayloadRemoved: onNewAcceptance)
+        return nil
     }
 
     public func directFinalizationRecordReady(
@@ -1579,15 +1596,14 @@ public final class FileOutbox {
             && accepted(split.remainderID, recorded: split.remainderAccepted)
     }
 
-    @discardableResult
     private func recordNutritionChildAcceptance(
-        itemID: String, receiverIdentity: String
-    ) throws -> Bool {
+        itemID: String, receiverIdentity: String, onNewAcceptance: () -> Void = {}
+    ) throws {
         guard var manifest = try loadManifest(),
               let index = manifest.nutritionSplits?.firstIndex(where: {
                   $0.supportedID == itemID || $0.remainderID == itemID
               }),
-               var splits = manifest.nutritionSplits else { return false }
+               var splits = manifest.nutritionSplits else { return }
         guard splits[index].receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
@@ -1601,9 +1617,9 @@ public final class FileOutbox {
         }
         manifest.nutritionSplits = splits
         try persistManifest(manifest)
+        if !alreadyAccepted { onNewAcceptance() }
         try nutritionSplitFault(.acceptancePersisted)
         try recoverNutritionSplits()
-        return !alreadyAccepted
     }
 
     private func recoverNutritionSplits() throws {
@@ -1693,6 +1709,10 @@ public final class FileOutbox {
     }
 
     public func markUploaded(_ item: FileOutboxItem) throws {
+        try markUploaded(item, onPayloadRemoved: {})
+    }
+
+    private func markUploaded(_ item: FileOutboxItem, onPayloadRemoved: () -> Void) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
         if let identity = item.receiverIdentity {
             try recordNutritionChildAcceptance(itemID: item.id, receiverIdentity: identity)
@@ -1704,6 +1724,7 @@ public final class FileOutbox {
         #endif
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
+            onPayloadRemoved()
         }
         _ = try reconciledManifest()
     }

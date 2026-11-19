@@ -79,10 +79,14 @@ final class CompanionPairingInputAppTests: XCTestCase {
         viewModel.pairingImportText = "not-a-link"
         await viewModel.importPairingText()
         XCTAssertEqual(viewModel.pairingInputError, .invalidJSON)
+        let previousStatus = viewModel.statusMessage
+        let previousStatusIsError = viewModel.statusIsError
 
         await viewModel.checkConnection()
 
         XCTAssertNil(viewModel.pairingInputError)
-        XCTAssertFalse(viewModel.statusIsError)
+        XCTAssertEqual(viewModel.connectionCheckNotice?.isError, false)
+        XCTAssertEqual(viewModel.statusMessage, previousStatus)
+        XCTAssertEqual(viewModel.statusIsError, previousStatusIsError)
     }
 }
