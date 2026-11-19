@@ -57,10 +57,10 @@ def test_candidate_notes_selection_uses_planned_tag_on_release_branch(
     assert (tmp_path / "dist/release-notes.md").read_bytes() == notes
 
 
-def _current_ios_build() -> str:
+def _current_ios_setting(setting: str) -> str:
     values: set[str] = set()
     for line in XCODE_PROJECT.read_text(encoding="utf-8").splitlines():
-        if "CURRENT_PROJECT_VERSION =" in line:
+        if line.strip().startswith(f"{setting} ="):
             _, _, value = line.partition("=")
             values.add(value.removesuffix(";").strip())
     assert len(values) == 1
@@ -288,8 +288,8 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     assert completed.returncode == 0, completed.stderr
     output = ValidateOutput.model_validate_json(completed.stdout)
     assert output.model_dump() == {
-        "ios_build": _current_ios_build(),
-        "ios_marketing_version": "1.2.0",
+        "ios_build": _current_ios_setting("CURRENT_PROJECT_VERSION"),
+        "ios_marketing_version": _current_ios_setting("MARKETING_VERSION"),
         "project_version": __version__,
         "release_scope": "coordinated",
         "tag": f"receiver-v{__version__}",
