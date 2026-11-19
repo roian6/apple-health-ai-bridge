@@ -1967,6 +1967,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             self.outbox = recovery.outbox
             let removedCount = recovery.removedPayloadCount
+            acceptedTransferStore.clear()
             outboxIdentityMigrationReady = true
             hasPendingPrivateStorageRecovery = false
             hasTransientPrivateStorageFailure = false

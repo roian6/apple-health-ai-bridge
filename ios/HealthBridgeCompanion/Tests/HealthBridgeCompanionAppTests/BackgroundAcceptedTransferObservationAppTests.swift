@@ -6,6 +6,35 @@ import XCTest
 
 @MainActor
 final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
+    func testBootstrapFinishesInterruptedResetAndClearsTransferConfirmation() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let accepted = LastAcceptedTransferObservation(
+            bindingID: binding, generation: generation,
+            observedAt: Date(timeIntervalSince1970: 1_790_000_000), evidenceKind: .directResponse
+        )
+        fixture.acceptedTransferStore.record(accepted)
+        let ordinaryLaunch = try await fixture.makeViewModel()
+        XCTAssertEqual(ordinaryLaunch.lastAcceptedTransferObservation, accepted)
+
+        let item = try enqueueSteps(fixture)
+        try FileOutbox.beginDestructiveRecovery(directory: fixture.outbox.directoryURL)
+        XCTAssertTrue(fixture.outbox.destructiveRecoveryIsRequested)
+        let resumed = try await fixture.makeViewModel()
+
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        XCTAssertNil(try reopened.pendingItem(id: item.id))
+        XCTAssertFalse(reopened.destructiveRecoveryIsRequested)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertNil(resumed.lastAcceptedTransferObservation)
+        XCTAssertNil(fixture.acceptedTransferStore.load(
+            bindingID: binding, generation: generation
+        ))
+    }
+
     func testUnrelatedBackgroundSuccessRetiresWithMalformedSleepJournal() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
