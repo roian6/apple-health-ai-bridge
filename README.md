@@ -32,39 +32,70 @@ Automatic sync brings new records into the same local history, without another e
 
 You'll need an **iPhone running iOS 18 or later**, a **macOS or Linux computer** that can stay awake to receive records, and an AI assistant.
 
-1. **Install the app.** Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806).
-2. **Set up the receiver.** Install the published [Receiver/CLI 1.1.5](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5) using its [tagged setup guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/setup.md), including a private HTTPS route for sync away from home.
+1. **Install the app.** Download [the iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806). Use iOS Companion **1.2.0 (build 51)** with the Receiver below.
+2. **Set up the receiver.** Install the published [Receiver/CLI 1.2.0](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0) using the [setup guide](docs/setup.md), including a private HTTPS route for sync away from home.
 3. **Pair your iPhone.** [Scan the pairing QR](docs/setup.md#pair-the-iphone), review Apple's Health permissions, and enable **Automatic Sync**.
 4. **Connect your AI.** [Choose your client](#choose-your-ai), then [ask your first question](docs/setup.md#ask-your-first-question).
 
-For the Mac-only iCloud Mailbox Beta, use the same release's [helper verification and installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.1.5/docs/icloud-mailbox-service.md). The maintenance release preserves 1.1.3 query behavior; newer features in main remain unreleased.
+These versions use Batch Protocol `health_bridge.batch.v1` (1.0.0). Already using the bridge? Follow the [upgrade steps](docs/setup.md#existing-users-receivercli-120-upgrade) to keep your database and pairing. For the optional Mac-only iCloud Mailbox Beta, use the [helper verification and installation guide](docs/icloud-mailbox-service.md), including its separate helper-replacement steps.
 
 ## Choose your AI
 
 Find your assistant's setup guide below.
 
+### AI chat apps
+
 <table width="100%">
 <tr>
-<td width="50%" align="center"><a href="docs/clients.md#antigravity-cli"><img src="assets/clients/antigravity.svg" alt="" width="24" height="24"><br>Antigravity CLI</a></td>
-<td width="50%" align="center"><a href="docs/clients.md#claude-code"><img src="assets/clients/claude-code-mark.svg" alt="" width="24" height="24"><br>Claude Code</a></td>
-</tr>
-<tr>
+<td width="50%" align="center"><a href="docs/clients.md#chatgpt-desktop"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"><br>ChatGPT Desktop</a></td>
 <td width="50%" align="center"><a href="docs/clients.md#claude-desktop"><img src="assets/clients/claude-desktop-mark.svg" alt="" width="24" height="24"><br>Claude Desktop</a></td>
-<td width="50%" align="center"><a href="docs/clients.md#codex-cli"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"><br>Codex CLI</a></td>
 </tr>
 <tr>
-<td width="50%" align="center"><a href="docs/clients.md#cursor"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/cursor-cube-2d-dark.svg"><img src="assets/clients/cursor-cube-2d-light.svg" alt="" width="21" height="24"></picture><br>Cursor</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#lm-studio"><img src="assets/clients/lm-studio.svg" alt="" width="24" height="24"><br>LM Studio</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#cherry-studio"><img src="assets/clients/cherry-studio.svg" alt="" height="24"><br>Cherry Studio</a></td>
+</tr>
+</table>
+
+### Agents & harnesses
+
+<table width="100%">
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#openclaw-manual-configuration"><img src="assets/clients/openclaw.svg" alt="" width="24" height="24"><br>OpenClaw</a></td>
 <td width="50%" align="center"><a href="docs/clients.md#hermes-agent"><img src="assets/clients/hermes-agent.svg" alt="" width="24" height="24"><br>Hermes Agent</a></td>
 </tr>
 <tr>
-<td width="50%" align="center"><a href="docs/clients.md#openclaw-manual-configuration"><img src="assets/clients/openclaw.svg" alt="" width="24" height="24"><br>OpenClaw</a></td>
-<td width="50%" align="center"><a href="docs/clients.md#opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/opencode-logo-dark.svg"><img src="assets/clients/opencode-logo-light.svg" alt="" width="19" height="24"></picture><br>OpenCode</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#goose"><img src="assets/clients/goose.svg" alt="" width="24" height="24"><br>Goose</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#pi"><img src="assets/clients/pi.svg" alt="" width="24" height="24"><br>Pi</a></td>
+</tr>
+</table>
+
+### Coding agents & developer tools
+
+<table width="100%">
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#claude-code"><img src="assets/clients/claude-code-mark.svg" alt="" width="24" height="24"><br>Claude Code</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#codex-cli"><img src="assets/clients/codex-openai-mark.svg" alt="" width="24" height="24"><br>Codex CLI</a></td>
+</tr>
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#github-copilot-cli"><img src="assets/clients/github-copilot.svg" alt="" width="24" height="24"><br>GitHub Copilot CLI</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#cursor"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/cursor-cube-2d-dark.svg"><img src="assets/clients/cursor-cube-2d-light.svg" alt="" width="21" height="24"></picture><br>Cursor</a></td>
 </tr>
 <tr>
 <td width="50%" align="center"><a href="docs/clients.md#vs-code-local-format"><img src="assets/clients/vscode.svg" alt="" width="24" height="24"><br>Visual Studio Code</a></td>
-<td width="50%" align="center"><a href="docs/setup.md#connect-an-mcp-client-intentionally">And more</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#warp"><img src="assets/clients/warp.svg" alt="" width="24" height="24"><br>Warp</a></td>
+</tr>
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#antigravity-cli"><img src="assets/clients/antigravity.svg" alt="" width="24" height="24"><br>Antigravity CLI</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/clients/opencode-logo-dark.svg"><img src="assets/clients/opencode-logo-light.svg" alt="" width="19" height="24"></picture><br>OpenCode</a></td>
+</tr>
+<tr>
+<td width="50%" align="center"><a href="docs/clients.md#amp"><img src="assets/clients/amp.svg" alt="" width="24" height="24"><br>Amp</a></td>
+<td width="50%" align="center"><a href="docs/clients.md#factory-droid"><img src="assets/clients/factory-droid.svg" alt="" width="24" height="24"><br>Factory Droid</a></td>
 </tr>
 </table>
+
+[Other local MCP clients](docs/setup.md#connect-an-mcp-client-intentionally) can
+use the same read-only server when their configuration supports local stdio.
 
 ## Supported data
 
@@ -89,8 +120,6 @@ You can also follow release news and see what we're working on next.
 - **Install and use:** [Setup and troubleshooting](docs/setup.md) · [Supported data](docs/supported-health-data.md) · [Support](https://healthbridge.chanhyo.dev/support)
 - **Understand and build:** [Architecture](docs/architecture.md) · [Compatibility](docs/versioning.md) · [Batch protocol](docs/reference/batch-v1.md) · [SQLite schema](docs/reference/sqlite-v1.md) · [Brand guide](docs/brand.md)
 - **Contribute:** [Development setup](.github/CONTRIBUTING.md) · [Contribution ideas](docs/contribution-ideas.md) · [Build the iPhone app](docs/self-build.md)
-
-Published components: **Receiver/CLI** `1.1.5` · **iOS Companion** `1.1.1` (build `50`) · **Batch Protocol** `1.0.0`. See [release downloads](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.1.5), [candidate source versions](component-versions.json), and the [compatibility policy](docs/versioning.md).
 
 ## License
 

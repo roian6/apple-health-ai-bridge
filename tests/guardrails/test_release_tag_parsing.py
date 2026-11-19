@@ -28,35 +28,6 @@ def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.parametrize(
-    ("tag", "version", "prerelease"),
-    [
-        ("v1.0.0", "1.0.0", False),
-        ("v1.0.1", "1.0.1", False),
-        ("receiver-v1.0.2", "1.0.2", False),
-        ("receiver-v0.3.4", "0.3.4", True),
-    ],
-)
-def test_tag_info_uses_canonical_receiver_tag_parser(
-    tag: str,
-    version: str,
-    prerelease: bool,
-) -> None:
-    # Given: a supported historical or component-scoped Receiver/CLI tag.
-
-    # When: the workflow-facing parser reports its canonical identity.
-    completed = _run_release_tool("tag-info", "--tag", tag)
-
-    # Then: version and prerelease state come from one parsed representation.
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {
-        "prerelease": prerelease,
-        "tag": tag,
-        "title": tag,
-        "version": version,
-    }
-
-
-@pytest.mark.parametrize(
     "tag",
     [
         "v0.1.0",

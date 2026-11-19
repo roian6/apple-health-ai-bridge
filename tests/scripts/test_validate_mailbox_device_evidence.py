@@ -67,7 +67,7 @@ def test_valid_aggregate_report_uses_local_anchor_and_consumes_challenge(
 ) -> None:
     fixture = build_synthetic_evidence(tmp_path / "evidence")
 
-    result = run_validator(fixture)
+    result = run_validator(fixture, process=True)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "PASS mailbox physical evidence\n"

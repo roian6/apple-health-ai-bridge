@@ -23,7 +23,7 @@ class ProjectLock(BaseModel):
     package: list[LockedPackage]
 
 
-def test_current_coordinated_receiver_matches_ios_1_2_0_build_51() -> None:
+def test_coordinated_receiver_metadata_matches_current_component_versions() -> None:
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = cast("dict[str, object]", tomllib.load(handle)["project"])
     component_versions = cast(
@@ -52,17 +52,17 @@ def test_current_coordinated_receiver_matches_ios_1_2_0_build_51() -> None:
         "release_tag": f"receiver-v{__version__}",
         "version": __version__,
     }
-    assert component_versions["release_scope"] == "receiver"
+    assert component_versions["release_scope"] == "coordinated"
     assert helper_info["CFBundleShortVersionString"] == __version__
     assert helper_info["CFBundleVersion"] == "1"
-    assert ios == {"build": "51", "marketing_version": "1.2.0"}
-    assert ios_project.count("MARKETING_VERSION = 1.2.0;") == 2
-    assert ios_project.count("CURRENT_PROJECT_VERSION = 51;") == 2
+    assert ios == {"build": "52", "marketing_version": "1.2.1"}
+    assert ios_project.count("MARKETING_VERSION = 1.2.1;") == 2
+    assert ios_project.count("CURRENT_PROJECT_VERSION = 52;") == 2
     notes = (ROOT / f".github/release/notes-receiver-v{__version__}.md").read_text(
         encoding="utf-8"
     )
-    assert "Receiver-only release" in notes
-    assert "Compatible iOS Companion: `1.2.0 (51)`" in notes
+    assert "Coordinated release" in notes
+    assert "Compatible iOS Companion: `1.2.1 (52)`" in notes
     assert "Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`" in notes
     assert f"@receiver-v{__version__}" in notes
     assert set(re.findall(r"^- `([^`]+)`[.;]?", notes, re.MULTILINE)) == {

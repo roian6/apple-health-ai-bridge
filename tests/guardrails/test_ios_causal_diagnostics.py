@@ -12,7 +12,7 @@ def test_each_automatic_healthkit_query_has_typed_start_and_result_seams() -> No
     for query in (
         "let changes: HealthKitAnchoredStepChanges",
         "let aggregates: [HealthKitDailyActivityAggregate]",
-        "let changes = try await HealthKitWorkoutReader",
+        "let changes: HealthKitAnchoredWorkoutChanges",
         "let changes: HealthKitAnchoredSleepChanges",
         "let changes: HealthKitAnchoredQuantityChanges",
     ):

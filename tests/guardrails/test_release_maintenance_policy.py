@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -15,6 +16,7 @@ from tests.guardrails.release_policy_fixtures import (
     REPOSITORY,
     TAG,
     ReleaseGraph,
+    install_transport,
     obj,
     policy_document,
     release_graph,
@@ -25,6 +27,7 @@ from tests.guardrails.release_version_fixtures import (
     commit_release_tree,
     git_output,
 )
+from tests.script_runner import run_script
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,31 +35,44 @@ if TYPE_CHECKING:
 PREFIX = f"/repos/{REPOSITORY}"
 
 
+@pytest.fixture(scope="module")
+def graph_template(tmp_path_factory: pytest.TempPathFactory) -> ReleaseGraph:
+    with pytest.MonkeyPatch.context() as environment:
+        return release_graph(
+            tmp_path_factory.mktemp("release-policy-template"), environment
+        )
+
+
 @pytest.fixture
-def graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReleaseGraph:
-    return release_graph(tmp_path, monkeypatch)
+def graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, graph_template: ReleaseGraph
+) -> ReleaseGraph:
+    repo = tmp_path / "repo"
+    _ = shutil.copytree(graph_template.repo, repo)
+    _ = git_output(repo, "config", "core.hooksPath", str(repo / ".git/hooks"))
+    _ = git_output(repo, "remote", "set-url", "origin", str(repo))
+    result = replace(graph_template, repo=repo, transport=tmp_path / "transport.json")
+    result.write(graph_template.read())
+    install_transport(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOURCE_TRANSPORT", str(result.transport))
+    return result
 
 
 def run_source(
-    graph: ReleaseGraph, *, local_tag: bool = False
+    graph: ReleaseGraph, *, local_tag: bool = False, process: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/release_source_policy.py"),
-            "--repo",
-            str(graph.repo),
-            "--tag",
-            graph.tag,
-            "--commit",
-            graph.target,
-            "--tag-object",
-            graph.tag_object,
-            *(["--local-tag"] if local_tag else []),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    return run_script(
+        ROOT / "scripts/release_source_policy.py",
+        "--repo",
+        str(graph.repo),
+        "--tag",
+        graph.tag,
+        "--commit",
+        graph.target,
+        "--tag-object",
+        graph.tag_object,
+        *(["--local-tag"] if local_tag else []),
+        process=process,
     )
 
 
@@ -94,7 +110,7 @@ def test_fixture_ignores_arbitrary_caller_refs(tmp_path: Path, detached: bool) -
 
 
 def test_exact_reviewed_source_resolves_published_baseline(graph: ReleaseGraph) -> None:
-    result = run_source(graph)
+    result = run_source(graph, process=True)
     assert result.returncode == 0, result.stderr
     receipt = TypeAdapter(dict[str, JsonValue]).validate_json(result.stdout)
     assert receipt["source_commit"] == graph.target

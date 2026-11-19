@@ -1,5 +1,7 @@
 # Pairing and receiver setup
 
+For released iOS Companion `1.2.0` (build `51`) with Receiver/CLI `1.2.0`, start with the maintained [setup guide](setup.md). This protocol reference also describes later development behavior: the explicit lost-key recovery and authenticated cancellation retry corrections remain [Unreleased](../CHANGELOG.md#unreleased) and are not included in build `51`. Do not rely on those recovery corrections when operating that build.
+
 Pairing connects the iOS companion to a receiver that you run. The default flow is **QR-first secure invitation pairing**: setup material contains a short-lived, single-use invitation, not the receiver bearer credential used for later health uploads.
 
 Setup pages, QR codes, copied links, and invitation codes are still private. Anyone who obtains an unexpired invitation may redeem it first.

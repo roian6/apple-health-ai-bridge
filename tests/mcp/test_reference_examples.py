@@ -9,6 +9,7 @@ from typing import Final
 from pydantic import BaseModel, JsonValue
 from typer.core import TyperGroup
 from typer.main import get_command
+from typer.testing import CliRunner
 
 from health_bridge.cli import app
 from health_bridge.mcp.tools import MCP_TOOL_DEFINITIONS
@@ -58,6 +59,7 @@ def test_cli_reference_covers_registered_public_commands_and_options() -> None:
     # Given
     reference = (REFERENCE / "cli.md").read_text()
     pending = [("", get_command(app))]
+    runner = CliRunner()
     # When
     while pending:
         prefix, command = pending.pop()
@@ -71,14 +73,8 @@ def test_cli_reference_covers_registered_public_commands_and_options() -> None:
                     prefix,
                     option,
                 )
-        completed = run(
-            ["uv", "run", "health-bridge", *prefix.split(), "--help"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        assert completed.returncode == 0, completed.stderr
+        completed = runner.invoke(app, [*prefix.split(), "--help"])
+        assert completed.exit_code == 0, (prefix, completed.output, completed.exception)
         if isinstance(command, TyperGroup):
             pending.extend(
                 (f"{prefix} {name}", child) for name, child in command.commands.items()

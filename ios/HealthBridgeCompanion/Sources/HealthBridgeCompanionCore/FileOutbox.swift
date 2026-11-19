@@ -349,19 +349,23 @@ public struct FileOutboxCursorCheckpoint: Codable, Equatable, Sendable {
     public let cursorKind: String
     public let cursorValue: String
     public let coreLaneUploadProof: FileOutboxCoreLaneUploadProof?
+    /// Coverage associated with this workout anchor, earned by the same transaction.
+    public let workoutHistoryStart: Date?
 
     public init(
         receiverIdentity: String,
         sourceKey: String,
         cursorKind: String,
         cursorValue: String,
-        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil
+        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil,
+        workoutHistoryStart: Date? = nil
     ) {
         self.receiverIdentity = receiverIdentity
         self.sourceKey = sourceKey
         self.cursorKind = cursorKind
         self.cursorValue = cursorValue
         self.coreLaneUploadProof = coreLaneUploadProof
+        self.workoutHistoryStart = workoutHistoryStart
     }
 }
 
@@ -651,6 +655,7 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    private var decodedManifest: (bytes: Data, value: SequenceManifest)?
     var observeNutritionCodec: @Sendable () -> Void = {}
     var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
     var nutritionSplitFault: (NutritionSplitBoundary) throws -> Void = { _ in }
@@ -2592,41 +2597,131 @@ public final class FileOutbox {
 
     private func recoverEnqueueTransactionsIfNeeded() throws {
         let transactions = try loadEnqueueTransactions()
+        guard !transactions.isEmpty else { return }
+        let loadedManifest = try loadManifest()
+        var manifest = loadedManifest ?? .empty
+        var manifestEntries = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
+        )
+        var sequenceOwners = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.sequence, $0.id) }
+        )
+        var removedIDs: Set<String> = []
+        var additions: [SequenceEntry] = []
+        var retainedTransactions: [EnqueueTransaction] = []
         for transaction in transactions {
-            let loadedManifest = try loadManifest()
-            var manifest = loadedManifest ?? .empty
-            try Self.validate(manifest)
-            let manifestEntries = Dictionary(
-                uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
-            )
-            let allPayloadsAreRecoverable = !clearIntentIsActive
-                && transaction.entries.allSatisfy { entry in
-                    transaction.directAcknowledgedIDs.contains(entry.id)
-                        || fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
-                        || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
-                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
+            let acknowledgedIDs = transaction.directAcknowledgedIDs
+            let payloads = transaction.entries.map { entry in
+                (
+                    entry: entry,
+                    staged: fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path),
+                    final: fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                )
+            }
+            let isApplied = !destructiveRecoveryIsRequested
+                && payloads.allSatisfy { payload in
+                    let entry = payload.entry
+                    guard manifest.nextSequence > entry.sequence, !payload.staged else {
+                        return false
+                    }
+                    if acknowledgedIDs.contains(entry.id) {
+                        return manifestEntries[entry.id] == nil && !payload.final
+                    }
+                    guard let current = manifestEntries[entry.id],
+                          Self.hasSameCollectionIdentity(current, entry) else {
+                        return false
+                    }
+                    return payload.final || current.deliveryState?.phase == .committedFinalized
                 }
-            if allPayloadsAreRecoverable {
-                _ = try commitEnqueueTransaction(transaction, manifest: manifest)
+            if isApplied {
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
                 continue
             }
-            if !transaction.directAcknowledgedIDs.isEmpty
+            let allPayloadsAreRecoverable = !clearIntentIsActive
+                && payloads.allSatisfy { payload in
+                    acknowledgedIDs.contains(payload.entry.id)
+                        || payload.staged || payload.final
+                        || manifestEntries[payload.entry.id]?.deliveryState?.phase == .committedFinalized
+                }
+            if allPayloadsAreRecoverable {
+                let additionsStart = additions.endIndex
+                for payload in payloads {
+                    let entry = payload.entry
+                    guard entry.sequence < UInt64.max else { throw SequenceError.exhausted }
+                    manifest.nextSequence = max(manifest.nextSequence, entry.sequence + 1)
+                    let stagedURL = stagedPayloadURL(for: entry.id)
+                    let finalURL = finalPayloadURL(for: entry.id)
+                    if acknowledgedIDs.contains(entry.id) {
+                        try removeIfExists(stagedURL)
+                        try removeIfExists(finalURL)
+                        if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                            sequenceOwners.removeValue(forKey: removed.sequence)
+                            removedIDs.insert(entry.id)
+                        }
+                        continue
+                    }
+                    if payload.staged {
+                        try Self.applySensitiveFileAttributes(to: stagedURL, fileManager: fileManager)
+                        if payload.final {
+                            try fileManager.removeItem(at: stagedURL)
+                        } else {
+                            try fileManager.moveItem(at: stagedURL, to: finalURL)
+                        }
+                    }
+                    let hasFinalPayload = fileManager.fileExists(atPath: finalURL.path)
+                    guard hasFinalPayload
+                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized else {
+                        throw SequenceError.invalidManifest
+                    }
+                    if hasFinalPayload {
+                        try Self.applySensitiveFileAttributes(to: finalURL, fileManager: fileManager)
+                    }
+                    if manifestEntries[entry.id] == nil {
+                        guard entry.sequence > 0, Self.isSafeItemID(entry.id) else {
+                            throw SequenceError.invalidManifest
+                        }
+                        manifestEntries[entry.id] = entry
+                        additions.append(entry)
+                    }
+                }
+                for entry in additions[additionsStart...] {
+                    guard sequenceOwners[entry.sequence] == nil else {
+                        throw SequenceError.invalidManifest
+                    }
+                    sequenceOwners[entry.sequence] = entry.id
+                }
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
+                continue
+            }
+            if !acknowledgedIDs.isEmpty
                 || transaction.entries.contains(where: {
                 manifestEntries[$0.id]?.deliveryState?.phase == .committedFinalized
             }) {
                 throw FileOutboxCursorCheckpointError.pendingCommit
             }
 
-            let transactionIDs = Set(transaction.entries.map(\.id))
             for entry in transaction.entries {
                 try removeIfExists(stagedPayloadURL(for: entry.id))
                 try removeIfExists(finalPayloadURL(for: entry.id))
+                if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                    sequenceOwners.removeValue(forKey: removed.sequence)
+                    removedIDs.insert(entry.id)
+                }
             }
-            manifest.entries.removeAll { transactionIDs.contains($0.id) }
-            if manifest != loadedManifest {
-                try persistManifest(manifest)
-            }
-            try removeEnqueueTransaction(transaction)
+        }
+        manifest.entries.removeAll { removedIDs.contains($0.id) }
+        manifest.entries.append(contentsOf: additions)
+        if manifest != loadedManifest {
+            try persistManifest(manifest)
+        }
+        // Journal pruning must follow the manifest durability boundary, including
+        // when a later transaction fails after earlier payloads have moved.
+        if retainedTransactions != transactions {
+            try persistEnqueueTransactions(retainedTransactions)
         }
     }
 
@@ -2636,6 +2731,10 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        // Hold all recovery, including orphan adoption, until terminal reset proceeds.
+        if terminalResetRequestIsActive {
+            return try loadManifest() ?? .empty
+        }
         try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
@@ -2725,12 +2824,16 @@ public final class FileOutbox {
 
     private func loadManifest() throws -> SequenceManifest? {
         guard fileManager.fileExists(atPath: sequenceURL.path) else { return nil }
-        let manifest = try JSONDecoder().decode(
-            SequenceManifest.self,
-            from: Data(contentsOf: sequenceURL)
-        )
+        let bytes = try Data(contentsOf: sequenceURL)
+        let manifest: SequenceManifest
+        if let decodedManifest, decodedManifest.bytes == bytes {
+            manifest = decodedManifest.value
+        } else {
+            manifest = try JSONDecoder().decode(SequenceManifest.self, from: bytes)
+        }
         try Self.validate(manifest)
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
         return manifest
     }
 
@@ -2738,8 +2841,10 @@ public final class FileOutbox {
         try Self.validate(manifest)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(manifest).write(to: sequenceURL, options: [.atomic])
+        let bytes = try encoder.encode(manifest)
+        try bytes.write(to: sequenceURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
     }
 
     private static func validate(_ manifest: SequenceManifest) throws {

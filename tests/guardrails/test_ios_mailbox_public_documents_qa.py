@@ -365,14 +365,22 @@ def test_production_mailbox_ui_is_truthful_about_readiness_and_holds() -> None:
     view_model = (IOS_ROOT / "App/HealthBridgeCompanionViewModel.swift").read_text(
         encoding="utf-8"
     )
-    content = (IOS_ROOT / "App/ContentView.swift").read_text(encoding="utf-8")
+    content = (IOS_ROOT / "App/ConnectionSettingsView.swift").read_text(
+        encoding="utf-8"
+    )
+    presentation = (
+        IOS_ROOT / "Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text(encoding="utf-8")
 
     assert "Mailbox folder is ready on this iPhone" in view_model
     assert "Receiver delivery has not been verified" in view_model
     assert "Receiver rejected" in view_model
     assert "signed ACK" not in view_model
     assert 'viewModel.usesMailboxTransport ? "Check Mailbox Folder"' in content
-    assert "pending secure delivery item(s)" in content
+    assert (
+        "usesMailboxTransport ? .mailboxConfirmationWaiting : .directQueued"
+        in presentation
+    )
 
 
 def test_public_documents_entitlements_are_cloud_documents_only() -> None:

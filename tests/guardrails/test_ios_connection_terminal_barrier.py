@@ -37,7 +37,7 @@ def test_disconnect_is_async_and_uses_the_terminal_connection_barrier() -> None:
     assert "cancelPairingOperation: true" in body
     assert "pairingCoordinator.cancelPendingPairing(" in body
 
-    content = CONTENT_VIEW.read_text()
+    content = CONTENT_VIEW.with_name("ConnectionSettingsView.swift").read_text()
     assert "Task {" in content
     assert "await viewModel.disconnectReceiver()" in content
 
@@ -820,20 +820,18 @@ def test_background_upload_cancellation_is_bounded() -> None:
         "private func runWithExclusiveDirectOutboxTransfer<Result>("
     )
     transfer_end = source.index(
-        "private func finishExclusiveDirectOutboxTransfer()", transfer_start
+        "private func finishExclusiveDirectOutboxTransfer(", transfer_start
     )
     transfer_body = source[transfer_start:transfer_end]
     cancel = transfer_body.index("cancelPendingUploads()")
     verify_empty = transfer_body.index("hasPendingUploadTasks()", cancel)
-    operation = transfer_body.index("let result = await operation()", verify_empty)
+    operation = transfer_body.index("let result = try await operation()", verify_empty)
     assert cancel < verify_empty < operation
     assert "throw CancellationError()" in transfer_body[verify_empty:operation]
 
 
 def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
-    content = CONTENT_VIEW.read_text()
-    start = content.index("private struct ReceiverSettingsView: View")
-    body = content[start:]
+    body = CONTENT_VIEW.with_name("ConnectionSettingsView.swift").read_text()
 
     assert "@State private var showDisconnectFailureAlert = false" in body
     view_model = VIEW_MODEL.read_text()
@@ -867,10 +865,12 @@ def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
         '"Reset Private Sync State (\\(viewModel.pendingOutboxCount) queued)"' in body
     )
     assert '"Delete Queued Uploads (' not in body
-    assert '.confirmationDialog("Reset private sync state?"' in body
+    assert "isPresented: $showPrivateResetConfirmation" in body
+    assert "showPrivateResetConfirmation = true" in body
     assert 'Button("Reset Private Sync State", role: .destructive)' in body
-    assert 'message.contains("disconnect")' in body
-    assert 'message.contains("queued upload")' in body
+    assert "viewModel.displayStatusMessage" in body
+    assert 'message.contains("disconnect")' not in body
+    assert 'message.contains("queued upload")' not in body
 
 
 def test_healthkit_callbacks_are_invalidated_when_observers_stop() -> None:

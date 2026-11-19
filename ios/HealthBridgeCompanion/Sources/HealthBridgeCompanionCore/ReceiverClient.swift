@@ -578,20 +578,26 @@ public enum ReceiverPairingCancellationOutcome: Equatable, Sendable {
     case committedCleanupPending
 }
 
+public enum NativeMailboxPairingRead: Sendable {
+    case missing
+    case downloading
+    case available(Data)
+}
+
 // Operations only; pending state, authentication and commit remain coordinator-owned.
 // Merely constructing this dependency performs no provider or filesystem access.
 @MainActor
 public struct NativeMailboxPairingIO {
     public let resolve: (MailboxBootstrapDescriptor) throws -> URL
     public let publish: (URL, Data) throws -> Void
-    public let read: (URL) throws -> Data?
+    public let read: (URL) throws -> NativeMailboxPairingRead
     public let hydrate: (URL) throws -> Void
     public let wait: () async throws -> Void
 
     public init(
         resolve: @escaping (MailboxBootstrapDescriptor) throws -> URL,
         publish: @escaping (URL, Data) throws -> Void,
-        read: @escaping (URL) throws -> Data?,
+        read: @escaping (URL) throws -> NativeMailboxPairingRead,
         hydrate: @escaping (URL) throws -> Void,
         wait: @escaping () async throws -> Void
     ) {
@@ -928,13 +934,25 @@ public final class ReceiverPairingCoordinator {
         guard let descriptor = pending.mailboxBootstrap, let request = pending.sealedRequest else {
             throw ReceiverPairingRedeemError.invalidResponse
         }
-        let cancel = try NativeMailboxPairing.cancellation(pending, keys: mailboxKeyStore)
         let io = nativeMailboxIO ?? NativeMailboxPairingIO.live()
         let directory = try io.resolve(descriptor)
         try requireNativeCancellationAuthority(pending)
+        let cancelURL = directory.appendingPathComponent("cancel.hbp")
+        try io.hydrate(cancelURL)
+        try requireNativeCancellationAuthority(pending)
+        let existing: Data?
+        let cancellationRead = try io.read(cancelURL)
+        try requireNativeCancellationAuthority(pending)
+        switch cancellationRead {
+        case .missing: existing = nil
+        case .downloading: throw MailboxLocatorError.storageFailure
+        case .available(let bytes): existing = bytes
+        }
+        let cancel = try NativeMailboxPairing.cancellation(pending, keys: mailboxKeyStore, existing: existing)
+        try requireNativeCancellationAuthority(pending)
         // Publish intent first: if the original provider effect never completed,
         // the receiver must see cancellation when the exact request arrives.
-        try io.publish(directory.appendingPathComponent("cancel.hbp"), cancel)
+        try io.publish(cancelURL, cancel)
         try requireNativeCancellationAuthority(pending)
         try io.publish(directory.appendingPathComponent("request.hbp"), request)
         try requireNativeCancellationAuthority(pending)
@@ -977,13 +995,16 @@ public final class ReceiverPairingCoordinator {
             try requireAuthority()
             try io.hydrate(url)
             try requireAuthority()
-            let bytes = try io.read(url)
+            let result = try io.read(url)
             try requireAuthority()
-            if let bytes {
+            switch result {
+            case .available(let bytes):
                 guard !bytes.isEmpty, bytes.count <= NativeMailboxPairing.maximumBytes else {
                     throw ReceiverPairingRedeemError.invalidResponse
                 }
                 return bytes
+            case .missing, .downloading:
+                break
             }
             if attempt < 14 {
                 try await io.wait()
@@ -1071,16 +1092,16 @@ extension NativeMailboxPairingIO {
             try FileProviderMailboxEnvelopePublisher().publishPairing(bytes, to: url, locator: checked(url))
         }, read: { url in
             let locator = try checked(url)
-            guard try MailboxLocatorV1.pairingFileExists(url, locator: locator) else { return nil }
+            guard try MailboxLocatorV1.pairingFileExists(url, locator: locator) else { return .missing }
             #if os(iOS)
             let values = try url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-            if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus != .current { return nil }
+            if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus != .current { return .downloading }
             #endif
             let bytes = try MailboxRegularFileReader.read(url, maximumBytes: 65_536) {
                 try MailboxLocatorV1.revalidatePairing(locator)
             }
             try MailboxLocatorV1.revalidatePairing(locator)
-            return bytes
+            return .available(bytes)
         }, hydrate: { url in
             let locator = try checked(url)
             if try MailboxLocatorV1.pairingFileExists(url, locator: locator) {
@@ -1233,7 +1254,7 @@ private enum NativeMailboxPairing {
             bearerToken: "", tokenPrefix: "", mailboxIdentity: expected)
     }
 
-    static func cancellation(_ pending: ReceiverPendingPairing, keys: MailboxKeyStore) throws -> Data {
+    static func cancellation(_ pending: ReceiverPendingPairing, keys: MailboxKeyStore, existing: Data?) throws -> Data {
         let device = try verifyRequest(pending, keys: keys)
         guard let request = pending.sealedRequest, let bootstrap = pending.mailboxBootstrap else {
             throw ReceiverPairingRedeemError.invalidResponse
@@ -1241,6 +1262,19 @@ private enum NativeMailboxPairing {
         var fields: [String: HBJCS1Value] = ["v": .integer(1), "kind": .string("cancel"),
             "invitation_id": .string(bootstrap.invitationID), "request_sha256": .string(hash(request).hexV1),
             "sender_signing_public_key": .string(device.signingPublicKey.base64URLEncodedString())]
+        if let existing {
+            var published = try object(existing, keys: cancellationFields)
+            let signature = try bytes(string(published, "signature"), count: 64)
+            published.removeValue(forKey: "signature")
+            let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+            guard published == fields,
+                  try publicKey.isValidSignature(signature, for: prefixed("cancel/signature\0", fields: published)) else {
+                throw ReceiverPairingRedeemError.invalidResponse
+            }
+            // CryptoKit signatures need not be byte-identical across invocations.
+            // The immutable publication, not a fresh signature, owns retry bytes.
+            return existing
+        }
         fields["signature"] = .string(try keys.sign(prefixed("cancel/signature\0", fields: fields)).base64URLEncodedString())
         return try bounded(canonical(fields))
     }

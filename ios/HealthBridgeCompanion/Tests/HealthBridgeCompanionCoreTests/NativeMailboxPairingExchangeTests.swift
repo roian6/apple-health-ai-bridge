@@ -137,6 +137,7 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         XCTAssertEqual(try f.state().loadPending()?.deviceCredential, pending.deviceCredential)
         XCTAssertGreaterThan(f.cancelPublications, 0, "NOT_REACHED: authenticated cancel publication")
         XCTAssertTrue(f.requests.allSatisfy { $0 == request })
+        let publishedCancellation = try Data(contentsOf: f.cancellationURL)
         f.allowReceipt = true
         for tamper in ["requestDigest", "signature"] {
             f.peer.receiptTamper = tamper
@@ -155,6 +156,7 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         XCTAssertNil(try f.state().loadPending())
         XCTAssertFalse(try f.state().hasPendingCancellation())
         XCTAssertNotEqual(f.settings.activeTransport, .mailbox)
+        XCTAssertEqual(try Data(contentsOf: f.cancellationURL), publishedCancellation)
     }
     func testExplicitPrivateResetClearsPublishedNativeAuthority() async throws {
         let f = try ExchangeFixture()
@@ -183,6 +185,119 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         XCTAssertEqual(try state.loadOrCreateInstallationID(), pending.installationID)
         XCTAssertEqual(f.requests.count, 1)
         XCTAssertEqual(f.cancelPublications, 0)
+    }
+
+    func testCancellationRetryRetainsAuthorityUntilPublishedFileIsDownloaded() async throws {
+        let f = try ExchangeFixture()
+        defer { f.close() }
+        let original = try await f.publishCancellationAwaitingReceipt()
+        let pending = try f.state().loadPending()
+        let publications = f.cancelPublications
+        f.cancellationDownloading = true
+        f.allowReceipt = true
+
+        do {
+            _ = try await f.coordinator().resumePendingPairing()
+            XCTFail("An unhydrated cancellation must not be replaced")
+        } catch {
+            XCTAssertEqual(error as? MailboxLocatorError, .storageFailure)
+        }
+        XCTAssertEqual(f.cancelPublications, publications)
+        XCTAssertEqual(try f.state().loadPending(), pending)
+        XCTAssertTrue(try f.state().hasPendingCancellation())
+        XCTAssertEqual(f.receiptReads, 0)
+
+        f.cancellationDownloading = false
+        _ = try await f.coordinator().resumePendingPairing()
+        XCTAssertEqual(try Data(contentsOf: f.cancellationURL), original)
+        XCTAssertNil(try f.state().loadPending())
+    }
+
+    func testCancellationRetryRejectsUntrustedPublishedBytesWithoutReplacingThem() async throws {
+        let invalidFields: [(String, HBJCS1Value)] = [
+            ("v", .integer(2)), ("kind", .string("cancelled")),
+            ("invitation_id", .string(String(repeating: "0", count: 32))),
+            ("request_sha256", .string(String(repeating: "0", count: 64))),
+            ("sender_signing_public_key", .string(Data(repeating: 0x41, count: 32).base64URLEncodedString())),
+            ("extra", .string("synthetic")), ("signature", .string("invalid")),
+            ("malformed", .null), ("oversized", .null),
+        ]
+        for (field, value) in invalidFields {
+            let f = try ExchangeFixture()
+            defer { f.close() }
+            let original = try await f.publishCancellationAwaitingReceipt()
+            guard case .object(var fields) = try DeliveryProtocolV1.decodeMetadata(original) else {
+                return XCTFail("Expected the real published cancellation")
+            }
+            fields.removeValue(forKey: "signature")
+            if field != "signature" { fields[field] = value }
+            let signed = try Data("health-bridge/mailbox-pairing/v1/cancel/signature\0".utf8)
+                + DeliveryProtocolV1.encodeMetadata(.object(fields))
+            fields["signature"] = .string(try f.keys.sign(signed).base64URLEncodedString())
+            if field == "signature" {
+                fields["signature"] = .string(Data(repeating: 0, count: 64).base64URLEncodedString())
+            }
+            let invalid: Data
+            switch field {
+            case "malformed": invalid = Data("{".utf8)
+            case "oversized": invalid = Data(repeating: 0x20, count: 65_537)
+            default: invalid = try DeliveryProtocolV1.encodeMetadata(.object(fields))
+            }
+            try ExchangePeer.write(invalid, to: f.cancellationURL)
+            let pending = try f.state().loadPending()
+            let publications = f.cancelPublications
+            f.allowReceipt = true
+
+            do {
+                _ = try await f.coordinator().resumePendingPairing()
+                XCTFail("Untrusted cancellation accepted: \(field)")
+            } catch { }
+            XCTAssertEqual(f.cancelPublications, publications, field)
+            XCTAssertEqual(f.receiptReads, 0, field)
+            XCTAssertEqual(try f.state().loadPending(), pending, field)
+            XCTAssertTrue(try f.state().hasPendingCancellation(), field)
+            XCTAssertEqual(try Data(contentsOf: f.cancellationURL), invalid, field)
+        }
+    }
+
+    func testCancellationPublicationRacePreservesTheExistingSignedFile() async throws {
+        let f = try ExchangeFixture()
+        defer { f.close() }
+        let original = try await f.publishCancellationAwaitingReceipt()
+        f.allowReceipt = true
+        f.hideCancellationOnce = true
+
+        do {
+            _ = try await f.coordinator().resumePendingPairing()
+        } catch {
+            XCTAssertEqual(error as? MailboxPublicationError, .conflict)
+            XCTAssertTrue(try f.state().hasPendingCancellation())
+            _ = try await f.coordinator().resumePendingPairing()
+        }
+
+        XCTAssertEqual(try Data(contentsOf: f.cancellationURL), original)
+        XCTAssertNil(try f.state().loadPending())
+        XCTAssertFalse(try f.state().hasPendingCancellation())
+    }
+
+    func testCancellationReadCannotPublishAfterAuthorityIsCleared() async throws {
+        let f = try ExchangeFixture()
+        defer { f.close() }
+        let original = try await f.publishCancellationAwaitingReceipt()
+        let publications = f.cancelPublications
+        let state = f.state()
+        f.cancellationReadAction = { try state.resetPrivatePairingState() }
+        f.allowReceipt = true
+
+        do {
+            _ = try await f.coordinator().resumePendingPairing()
+            XCTFail("Superseded cancellation must not publish")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(f.cancelPublications, publications)
+        XCTAssertEqual(f.receiptReads, 0)
+        XCTAssertEqual(try Data(contentsOf: f.cancellationURL), original)
     }
 
     func testUnavailableNativeContainerCanCancelWithoutReceipt() async throws {
@@ -289,6 +404,9 @@ private final class ExchangeFixture {
     var publishedPending: ReceiverPendingPairing?
     var completionReads = 0, cancelPublications = 0, receiptReads = 0, resolutions = 0
     var allowCompletion = true, allowReceipt = true
+    var cancellationDownloading = false
+    var hideCancellationOnce = false
+    var cancellationReadAction: (() throws -> Void)?
     var resolveAction: (() throws -> Void)?
 
     init() throws {
@@ -327,6 +445,11 @@ private final class ExchangeFixture {
                 XCTFail("Operation escaped private fixture root")
                 throw ExchangeFailure.invalidPeer
             }
+            // Match the provider's immutable publication contract on every retry.
+            if FileManager.default.fileExists(atPath: url.path),
+               try MailboxRegularFileReader.read(url, maximumBytes: 65_536) != bytes {
+                throw MailboxPublicationError.conflict
+            }
             if url.lastPathComponent == "request.hbp" {
                 let staged = try XCTUnwrap(state().loadPending())
                 XCTAssertTrue(staged.publicationMayHaveOccurred)
@@ -349,14 +472,22 @@ private final class ExchangeFixture {
                 throw ExchangeFailure.invalidPeer
             }
             if url.lastPathComponent == "completion.hbp" {
-                if !allowCompletion { return nil }
+                if !allowCompletion { return .missing }
                 completionReads += 1
             }
             if url.lastPathComponent == "cancelled.hbp" {
-                if !allowReceipt { return nil }
+                if !allowReceipt { return .missing }
                 receiptReads += 1
             }
-            return FileManager.default.fileExists(atPath: url.path) ? try Data(contentsOf: url) : nil
+            if url.lastPathComponent == "cancel.hbp" {
+                try cancellationReadAction?()
+                if cancellationDownloading { return .downloading }
+                if hideCancellationOnce {
+                    hideCancellationOnce = false
+                    return .missing
+                }
+            }
+            return FileManager.default.fileExists(atPath: url.path) ? .available(try Data(contentsOf: url)) : .missing
         }, hydrate: { [self] url in
             guard url.isFileURL, url.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.path + "/") else {
                 XCTFail("Operation escaped private fixture root")
@@ -370,6 +501,26 @@ private final class ExchangeFixture {
         let cancel = try Data(contentsOf: directory.appendingPathComponent("cancel.hbp"))
         let receipt = try peer.cancelled(cancel: cancel, request: XCTUnwrap(requests.first))
         try ExchangePeer.write(receipt, to: directory.appendingPathComponent("cancelled.hbp"))
+    }
+
+    var cancellationURL: URL {
+        root.appendingPathComponent("provider/pairing/\(ExchangePeer.invitationID)/cancel.hbp")
+    }
+
+    func publishCancellationAwaitingReceipt() async throws -> Data {
+        allowCompletion = false
+        allowReceipt = false
+        do {
+            _ = try await coordinator().pair(invitation: peer.invitation())
+            XCTFail("Missing completion must preserve the request")
+        } catch ExchangeFailure.responseUnavailable { }
+        try coordinator().beginPendingCancellation()
+        do {
+            _ = try await coordinator().resumePendingPairing()
+            XCTFail("Missing receipt must preserve cancellation")
+        } catch ExchangeFailure.responseUnavailable { }
+        XCTAssertEqual(cancelPublications, 1)
+        return try Data(contentsOf: cancellationURL)
     }
 
     func close() {

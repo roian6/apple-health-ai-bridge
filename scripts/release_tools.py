@@ -203,14 +203,6 @@ def _stable_version_tuple(value: str, *, surface: str) -> tuple[int, int, int]:
     return parse_semantic_version(value, surface=surface).as_tuple()
 
 
-def _release_scope(versions: ReleaseVersions) -> str:
-    return versions.components.release_scope
-
-
-def _expected_receiver_tag(version: str) -> str:
-    return canonical_receiver_tag(version)
-
-
 def requires_provenance(tag: str) -> bool:
     return parse_receiver_release_tag(tag).version.as_tuple() >= (1, 1, 3)
 
@@ -278,7 +270,7 @@ def _validate_release_notes(
 
 def validate_tag(repo: Path, tag: str) -> ReleaseVersions:
     versions = read_versions(repo)
-    expected = _expected_receiver_tag(versions.project_version)
+    expected = canonical_receiver_tag(versions.project_version)
     if tag != expected:
         message = f"receiver release tag must exactly match package version: {expected}"
         raise ReleaseError(message)
@@ -492,7 +484,7 @@ def _read_component_snapshot(raw: str, *, surface: str) -> ComponentSnapshot:
     if not ios_build.isdecimal() or int(ios_build) < 1:
         message = f"{surface} iOS build must be a positive integer"
         raise ReleaseError(message)
-    expected_tag = _expected_receiver_tag(receiver_version)
+    expected_tag = canonical_receiver_tag(receiver_version)
     if receiver_tag != expected_tag:
         message = f"{surface} Receiver/CLI tag must be {expected_tag}"
         raise ReleaseError(message)
@@ -812,7 +804,7 @@ def create_manifest(request: ManifestRequest) -> None:
             "requires_python": versions.requires_python,
             "version": versions.project_version,
         },
-        "release_scope": _release_scope(versions),
+        "release_scope": versions.components.release_scope,
         "release_version": versions.project_version,
         "schema_id": "health_bridge.release.v4"
         if request.candidate
@@ -915,7 +907,7 @@ def _validate_release_metadata(
     if (
         payload.get("schema_id")
         not in {"health_bridge.release.v3", "health_bridge.release.v4"}
-        or payload.get("release_scope") != _release_scope(versions)
+        or payload.get("release_scope") != versions.components.release_scope
         or payload.get("release_version") != versions.project_version
         or payload.get("batch_contract") != _batch_contract(repo)
         or payload.get("ios") != _expected_ios_metadata(repo, versions)
@@ -1202,19 +1194,26 @@ def _verify_release_identity(
     request: DraftVerificationRequest,
     *,
     expected_draft: bool,
+    published_artifacts_only: bool = False,
 ) -> None:
+    if published_artifacts_only and expected_draft:
+        message = "published artifact audit requires a published release"
+        raise ReleaseError(message)
     state_name = "draft" if expected_draft else "published"
     parsed_tag = parse_receiver_release_tag(request.tag)
     if (
         payload.get("tag_name") != request.tag
-        or payload.get("name") != release_title(request.tag)
+        or (
+            not published_artifacts_only
+            and payload.get("name") != release_title(request.tag)
+        )
         or payload.get("draft") is not expected_draft
         or payload.get("prerelease") is not parsed_tag.is_prerelease
     ):
         message = f"GitHub {state_name} release metadata is not exact"
         raise ReleaseError(message)
     expected_notes = request.notes_file.read_text(encoding="utf-8")
-    if payload.get("body") != expected_notes:
+    if not published_artifacts_only and payload.get("body") != expected_notes:
         message = "release body does not match exact notes"
         raise ReleaseError(message)
 
@@ -1372,13 +1371,22 @@ def verify_final_release_state(
     *,
     expected_draft: bool,
     final: bool = True,
+    published_artifacts_only: bool = False,
 ) -> None:
+    if published_artifacts_only and not final:
+        message = "published artifact audit requires a final release packet"
+        raise ReleaseError(message)
     release = request.release
     payload = json.loads(release.release_json.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         message = "GitHub release response must be an object"
         raise ReleaseError(message)
-    _verify_release_identity(payload, release, expected_draft=expected_draft)
+    _verify_release_identity(
+        payload,
+        release,
+        expected_draft=expected_draft,
+        published_artifacts_only=published_artifacts_only,
+    )
     expected_names = verify_final_packet(
         HelperVerificationRequest(
             repo=release.repo,
@@ -1396,14 +1404,22 @@ def verify_final_release_state(
 
 
 def verify_release_state(
-    request: DraftVerificationRequest, *, expected_draft: bool
+    request: DraftVerificationRequest,
+    *,
+    expected_draft: bool,
+    published_artifacts_only: bool = False,
 ) -> None:
     versions = validate_tag(request.repo, request.tag)
     payload = json.loads(request.release_json.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         message = "GitHub release response must be an object"
         raise ReleaseError(message)
-    _verify_release_identity(payload, request, expected_draft=expected_draft)
+    _verify_release_identity(
+        payload,
+        request,
+        expected_draft=expected_draft,
+        published_artifacts_only=published_artifacts_only,
+    )
     metadata_payload = json.loads(
         (request.dist / "release-metadata.json").read_text(encoding="utf-8")
     )
@@ -1526,6 +1542,12 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         verify_packet_parser.add_argument("--tree", required=True)
     for command in ("verify-draft", "verify-published"):
         verify_release_parser = subparsers.add_parser(command)
+        if command == "verify-published":
+            verify_release_parser.add_argument(
+                "--published-artifacts-only",
+                action="store_true",
+                help="Audit published artifacts without hosted title/body equality.",
+            )
         verify_release_parser.add_argument("--repo", type=Path, required=True)
         verify_release_parser.add_argument("--dist-dir", type=Path, required=True)
         verify_release_parser.add_argument("--release-json", type=Path, required=True)
@@ -1549,6 +1571,12 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         "verify-final-published",
     ):
         final_parser = subparsers.add_parser(command)
+        if command == "verify-final-published":
+            final_parser.add_argument(
+                "--published-artifacts-only",
+                action="store_true",
+                help="Audit published artifacts without hosted title/body equality.",
+            )
         final_parser.add_argument("--repo", type=Path, required=True)
         final_parser.add_argument("--dist-dir", type=Path, required=True)
         final_parser.add_argument("--release-json", type=Path, required=True)
@@ -1640,7 +1668,7 @@ def main() -> int:  # noqa: C901, PLR0912
                         "ios_build": versions.ios_build,
                         "ios_marketing_version": versions.ios_marketing_version,
                         "project_version": versions.project_version,
-                        "release_scope": _release_scope(versions),
+                        "release_scope": versions.components.release_scope,
                         "tag": args.tag,
                     },
                     sort_keys=True,
@@ -1717,6 +1745,9 @@ def main() -> int:  # noqa: C901, PLR0912
                     tree=args.tree,
                 ),
                 expected_draft=args.command == "verify-draft",
+                published_artifacts_only=(
+                    args.command == "verify-published" and args.published_artifacts_only
+                ),
             )
         elif args.command == "verify-core-draft":
             verify_core_draft(
@@ -1753,6 +1784,10 @@ def main() -> int:  # noqa: C901, PLR0912
                 ),
                 expected_draft=args.command != "verify-final-published",
                 final=args.command != "verify-helper-draft",
+                published_artifacts_only=(
+                    args.command == "verify-final-published"
+                    and args.published_artifacts_only
+                ),
             )
     except (
         OSError,

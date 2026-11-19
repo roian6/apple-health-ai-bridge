@@ -78,6 +78,149 @@ final class AnchoredWorkoutSyncPolicyTests: XCTestCase {
         XCTAssertNil(plan.queryStart)
         XCTAssertNil(plan.bootstrapStartToPersist)
     }
+
+    func testManualHistoryRequestArmsBackfillWhileAnchorStaysIncremental() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let plan = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: "existing-anchor",
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: try date("2025-01-01T00:00:00Z"),
+            storedHistoryBackfillStartValue: nil,
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertNil(plan.queryStart)
+        XCTAssertNil(plan.bootstrapStartToPersist)
+        XCTAssertEqual(plan.historicalBackfillStart, try date("2025-01-01T00:00:00Z"))
+    }
+
+    func testManualHistoryRequestWidensFirstBootstrap() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let plan = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: nil,
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: try date("2025-01-01T00:00:00Z"),
+            storedHistoryBackfillStartValue: nil,
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(plan.queryStart, try date("2025-01-01T00:00:00Z"))
+        XCTAssertEqual(plan.bootstrapStartToPersist, try date("2025-01-01T00:00:00Z"))
+    }
+
+    func testManualHistoryRequestNeverShrinksTheDefaultBootstrapWindow() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let plan = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: nil,
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: try date("2026-06-01T00:00:00Z"),
+            storedHistoryBackfillStartValue: nil,
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(plan.queryStart, try date("2026-03-17T00:00:00Z"))
+    }
+
+    func testNarrowerManualDepthReplacesUnacceptedWiderBootstrap() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+        let firstAttempt = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: nil,
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: Date(timeIntervalSince1970: 0),
+            now: now,
+            calendar: calendar
+        )
+        let savedQueryStart = HealthBridgeUTCFormatter.string(from: try XCTUnwrap(firstAttempt.bootstrapStartToPersist))
+
+        // The first attempt saved its query bound, then failed before accepting any payload.
+        for (newSelection, expectedStart) in [
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            ("2026-06-01T00:00:00Z", "2026-03-17T00:00:00Z")
+        ] {
+            let retry = AnchoredWorkoutSyncPolicy.queryPlan(
+                anchorCursorValue: nil,
+                storedBootstrapStartValue: savedQueryStart,
+                requestedHistoryStart: try date(newSelection),
+                now: now,
+                calendar: calendar
+            )
+            XCTAssertEqual(retry.queryStart, try date(expectedStart))
+            XCTAssertEqual(retry.bootstrapStartToPersist, try date(expectedStart))
+        }
+    }
+
+    func testStoredBackfillMarkerSuppressesSameDepthRepeat() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let plan = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: "existing-anchor",
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: try date("2025-01-01T00:00:00Z"),
+            storedHistoryBackfillStartValue: "2025-01-01T00:00:00Z",
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertNil(plan.historicalBackfillStart)
+    }
+
+    func testDeeperHistoryRequestRearmsBackfill() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let plan = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: "existing-anchor",
+            storedBootstrapStartValue: nil,
+            requestedHistoryStart: try date("2024-01-01T00:00:00Z"),
+            storedHistoryBackfillStartValue: "2025-01-01T00:00:00Z",
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(plan.historicalBackfillStart, try date("2024-01-01T00:00:00Z"))
+    }
+
+    func testAutomaticModeNeverArmsHistoryBackfill() throws {
+        let calendar = utcCalendar()
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let plan = AnchoredWorkoutSyncPolicy.queryPlan(
+            anchorCursorValue: "existing-anchor",
+            storedBootstrapStartValue: nil,
+            bootstrapLookbackDays: 1,
+            clampStoredBootstrapToLookback: true,
+            requestedHistoryStart: nil,
+            storedHistoryBackfillStartValue: nil,
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertNil(plan.historicalBackfillStart)
+        XCTAssertNil(plan.queryStart)
+    }
+
+    func testFutureDatedHistoryRequestIsIgnored() throws {
+        let now = try date("2026-06-15T12:00:00Z")
+
+        let backfillStart = AnchoredWorkoutSyncPolicy.historicalBackfillStart(
+            requestedHistoryStart: try date("2027-01-01T00:00:00Z"),
+            storedHistoryBackfillStartValue: nil,
+            now: now
+        )
+
+        XCTAssertNil(backfillStart)
+    }
 }
 
 private func utcCalendar() -> Calendar {

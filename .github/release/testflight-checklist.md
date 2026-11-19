@@ -96,7 +96,7 @@ Then use the private signing/archive flow for TestFlight upload.
 The detailed procedure, evidence fields, and validator requirements are in
 [`docs/qa/public-release-qa.md`](../../docs/qa/public-release-qa.md). Before
 cutover, confirm a clean uninstall/reinstall, absent bundle, and empty
-**Not Connected** first launch; verify the advertised `/health` route, scan the
+unpaired **Connect your receiver** first launch; verify the advertised `/health` route, scan the
 setup-page QR with the iPhone Camera, and do not relaunch before pairing commits.
 Confirm that `devicectl --payload-url` was not used. Exercise native permission prompts and
 record exactly one invitation redemption and one active mapped credential.

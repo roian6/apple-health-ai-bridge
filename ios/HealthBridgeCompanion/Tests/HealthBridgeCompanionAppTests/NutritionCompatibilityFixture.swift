@@ -8,10 +8,17 @@ final class NutritionReceiver: @unchecked Sendable {
     private let lock = NSLock()
     private var capabilityValue = Capability.supported
     private var statusValue = 202
+    private var rejectedCursorKindValue: String?
+    private var requestSizesValue: [Int] = []
     private var batchesValue: [HealthBridgeBatchV1] = []
     private var recordsValue: [String: HealthBridgeSample] = [:]
     private var workoutsValue: [String: HealthBridgeWorkout] = [:]
     private var credentialsValue: [String] = []
+    private var responseProbeValue: NutritionCodecProbe?
+    var responseProbe: NutritionCodecProbe? {
+        get { lock.withLock { responseProbeValue } }
+        set { lock.withLock { responseProbeValue = newValue } }
+    }
     var capability: Capability {
         get { lock.withLock { capabilityValue } }
         set { lock.withLock { capabilityValue = newValue } }
@@ -21,6 +28,11 @@ final class NutritionReceiver: @unchecked Sendable {
         set { lock.withLock { statusValue = newValue } }
     }
     var batches: [HealthBridgeBatchV1] { lock.withLock { batchesValue } }
+    var requestSizes: [Int] { lock.withLock { requestSizesValue } }
+    var rejectedCursorKind: String? {
+        get { lock.withLock { rejectedCursorKindValue } }
+        set { lock.withLock { rejectedCursorKindValue = newValue } }
+    }
     var records: [HealthBridgeSample] { lock.withLock { Array(recordsValue.values) } }
     var workouts: [HealthBridgeWorkout] { lock.withLock { Array(workoutsValue.values) } }
     var credentials: [String] { lock.withLock { credentialsValue } }
@@ -45,6 +57,11 @@ final class NutritionReceiver: @unchecked Sendable {
             guard let body else { return (200, Data(#"{"status":"ok"}"#.utf8)) }
             let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: body)
             batchesValue.append(batch)
+            requestSizesValue.append(body.count)
+            if let rejectedCursorKindValue,
+               batch.sync.cursors.contains(where: { $0.cursorKind == rejectedCursorKindValue }) {
+                return (503, Data())
+            }
             if capabilityValue != .supported && NutritionCompatibility.containsNutrition(batch) {
                 return (422, Data())
             }
@@ -81,6 +98,7 @@ final class NutritionURLProtocol: URLProtocol, @unchecked Sendable {
             }
             let receiver = try XCTUnwrap(Self.receiver)
             let (status, data) = try receiver.respond(request, body: body)
+            if body != nil { receiver.responseProbe?.record() }
             let response = try XCTUnwrap(HTTPURLResponse(
                 url: try XCTUnwrap(request.url), statusCode: status, httpVersion: nil,
                 headerFields: ["Content-Type": "application/json", "Cache-Control": "no-store"]
@@ -108,6 +126,7 @@ final class NutritionFixture {
     let anchor: String
     var values: [String: Double] = ["weight": 70, "dietary_protein": 12]
     var reads: [String] = []
+    lazy var acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
     private var ids: [String: UUID] = [:]
 
     init(directPairing: Bool = true) throws {
@@ -136,8 +155,19 @@ final class NutritionFixture {
         eligibleTypeCodes: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
-        ) async throws -> [HealthKitDailyActivityAggregate])? = nil
+        ) async throws -> [HealthKitDailyActivityAggregate])? = nil,
+        readAnchoredStepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredStepChanges)? = nil,
+        readAnchoredWorkoutChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredWorkoutChanges)? = nil,
+        readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])? = nil,
+        requestReadAuthorization: @escaping @MainActor ([String]) async throws -> Void = { _ in },
+        reopenStorage: Bool = false
     ) async throws -> HealthBridgeCompanionViewModel {
+        let deliveryOutbox = reopenStorage ? try FileOutbox(directory: outbox.directoryURL) : outbox
+        let deliveryCursors = reopenStorage ? try FileSyncCursorStore(fileURL: cursors.fileURL) : cursors
         let vm = HealthBridgeCompanionViewModel(
             receiverClient: client, settingsStore: settings,
             pairingStateStore: ReceiverPairingStateStore(
@@ -151,12 +181,16 @@ final class NutritionFixture {
             historicalBackfillStateStore: HealthHistoricalBackfillStateStore(userDefaults: defaults),
             quantityObservationStore: QuantityObservationStore(userDefaults: defaults),
             coreLaneUploadProofStore: CoreLaneUploadProofStore(userDefaults: defaults),
-            outbox: outbox, outboxDirectoryURL: outbox.directoryURL,
-            cursorStore: cursors, cursorStoreFileURL: cursors.fileURL,
+            acceptedTransferStore: acceptedTransferStore,
+            outbox: deliveryOutbox, outboxDirectoryURL: outbox.directoryURL,
+            cursorStore: deliveryCursors, cursorStoreFileURL: cursors.fileURL,
             sleepManifestStore: try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json")),
             sleepManifestFileURL: root.appendingPathComponent("sleep.json"),
             sleepResetEpochStore: SleepResetEpochStore(tokenStore: NutritionTokenStore(), epochFloorProvider: { 1 }),
             mailboxKeyStore: mailbox?.keys ?? MailboxKeyStore(service: suite, keychain: NutritionKeychain()),
+            readAnchoredStepChanges: readAnchoredStepChanges,
+            readAnchoredWorkoutChanges: readAnchoredWorkoutChanges,
+            readWorkoutHistory: readWorkoutHistory,
             automaticSyncEligibleTypeCodesForTesting: eligibleTypeCodes,
             readDailyActivityAggregates: readDailyActivityAggregates ?? { _, _, _, _ in [] },
             scheduleDirectBackgroundUploads: { 0 },
@@ -183,7 +217,7 @@ final class NutritionFixture {
                     windowStart: start ?? now, windowEnd: now
                 )
             },
-            requestProjectionReadAuthorization: { _ in }
+            requestProjectionReadAuthorization: requestReadAuthorization
         )
         await vm.bootstrap()
         return vm
