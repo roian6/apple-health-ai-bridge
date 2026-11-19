@@ -243,6 +243,138 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
                        "Successful cursor replay must leave the original confirmation visible")
     }
 
+    func testDurableOrdinaryAcceptanceConfirmsWhenPayloadCleanupFails() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let vm = try await fixture.makeViewModel()
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: "synthetic_collection", cursorValue: fixture.anchor
+        )
+        let items = try fixture.outbox.enqueueSequence(
+            [try stepsPayload(), try stepsPayload()], receiverIdentity: binding, cursorCheckpoint: checkpoint
+        )
+        let journal = fixture.outbox.directoryURL.appendingPathComponent(".enqueue-transaction")
+        let cursors = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("sync-cursors.json"))
+
+        try await verifyAcceptanceSurvivesCleanupFailure(items[0], fixture: fixture, viewModel: vm) {
+            let persisted = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [String: Any]
+            )
+            let transactions = try XCTUnwrap(persisted["transactions"] as? [[String: Any]])
+            XCTAssertEqual(transactions.first?["directAcknowledgedItemIDs"] as? [String], [items[0].id])
+            XCTAssertNil(try cursors.cursorValue(
+                receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+            ))
+        }
+
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [items[1].id])
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertNil(try cursors.cursorValue(
+            receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        ))
+        _ = try await receiveBackgroundCallback(items[1], fixture: fixture)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try cursors.cursorValue(
+            receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        ), checkpoint.cursorValue)
+    }
+
+    func testDurableNutritionChildAcceptanceConfirmsWhenPayloadCleanupFails() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let vm = try await fixture.makeViewModel()
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let parent = try fixture.enqueueMixed()
+        try await fixture.outbox.prepareNutritionCompatibility()
+        let supported = try XCTUnwrap(fixture.outbox.nutritionCompatibleItems(
+            for: binding, support: .unsupported
+        ).first)
+        let remainder = try XCTUnwrap(fixture.outbox.pendingItems().first {
+            $0.id != parent.id && $0.id != supported.id
+        })
+        XCTAssertNotEqual(supported.id, parent.id)
+        let manifest = fixture.outbox.directoryURL.appendingPathComponent(".fifo-sequence")
+        let cursorKind = GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "dietary_protein")
+        let sourceKey = HealthBridgeAppleHealthSource.phone.sourceKey
+        let cursors = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("sync-cursors.json"))
+
+        try await verifyAcceptanceSurvivesCleanupFailure(supported, fixture: fixture, viewModel: vm) {
+            let persisted = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any]
+            )
+            let splits = try XCTUnwrap(persisted["nutritionSplits"] as? [[String: Any]])
+            let split = try XCTUnwrap(splits.first)
+            XCTAssertEqual(split["parentID"] as? String, parent.id)
+            XCTAssertEqual(split["supportedID"] as? String, supported.id)
+            XCTAssertEqual(split["supportedAccepted"] as? Bool, true)
+            XCTAssertEqual(split["remainderAccepted"] as? Bool, false)
+            XCTAssertNil(try cursors.cursorValue(
+                receiverBindingID: binding, sourceKey: sourceKey, cursorKind: cursorKind
+            ))
+        }
+
+        try await fixture.outbox.prepareNutritionCompatibility()
+        XCTAssertTrue(try fixture.outbox.nutritionCompatibleItems(for: binding, support: .unsupported).isEmpty)
+        XCTAssertEqual(try fixture.outbox.nutritionCompatibleItems(for: binding, support: .supported)
+            .map(\.id), [remainder.id])
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertNil(try cursors.cursorValue(
+            receiverBindingID: binding, sourceKey: sourceKey, cursorKind: cursorKind
+        ))
+        _ = try await receiveBackgroundCallback(remainder, fixture: fixture)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try cursors.cursorValue(
+            receiverBindingID: binding, sourceKey: sourceKey, cursorKind: cursorKind
+        ), fixture.anchor)
+    }
+
+    private func verifyAcceptanceSurvivesCleanupFailure(
+        _ item: FileOutboxItem,
+        fixture: NutritionFixture,
+        viewModel: HealthBridgeCompanionViewModel,
+        verifyPersistedACK: () throws -> Void
+    ) async throws {
+        let path = item.fileURL.path
+        defer { _ = chflags(path, 0) }
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+        let completion = try await receiveBackgroundCallback(item, fixture: fixture, expectRetainedOwnership: true) {
+            // Refuse unlinking the payload without blocking the ACK write elsewhere.
+            guard chflags(path, UInt32(UF_APPEND)) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+        }
+        XCTAssertEqual(completion?.statusCode, 202)
+        XCTAssertEqual(completion?.hadTransportError, false)
+        try verifyPersistedACK()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        XCTAssertThrowsError(try fixture.outbox.pendingItems())
+        let observed = viewModel.lastAcceptedTransferObservation
+        XCTAssertEqual(observed?.evidenceKind, .directResponse,
+                       "Report the first durable ACK even when payload cleanup fails")
+
+        guard chflags(path, 0) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let ownership = try FileBackgroundUploadTaskOwnershipStore(
+            fileURL: fixture.root.appendingPathComponent("background-tasks.json")
+        )
+        let retained = try XCTUnwrap(ownership.records().first)
+        XCTAssertEqual(retained.itemID, item.id)
+        XCTAssertEqual(retained.completion, completion)
+        let restarted = BackgroundURLSessionOutboxUploader(
+            receiverSettingsStore: fixture.settings, acceptedTransferStore: fixture.acceptedTransferStore,
+            taskOwnershipStore: ownership
+        )
+        await recoverWithoutScheduling(restarted, fixture: fixture)
+
+        XCTAssertTrue(try ownership.records().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        XCTAssertEqual(viewModel.lastAcceptedTransferObservation, observed,
+                       "Replaying cleanup must not refresh the original observation")
+    }
+
     func testPersistedCompletionReplayPreservesAcceptedObservation() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

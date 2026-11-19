@@ -74,13 +74,12 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         }
         try Task.checkCancellation()
         try validate()
-        let acceptance = try outbox.recordDirectUploadAcceptance(
-            itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID
+        let record = try outbox.recordDirectUploadAcceptance(
+            itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID,
+            onNewAcceptance: { onNewAcceptance() }
         )
-        // The item ACK is durable even if collection finalization needs to retry.
-        if acceptance.newlyAccepted { onNewAcceptance() }
-        if let record = acceptance.finalizationRecord { try finalize(record) }
-        return acceptance.finalizationRecord != nil
+        if let record { try finalize(record) }
+        return record != nil
     }
 
     @MainActor
