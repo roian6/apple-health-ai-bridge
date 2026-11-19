@@ -53,19 +53,18 @@ def test_paired_valid_observation_reaches_http_ingest_and_current_query(
 
 
 @pytest.mark.parametrize(
-    ("legacy_id", "generated_tombstone", "unknown_raw", "expected"),
+    ("scenario", "expected"),
     [
-        pytest.param("hk-steps-20260602", True, False, 6.0, id="paired-legacy"),
-        pytest.param("hk-steps-20260602", True, True, None, id="genuine-unknown"),
-        pytest.param("hk-steps-20260601", True, False, None, id="wrong-day"),
-        pytest.param("hk-steps-20260602", False, False, None, id="wrong-timestamp"),
+        ("paired-legacy", 6.0),
+        ("zero-raw", None),
+        ("genuine-unknown", None),
+        ("wrong-day", None),
+        ("wrong-timestamp", None),
     ],
 )
 def test_raw_steps_tombstone_preserves_only_unrelated_current_totals(
     tmp_path: Path,
-    legacy_id: str,
-    generated_tombstone: bool,
-    unknown_raw: bool,
+    scenario: str,
     expected: float | None,
 ) -> None:
     db = tmp_path / "http.sqlite"
@@ -74,6 +73,7 @@ def test_raw_steps_tombstone_preserves_only_unrelated_current_totals(
     raw = root.raw_sample(day=june_second).model_copy(
         update={
             "client_record_id": "hk-step-sample-00000000-0000-0000-0000-000000000058",
+            "value": 0.0 if scenario == "zero-raw" else 1.0,
             "metadata": {
                 "sample_kind": "raw_quantity",
                 "aggregation": "sum",
@@ -86,11 +86,12 @@ def test_raw_steps_tombstone_preserves_only_unrelated_current_totals(
         sequence=1,
         statistics=True,
     )
+    legacy_id = "hk-steps-20260601" if scenario == "wrong-day" else "hk-steps-20260602"
     legacy = root.raw_deletion().model_copy(
         update={
             "client_record_id": legacy_id,
             "deleted_at": seed.generated_at
-            if generated_tombstone
+            if scenario != "wrong-timestamp"
             else root.raw_deletion().deleted_at,
         },
     )
@@ -99,7 +100,7 @@ def test_raw_steps_tombstone_preserves_only_unrelated_current_totals(
             "client_record_id": "hk-step-sample-00000000-0000-0000-0000-000000000059",
         }
     )
-    deletes = (unknown, legacy) if unknown_raw else (legacy,)
+    deletes = (unknown, legacy) if scenario == "genuine-unknown" else (legacy,)
     change = root.root_batch((raw,), deleted=deletes, sequence=2)
     anchor = SyncCursor(
         source_key=raw.source_key,

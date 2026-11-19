@@ -649,6 +649,7 @@ def _legacy_step_intervals(
     for sample in samples:
         if (
             sample.type_code == "steps"
+            and sample.value > 0
             and sample.metadata.get("sample_kind") == "raw_quantity"
             and not is_projection(sample)
             and RAW_STEP_ID.fullmatch(sample.client_record_id)

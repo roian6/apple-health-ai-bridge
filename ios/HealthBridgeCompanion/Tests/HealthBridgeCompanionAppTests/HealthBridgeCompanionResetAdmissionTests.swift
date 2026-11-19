@@ -909,7 +909,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertFalse(runtime.viewModel.automaticSyncOwnerIsActive)
         XCTAssertEqual(fixture.rawAnchors, [fixture.previousAnchor])
         // Basal Energy can finish the first pass while Steps waits for its raw ACK.
-        let successfulDailyTypes = ["basal_energy"] + (failRawRead ? [] : ["steps"])
+        let successfulDailyTypes = eligibleTypeCodes.filter { $0 != "steps" }
+            + eligibleTypeCodes.filter { $0 == "steps" && !failRawRead }
         XCTAssertEqual(fixture.dailyRequests, successfulDailyTypes.map { [$0] })
         XCTAssertEqual(fixture.readEvents,
             ["steps.raw", failRawRead ? "steps.raw.failed" : "steps.raw.succeeded"]
