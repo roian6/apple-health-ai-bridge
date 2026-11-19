@@ -293,7 +293,8 @@ struct ConnectionSettingsView: View {
                     }
                 }
 
-                if viewModel.pendingOutboxCount > 0
+                if (viewModel.usesMailboxTransport && viewModel.mailboxKeyDiagnosticState == .lost)
+                    || viewModel.pendingOutboxCount > 0
                     || viewModel.hasPendingSleepTransition
                     || viewModel.hasPendingOutboxDeletion
                     || viewModel.hasPendingPrivateStorageRecovery
