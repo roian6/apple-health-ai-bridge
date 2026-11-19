@@ -22,7 +22,18 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         let item = try enqueueSteps(fixture)
         try FileOutbox.beginDestructiveRecovery(directory: fixture.outbox.directoryURL)
         XCTAssertTrue(fixture.outbox.destructiveRecoveryIsRequested)
+        let outboxDirectory = fixture.outbox.directoryURL
+        let invalidated = expectation(description: "Transfer evidence invalidated during reset")
+        let observer = NotificationCenter.default.addObserver(
+            forName: LastAcceptedTransferObservationStore.didChange, object: nil, queue: nil
+        ) { _ in
+            XCTAssertTrue(FileOutbox.destructiveRecoveryIsRequested(directory: outboxDirectory),
+                          "A stop at invalidation must leave an intent bootstrap can resume")
+            invalidated.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
         let resumed = try await fixture.makeViewModel()
+        await fulfillment(of: [invalidated], timeout: 1)
 
         let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
         XCTAssertNil(try reopened.pendingItem(id: item.id))
@@ -33,6 +44,36 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertNil(fixture.acceptedTransferStore.load(
             bindingID: binding, generation: generation
         ))
+    }
+
+    func testBootstrapRetainsResetIntentWhenTransferInvalidationCannotPersist() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let accepted = LastAcceptedTransferObservation(
+            bindingID: binding, generation: generation,
+            observedAt: Date(timeIntervalSince1970: 1_790_000_000), evidenceKind: .directResponse
+        )
+        fixture.acceptedTransferStore.record(accepted)
+        let item = try enqueueSteps(fixture)
+        let bytes = try Data(contentsOf: item.fileURL)
+        let blocker = fixture.acceptedTransferResetEpochURL.deletingLastPathComponent()
+        try Data().write(to: blocker)
+        try FileOutbox.beginDestructiveRecovery(directory: fixture.outbox.directoryURL)
+
+        let interrupted = try await fixture.makeViewModel()
+        XCTAssertTrue(interrupted.hasPendingOutboxDeletion)
+        XCTAssertTrue(FileOutbox.destructiveRecoveryIsRequested(directory: fixture.outbox.directoryURL))
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), bytes)
+
+        try FileManager.default.removeItem(at: blocker)
+        XCTAssertEqual(fixture.acceptedTransferStore.load(bindingID: binding, generation: generation), accepted)
+        await interrupted.retryPrivateStorage()
+
+        XCTAssertFalse(FileOutbox.destructiveRecoveryIsRequested(directory: fixture.outbox.directoryURL))
+        XCTAssertNil(try FileOutbox(directory: fixture.outbox.directoryURL).pendingItem(id: item.id))
+        XCTAssertNil(interrupted.lastAcceptedTransferObservation)
     }
 
     func testUnrelatedBackgroundSuccessRetiresWithMalformedSleepJournal() async throws {

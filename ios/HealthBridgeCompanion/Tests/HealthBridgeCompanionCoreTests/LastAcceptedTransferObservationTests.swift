@@ -6,7 +6,7 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
     func testMissingRecordLoadsUnknown() throws {
         let (defaults, _) = try makeDefaults()
 
-        XCTAssertNil(LastAcceptedTransferObservationStore(userDefaults: defaults)
+        XCTAssertNil(makeStore(defaults)
             .load(bindingID: "binding-a", generation: "generation-a"))
     }
 
@@ -18,10 +18,10 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
             observedAt: Date(timeIntervalSinceReferenceDate: 123_456),
             evidenceKind: .directResponse
         )
-        LastAcceptedTransferObservationStore(userDefaults: defaults).record(observation)
+        makeStore(defaults).record(observation)
 
         let reloadedDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        let reloaded = LastAcceptedTransferObservationStore(userDefaults: reloadedDefaults)
+        let reloaded = makeStore(reloadedDefaults)
         XCTAssertEqual(
             reloaded.load(bindingID: "binding-a", generation: "generation-a"),
             observation
@@ -30,7 +30,7 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
 
     func testChangedBindingOrGenerationCannotLoadObservation() throws {
         let (defaults, _) = try makeDefaults()
-        let store = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        let store = makeStore(defaults)
         store.record(LastAcceptedTransferObservation(
             bindingID: "binding-a",
             generation: "generation-a",
@@ -45,7 +45,7 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
 
     func testRecordingReplacesSoleRecordRatherThanRetainingScopes() throws {
         let (defaults, _) = try makeDefaults()
-        let store = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        let store = makeStore(defaults)
         store.record(LastAcceptedTransferObservation(
             bindingID: "binding-a",
             generation: "generation-a",
@@ -61,7 +61,7 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
 
         store.record(latest)
 
-        let reloaded = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        let reloaded = makeStore(defaults)
         XCTAssertEqual(reloaded.load(bindingID: "binding-b", generation: "generation-b"), latest)
         XCTAssertNil(reloaded.load(bindingID: "binding-a", generation: "generation-a"))
     }
@@ -70,7 +70,7 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
         let (defaults, _) = try makeDefaults()
         defaults.set(Data(versionOneFixture.utf8), forKey: storageKey)
 
-        let loaded = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        let loaded = makeStore(defaults)
             .load(bindingID: "binding-a", generation: "generation-a")
 
         XCTAssertEqual(loaded, LastAcceptedTransferObservation(
@@ -95,33 +95,41 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
 
         for invalidRecord in invalidRecords {
             defaults.set(Data(invalidRecord.utf8), forKey: storageKey)
-            XCTAssertNil(LastAcceptedTransferObservationStore(userDefaults: defaults)
+            XCTAssertNil(makeStore(defaults)
                 .load(bindingID: "binding-a", generation: "generation-a"))
         }
         defaults.set(42, forKey: storageKey)
-        XCTAssertNil(LastAcceptedTransferObservationStore(userDefaults: defaults)
+        XCTAssertNil(makeStore(defaults)
             .load(bindingID: "binding-a", generation: "generation-a"))
     }
 
-    func testClearRemovesObservationWithoutChangingOtherSettings() throws {
+    func testClearMasksReplayedLegacyDefaultsAndAllowsNewSameScopeEvidence() throws {
         let (defaults, _) = try makeDefaults()
         defaults.set(true, forKey: "unrelated.synthetic.setting")
-        let store = LastAcceptedTransferObservationStore(userDefaults: defaults)
-        store.record(LastAcceptedTransferObservation(
-            bindingID: "binding-a",
-            generation: "generation-a",
-            observedAt: Date(timeIntervalSinceReferenceDate: 123_456),
-            evidenceKind: .directResponse
-        ))
+        let store = makeStore(defaults)
+        let oldBytes = Data(versionOneFixture.utf8)
+        defaults.set(oldBytes, forKey: storageKey)
+        XCTAssertNotNil(store.load(bindingID: "binding-a", generation: "generation-a"))
 
-        store.clear()
-        store.clear()
+        try store.clear()
+        try store.clear()
 
-        XCTAssertNil(LastAcceptedTransferObservationStore(userDefaults: defaults)
-            .load(bindingID: "binding-a", generation: "generation-a"))
+        XCTAssertNil(defaults.data(forKey: storageKey))
+        defaults.set(oldBytes, forKey: storageKey) // Model an interrupted defaults flush.
+        let reopened = makeStore(defaults)
+        XCTAssertNil(reopened.load(bindingID: "binding-a", generation: "generation-a"))
         XCTAssertTrue(defaults.bool(forKey: "unrelated.synthetic.setting"))
+
+        let new = LastAcceptedTransferObservation(
+            bindingID: "binding-a", generation: "generation-a",
+            observedAt: Date(timeIntervalSinceReferenceDate: 234_567), evidenceKind: .directResponse
+        )
+        reopened.record(new)
+        XCTAssertEqual(makeStore(defaults).load(bindingID: "binding-a", generation: "generation-a"), new)
     }
 
+    private let resetEpochDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
     private let storageKey = "healthBridge.lastAcceptedTransferObservation"
     // Independent v1 compatibility fixture, also used to exercise invalid storage.
     private let versionOneFixture = """
@@ -132,9 +140,19 @@ final class LastAcceptedTransferObservationTests: XCTestCase {
     private func makeDefaults() throws -> (UserDefaults, String) {
         let suiteName = "LastAcceptedTransferObservationTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let resetEpochDirectory = self.resetEpochDirectory
         addTeardownBlock {
             UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+            if FileManager.default.fileExists(atPath: resetEpochDirectory.path) {
+                try FileManager.default.removeItem(at: resetEpochDirectory)
+            }
         }
         return (defaults, suiteName)
+    }
+
+    private func makeStore(_ defaults: UserDefaults) -> LastAcceptedTransferObservationStore {
+        LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: resetEpochDirectory.appendingPathComponent("epoch")
+        )
     }
 }

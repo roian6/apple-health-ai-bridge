@@ -1702,7 +1702,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return true
     }
 
-    private func resetPrivateSyncProgressForClear() throws {
+    private func resetPrivateSyncStateAndOutbox() throws -> FileOutboxDestructiveRecoveryResult {
         if connectionStateNeedsRecovery {
             try settingsStore.resetInvalidConnectionRecord()
             connectionStateNeedsRecovery = false
@@ -1749,21 +1749,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         historicalBackfillStateStore.reset()
         refreshHistoricalBackfillPublishedStateIfAllowed()
         cursorStateNeedsRecovery = false
+        guard let outboxDirectoryURL else {
+            throw CompanionPrivateStorageError.outboxUnavailable
+        }
+        try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
+        try acceptedTransferStore.clear()
+        return try FileOutbox.completeConfirmedTerminalReset(directory: outboxDirectoryURL)
     }
 
     private func performClearPendingOutbox() async -> Bool {
         do {
-            try resetPrivateSyncProgressForClear()
-            guard let outboxDirectoryURL else {
-                throw CompanionPrivateStorageError.outboxUnavailable
-            }
-            try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
-            let recovery = try FileOutbox.completeConfirmedTerminalReset(
-                directory: outboxDirectoryURL
-            )
+            let recovery = try resetPrivateSyncStateAndOutbox()
             self.outbox = recovery.outbox
             let removedCount = recovery.removedPayloadCount
-            acceptedTransferStore.clear()
             outboxIdentityMigrationReady = true
             hasPendingPrivateStorageRecovery = false
             hasTransientPrivateStorageFailure = false
@@ -2012,17 +2010,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return false
         }
         do {
-            try resetPrivateSyncProgressForClear()
-            guard let outboxDirectoryURL else {
-                throw CompanionPrivateStorageError.outboxUnavailable
-            }
-            try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
-            let recovery = try FileOutbox.completeConfirmedTerminalReset(
-                directory: outboxDirectoryURL
-            )
+            let recovery = try resetPrivateSyncStateAndOutbox()
             self.outbox = recovery.outbox
             let removedCount = recovery.removedPayloadCount
-            acceptedTransferStore.clear()
             outboxIdentityMigrationReady = true
             hasPendingPrivateStorageRecovery = false
             hasTransientPrivateStorageFailure = false

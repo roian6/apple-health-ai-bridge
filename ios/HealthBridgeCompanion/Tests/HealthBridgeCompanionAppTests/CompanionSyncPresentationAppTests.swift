@@ -367,7 +367,9 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
         let defaults = try XCTUnwrap(UnavailableObservationDefaults(suiteName: fixture.suite + ".unavailable"))
-        fixture.acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        fixture.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.acceptedTransferResetEpochURL
+        )
         let viewModel = try await fixture.makeViewModel()
 
         await viewModel.syncSupportedQuantityMetrics()
@@ -390,7 +392,9 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         try fixture.writeCapabilities()
         _ = try fixture.base.enqueueMixed()
         let defaults = try XCTUnwrap(UnavailableObservationDefaults(suiteName: fixture.base.suite + ".unavailable"))
-        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(userDefaults: defaults)
+        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
         let viewModel = try await fixture.base.makeViewModel(mailbox: fixture)
         await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
         let pending = try XCTUnwrap(fixture.base.outbox.pendingItems().first {
