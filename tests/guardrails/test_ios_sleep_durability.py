@@ -82,7 +82,7 @@ def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> No
 def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     start = source.index("func clearPendingOutbox()")
-    end = source.index("\n    private func resetPrivateSyncProgressForClear", start)
+    end = source.index("\n    private func resetPrivateSyncStateAndOutbox(", start)
     operation = source[start:end]
     expected_capture = "".join(  # noqa: FLY002
         (
@@ -118,10 +118,12 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
     perform_start = source.index("private func performClearPendingOutbox()", end)
     perform_end = source.index("\n    func retryPrivateStorage()", perform_start)
     perform = source[perform_start:perform_end]
-    perform_reset = perform.index("try resetPrivateSyncProgressForClear()")
-    destructive_intent = perform.index("try FileOutbox.beginDestructiveRecovery(")
-    finish = perform.index("try FileOutbox.completeConfirmedTerminalReset(")
-    assert perform_reset < destructive_intent < finish
+    assert operation.index("return await self.performClearPendingOutbox()") > (
+        commit_generation
+    )
+    assert perform.index("try resetPrivateSyncStateAndOutbox()") < perform.index(
+        "hasPendingPrivateStorageRecovery = false"
+    )
     assert "activateAutomaticSyncIfReady()" in operation
 
     pairing = (ROOT / "docs/pairing.md").read_text(encoding="utf-8")
@@ -141,24 +143,39 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
         "\n    func resumePendingPairingIfNeeded()", recovery_start
     )
     recovery = source[recovery_start:recovery_end]
-    recovery_reset = recovery.index("try resetPrivateSyncProgressForClear()")
-    recovery_finish = recovery.index("try FileOutbox.completeConfirmedTerminalReset(")
-    assert recovery_reset < recovery_finish
+    assert (
+        recovery.index("guard await drainTerminalBackgroundPayloadCancellation()")
+        < recovery.index("try resetPrivateSyncStateAndOutbox()")
+        < recovery.index("hasPendingPrivateStorageRecovery = false")
+    )
     assert "hasPendingPrivateStorageRecovery = false" in recovery
     assert "hasTransientPrivateStorageFailure = false" in recovery
 
-    helper_start = source.index("private func resetPrivateSyncProgressForClear()")
-    helper_end = source.index(
-        "\n    private func performClearPendingOutbox(", helper_start
-    )
-    helper = source[helper_start:helper_end]
+    helper = source[end:perform_start]
+    destructive_intent = helper.index("try FileOutbox.beginDestructiveRecovery(")
+    invalidate_evidence = helper.index("try acceptedTransferStore.clear()")
+    finish = helper.index("return try FileOutbox.completeConfirmedTerminalReset(")
+    assert destructive_intent < invalidate_evidence < finish
     for required_reset in (
         "try sleepManifestStore.resetSynchronizationState()",
         "try cursorStore.resetAll()",
+        "try backgroundSyncStore.resetPendingObserverDirtiness()",
         "coreLaneUploadProofStore.resetAll()",
         "historicalBackfillStateStore.reset()",
     ):
-        assert required_reset in helper
+        assert helper.index(required_reset) < destructive_intent
+
+    outbox = FILE_OUTBOX.read_text(encoding="utf-8")
+    completion = outbox.index("public static func completeConfirmedTerminalReset(")
+    cleanup = outbox.index("private static func completeDestructiveRecovery(")
+    assert "try completeDestructiveRecovery(" in outbox[completion:cleanup]
+    cleanup_end = outbox.index("public init(directory:", cleanup)
+    cleanup_body = outbox[cleanup:cleanup_end]
+    assert (
+        cleanup_body.index("where child.lastPathComponent != clearIntentFilename")
+        < cleanup_body.index("try fileManager.removeItem(at: child)")
+        < cleanup_body.index("try outbox.finishClearIntent()")
+    )
 
 
 def test_private_storage_preflight_precedes_bootstrap_activation_and_fifo_flush() -> (
@@ -313,17 +330,22 @@ def test_private_store_retry_recovery_and_manifest_probe_are_explicit() -> None:
 def test_destructive_intent_is_persisted_only_after_transfer_cancellation() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     start = source.index("func clearPendingOutbox()")
-    end = source.index("\n    private func resetPrivateSyncProgressForClear", start)
+    end = source.index("\n    private func resetPrivateSyncStateAndOutbox(", start)
     operation = source[start:end]
     exclusive = operation.index("runWithExclusiveDirectOutboxTransfer")
     cancel_foreground = operation.index("cancelAndAwaitForegroundPayloadTasks")
     terminal_request = operation.index("beginTerminalResetRequest")
-    assert terminal_request < cancel_foreground < exclusive
+    drain = operation.index("await self.drainTerminalBackgroundPayloadCancellation()")
+    clear = operation.index("return await self.performClearPendingOutbox()")
+    assert terminal_request < cancel_foreground < drain < exclusive < clear
+    assert "beginDestructiveRecovery" not in operation
     perform_start = source.index("private func performClearPendingOutbox()", start)
     perform_end = source.index("\n    func retryPrivateStorage()", perform_start)
     perform = source[perform_start:perform_end]
-    assert perform.index("resetPrivateSyncProgressForClear()") < perform.index(
-        "beginDestructiveRecovery"
+    assert "try resetPrivateSyncStateAndOutbox()" in perform
+    reset = source[end:perform_start]
+    assert reset.index("try cursorStore.resetAll()") < reset.index(
+        "try FileOutbox.beginDestructiveRecovery("
     )
 
 
@@ -590,16 +612,13 @@ def test_pairing_entry_points_stay_closed_until_private_recovery_completes() -> 
 
 def test_destructive_recovery_resets_all_progress_and_unreadable_connection() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
-    helper_start = source.index("private func resetPrivateSyncProgressForClear()")
+    helper_start = source.index("private func resetPrivateSyncStateAndOutbox(")
     helper_end = source.index(
         "\n    private func performClearPendingOutbox(", helper_start
     )
     reset = source[helper_start:helper_end]
     recovery_start = source.index("func clearPendingOutbox() async")
-    recovery_end = source.index(
-        "private func resetPrivateSyncProgressForClear", recovery_start
-    )
-    recovery = source[recovery_start:recovery_end]
+    recovery = source[recovery_start:helper_start]
     clear_start = helper_end
     clear_end = source.index("\n    func bootstrap()", clear_start)
     clear = source[clear_start:clear_end]
@@ -607,7 +626,7 @@ def test_destructive_recovery_resets_all_progress_and_unreadable_connection() ->
     assert "connectionTerminalBarrier.performRecovery(" in recovery
     assert "drainBackgroundPayloads:" in recovery
     assert "await self.drainTerminalBackgroundPayloadCancellation()" in recovery
-    assert "try resetPrivateSyncProgressForClear()" in clear
+    assert "try resetPrivateSyncStateAndOutbox()" in clear
     assert "try settingsStore.resolveTerminalCancellationForPrivateReset()" in reset
     assert "try pairingStateStore.resetPrivatePairingState()" in reset
     assert "hasPendingPairing = false" in reset

@@ -218,7 +218,7 @@ def test_lifecycle_and_pairing_waiters_respect_terminal_requests() -> None:
 
     clear_start = source.index("func clearPendingOutbox() async")
     clear_end = source.index(
-        "private func resetPrivateSyncProgressForClear()", clear_start
+        "private func resetPrivateSyncStateAndOutbox(", clear_start
     )
     clear_body = source[clear_start:clear_end]
     assert clear_body.index("pairingRequestEpoch.invalidate()") < clear_body.index(
@@ -251,10 +251,15 @@ def test_clear_and_disconnect_reactivate_automatic_sync_after_request_release() 
 
     clear_worker_start = clear_end
     clear_worker_end = source.index(
-        "private func resetPrivateSyncProgressForClear()", clear_worker_start
+        "private func resetPrivateSyncStateAndOutbox(", clear_worker_start
     )
     clear_worker = source[clear_worker_start:clear_worker_end]
     assert "activateAutomaticSyncIfReady()" not in clear_worker
+    clear_completion_end = source.index("func retryPrivateStorage()", clear_worker_end)
+    assert (
+        "activateAutomaticSyncIfReady()"
+        not in source[clear_worker_end:clear_completion_end]
+    )
 
     disconnect_start = source.index("func disconnectReceiver() async")
     disconnect_worker_start = source.index(
@@ -400,13 +405,27 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
 
     clear_start = source.index("func clearPendingOutbox() async")
     clear_end = source.index(
-        "private func resetPrivateSyncProgressForClear()", clear_start
+        "private func resetPrivateSyncStateAndOutbox(", clear_start
     )
     clear_body = source[clear_start:clear_end]
     assert clear_body.index("withTerminalTransitionRequestGate") < clear_body.index(
         "connectionTerminalBarrier.performRecovery("
     )
     assert "await retryBootstrapAfterRecoveryIfNeeded()" in clear_body
+    barrier_source = RECEIVER_CLIENT.read_text()
+    recovery_start = barrier_source.index("public func performRecovery<Result>(")
+    recovery_end = barrier_source.index(
+        "private func acquireTransition(", recovery_start
+    )
+    recovery = barrier_source[recovery_start:recovery_end]
+    assert (
+        recovery.index("closeAdmission()")
+        < recovery.index("try prepareRecovery()")
+        < recovery.index("await cancelAndAwaitPairing()")
+        < recovery.index("await cancelAndAwaitForegroundPayloads()")
+        < recovery.index("guard await drainBackgroundPayloads()")
+        < recovery.index("return try await commit()")
+    )
 
     toggle_start = source.index("func requestBackgroundSyncEnabled(_ enabled: Bool)")
     toggle_end = source.index("private func receiverIdentityMatches(", toggle_start)
