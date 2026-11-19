@@ -3541,6 +3541,12 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
     }
 
     func testExpiredAutomaticCollectionFinishesWhileSchedulingIsSuspended() async throws {
+        for expireWhileWaiting in [false, true] {
+            try await exerciseExpiredAutomaticCollection(expireWhileWaiting: expireWhileWaiting)
+        }
+    }
+
+    private func exerciseExpiredAutomaticCollection(expireWhileWaiting: Bool) async throws {
         let fixture = try AutomaticStepsFaultFixture()
         defer { fixture.cleanUp() }
         let runtime = try await makeStepsFaultRuntime(fixture, platformBackgroundPayloadDrain: { true })
@@ -3548,15 +3554,26 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         await viewModel.waitForBootstrapAndForegroundWork()
         let pending = try fixture.admit(["steps"])
         let outbox = try FileOutbox(directory: fixture.root.appendingPathComponent("outbox"))
+        let schedulesBefore = fixture.declinedBackgroundSchedules
         let schedulingEntered = expectation(description: "Independent retry reached the scheduler")
-        let ownerFinished = expectation(description: "Expired owner finished before the retry was released")
+        let timing = expireWhileWaiting ? "after joining scheduler" : "before handoff"
+        let ownerFinished = expectation(description: "Owner expired \(timing) finished while retry was held")
         let (release, gate) = AsyncStream<Void>.makeStream()
+        var expire: AutomaticSyncEngine.CancelOwner?
+        var schedulerReleased = false
         fixture.beforeBackgroundSchedule = {
             schedulingEntered.fulfill()
+            if expireWhileWaiting {
+                // Both tasks are on the main actor. The scheduler can only run after
+                // the owner suspends in the scheduling handoff.
+                XCTAssertNotNil(expire)
+                expire?()
+            }
             var iterator = release.makeAsyncIterator()
             _ = await iterator.next()
+            XCTAssertTrue(schedulerReleased, "Only the test may release the independent retry")
+            XCTAssertFalse(Task.isCancelled, "Expiring the owner must not cancel the scheduler")
         }
-        var expire: AutomaticSyncEngine.CancelOwner?
         let engine = AutomaticSyncEngine(
             pendingStore: BackgroundSyncSettingsStore(
                 userDefaults: try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName))
@@ -3568,9 +3585,11 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 let diagnostic = await viewModel.performAutomaticSyncOpportunity(opportunity: opportunity) {
                     _ = try await processPendingTypes()
                     XCTAssertEqual(try outbox.pendingItems().count, 1)
-                    try XCTUnwrap(expire)()
-                    try Task.checkCancellation()
-                    return true
+                    if !expireWhileWaiting {
+                        try XCTUnwrap(expire)()
+                        try Task.checkCancellation()
+                    }
+                    throw AutomaticStepsFaultFixture.ReadFailure.injected
                 }
                 XCTAssertEqual(diagnostic.record.runOutcome, .interrupted)
             },
@@ -3582,9 +3601,12 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
 
         let run = Task { try await engine.requestRun(reason: .observerBatch(typeCodes: ["steps"])) }
         await fulfillment(of: [schedulingEntered, ownerFinished], timeout: 5)
+        XCTAssertEqual(fixture.declinedBackgroundSchedules, schedulesBefore, timing)
+        schedulerReleased = true
         gate.finish()
         try await run.value
         await viewModel.waitForBootstrapAndForegroundWork()
+        XCTAssertEqual(fixture.declinedBackgroundSchedules, schedulesBefore + 1, timing)
         let items = try outbox.pendingItems()
         XCTAssertEqual(items.count, 1)
         let raw = try JSONDecoder().decode(

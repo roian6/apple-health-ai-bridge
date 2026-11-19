@@ -421,6 +421,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let pairingRequestEpoch = PairingRequestEpoch()
     private var backgroundOutboxSchedulingTask: Task<Void, Never>?
     private var backgroundOutboxSchedulingID: UUID?
+    private var backgroundOutboxSchedulingWaiters: [
+        UUID: (schedulingID: UUID, completion: AsyncStream<Void>.Continuation)
+    ] = [:]
     private var trackedSyncTasks: [UUID: Task<Void, Never>] = [:]
     private var directOutboxTransferRequestCount = 0
     private var automaticDirectPendingTypes: Set<String>?
@@ -3396,9 +3399,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               directOutboxTransferRequestCount == 0 else { return }
         #if os(iOS)
         startBackgroundOutboxScheduling(cancelExistingUploads: false)
-        if !Task.isCancelled {
-            await backgroundOutboxSchedulingTask?.value
-        }
+        guard !Task.isCancelled, let schedulingID = backgroundOutboxSchedulingID else { return }
+        // Cancelling the stream wait releases the owner without cancelling the scheduler.
+        let (finished, completion) = AsyncStream<Void>.makeStream()
+        let waiterID = UUID()
+        backgroundOutboxSchedulingWaiters[waiterID] = (schedulingID, completion)
+        defer { backgroundOutboxSchedulingWaiters.removeValue(forKey: waiterID) }
+        var iterator = finished.makeAsyncIterator()
+        _ = await iterator.next()
         #endif
     }
 
@@ -3487,6 +3495,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func finishBackgroundOutboxScheduling(id: UUID) {
+        // A replaced or terminally cancelled scheduler still finishes its own waiters.
+        for waiter in backgroundOutboxSchedulingWaiters.values where waiter.schedulingID == id {
+            waiter.completion.finish()
+        }
         guard backgroundOutboxSchedulingID == id else { return }
         backgroundOutboxSchedulingTask = nil
         backgroundOutboxSchedulingID = nil
