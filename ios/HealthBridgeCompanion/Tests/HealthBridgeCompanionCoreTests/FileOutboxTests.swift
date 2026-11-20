@@ -684,22 +684,34 @@ final class FileOutboxTests: XCTestCase {
 
         XCTAssertThrowsError(try outbox.enqueueForTesting(Data("must-not-publish".utf8)))
         XCTAssertTrue(try payloadFileURLs(in: directory).isEmpty)
+    }
 
-        let collisionDirectory = temporaryOutboxDirectory()
-        defer { try? FileManager.default.removeItem(at: collisionDirectory) }
-        let collisionOutbox = try FileOutbox(directory: collisionDirectory)
-        let fixture = RecoveryDiskFixture(directory: collisionDirectory)
-        var existing = fixture.entries[0]
-        existing["id"] = "different-synthetic-id"
-        try fixture.writeManifest(entries: [existing], nextSequence: 2)
-        try fixture.payloads[0].write(to: collisionDirectory.appendingPathComponent("different-synthetic-id.json"))
-        try fixture.writeJournal(retained: [])
-        for index in fixture.entries.indices {
-            try fixture.payloads[index].write(to: fixture.payloadURL(index, staged: true))
+    func testRecoveryRejectsSequenceCollisionAndAcceptsNonconflictingControl() throws {
+        for existingSequence in [4, 1] {
+            let directory = temporaryOutboxDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let outbox = try FileOutbox(directory: directory)
+            let fixture = RecoveryDiskFixture(directory: directory)
+            let existingID = "different-synthetic-id"
+            var existing = fixture.entries[0]
+            existing["id"] = existingID
+            existing["sequence"] = existingSequence
+            try fixture.writeManifest(entries: [existing], nextSequence: 5)
+            try fixture.payloads[0].write(to: directory.appendingPathComponent("\(existingID).json"))
+            try fixture.writeJournal(retained: [])
+            for index in fixture.entries.indices {
+                try fixture.payloads[index].write(to: fixture.payloadURL(index, staged: true))
+            }
+
+            if existingSequence == 1 {
+                let journal = try Data(contentsOf: fixture.journalURL)
+                XCTAssertThrowsError(try outbox.pendingItems())
+                XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journal)
+            } else {
+                XCTAssertEqual(try outbox.pendingItems().map(\.id), fixture.ids + [existingID])
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.journalURL.path))
+            }
         }
-        let journal = try Data(contentsOf: fixture.journalURL)
-        XCTAssertThrowsError(try collisionOutbox.pendingItems())
-        XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journal)
     }
 
     func testVersionOneManifestMigratesToReceiverScopedVersionTwo() throws {

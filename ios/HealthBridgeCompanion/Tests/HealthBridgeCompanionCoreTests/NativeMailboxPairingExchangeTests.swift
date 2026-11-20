@@ -195,6 +195,8 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         let publications = f.cancelPublications
         f.cancellationDownloading = true
         f.allowReceipt = true
+        var waits = 0
+        f.waitAction = { waits += 1 }
 
         do {
             _ = try await f.coordinator().resumePendingPairing()
@@ -206,8 +208,13 @@ final class NativeMailboxPairingExchangeTests: XCTestCase {
         XCTAssertEqual(try f.state().loadPending(), pending)
         XCTAssertTrue(try f.state().hasPendingCancellation())
         XCTAssertEqual(f.receiptReads, 0)
+        XCTAssertEqual(waits, 14)
 
-        f.cancellationDownloading = false
+        f.waitAction = {
+            XCTAssertEqual(f.cancelPublications, publications)
+            f.cancellationDownloading = false
+        }
+        defer { f.waitAction = nil }
         _ = try await f.coordinator().resumePendingPairing()
         XCTAssertEqual(try Data(contentsOf: f.cancellationURL), original)
         XCTAssertNil(try f.state().loadPending())
@@ -405,6 +412,7 @@ private final class ExchangeFixture {
     var completionReads = 0, cancelPublications = 0, receiptReads = 0, resolutions = 0
     var allowCompletion = true, allowReceipt = true
     var cancellationDownloading = false
+    var waitAction: (() throws -> Void)?
     var hideCancellationOnce = false
     var cancellationReadAction: (() throws -> Void)?
     var resolveAction: (() throws -> Void)?
@@ -493,7 +501,10 @@ private final class ExchangeFixture {
                 XCTFail("Operation escaped private fixture root")
                 throw ExchangeFailure.invalidPeer
             }
-        }, wait: { throw ExchangeFailure.responseUnavailable })
+        }, wait: { [self] in
+            guard let waitAction else { throw ExchangeFailure.responseUnavailable }
+            try waitAction()
+        })
     }
 
     func refreshReceipt() throws {

@@ -49,6 +49,7 @@ final class NutritionMailboxFixture {
     var envelopeNumber: UInt8 = 0
     var capabilityReadIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in })
     var beforeTransportLocate: (() throws -> Void)?
+    var prepareAckCandidate = MailboxAckScanner.prepareCandidateForBoundedRead
 
     init(nativePairing: Bool = false) throws {
         base = try NutritionFixture(directPairing: !nativePairing)
@@ -154,7 +155,11 @@ final class NutritionMailboxFixture {
         return ProductionMailboxComponents(
             identity: identity, deviceSigningPublicKey: context.deviceSigningPublicKey, ackContext: context,
             transport: transport, ackLookup: lookup,
-            scanner: MailboxAckScanner(context: context, lookup: lookup, locate: { location }), locate: { location }
+            scanner: MailboxAckScanner(
+                context: context, lookup: lookup, locate: { location }, fault: { _ in },
+                prepareCandidate: prepareAckCandidate
+            ),
+            locate: { location }
         )
     }
 

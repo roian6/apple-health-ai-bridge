@@ -10,8 +10,7 @@ struct ActivityDiagnosticsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label(viewModel.syncPresentation.title, systemImage: viewModel.syncPresentation.symbol)
                         .font(.headline)
-                    Text(viewModel.syncPresentation.phase == .needsAttention
-                        ? viewModel.displayStatusMessage : viewModel.syncPresentation.detail)
+                    Text(viewModel.activityStatusDetail)
                         .foregroundStyle(.secondary)
                 }
                 nextAction
@@ -52,6 +51,10 @@ struct ActivityDiagnosticsView: View {
                         LabeledContent("Last run", value: viewModel.automaticSyncRunLine)
                         Text(viewModel.automaticSyncLaneDiagnosticLine)
                             .textSelection(.enabled)
+                        if let mailboxFailure = viewModel.activityMailboxFailureMessage {
+                            Text(mailboxFailure)
+                                .textSelection(.enabled)
+                        }
                         if !viewModel.historicalBackfillState.selectedTypeCodes.isEmpty {
                             Text(viewModel.historicalBackfillSummary)
                             LabeledContent(

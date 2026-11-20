@@ -40,6 +40,13 @@ final class NutritionReceiver: @unchecked Sendable {
     func respond(_ request: URLRequest, body: Data?) throws -> (Int, Data) {
         try lock.withLock {
             if capabilityValue == .offline { throw URLError(.notConnectedToInternet) }
+            if request.url?.path == "/v1/pairing/redeem" {
+                return (200, Data("""
+                {"schema_id":"health_bridge.receiver_pairing_completion.v1",
+                 "schema_version":"1.0.0","label":"Synthetic receiver",
+                 "receiver_url":"http://127.0.0.1:8766/v1/batches"}
+                """.utf8))
+            }
             if request.url?.path == "/v1/capabilities" {
                 credentialsValue.append(request.value(forHTTPHeaderField: "Authorization") ?? "")
                 switch capabilityValue {
@@ -157,6 +164,7 @@ final class NutritionFixture {
 
     func makeViewModel(
         mailbox: NutritionMailboxFixture? = nil,
+        backgroundSyncStore: BackgroundSyncSettingsStore? = nil,
         eligibleTypeCodes: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
@@ -169,6 +177,7 @@ final class NutritionFixture {
         ) async throws -> HealthKitAnchoredWorkoutChanges)? = nil,
         readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])? = nil,
         requestReadAuthorization: @escaping @MainActor ([String]) async throws -> Void = { _ in },
+        terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
         reopenStorage: Bool = false
     ) async throws -> HealthBridgeCompanionViewModel {
         let deliveryOutbox = reopenStorage ? try FileOutbox(directory: outbox.directoryURL) : outbox
@@ -179,7 +188,7 @@ final class NutritionFixture {
                 pendingStore: NutritionTokenStore(), installationIDStore: NutritionTokenStore(),
                 cancellationStore: NutritionTokenStore()
             ),
-            backgroundSyncStore: BackgroundSyncSettingsStore(userDefaults: defaults),
+            backgroundSyncStore: backgroundSyncStore ?? BackgroundSyncSettingsStore(userDefaults: defaults),
             automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json")),
             healthPermissionRequestStore: CompanionHealthPermissionRequestStore(userDefaults: defaults),
             healthHistoryDepthStore: HealthHistoryDepthSelectionStore(userDefaults: defaults),
@@ -202,6 +211,7 @@ final class NutritionFixture {
             cancelInheritedLegacyUploads: {
                 BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
             },
+            terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             platformBackgroundPayloadDrain: { true },
             productionMailboxDelivery: mailbox.map { fixture in
                 { @MainActor @Sendable in fixture.delivery() }

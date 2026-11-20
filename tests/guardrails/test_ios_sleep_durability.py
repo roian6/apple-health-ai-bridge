@@ -56,7 +56,7 @@ def test_sleep_transition_is_journaled_before_delivery() -> None:
     assert create_start < journal < delivery
 
 
-def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> None:
+def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     helper_start = source.index("private func deliverPendingSleepTransition(")
     helper_end = source.index("\n    func syncSupportedQuantityMetrics()", helper_start)
@@ -66,17 +66,23 @@ def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> No
     track = helper.index(
         "try await store.savePendingForSync(trackedTransition, validate: validate)"
     )
-    absence_gate = helper.index("if itemRemains {")
-    prefix = "try await store."
-    manifest_commit = helper.rindex(
-        f"{prefix}saveManifestForSync(pendingTransition.manifest, validate: validate)"
+    refresh = helper.index("snapshot.fifo = try outbox.pendingItems()", track)
+    held = helper.index(
+        "if snapshot.fifo.contains(where: { $0.id == outboxItemID })", refresh
     )
-    journal_clear = helper.rindex(
-        f"{prefix}clearPendingForSync(id: pendingTransition.id, validate: validate)"
+    routes = helper.index("if target.route == .mailbox {", held)
+    assert enqueue < track < refresh < held
+    assert "if enqueueResult.wasInserted" in helper[track:held]
+    assert "return false" in helper[held:routes]
+    # Absence alone is not acceptance. A different successful item in the
+    # same Direct flush cannot complete the tracked transition.
+    accepted = helper.index(
+        "guard upload.acceptedDirectItemIDs.contains(outboxItemID)", routes
     )
-    acceptance = helper.index("guard lastDirectAcceptance.map(")
-    assert enqueue < track < absence_gate < acceptance < manifest_commit < journal_clear
-    assert "if enqueueResult.wasInserted" in helper[track:absence_gate]
+    complete = helper.index(
+        "pending == nil && manifest == pendingTransition.manifest", accepted
+    )
+    assert "guard complete else { throw CancellationError() }" in helper[complete:]
 
 
 def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None:

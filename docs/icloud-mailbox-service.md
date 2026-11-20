@@ -485,11 +485,10 @@ health-bridge mailbox helper install \
 health-bridge mailbox helper status --json
 ```
 
-For a foreground receiver, check helper status before restarting the same
-command. No helper `upgrade` command exists.
-Continue only when helper status reports `{"code": "ready"}`. Then restore the
-service with the original or intentionally updated values; startup must pass
-the IPC discovery and helper-owned self-test:
+No helper `upgrade` command exists. Continue only when helper status reports
+`{"code": "ready"}` and any required database initialization has succeeded.
+Restart the original foreground command or restore the service with its
+original or intentionally updated values:
 
 ```bash
 health-bridge mailbox service install \
@@ -500,6 +499,10 @@ health-bridge mailbox service install \
   --json
 health-bridge mailbox service status --json
 ```
+
+For an owned service, require `running_healthy`. An IPC-qualified release must
+also pass IPC discovery and the helper-owned self-test at startup. The stock
+1.2.0 release uses the legacy handoff and does not perform those IPC checks.
 
 Service uninstall stops the loaded LaunchAgent and removes only its verified
 owned service artifacts. It does not remove the receiver database, mailbox,

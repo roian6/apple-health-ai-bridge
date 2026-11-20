@@ -492,6 +492,13 @@ public struct FileOutboxDestructiveRecoveryResult {
     }
 }
 
+struct DirectSleepCleanupIntent: Codable, Equatable {
+    let itemID: String
+    let journalID: String
+    let receiverBindingID: String
+    let receiverGeneration: String
+}
+
 public final class FileOutbox {
     private struct SequenceEntry: Codable, Equatable {
         let sequence: UInt64
@@ -585,6 +592,10 @@ public final class FileOutbox {
         let pendingGenerationRetirements: [String: Int]?
         let stepsRawAndDailyCoverage: Bool?
         let directAcknowledgedItemIDs: [String]?
+        // Older Direct writers could acknowledge an item without checking Sleep.
+        let directSleepCheckedItemIDs: [String]?
+        // Keep the ACK unchecked until the exact Sleep journal is gone.
+        var directSleepCleanupIntent: DirectSleepCleanupIntent? = nil
 
         init(
             version: Int,
@@ -592,7 +603,8 @@ public final class FileOutbox {
             cursorCheckpoint: FileOutboxCursorCheckpoint?,
             pendingGenerationRetirements: [String: Int]? = nil,
             stepsRawAndDailyCoverage: Bool? = nil,
-            directAcknowledgedItemIDs: [String]? = nil
+            directAcknowledgedItemIDs: [String]? = nil,
+            directSleepCheckedItemIDs: [String]? = nil
         ) {
             self.version = version
             self.entries = entries
@@ -600,6 +612,7 @@ public final class FileOutbox {
             self.pendingGenerationRetirements = pendingGenerationRetirements
             self.stepsRawAndDailyCoverage = stepsRawAndDailyCoverage
             self.directAcknowledgedItemIDs = directAcknowledgedItemIDs
+            self.directSleepCheckedItemIDs = directSleepCheckedItemIDs
         }
 
         var finalizationRecord: FileOutboxFinalizationRecord? {
@@ -617,17 +630,26 @@ public final class FileOutbox {
             Set(directAcknowledgedItemIDs ?? [])
         }
 
-        func recordingDirectAcknowledgment(for itemID: String) -> EnqueueTransaction {
+        var uncheckedDirectAcknowledgmentIDs: Set<String> {
+            directAcknowledgedIDs.subtracting(directSleepCheckedItemIDs ?? [])
+        }
+
+        func recordingDirectAcknowledgment(for itemID: String, sleepChecked: Bool) -> EnqueueTransaction {
             var acknowledged = directAcknowledgedIDs
             acknowledged.insert(itemID)
-            return EnqueueTransaction(
+            var checked = Set(directSleepCheckedItemIDs ?? [])
+            if sleepChecked, directSleepCleanupIntent?.itemID != itemID { checked.insert(itemID) }
+            var updated = EnqueueTransaction(
                 version: version,
                 entries: entries,
                 cursorCheckpoint: cursorCheckpoint,
                 pendingGenerationRetirements: pendingGenerationRetirements,
                 stepsRawAndDailyCoverage: stepsRawAndDailyCoverage,
-                directAcknowledgedItemIDs: acknowledged.sorted()
+                directAcknowledgedItemIDs: acknowledged.sorted(),
+                directSleepCheckedItemIDs: checked.isEmpty ? nil : checked.sorted()
             )
+            updated.directSleepCleanupIntent = directSleepCleanupIntent
+            return updated
         }
     }
 
@@ -1295,6 +1317,9 @@ public final class FileOutbox {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
+        guard transaction.directSleepCleanupIntent == nil else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
         guard let manifest = try loadManifest() else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
@@ -1347,10 +1372,70 @@ public final class FileOutbox {
         )
     }
 
+    func hasDirectAcknowledgmentWithSleepChecked(itemID: String, receiverIdentity: String) throws -> Bool {
+        try loadEnqueueTransactions().contains { transaction in
+            transaction.directSleepCheckedItemIDs?.contains(itemID) == true
+                && transaction.entries.contains { $0.id == itemID && $0.receiverIdentity == receiverIdentity }
+        }
+    }
+
+    func uncheckedDirectAcknowledgmentIDs(for record: FileOutboxFinalizationRecord) throws -> Set<String> {
+        guard let transaction = try loadEnqueueTransactions().first(where: {
+            $0.finalizationRecord == record
+        }) else {
+            throw FileOutboxCursorCheckpointError.checkpointMismatch
+        }
+        return transaction.uncheckedDirectAcknowledgmentIDs
+    }
+
+    func hasUncheckedDirectAcknowledgment(itemID: String, receiverBindingID: String) throws -> Bool {
+        try loadEnqueueTransactions().contains {
+            $0.uncheckedDirectAcknowledgmentIDs.contains(itemID)
+                && $0.entries.contains { $0.id == itemID && $0.receiverIdentity == receiverBindingID }
+        }
+    }
+
+    func directSleepCleanupIntent(for record: FileOutboxFinalizationRecord) throws -> DirectSleepCleanupIntent? {
+        try loadEnqueueTransactions().first { $0.finalizationRecord == record }?.directSleepCleanupIntent
+    }
+
+    func hasDirectSleepCleanupIntent(itemID: String, receiverBindingID: String, receiverGeneration: String) throws -> Bool {
+        try loadEnqueueTransactions().contains {
+            guard let intent = $0.directSleepCleanupIntent else { return false }
+            return intent.itemID == itemID && intent.receiverBindingID == receiverBindingID
+                && intent.receiverGeneration == receiverGeneration
+        }
+    }
+
+    func beginDirectSleepCleanup(_ intent: DirectSleepCleanupIntent, for record: FileOutboxFinalizationRecord) throws {
+        try requireUploadAdmission()
+        var transactions = try loadEnqueueTransactions()
+        guard let index = transactions.firstIndex(where: { $0.finalizationRecord == record }),
+              transactions[index].directSleepCleanupIntent == nil,
+              transactions[index].uncheckedDirectAcknowledgmentIDs == Set([intent.itemID]) else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        transactions[index].directSleepCleanupIntent = intent
+        try persistEnqueueTransactions(transactions)
+    }
+
+    func finishDirectSleepCleanup(_ intent: DirectSleepCleanupIntent, for record: FileOutboxFinalizationRecord) throws {
+        try requireUploadAdmission()
+        var transactions = try loadEnqueueTransactions()
+        guard let index = transactions.firstIndex(where: { $0.finalizationRecord == record }),
+              transactions[index].directSleepCleanupIntent == intent else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        transactions[index].directSleepCleanupIntent = nil
+        transactions[index] = transactions[index].recordingDirectAcknowledgment(for: intent.itemID, sleepChecked: true)
+        try persistEnqueueTransactions(transactions)
+    }
+
     // A new durable ACK is observable even if this call later throws during cleanup.
     func recordDirectUploadAcceptance(
         itemID: String,
         receiverIdentity: String,
+        sleepChecked: Bool = false,
         onNewAcceptance: () -> Void
     ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
@@ -1378,17 +1463,18 @@ public final class FileOutbox {
                 == receiverIdentity || finalizationRecord.cursorCheckpoint == nil else {
                 throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
             }
-            if !transaction.directAcknowledgedIDs.contains(itemID) {
+            let isNewAcceptance = !transaction.directAcknowledgedIDs.contains(itemID)
+            if isNewAcceptance {
                 try requireDirectRetirementAllowed(itemID: itemID)
             }
             #if !HEALTH_BRIDGE_MAILBOX_QA
             try acknowledgeProjectionPayload(itemID: itemID, receiverBindingID: receiverIdentity)
             #endif
-            let updated = transaction.recordingDirectAcknowledgment(for: itemID)
+            let updated = transaction.recordingDirectAcknowledgment(for: itemID, sleepChecked: sleepChecked)
             if updated != transaction {
                 transactions[transactionIndex] = updated
                 try persistEnqueueTransactions(transactions)
-                onNewAcceptance()
+                if isNewAcceptance { onNewAcceptance() }
             }
             let manifest = try reconciledManifest()
             guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
@@ -1414,11 +1500,19 @@ public final class FileOutbox {
     public func directFinalizationRecordReady(
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
+        try directFinalizationRecordReady(receiverIdentity: receiverIdentity) { _, _ in true }
+    }
+
+    func directFinalizationRecordReady(
+        receiverIdentity: String,
+        where accepts: (FileOutboxFinalizationRecord, Set<String>) -> Bool
+    ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         let manifest = try reconciledManifest()
         let transactions = try loadEnqueueTransactions()
         for (index, transaction) in transactions.enumerated() {
             guard let finalizationRecord = transaction.finalizationRecord,
+                  accepts(finalizationRecord, transaction.uncheckedDirectAcknowledgmentIDs),
                   transaction.entries.allSatisfy({ $0.receiverIdentity == receiverIdentity }),
                   finalizationRecord.cursorCheckpoint?.receiverIdentity
                     == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
@@ -1740,7 +1834,7 @@ public final class FileOutbox {
         _ = try reconciledManifest()
     }
 
-    private func requireDirectRetirementAllowed(itemID: String) throws {
+    func requireDirectRetirementAllowed(itemID: String) throws {
         let current = try reconciledManifest().entries.first { $0.id == itemID }
         let hasMailboxBinding = current?.mailboxBinding != nil
         let hasDeliveryState = current?.deliveryState != nil
@@ -2614,11 +2708,19 @@ public final class FileOutbox {
             let entryIDs = Set(transaction.entries.map(\.id))
             let sequences = Set(transaction.entries.map(\.sequence))
             let acknowledgedIDs = transaction.directAcknowledgedIDs
+            if let intent = transaction.directSleepCleanupIntent {
+                guard !intent.journalID.isEmpty, !intent.receiverBindingID.isEmpty, !intent.receiverGeneration.isEmpty,
+                      transaction.uncheckedDirectAcknowledgmentIDs == Set([intent.itemID]),
+                      transaction.entries.allSatisfy({ $0.receiverIdentity == intent.receiverBindingID }) else {
+                    throw SequenceError.invalidManifest
+                }
+            }
             guard transaction.version == EnqueueTransaction.currentVersion,
                   !transaction.entries.isEmpty,
                   entryIDs.count == transaction.entries.count,
                   sequences.count == transaction.entries.count,
                   acknowledgedIDs.isSubset(of: entryIDs),
+                  Set(transaction.directSleepCheckedItemIDs ?? []).isSubset(of: acknowledgedIDs),
                   transaction.pendingGenerationRetirements?.allSatisfy({
                       !$0.key.isEmpty && $0.value > 0
                   }) != false,

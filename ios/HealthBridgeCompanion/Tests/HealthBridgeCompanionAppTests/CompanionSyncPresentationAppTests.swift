@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import os
 import SwiftUI
 import Vision
 import XCTest
@@ -268,6 +269,8 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
             $0.deliveryState?.phase == .providerObserved
         })
         XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxConfirmationWaiting)
+        XCTAssertNil(viewModel.activityMailboxFailureMessage)
+        XCTAssertEqual(viewModel.activityStatusDetail, viewModel.syncPresentation.detail)
         XCTAssertNil(viewModel.lastAcceptedTransferObservation)
     }
 
@@ -309,6 +312,10 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
                 XCTAssertEqual(try outbox.pendingItem(id: item.id)?.deliveryState?.phase, failurePhase, context)
                 XCTAssertEqual(viewModel.syncPresentation.phase,
                                failurePhase == .published ? .mailboxConfirmationWaiting : .mailboxQueued, context)
+                let diagnostic = try XCTUnwrap(viewModel.activityMailboxFailureMessage, context)
+                XCTAssertTrue(diagnostic.hasPrefix("Mailbox ACK diagnostics failed: "), context)
+                XCTAssertFalse(diagnostic.contains(fixture.base.root.path), context)
+                XCTAssertEqual(viewModel.activityStatusDetail, diagnostic, context)
                 XCTAssertNil(viewModel.lastAcceptedTransferObservation, context)
                 XCTAssertNil(try fixture.base.cursor("dietary_protein"), context)
             }
@@ -361,6 +368,52 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: ackURL.path))
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
         XCTAssertEqual(fixture.base.receiver.batches.count, batches)
+    }
+
+    func testMailboxCommitRecordsAcceptedTransferWhenScanCheckpointWriteFails() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let suite = fixture.base.suite + ".checkpoint-fault"
+        let defaults = try XCTUnwrap(ScanCheckpointRejectingDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let item = try fixture.base.enqueueMixed()
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let pending = try XCTUnwrap(fixture.base.outbox.pendingItem(id: item.id))
+        XCTAssertEqual(pending.deliveryState?.phase, .providerObserved)
+        let vm = try await fixture.base.makeViewModel(mailbox: fixture, backgroundSyncStore: background)
+        XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+        XCTAssertNil(vm.lastAcceptedTransferObservation)
+        _ = try fixture.receiveAndAcknowledge(pending)
+        // Simulate the ACK becoming readable between the exact probe and the bounded scan.
+        let skipExactProbe = OSAllocatedUnfairLock(initialState: true)
+        fixture.prepareAckCandidate = { url in
+            let first = skipExactProbe.withLock { pending in
+                defer { pending = false }
+                return pending
+            }
+            if first { return false }
+            return MailboxAckScanner.prepareCandidateForBoundedRead(url)
+        }
+        defaults.rejectScanCheckpoint = true
+
+        vm.runForegroundMailboxReconciliationIfNeeded()
+        await vm.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(defaults.rejectedSynchronizations, 1)
+        XCTAssertTrue(vm.backgroundSyncStatus.contains("mailbox reconciliation failed"))
+        XCTAssertNil(try fixture.base.outbox.pendingItem(id: item.id))
+        XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
+        let observation = try XCTUnwrap(vm.lastAcceptedTransferObservation)
+        XCTAssertEqual(observation.evidenceKind, .mailboxCommit)
+        XCTAssertEqual(observation.bindingID, fixture.identity.opaqueBinding)
     }
 
     func testUnavailableObservationWriteCannotChangeDirectAcceptance() async throws {
@@ -459,5 +512,28 @@ private final class UnavailableObservationDefaults: UserDefaults, @unchecked Sen
 
     override func set(_ value: Any?, forKey defaultName: String) {
         rejectedWrites += 1
+    }
+}
+
+private final class ScanCheckpointRejectingDefaults: UserDefaults, @unchecked Sendable {
+    var rejectScanCheckpoint = false
+    private var hasRejectedCheckpointWrite = false
+    private(set) var rejectedSynchronizations = 0
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        if rejectScanCheckpoint, defaultName == "healthBridge.backgroundSync.mailboxAckScanCheckpoint" {
+            hasRejectedCheckpointWrite = true
+            return
+        }
+        super.set(value, forKey: defaultName)
+    }
+
+    override func synchronize() -> Bool {
+        if hasRejectedCheckpointWrite {
+            hasRejectedCheckpointWrite = false
+            rejectedSynchronizations += 1
+            return false
+        }
+        return super.synchronize()
     }
 }

@@ -264,6 +264,9 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertEqual(observed?.evidenceKind, .directResponse,
                        "The first durable ACK must confirm while cursor finalization is still failing")
 
+        let sleepJournal = fixture.root.appendingPathComponent("sleep-sync-manifest-v1.json.pending")
+        let damaged = Data("{".utf8)
+        try damaged.write(to: sleepJournal)
         guard chflags(cursorURL.path, 0) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
@@ -278,6 +281,7 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertEqual(try cursors.cursorValue(
             receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
         ), checkpoint.cursorValue)
+        XCTAssertEqual(try Data(contentsOf: sleepJournal), damaged)
         XCTAssertEqual(vm.lastAcceptedTransferObservation, observed,
                        "Replaying the durable ACK must not record it a second time")
         XCTAssertEqual(vm.lastAcceptedTransferObservation?.evidenceKind, .directResponse,
