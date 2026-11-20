@@ -388,14 +388,27 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
         "mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine"
     )
     publication = mailbox.index(
-        "mailboxDeliveryDiagnosticLine = flushSummary.mailboxDeliveryDiagnosticLine"
+        str.join(
+            "",
+            (
+                "mailboxDeliveryDiagnosticLine = ",
+                ".summary(flushSummary.mailboxDeliveryDiagnosticLine)",
+            ),
+        )
     )
 
-    assert delivery < post_await_target_check < summary_mapping < publication
-    assert mailbox.index("catch let cancellation as CancellationError") < mailbox.index(
-        "catch {"
+    cancellation_catch = mailbox.index("catch let cancellation as CancellationError {")
+    failure_catch = mailbox.index("} catch {", cancellation_catch)
+    assert (
+        delivery
+        < post_await_target_check
+        < summary_mapping
+        < publication
+        < cancellation_catch
     )
-    failure_catch = mailbox.index("catch {")
+    assert mailbox[cancellation_catch:failure_catch].split("{", 1)[1].strip() == (
+        "throw cancellation"
+    )
     failure_target_check = mailbox.index(
         "try requireCurrentPayloadDeliveryTarget(target)", failure_catch
     )
@@ -422,12 +435,34 @@ def test_background_mailbox_failure_checks_generation_before_publication() -> No
 
     assert "publishPendingFIFOHead()" in mailbox
     assert "deliverPending()" not in mailbox
-    success_publication = mailbox.index(
-        "mailboxDeliveryDiagnosticLine = summary.diagnosticLine"
+    publish = mailbox.index(".publishPendingFIFOHead()")
+    post_await_generation_check = mailbox.index(
+        "try requireCurrentConnectionGeneration(expectedGeneration)", publish
     )
-    failure_catch = mailbox.index("} catch {", success_publication)
+    success_status_publication = mailbox.index(
+        "backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage("
+    )
+    success_publication = mailbox.index(
+        "mailboxDeliveryDiagnosticLine = .summary(summary.diagnosticLine)"
+    )
+    cancellation_catch = mailbox.index("catch is CancellationError {")
+    failure_catch = mailbox.index("} catch {", cancellation_catch)
+    assert (
+        publish
+        < post_await_generation_check
+        < success_status_publication
+        < success_publication
+        < cancellation_catch
+    )
+    assert (
+        mailbox[cancellation_catch:failure_catch].split("{", 1)[1].strip() == "return"
+    )
     failure_generation_check = mailbox.index(
         "try requireCurrentConnectionGeneration(expectedGeneration)", failure_catch
+    )
+    stale_return = mailbox.index(
+        "} catch {\n                    return\n                }",
+        failure_generation_check,
     )
     failure_publication = mailbox.index(
         "MailboxDeliveryDiagnosticLine.failure(for: error)",
@@ -438,8 +473,8 @@ def test_background_mailbox_failure_checks_generation_before_publication() -> No
         failure_catch,
     )
 
-    assert failure_catch < failure_generation_check < failure_publication
-    assert failure_generation_check < failure_status_publication
+    assert failure_catch < failure_generation_check < stale_return < failure_publication
+    assert stale_return < failure_status_publication
 
 
 def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:

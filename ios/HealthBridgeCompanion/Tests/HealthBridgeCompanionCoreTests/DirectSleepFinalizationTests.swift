@@ -5,6 +5,35 @@ import XCTest
 
 @MainActor
 final class DirectSleepFinalizationTests: XCTestCase {
+    func testLegacyMissingJournalWithoutCleanupIntentRetainsAcceptedOwnership() async throws {
+        let f = try DirectSleepFinalizationFixture()
+        defer { f.remove() }
+        let d = f.descriptor
+        let manifestURL = f.root.appendingPathComponent("sleep.json")
+        let record = try XCTUnwrap(f.outbox.recordDirectUploadAccepted(
+            itemID: d.itemID, receiverIdentity: d.receiverBindingID
+        ))
+        try f.sleep.saveManifest(f.pending.manifest)
+        try FileManager.default.removeItem(at: f.root.appendingPathComponent("sleep.json.pending"))
+
+        let outbox = try FileOutbox(directory: f.outbox.directoryURL)
+        let sleep = try FileSleepSyncManifestStore(fileURL: manifestURL)
+        let recovered = OutboxDeliveryCursorFinalizer(
+            outbox: outbox, cursorStore: try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("cursors.json")),
+            pendingGenerationStore: f.background
+        )
+        XCTAssertNil(try sleep.loadPendingTransition())
+        let finished = try await recovered.finalizeDirectAcknowledgments(
+            receiverBindingID: d.receiverBindingID, receiverGeneration: d.receiverGeneration,
+            sleepStore: sleep, validate: {}
+        )
+        XCTAssertFalse(finished, "A manifest and an absent journal do not bind this unchecked ACK to a transition.")
+        XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: d.receiverBindingID), record)
+        XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
+        XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+    }
+
     func testLegacySleepCleanupInterruptionRetainsAcceptanceAcrossRestart() async throws {
         for afterUnlink in [false, true] {
             let f = try DirectSleepFinalizationFixture()

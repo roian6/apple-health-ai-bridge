@@ -40,6 +40,13 @@ final class NutritionReceiver: @unchecked Sendable {
     func respond(_ request: URLRequest, body: Data?) throws -> (Int, Data) {
         try lock.withLock {
             if capabilityValue == .offline { throw URLError(.notConnectedToInternet) }
+            if request.url?.path == "/v1/pairing/redeem" {
+                return (200, Data("""
+                {"schema_id":"health_bridge.receiver_pairing_completion.v1",
+                 "schema_version":"1.0.0","label":"Synthetic receiver",
+                 "receiver_url":"http://127.0.0.1:8766/v1/batches"}
+                """.utf8))
+            }
             if request.url?.path == "/v1/capabilities" {
                 credentialsValue.append(request.value(forHTTPHeaderField: "Authorization") ?? "")
                 switch capabilityValue {

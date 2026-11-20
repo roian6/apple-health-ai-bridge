@@ -42,7 +42,7 @@ def test_disconnect_is_async_and_uses_the_terminal_connection_barrier() -> None:
     assert "await viewModel.disconnectReceiver()" in content
 
 
-def test_legacy_v1_and_v2_replacement_call_the_same_barrier_helper() -> None:
+def test_pairing_checks_each_barrier_result_before_promotion() -> None:
     source = VIEW_MODEL.read_text()
     start = source.index("private func applyPairingMaterial(")
     end = source.index("private func applyCommittedPairingCredential(", start)
@@ -50,28 +50,40 @@ def test_legacy_v1_and_v2_replacement_call_the_same_barrier_helper() -> None:
 
     legacy = body[body.index("case .legacy") : body.index("case .invitation")]
     invitation = body[body.index("case .invitation") :]
-    assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in legacy
-    assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in invitation
-
-
-def test_pairing_ui_promotion_rechecks_the_committed_generation_after_the_barrier() -> (
-    None
-):
-    source = VIEW_MODEL.read_text()
-    start = source.index("private func applyPairingMaterial(")
-    end = source.index("private func applyCommittedPairingCredential(", start)
-    body = source[start:end]
-
-    assert body.count("committedGeneration") >= 2
-    assert (
-        body.count(
-            "requireCommittedConnectionGenerationWhileHoldingRequestGate(committedGeneration)"
+    for source_branch, promotion in (
+        (legacy, "applyCommittedPairingConnection("),
+        (invitation, "applyCommittedPairingCredential("),
+    ):
+        branch = "".join(source_branch.split())
+        barrier = branch.index(
+            "lettransition=tryawaitperformTerminalConnectionTransitionWhileHoldingRequestGate("
         )
-        >= 2
+        check = branch.index(
+            "tryrequireCommittedConnectionGenerationWhileHoldingRequestGate(", barrier
+        )
+        argument = branch[check:].partition("(")[2].partition(")")[0]
+        if argument != "transition.committedGeneration":
+            assert (
+                f"let{argument}=transition.committedGeneration" in branch[barrier:check]
+            )
+        assert check < branch.index(promotion)
+
+
+def test_history_picker_and_setter_share_terminal_user_admission() -> None:
+    source = VIEW_MODEL.read_text()
+    start = source.index("var canChangeHealthHistoryDepth: Bool")
+    end = source.index("func saveReceiverSettings() async", start)
+    admission, setter = source[start:end].split("func setHealthHistoryDepthOption(")
+    assert "terminalUserActionAdmissionIsOpen" in admission
+    assert setter.index("guard canChangeHealthHistoryDepth else { return }") < (
+        setter.index("healthHistoryDepthStore.saveHistoryDepth(")
     )
-    assert body.index(
-        "requireCommittedConnectionGenerationWhileHoldingRequestGate(committedGeneration)"
-    ) < body.index("applyCommittedPairingConnection(")
+
+    view = CONTENT_VIEW.with_name("DataScopeView.swift").read_text()
+    start = view.index("Picker(")
+    picker = view[start : view.index("VStack(", start)]
+    assert "set: { viewModel.setHealthHistoryDepthOption($0) }" in picker
+    assert ".disabled(!viewModel.canChangeHealthHistoryDepth)" in picker
 
 
 def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
@@ -458,7 +470,6 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
     )
 
     for action_entry in (
-        "func setHealthHistoryDepthOption(_ optionID: String)",
         "func retryPrivateStorage() async",
         "func saveReceiverSettings() async",
         "func requestHealthPermissions() async",
