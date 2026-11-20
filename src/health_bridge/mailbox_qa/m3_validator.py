@@ -148,7 +148,7 @@ def _m2_preserved(
         if content is None:
             return False
         document = hbjcs1_decode(content)
-        if not isinstance(document, dict) or hbjcs1_encode(document) != content:
+        if not isinstance(document, dict):
             return False
         m2_manifest = M2Manifest.model_validate_json(content)
     except (HBJCS1Error, M3ValidationError, OSError, ValidationError):

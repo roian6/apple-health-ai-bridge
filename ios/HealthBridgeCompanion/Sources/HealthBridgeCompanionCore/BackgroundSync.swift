@@ -92,6 +92,7 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
         case retryableReadFailure
         case unknownAvailability
         case payloadEnqueued
+        case deferred
         case blocked
     }
 
@@ -123,6 +124,10 @@ public struct AutomaticSyncTypeResult: Equatable, Sendable {
 
     public static func unknownAvailabilityCovering(_ generations: [String: Int]) -> Self {
         Self(disposition: .unknownAvailability, coveredGenerations: generations)
+    }
+
+    public static func deferredCovering(_ generations: [String: Int]) -> Self {
+        Self(disposition: .deferred, coveredGenerations: generations)
     }
 }
 
@@ -401,6 +406,14 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
         for typeCode in typeCodes where !handled.contains(typeCode) {
             try Task.checkCancellation()
             guard let generation = snapshot[typeCode] else { continue }
+            if reason == .scheduledRefresh || reason == .launchCatchUp {
+                // Retain this generation, but let the next opportunity reach
+                // other types if processing consumes the remaining lifetime.
+                try pendingStore.advanceAutomaticSyncContinuation(
+                    after: typeCode,
+                    in: typeCodes
+                )
+            }
             let result = try await processType(typeCode, snapshot)
             let coveredGenerations = (result.coveredGenerations ?? [typeCode: generation])
                 .filter { snapshot[$0.key] == $0.value }
@@ -415,16 +428,12 @@ public final class AutomaticSyncEngine: @unchecked Sendable {
                 break
             case .unknownAvailability:
                 allAvailable = false
+            case .deferred:
+                allAvailable = false
             case .payloadEnqueued:
                 break
             case .blocked:
                 return false
-            }
-            if reason == .scheduledRefresh || reason == .launchCatchUp {
-                try pendingStore.advanceAutomaticSyncContinuation(
-                    after: typeCode,
-                    in: typeCodes
-                )
             }
             try Task.checkCancellation()
         }
@@ -1217,7 +1226,7 @@ public final class BackgroundSyncSettingsStore {
         let ordered = GenericQuantityCoveragePolicy.canonicalTypeCodes(for: typeCodes)
         guard let continuation = userDefaults.string(
             forKey: Key.automaticSyncContinuationTypeCode
-        ), let index = ordered.firstIndex(of: continuation) else {
+        ), let index = ordered.firstIndex(where: { $0 >= continuation }) else {
             return ordered
         }
         return Array(ordered[index...] + ordered[..<index])

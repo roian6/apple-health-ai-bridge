@@ -29,6 +29,28 @@ def test_hbjcs1_encodes_the_integer_only_profile() -> None:
 
 
 @pytest.mark.parametrize(
+    ("value", "encoded"),
+    [
+        ("", b'""'),
+        ("literal \u2603", b'"literal \xe2\x98\x83"'),
+        ('before"\\\nafter', b'"before\\"\\\\\\u000aafter"'),
+        ("abc" * 1024, b'"' + b"abc" * 1024 + b'"'),
+    ],
+)
+def test_hbjcs1_string_bytes_preserve_literals_and_canonical_escapes(
+    value: str, encoded: bytes
+) -> None:
+    assert delivery.hbjcs1_encode(value) == encoded
+    assert delivery.hbjcs1_decode(encoded) == value
+
+
+@pytest.mark.parametrize("value", ["\ud800", "prefix\udfff", "prefix\ud800suffix"])
+def test_hbjcs1_surrogates_raise_profile_error(value: str) -> None:
+    with pytest.raises(delivery.HBJCS1Error):
+        _ = delivery.hbjcs1_encode(value)
+
+
+@pytest.mark.parametrize(
     "value", [1.0, 1.25, float("nan"), float("inf"), float("-inf")]
 )
 def test_hbjcs1_rejects_every_float(value: float) -> None:
@@ -46,6 +68,9 @@ def test_hbjcs1_rejects_every_float(value: float) -> None:
         b'{"a":1,"a":1}',
         b'{"A":1}',
         b"\xff",
+        b'{"a":"before\\nafter"}',
+        b'{"a":"before\nafter"}',
+        b'{"a":"unfinished}',
     ],
 )
 def test_hbjcs1_rejects_noncanonical_metadata(

@@ -349,19 +349,23 @@ public struct FileOutboxCursorCheckpoint: Codable, Equatable, Sendable {
     public let cursorKind: String
     public let cursorValue: String
     public let coreLaneUploadProof: FileOutboxCoreLaneUploadProof?
+    /// Coverage associated with this workout anchor, earned by the same transaction.
+    public let workoutHistoryStart: Date?
 
     public init(
         receiverIdentity: String,
         sourceKey: String,
         cursorKind: String,
         cursorValue: String,
-        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil
+        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil,
+        workoutHistoryStart: Date? = nil
     ) {
         self.receiverIdentity = receiverIdentity
         self.sourceKey = sourceKey
         self.cursorKind = cursorKind
         self.cursorValue = cursorValue
         self.coreLaneUploadProof = coreLaneUploadProof
+        self.workoutHistoryStart = workoutHistoryStart
     }
 }
 
@@ -651,6 +655,7 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    private var decodedManifest: (bytes: Data, value: SequenceManifest)?
     var observeNutritionCodec: @Sendable () -> Void = {}
     var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
     var nutritionSplitFault: (NutritionSplitBoundary) throws -> Void = { _ in }
@@ -842,6 +847,7 @@ public final class FileOutbox {
             }
         }
         for batch in batches {
+            var legacyStepRecordIDs: Set<String> = []
             for sample in batch.samples {
                 guard let start = HealthBridgeUTCFormatter.date(from: sample.startTime),
                       let end = HealthBridgeUTCFormatter.date(from: sample.endTime) else {
@@ -853,8 +859,18 @@ public final class FileOutbox {
                 note(interval)
                 if tracksDaily { index[identity] = interval }
                 evidence[sample.clientRecordID] = .init(clientRecordID: sample.clientRecordID, start: start, end: end)
+                if typeCode == "steps", sample.typeCode == typeCode, sample.sourceKey == source,
+                   sample.metadata["sample_kind"] == "raw_quantity" {
+                    legacyStepRecordIDs.insert(StepCountSyncBatchFactory.legacyDailyStepRecordID(for: start))
+                }
             }
             for deletion in batch.deletedRecords where deletion.recordFamily == "sample" {
+                // Keep the paired legacy aggregate tombstone on the wire. Its raw
+                // sample already provides repair evidence; it is not a raw deletion.
+                if deletion.sourceKey == source, deletion.deletedAt == batch.generatedAt,
+                   legacyStepRecordIDs.contains(deletion.clientRecordID) {
+                    continue
+                }
                 let identity = key + "\n" + deletion.clientRecordID
                 if let previous = index[identity] {
                     note(previous)
@@ -1157,6 +1173,19 @@ public final class FileOutbox {
         try pendingItems(in: reconciledManifest())
     }
 
+    // Route this synchronous operation from one reconciled manifest.
+    func readMailboxPublicationRoute(
+        itemID: String
+    ) throws -> (state: FileOutboxDeliveryStateV1?, pendingItem: FileOutboxItem?) {
+        guard Self.isSafeItemID(itemID) else { return (nil, nil) }
+        let manifest = try reconciledManifest()
+        let state = manifest.entries.first(where: { $0.id == itemID })?.deliveryState
+        let pending = state?.phase == .published
+            ? try pendingItems(in: manifest).first(where: { $0.id == itemID })
+            : nil
+        return (state, pending)
+    }
+
     func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
         try requireUploadAdmission()
         guard let manifest = try loadManifest() else { throw CancellationError() }
@@ -1313,13 +1342,26 @@ public final class FileOutbox {
         itemID: String,
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
+        try recordDirectUploadAcceptance(
+            itemID: itemID, receiverIdentity: receiverIdentity, onNewAcceptance: {}
+        )
+    }
+
+    // A new durable ACK is observable even if this call later throws during cleanup.
+    func recordDirectUploadAcceptance(
+        itemID: String,
+        receiverIdentity: String,
+        onNewAcceptance: () -> Void
+    ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
         }
         if try nutritionCollectionOwner(itemID) != itemID {
             try requireDirectRetirementAllowed(itemID: itemID)
-            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
+            try recordNutritionChildAcceptance(
+                itemID: itemID, receiverIdentity: receiverIdentity, onNewAcceptance: onNewAcceptance
+            )
             return try directFinalizationRecordReady(receiverIdentity: receiverIdentity)
         }
         var transactions = try loadEnqueueTransactions()
@@ -1346,6 +1388,7 @@ public final class FileOutbox {
             if updated != transaction {
                 transactions[transactionIndex] = updated
                 try persistEnqueueTransactions(transactions)
+                onNewAcceptance()
             }
             let manifest = try reconciledManifest()
             guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
@@ -1364,7 +1407,7 @@ public final class FileOutbox {
         guard item.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        try markUploaded(item)
+        try markUploaded(item, onPayloadRemoved: onNewAcceptance)
         return nil
     }
 
@@ -1497,12 +1540,14 @@ public final class FileOutbox {
         try recoverNutritionSplits()
         preparedNutritionPayloads[split.supportedID] = PreparedNutritionPayload(
             revision: try NutritionPayloadRevision(finalPayloadURL(for: split.supportedID)),
-            containsNutrition: false, permitsSupported: true, projection: nil,
+            containsNutrition: false, mayContainSleep: prepared.mayContainSleep,
+            permitsSupported: true, projection: nil,
             remainder: nil, cursors: []
         )
         preparedNutritionPayloads[split.remainderID] = PreparedNutritionPayload(
             revision: try NutritionPayloadRevision(finalPayloadURL(for: split.remainderID)),
-            containsNutrition: true, permitsSupported: prepared.permitsSupported,
+            containsNutrition: true, mayContainSleep: prepared.mayContainSleep,
+            permitsSupported: prepared.permitsSupported,
             projection: nil, remainder: nil, cursors: prepared.cursors
         )
     }
@@ -1563,23 +1608,27 @@ public final class FileOutbox {
     }
 
     private func recordNutritionChildAcceptance(
-        itemID: String, receiverIdentity: String
+        itemID: String, receiverIdentity: String, onNewAcceptance: () -> Void = {}
     ) throws {
         guard var manifest = try loadManifest(),
               let index = manifest.nutritionSplits?.firstIndex(where: {
                   $0.supportedID == itemID || $0.remainderID == itemID
               }),
-              var splits = manifest.nutritionSplits else { return }
+               var splits = manifest.nutritionSplits else { return }
         guard splits[index].receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
+        let alreadyAccepted: Bool
         if splits[index].supportedID == itemID {
+            alreadyAccepted = splits[index].supportedAccepted
             splits[index].supportedAccepted = true
         } else {
+            alreadyAccepted = splits[index].remainderAccepted
             splits[index].remainderAccepted = true
         }
         manifest.nutritionSplits = splits
         try persistManifest(manifest)
+        if !alreadyAccepted { onNewAcceptance() }
         try nutritionSplitFault(.acceptancePersisted)
         try recoverNutritionSplits()
     }
@@ -1671,6 +1720,10 @@ public final class FileOutbox {
     }
 
     public func markUploaded(_ item: FileOutboxItem) throws {
+        try markUploaded(item, onPayloadRemoved: {})
+    }
+
+    private func markUploaded(_ item: FileOutboxItem, onPayloadRemoved: () -> Void) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
         if let identity = item.receiverIdentity {
             try recordNutritionChildAcceptance(itemID: item.id, receiverIdentity: identity)
@@ -1682,6 +1735,7 @@ public final class FileOutbox {
         #endif
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
+            onPayloadRemoved()
         }
         _ = try reconciledManifest()
     }
@@ -2592,41 +2646,131 @@ public final class FileOutbox {
 
     private func recoverEnqueueTransactionsIfNeeded() throws {
         let transactions = try loadEnqueueTransactions()
+        guard !transactions.isEmpty else { return }
+        let loadedManifest = try loadManifest()
+        var manifest = loadedManifest ?? .empty
+        var manifestEntries = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
+        )
+        var sequenceOwners = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.sequence, $0.id) }
+        )
+        var removedIDs: Set<String> = []
+        var additions: [SequenceEntry] = []
+        var retainedTransactions: [EnqueueTransaction] = []
         for transaction in transactions {
-            let loadedManifest = try loadManifest()
-            var manifest = loadedManifest ?? .empty
-            try Self.validate(manifest)
-            let manifestEntries = Dictionary(
-                uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
-            )
-            let allPayloadsAreRecoverable = !clearIntentIsActive
-                && transaction.entries.allSatisfy { entry in
-                    transaction.directAcknowledgedIDs.contains(entry.id)
-                        || fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
-                        || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
-                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
+            let acknowledgedIDs = transaction.directAcknowledgedIDs
+            let payloads = transaction.entries.map { entry in
+                (
+                    entry: entry,
+                    staged: fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path),
+                    final: fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                )
+            }
+            let isApplied = !destructiveRecoveryIsRequested
+                && payloads.allSatisfy { payload in
+                    let entry = payload.entry
+                    guard manifest.nextSequence > entry.sequence, !payload.staged else {
+                        return false
+                    }
+                    if acknowledgedIDs.contains(entry.id) {
+                        return manifestEntries[entry.id] == nil && !payload.final
+                    }
+                    guard let current = manifestEntries[entry.id],
+                          Self.hasSameCollectionIdentity(current, entry) else {
+                        return false
+                    }
+                    return payload.final || current.deliveryState?.phase == .committedFinalized
                 }
-            if allPayloadsAreRecoverable {
-                _ = try commitEnqueueTransaction(transaction, manifest: manifest)
+            if isApplied {
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
                 continue
             }
-            if !transaction.directAcknowledgedIDs.isEmpty
+            let allPayloadsAreRecoverable = !clearIntentIsActive
+                && payloads.allSatisfy { payload in
+                    acknowledgedIDs.contains(payload.entry.id)
+                        || payload.staged || payload.final
+                        || manifestEntries[payload.entry.id]?.deliveryState?.phase == .committedFinalized
+                }
+            if allPayloadsAreRecoverable {
+                let additionsStart = additions.endIndex
+                for payload in payloads {
+                    let entry = payload.entry
+                    guard entry.sequence < UInt64.max else { throw SequenceError.exhausted }
+                    manifest.nextSequence = max(manifest.nextSequence, entry.sequence + 1)
+                    let stagedURL = stagedPayloadURL(for: entry.id)
+                    let finalURL = finalPayloadURL(for: entry.id)
+                    if acknowledgedIDs.contains(entry.id) {
+                        try removeIfExists(stagedURL)
+                        try removeIfExists(finalURL)
+                        if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                            sequenceOwners.removeValue(forKey: removed.sequence)
+                            removedIDs.insert(entry.id)
+                        }
+                        continue
+                    }
+                    if payload.staged {
+                        try Self.applySensitiveFileAttributes(to: stagedURL, fileManager: fileManager)
+                        if payload.final {
+                            try fileManager.removeItem(at: stagedURL)
+                        } else {
+                            try fileManager.moveItem(at: stagedURL, to: finalURL)
+                        }
+                    }
+                    let hasFinalPayload = fileManager.fileExists(atPath: finalURL.path)
+                    guard hasFinalPayload
+                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized else {
+                        throw SequenceError.invalidManifest
+                    }
+                    if hasFinalPayload {
+                        try Self.applySensitiveFileAttributes(to: finalURL, fileManager: fileManager)
+                    }
+                    if manifestEntries[entry.id] == nil {
+                        guard entry.sequence > 0, Self.isSafeItemID(entry.id) else {
+                            throw SequenceError.invalidManifest
+                        }
+                        manifestEntries[entry.id] = entry
+                        additions.append(entry)
+                    }
+                }
+                for entry in additions[additionsStart...] {
+                    guard sequenceOwners[entry.sequence] == nil else {
+                        throw SequenceError.invalidManifest
+                    }
+                    sequenceOwners[entry.sequence] = entry.id
+                }
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
+                continue
+            }
+            if !acknowledgedIDs.isEmpty
                 || transaction.entries.contains(where: {
                 manifestEntries[$0.id]?.deliveryState?.phase == .committedFinalized
             }) {
                 throw FileOutboxCursorCheckpointError.pendingCommit
             }
 
-            let transactionIDs = Set(transaction.entries.map(\.id))
             for entry in transaction.entries {
                 try removeIfExists(stagedPayloadURL(for: entry.id))
                 try removeIfExists(finalPayloadURL(for: entry.id))
+                if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                    sequenceOwners.removeValue(forKey: removed.sequence)
+                    removedIDs.insert(entry.id)
+                }
             }
-            manifest.entries.removeAll { transactionIDs.contains($0.id) }
-            if manifest != loadedManifest {
-                try persistManifest(manifest)
-            }
-            try removeEnqueueTransaction(transaction)
+        }
+        manifest.entries.removeAll { removedIDs.contains($0.id) }
+        manifest.entries.append(contentsOf: additions)
+        if manifest != loadedManifest {
+            try persistManifest(manifest)
+        }
+        // Journal pruning must follow the manifest durability boundary, including
+        // when a later transaction fails after earlier payloads have moved.
+        if retainedTransactions != transactions {
+            try persistEnqueueTransactions(retainedTransactions)
         }
     }
 
@@ -2636,6 +2780,10 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        // Hold all recovery, including orphan adoption, until terminal reset proceeds.
+        if terminalResetRequestIsActive {
+            return try loadManifest() ?? .empty
+        }
         try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
@@ -2725,12 +2873,16 @@ public final class FileOutbox {
 
     private func loadManifest() throws -> SequenceManifest? {
         guard fileManager.fileExists(atPath: sequenceURL.path) else { return nil }
-        let manifest = try JSONDecoder().decode(
-            SequenceManifest.self,
-            from: Data(contentsOf: sequenceURL)
-        )
+        let bytes = try Data(contentsOf: sequenceURL)
+        let manifest: SequenceManifest
+        if let decodedManifest, decodedManifest.bytes == bytes {
+            manifest = decodedManifest.value
+        } else {
+            manifest = try JSONDecoder().decode(SequenceManifest.self, from: bytes)
+        }
         try Self.validate(manifest)
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
         return manifest
     }
 
@@ -2738,8 +2890,10 @@ public final class FileOutbox {
         try Self.validate(manifest)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(manifest).write(to: sequenceURL, options: [.atomic])
+        let bytes = try encoder.encode(manifest)
+        try bytes.write(to: sequenceURL, options: [.atomic])
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
     }
 
     private static func validate(_ manifest: SequenceManifest) throws {

@@ -3,6 +3,59 @@ import XCTest
 @testable import HealthBridgeCompanionCore
 
 final class DailyProjectionRepairTests: XCTestCase {
+    func testPairedLegacyStepsTombstoneStaysOnWireWithoutWideningRepair() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+
+        let batch = try fixture.prepareAnchoredSteps()
+
+        XCTAssertEqual(batch.deletedRecords, [HealthBridgeDeletedRecord(
+            recordFamily: "sample", sourceKey: fixture.source.sourceKey, clientRecordID: "hk-steps-20240310",
+            deletedAt: HealthBridgeUTCFormatter.string(from: fixture.end)
+        )])
+        XCTAssertEqual(try fixture.repairStart(type: "steps"), fixture.b)
+        XCTAssertEqual(try fixture.stepRetirementsForLastCompletedDay(), ["steps": 1])
+    }
+
+    func testUnknownRawStepsDeletionStillWidensRepairWithPairedLegacyTombstone() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let deletedID = UUID()
+
+        let batch = try fixture.prepareAnchoredSteps(
+            deletions: [HealthKitDeletedStepSample(uuid: deletedID, deletedAt: fixture.end)]
+        )
+
+        XCTAssertEqual(batch.deletedRecords.map(\.clientRecordID), [
+            "hk-step-sample-\(deletedID.uuidString.lowercased())", "hk-steps-20240310",
+        ])
+        XCTAssertEqual(try fixture.repairStart(type: "steps"), fixture.a)
+        XCTAssertTrue(try fixture.stepRetirementsForLastCompletedDay().isEmpty)
+    }
+
+    func testManifestReadObservesSameSizeReplacementAndRejectsInvalidBytes() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        var manifest = try fixture.manifest()
+        manifest["nextSequence"] = 100
+        try fixture.writeManifest(manifest)
+        XCTAssertEqual(try fixture.outbox.reserveDailyProjectionObservation().sequence, 100)
+        let url = fixture.directory.appendingPathComponent(".fifo-sequence")
+        let prior = try Data(contentsOf: url)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        manifest = try fixture.manifest()
+        manifest["nextSequence"] = 201
+        try fixture.writeManifest(manifest)
+        XCTAssertEqual(try Data(contentsOf: url).count, prior.count)
+        try FileManager.default.setAttributes(
+            [.modificationDate: try XCTUnwrap(attributes[.modificationDate])],
+            ofItemAtPath: url.path
+        )
+        XCTAssertEqual(try fixture.outbox.reserveDailyProjectionObservation().sequence, 201)
+        try Data("{".utf8).write(to: url)
+        XCTAssertThrowsError(try fixture.outbox.reserveDailyProjectionObservation())
+    }
+
     func testPartialWindowRetainsACKedMissingDayAcrossACKRestartAndStrictlyNewerCoverage() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -303,8 +356,35 @@ final class DailyProjectionRepairTests: XCTestCase {
             }
         }
 
-        func repairStart() throws -> Date? {
-            try outbox.projectionRepairStart(receiverBindingID: receiver, sourceKey: source.sourceKey, typeCodes: [type])
+        func repairStart(type: String? = nil) throws -> Date? {
+            try outbox.projectionRepairStart(
+                receiverBindingID: receiver, sourceKey: source.sourceKey, typeCodes: [type ?? self.type]
+            )
+        }
+
+        func prepareAnchoredSteps(deletions: [HealthKitDeletedStepSample] = []) throws -> HealthBridgeBatchV1 {
+            let start = b.addingTimeInterval(3_600)
+            let sample = HealthKitStepSampleSummary(
+                uuid: UUID(), start: start, end: start.addingTimeInterval(60), count: 17
+            )
+            let batch = StepCountSyncBatchFactory.makeAnchoredStepBatch(
+                stepSamples: [sample], deletedStepSamples: deletions, anchorCursorValue: "synthetic-step-anchor",
+                windowStart: a, windowEnd: end, generatedAt: end
+            )
+            let order = try outbox.reserveDailyProjectionObservation()
+            return try XCTUnwrap(outbox.prepareProjectionRawBatches(
+                [batch], order: order, receiverBindingID: receiver, typeCode: "steps",
+                fallbackStart: a, end: end, calendar: calendar
+            ).first)
+        }
+
+        func stepRetirementsForLastCompletedDay() throws -> [String: Int] {
+            let order = try outbox.reserveDailyProjectionObservation()
+            let daily = try batch([(b, 4_321)], type: "steps", start: b)
+            try note(daily, order: order, type: "steps", start: b)
+            return try outbox.projectionRetirementsCovered(
+                ["steps": 1], batch: daily, order: order, receiverBindingID: receiver
+            )
         }
 
         func manifest() throws -> [String: Any] {

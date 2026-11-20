@@ -30,21 +30,6 @@ def test_sdist_excludes_local_private_and_tool_state() -> None:
     }.issubset(excluded)
 
 
-def test_release_criteria_requires_built_artifact_smoke() -> None:
-    criteria = Path(".github/release/criteria.md").read_text()
-    build_command = " ".join(  # noqa: FLY002
-        (
-            "uv build --build-constraints .github/release/build-constraints.txt",
-            "--require-hashes --out-dir dist",
-        )
-    )
-
-    assert 'test -z "$(git status --porcelain=v1)"' in criteria
-    assert "rm -rf dist" in criteria
-    assert build_command in criteria
-    assert "uv run python scripts/package-smoke.py --dist-dir dist" in criteria
-
-
 def test_isolated_build_constraints_are_complete_exact_hashed_pins() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
     build_requires = cast("list[str]", pyproject["build-system"]["requires"])

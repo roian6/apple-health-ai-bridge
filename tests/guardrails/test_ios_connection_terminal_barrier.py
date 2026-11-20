@@ -30,14 +30,14 @@ TERMINAL_TRANSITION_HELPER = (
 def test_disconnect_is_async_and_uses_the_terminal_connection_barrier() -> None:
     source = VIEW_MODEL.read_text()
     start = source.index("func disconnectReceiver() async")
-    end = source.index("private func checkReceiverHealth()", start)
+    end = source.index("private func checkReceiverHealth(", start)
     body = source[start:end]
 
     assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in body
     assert "cancelPairingOperation: true" in body
     assert "pairingCoordinator.cancelPendingPairing(" in body
 
-    content = CONTENT_VIEW.read_text()
+    content = CONTENT_VIEW.with_name("ConnectionSettingsView.swift").read_text()
     assert "Task {" in content
     assert "await viewModel.disconnectReceiver()" in content
 
@@ -218,7 +218,7 @@ def test_lifecycle_and_pairing_waiters_respect_terminal_requests() -> None:
 
     clear_start = source.index("func clearPendingOutbox() async")
     clear_end = source.index(
-        "private func resetPrivateSyncProgressForClear()", clear_start
+        "private func resetPrivateSyncStateAndOutbox(", clear_start
     )
     clear_body = source[clear_start:clear_end]
     assert clear_body.index("pairingRequestEpoch.invalidate()") < clear_body.index(
@@ -251,10 +251,15 @@ def test_clear_and_disconnect_reactivate_automatic_sync_after_request_release() 
 
     clear_worker_start = clear_end
     clear_worker_end = source.index(
-        "private func resetPrivateSyncProgressForClear()", clear_worker_start
+        "private func resetPrivateSyncStateAndOutbox(", clear_worker_start
     )
     clear_worker = source[clear_worker_start:clear_worker_end]
     assert "activateAutomaticSyncIfReady()" not in clear_worker
+    clear_completion_end = source.index("func retryPrivateStorage()", clear_worker_end)
+    assert (
+        "activateAutomaticSyncIfReady()"
+        not in source[clear_worker_end:clear_completion_end]
+    )
 
     disconnect_start = source.index("func disconnectReceiver() async")
     disconnect_worker_start = source.index(
@@ -265,7 +270,7 @@ def test_clear_and_disconnect_reactivate_automatic_sync_after_request_release() 
     assert "defer { activateAutomaticSyncIfReady() }" in disconnect_body
 
     disconnect_worker_end = source.index(
-        "private func checkReceiverHealth()", disconnect_worker_start
+        "private func checkReceiverHealth(", disconnect_worker_start
     )
     disconnect_worker = source[disconnect_worker_start:disconnect_worker_end]
     assert "activateAutomaticSyncIfReady()" not in disconnect_worker
@@ -297,7 +302,7 @@ def test_stale_cancellation_is_rejected_before_durable_marker_write() -> None:
 def test_disconnect_failure_preserves_the_committed_connection_ui() -> None:
     source = VIEW_MODEL.read_text()
     start = source.index("func disconnectReceiver() async")
-    end = source.index("private func checkReceiverHealth()", start)
+    end = source.index("private func checkReceiverHealth(", start)
     body = source[start:end]
 
     preflight = body.index("try requireTrustedEmptyOutboxForConnectionTransition(")
@@ -400,13 +405,27 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
 
     clear_start = source.index("func clearPendingOutbox() async")
     clear_end = source.index(
-        "private func resetPrivateSyncProgressForClear()", clear_start
+        "private func resetPrivateSyncStateAndOutbox(", clear_start
     )
     clear_body = source[clear_start:clear_end]
     assert clear_body.index("withTerminalTransitionRequestGate") < clear_body.index(
         "connectionTerminalBarrier.performRecovery("
     )
     assert "await retryBootstrapAfterRecoveryIfNeeded()" in clear_body
+    barrier_source = RECEIVER_CLIENT.read_text()
+    recovery_start = barrier_source.index("public func performRecovery<Result>(")
+    recovery_end = barrier_source.index(
+        "private func acquireTransition(", recovery_start
+    )
+    recovery = barrier_source[recovery_start:recovery_end]
+    assert (
+        recovery.index("closeAdmission()")
+        < recovery.index("try prepareRecovery()")
+        < recovery.index("await cancelAndAwaitPairing()")
+        < recovery.index("await cancelAndAwaitForegroundPayloads()")
+        < recovery.index("guard await drainBackgroundPayloads()")
+        < recovery.index("return try await commit()")
+    )
 
     toggle_start = source.index("func requestBackgroundSyncEnabled(_ enabled: Bool)")
     toggle_end = source.index("private func receiverIdentityMatches(", toggle_start)
@@ -820,20 +839,18 @@ def test_background_upload_cancellation_is_bounded() -> None:
         "private func runWithExclusiveDirectOutboxTransfer<Result>("
     )
     transfer_end = source.index(
-        "private func finishExclusiveDirectOutboxTransfer()", transfer_start
+        "private func finishExclusiveDirectOutboxTransfer(", transfer_start
     )
     transfer_body = source[transfer_start:transfer_end]
     cancel = transfer_body.index("cancelPendingUploads()")
     verify_empty = transfer_body.index("hasPendingUploadTasks()", cancel)
-    operation = transfer_body.index("let result = await operation()", verify_empty)
+    operation = transfer_body.index("let result = try await operation()", verify_empty)
     assert cancel < verify_empty < operation
     assert "throw CancellationError()" in transfer_body[verify_empty:operation]
 
 
 def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
-    content = CONTENT_VIEW.read_text()
-    start = content.index("private struct ReceiverSettingsView: View")
-    body = content[start:]
+    body = CONTENT_VIEW.with_name("ConnectionSettingsView.swift").read_text()
 
     assert "@State private var showDisconnectFailureAlert = false" in body
     view_model = VIEW_MODEL.read_text()
@@ -847,10 +864,9 @@ def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
     assert "switch outcome" in body
     assert "case .rejected(let message, let pendingOutboxCount" in body
     assert "showDisconnectFailureAlert = true" in body
-    assert '.alert("Can\u2019t Disconnect Yet"' in body
-    assert (
-        "if connectionPreserved, let pendingOutboxCount, pendingOutboxCount > 0" in body
-    )
+    assert '"Can\u2019t Disconnect Yet"' in body
+    assert ".alert(disconnectAlertTitle" in body
+    assert "if connectionPreserved, pendingOutboxCount == nil" in body
     task_start = body.index("let outcome = await viewModel.disconnectReceiver()")
     task_end = body.index("showDisconnectFailureAlert = true", task_start)
     task_body = body[task_start:task_end]
@@ -858,19 +874,22 @@ def test_disconnect_failure_is_presented_immediately_in_settings() -> None:
     assert "viewModel.canSendConnectionTest" not in task_body
     assert "viewModel.pendingOutboxCount" not in task_body
     assert "viewModel.statusMessage" not in task_body
-    assert (
-        "Queued uploads are waiting on this iPhone. Bring the server back and tap "
-        "Sync Now to send them, or use Reset Private Sync State in Settings to "
-        "discard them and rebuild local sync history before disconnecting."
-    ) in body
+    assert "disconnectFailureMessage = message" in task_body
     assert (
         '"Reset Private Sync State (\\(viewModel.pendingOutboxCount) queued)"' in body
     )
     assert '"Delete Queued Uploads (' not in body
-    assert '.confirmationDialog("Reset private sync state?"' in body
+    assert "isPresented: $showPrivateResetConfirmation" in body
+    assert "showPrivateResetConfirmation = true" in body
     assert 'Button("Reset Private Sync State", role: .destructive)' in body
-    assert 'message.contains("disconnect")' in body
-    assert 'message.contains("queued upload")' in body
+    assert "case .disconnectedWithRecoveryRequired:" in body
+    assert '"Disconnected: Recovery Required"' in body
+    assert "Private sync storage must recover before uploads can resume." in body
+    assert "Text(disconnectFailureMessage)" in body
+    assert "viewModel.displayStatusMessage" not in body
+    assert "let notice = viewModel.connectionCheckNotice" in body
+    assert 'message.contains("disconnect")' not in body
+    assert 'message.contains("queued upload")' not in body
 
 
 def test_healthkit_callbacks_are_invalidated_when_observers_stop() -> None:
@@ -966,9 +985,7 @@ def test_bootstrap_consumes_terminal_cancellation_before_generation_advance() ->
     assert "if advanceGeneration" in source
 
     disconnect_start = source.index("func disconnectReceiver() async")
-    disconnect_end = source.index(
-        "private func checkReceiverHealth()", disconnect_start
-    )
+    disconnect_end = source.index("private func checkReceiverHealth(", disconnect_start)
     disconnect_body = source[disconnect_start:disconnect_end]
     assert (
         disconnect_body.index("backgroundSyncStore.setEnabledDurably(false)")

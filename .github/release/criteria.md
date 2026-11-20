@@ -161,13 +161,8 @@ Do not publish detailed private device-session logs or screenshots to prove dili
 
 ## Release wording
 
-Safe wording:
-
-- developer preview;
-- local-first;
-- read-only HealthKit access;
-- self-build iOS path;
-- TestFlight planned or available only after it is intentionally published;
-- background sync is best-effort.
-
-Avoid claims that the project exports every Apple Health family, guarantees background freshness, provides a hosted service by default, or makes clinical decisions.
+- Start with the user-visible benefit and concise highlights, then compatibility, installation/upgrading and real limitations. Use `.github/release/release-notes-template.md`; put detailed assets/provenance in a collapsible section.
+- Keep the exact component/version title and complete compatibility declarations for initial source-note validation. Initial staging, publication and recovery still compare the exact source-bound body.
+- State actual App Store and TestFlight availability separately from Receiver publication. Do not advertise an unavailable public beta or a compatible build set that has not been established.
+- After publication, factual hosted title/notes changes are allowed under the explicit read-only published-artifact audit in `docs/release-operations.md`. Review the revised prose separately and preserve the immutable tag, assets, manifests, checksums, signatures and provenance.
+- Keep private infrastructure, credentials and real health data out of public release copy. Describe only actual privacy changes and retain any required maintainer discussion.

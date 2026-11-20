@@ -48,6 +48,7 @@ final class NutritionMailboxFixture {
     let agreement = Curve25519.KeyAgreement.PrivateKey()
     var envelopeNumber: UInt8 = 0
     var capabilityReadIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in })
+    var beforeTransportLocate: (() throws -> Void)?
 
     init(nativePairing: Bool = false) throws {
         base = try NutritionFixture(directPairing: !nativePairing)
@@ -138,7 +139,10 @@ final class NutritionMailboxFixture {
                 receiverAgreementPublicKey: agreement.publicKey, receiverAgreementKeyID: identity.receiverAgreementKeyID,
                 deviceSigningPublicKey: context.deviceSigningPublicKey, deviceSigningKeyID: identity.deviceSigningKeyID
             ),
-            sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keys), locate: { location },
+            sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keys), locate: { [self] in
+                try beforeTransportLocate?()
+                return location
+            },
             publisher: POSIXMailboxEnvelopePublisher(),
             envelopeID: { [self] in envelopeNumber += 1; return Data(repeating: envelopeNumber, count: 16) },
             nowMilliseconds: { 1_790_000_000_000 },

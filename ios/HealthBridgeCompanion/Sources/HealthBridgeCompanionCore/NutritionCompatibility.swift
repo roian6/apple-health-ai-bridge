@@ -150,6 +150,7 @@ struct NutritionPayloadRevision: Equatable, Sendable {
 struct PreparedNutritionPayload: Sendable {
     let revision: NutritionPayloadRevision
     let containsNutrition: Bool
+    let mayContainSleep: Bool
     let permitsSupported: Bool
     let projection: Data?
     let remainder: Data?
@@ -183,6 +184,14 @@ extension FileOutbox {
         }
         let previous = preparedNutritionPayloads
         let observe = observeNutritionCodec
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        let sleepCursorKinds = Set([
+            SleepSyncBatchFactory.foregroundCursorKind, SleepSyncBatchFactory.anchoredCursorKind,
+            SleepSyncBatchFactory.baselineResetCursorKind,
+        ])
+        #else
+        let sleepCursorKinds: Set<String> = []
+        #endif
         let prepared = try await SleepSyncValueWork.run {
             try Dictionary(uniqueKeysWithValues: payloads.map { id, revision, bytes in
                 if let retained = previous[id], retained.revision == revision {
@@ -196,6 +205,10 @@ extension FileOutbox {
                     : nil
                 return (id, PreparedNutritionPayload(
                     revision: revision, containsNutrition: contains,
+                    mayContainSleep: !batch.sleepSessions.isEmpty
+                        || batch.healthTypes.contains { $0.typeCode == HealthBridgeHealthType.sleepAnalysis.typeCode }
+                        || batch.deletedRecords.contains { $0.recordFamily == "sleep_session" }
+                        || batch.sync.cursors.contains { sleepCursorKinds.contains($0.cursorKind) },
                     permitsSupported: NutritionCompatibility.permits(batch, support: .supported),
                     projection: projection,
                     remainder: projection == nil ? nil : try JSONEncoder().encode(

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from health_bridge._milestone_files import read_scoped_regular_file
+from health_bridge.mailbox_qa import m3_files
+from health_bridge.mailbox_qa.m3_models import ArtifactBinding
 from health_bridge.mailbox_qa.m3_signatures import short_fingerprint
 from health_bridge.mailbox_qa.parent_operations import ParentOperationError
 from tests.scripts import mailbox_m3_v1_support as m3_support
@@ -21,6 +25,28 @@ from tests.scripts.production_seal_support import write_synthetic_production_sea
 
 M3 = Path("scripts/validate-mailbox-m3-v1.py")
 HEAD = "6eb12a4fb29543e691c7e930f385dc4f9964598f"
+
+
+def test_bound_document_parses_the_bytes_whose_digest_was_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "receipt.hbjcs1"
+    original = b'{"v":1}'
+    _ = path.write_bytes(original)
+    binding = ArtifactBinding(
+        kind="device_report",
+        path=path.name,
+        sha256=hashlib.sha256(original).hexdigest(),
+    )
+
+    def replace_after_read(root: Path, relative_path: str) -> bytes | None:
+        content = read_scoped_regular_file(root, relative_path)
+        _ = path.write_bytes(b'{"v":2}')
+        return content
+
+    monkeypatch.setattr(m3_files, "read_scoped_regular_file", replace_after_read)
+
+    assert m3_files.bound_document(tmp_path, binding) == {"v": 1}
 
 
 def _run(manifest: Path, anchor: Path) -> subprocess.CompletedProcess[str]:
@@ -112,7 +138,7 @@ def test_m3_v1_accepts_one_report_and_independent_signed_receipts(
     fixture = build_m3_fixture(tmp_path / "attempt")
 
     # When: the strict versioned validator consumes the challenge.
-    result = run(fixture)
+    result = run(fixture, process=True)
 
     # Then: M3 passes once and the validator-local anchor is consumed.
     assert (result.returncode, result.stdout, result.stderr) == (0, "PASS M3\n", "")

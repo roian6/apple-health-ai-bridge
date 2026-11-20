@@ -1,9 +1,12 @@
 # Apple Health AI Bridge Receiver/CLI `1.2.1`
 
-**Receiver-only release**
+**Coordinated release draft**
 
-This patch repairs the native Mailbox publication boundary in the Receiver and
-its matching macOS helper. No TestFlight update is required.
+This candidate combines the Receiver and matching macOS helper with Companion
+sync and recovery fixes. The public install baseline remains Receiver/CLI
+`1.2.0` with Companion `1.2.0 (51)`. The draft proposes Companion `1.2.1 (52)`
+for these newer iOS sources. Confirm version and build eligibility in App Store
+Connect before distribution; the draft does not reserve a build number.
 
 ## Highlights
 
@@ -14,12 +17,17 @@ its matching macOS helper. No TestFlight update is required.
   startup binds the network listener.
 - Preserve committed pairing receipts across native publication failures and
   make retryable service failures visible.
+- Request materialization when the owned Receiver LaunchAgent reads Mailbox
+  documents. Retry unstable deliveries on the normal retry interval without
+  turning them into completed quarantine work.
+- Collect independent automatic Direct work even while earlier transfers are
+  pending, and avoid rewriting already-applied retained outbox journals.
 - Keep DB commit, receipt storage, ACK signing, and device cursor advancement
   with their existing owners. The helper remains the native file publisher.
 
 ## Compatibility
 
-Compatible iOS Companion: `1.2.0 (51)`
+Compatible iOS Companion: `1.2.1 (52)` (proposed)
 
 Compatible Batch Protocol: `health_bridge.batch.v1 (1.0.0)`
 
@@ -43,7 +51,8 @@ installation failure must leave the service stopped rather than claim rollback.
 
 ## Limits and privacy
 
-- No iOS source, Companion version/build, or Batch protocol changes.
+- Batch protocol remains unchanged. The changed Companion source still requires
+  a distinct approved build and separate Apple distribution qualification.
 - No new HealthKit writes, telemetry, or third-party AI calls.
 - No claim that this resolves every startup, active-CPU, or ACK symptom in the
   broader iCloud incident.

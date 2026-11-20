@@ -54,8 +54,8 @@ fresh-user run must use the following sequence:
 2. drain or explicitly discard queued uploads, disconnect and revoke the previous
    test device, remove the app, and verify that the bundle is absent;
 3. install the sealed candidate and launch it normally, without delivering a URL;
-4. verify that the first screen is **Not Connected**, with no saved receiver,
-   pending pairing, recovery banner, or queued upload;
+4. verify that the first screen shows the unpaired **Connect your receiver** setup,
+   with no saved receiver, pending pairing, recovery banner, or queued upload;
 5. start a clean receiver database and verify the exact advertised `/health` URL
    from the iPhone's active LAN or VPN route before creating an invitation;
 6. display the private setup page on a separate trusted screen and scan its QR with

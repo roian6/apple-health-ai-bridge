@@ -26,6 +26,22 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
     static let cancellationCompletionTimeout: TimeInterval = 5
     static let maximumResponseBodyBytes = 65_536
 
+    private let receiverSettingsStore: ReceiverSettingsStore
+    private let acceptedTransferStore: LastAcceptedTransferObservationStore
+
+    init(
+        receiverSettingsStore: ReceiverSettingsStore = ReceiverSettingsStore(),
+        acceptedTransferStore: LastAcceptedTransferObservationStore = LastAcceptedTransferObservationStore(),
+        taskOwnershipStore: FileBackgroundUploadTaskOwnershipStore? = nil
+    ) {
+        self.receiverSettingsStore = receiverSettingsStore
+        self.acceptedTransferStore = acceptedTransferStore
+        super.init()
+        if let taskOwnershipStore {
+            self.taskOwnershipStore = taskOwnershipStore
+        }
+    }
+
     private let stateLock = NSLock()
     private let cancellationBarrier = AsyncCompletionBarrier<Int>()
     private let legacyCancellationBarrier = AsyncCompletionBarrier<Int>()
@@ -940,7 +956,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         }
         do {
             let outbox = try FileOutbox(directory: outboxDirectory)
-            let settingsStore = ReceiverSettingsStore()
+            let settingsStore = receiverSettingsStore
             let receiverURL = settingsStore.receiverURLString
             let validate = { @MainActor in
                 try Task.checkCancellation()
@@ -973,11 +989,24 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                     )
                 },
                 retire: { itemID, receiverBindingID in
-                    _ = try await self.directCursorFinalizer(outbox: outbox)
+                    try await self.directCursorFinalizer(outbox: outbox)
                         .recordDirectReceiverAcceptanceForSync(
-                            itemID: itemID,
-                            receiverBindingID: receiverBindingID,
-                            validate: validate
+                            descriptor: descriptor,
+                            sleepStore: try FileSleepSyncManifestStore(
+                                fileURL: outboxDirectory.deletingLastPathComponent()
+                                    .appendingPathComponent("sleep-sync-manifest-v1.json")
+                            ),
+                            validate: validate,
+                            onNewAcceptance: {
+                                guard settingsStore.receiverSettingsGenerationToken == descriptor.receiverGeneration,
+                                      settingsStore.receiverBindingID == descriptor.receiverBindingID else { return }
+                                self.acceptedTransferStore.record(LastAcceptedTransferObservation(
+                                    bindingID: descriptor.receiverBindingID,
+                                    generation: descriptor.receiverGeneration,
+                                    observedAt: Date(),
+                                    evidenceKind: .directResponse
+                                ))
+                            }
                         )
                     // A replayed successful callback may follow durable payload retirement.
                     outbox.noteDiagnosticDelivery(itemID: itemID, outcome: .accepted)

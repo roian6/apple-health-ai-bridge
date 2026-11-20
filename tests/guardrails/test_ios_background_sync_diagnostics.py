@@ -101,31 +101,31 @@ def test_diagnostic_record_contains_only_bounded_operational_metadata() -> None:
 
 
 def test_settings_render_distinct_read_only_automatic_sync_evidence_lines() -> None:
-    # Given: the Settings automatic-sync section and its view model.
-    content = CONTENT_VIEW.read_text(encoding="utf-8")
+    # Given: the Settings diagnostics destination and its view model.
+    content = CONTENT_VIEW.with_name("ActivityDiagnosticsView.swift").read_text(
+        encoding="utf-8"
+    )
     view_model = VIEW_MODEL.read_text(encoding="utf-8")
 
     # When: the read-only diagnostic labels and values are inspected.
-    labels = {
-        "Current status": "backgroundSyncStatus",
-        "Registration": "automaticSyncRegistrationLine",
-        "BG request": "automaticSyncScheduleLine",
-        "Last wake": "automaticSyncWakeLine",
-        "Last run": "automaticSyncRunLine",
-        "Latest lane": "automaticSyncLaneDiagnosticLine",
-    }
+    properties = (
+        "automaticSyncRegistrationLine",
+        "automaticSyncScheduleLine",
+        "automaticSyncWakeLine",
+        "automaticSyncRunLine",
+        "automaticSyncLaneDiagnosticLine",
+    )
 
     # Then: each evidence class has its own line without removing the current status.
-    for label, property_name in labels.items():
-        assert f'LabeledContent("{label}", value: viewModel.{property_name})' in content
+    for property_name in properties:
+        assert f"viewModel.{property_name}" in content
         assert f"var {property_name}: String" in view_model
-    automatic_sync_section = content.split('Section("Automatic Sync")', 1)[1].split(
-        'Section("Activity Log")', 1
-    )[0]
-    assert (
-        'LabeledContent("Current status", value: viewModel.backgroundSyncStatus)'
-        in automatic_sync_section
-    )
+        assert f"viewModel.{property_name} =" not in content
+    assert "viewModel.syncPresentation.title" in content
+    assert "viewModel.displayStatusMessage" in content
+    assert "viewModel.backgroundSyncStatus" not in content
+    assert "@State private var showsAdvanced = false" in content
+    assert "isExpanded: $showsAdvanced" in content
 
 
 def test_diagnostic_types_are_not_connected_to_upload_or_public_status_surfaces() -> (

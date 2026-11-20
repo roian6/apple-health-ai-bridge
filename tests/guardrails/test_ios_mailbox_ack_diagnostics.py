@@ -199,7 +199,7 @@ def _assert_shared_engine_ack_backpressure(
     )
     automatic_flush = _region(
         source,
-        "private func flushAutomaticPendingOutbox()",
+        "private func flushAutomaticPendingOutbox(",
         "private func flushPendingOutbox(",
     )
     assert (
@@ -208,7 +208,7 @@ def _assert_shared_engine_ack_backpressure(
     assert automatic_flush.index(
         "return await flushPendingOutbox(executionMode: .automatic)"
     ) < (
-        automatic_flush.index("return try await runWithExclusiveDirectOutboxTransfer {")
+        automatic_flush.index("return try await runWithExclusiveDirectOutboxTransfer(")
     )
     assert "await self.flushPendingOutbox(executionMode: .automatic)" in automatic_flush
     assert "viewModel.flushPendingOutbox(executionMode: .foreground)" in source
@@ -224,9 +224,23 @@ def _assert_shared_engine_ack_backpressure(
         steps[:raw_read],
     )
     daily_read = steps.index("let daily = await performDailyActivityAggregates(")
-    assert re.search(r"case \.queued:\s*return \.blocked", steps[raw_read:daily_read])
+    assert re.search(
+        str.join(
+            "",
+            (
+                r"case \.queued\(_, let canProjectBehindRaw\):\s*",
+                r"guard automaticDirectPendingTypes != nil else ",
+                r"\{ return \.blocked \}\s*",
+                r"if !canProjectBehindRaw \{\s*",
+                r"automaticDirectRawStepsGeneration = pendingGeneration\s*",
+                r"return deferAutomaticDirectTypes\(pendingGenerationRetirements\)",
+                r"\s*\}",
+            ),
+        ),
+        steps[raw_read:daily_read],
+    )
     pending_result = _region(
-        background_sync, "switch result.disposition {", "if reason == .scheduledRefresh"
+        background_sync, "switch result.disposition {", "try Task.checkCancellation()"
     )
     assert re.search(r"case \.payloadEnqueued:\s*break", pending_result)
     assert re.search(r"case \.blocked:\s*return false", pending_result)

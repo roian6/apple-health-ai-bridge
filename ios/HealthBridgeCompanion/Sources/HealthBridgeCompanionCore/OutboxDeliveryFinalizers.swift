@@ -48,6 +48,90 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     @discardableResult
     @MainActor
     public func recordDirectReceiverAcceptanceForSync(
+        descriptor: DirectUploadCompletionDescriptor,
+        sleepStore: @autoclosure () throws -> any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void,
+        onNewAcceptance: @MainActor () -> Void = {}
+    ) async throws -> Bool {
+        try await outbox.prepareNutritionCompatibility(validate: validate)
+        let item = try outbox.pendingItem(id: descriptor.itemID)
+        if let item, item.receiverIdentity != descriptor.receiverBindingID {
+            throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+        }
+        let prepared = try item.flatMap { try outbox.preparedNutritionPayload(for: $0) }
+        // A missing payload on replay cannot prove this was unrelated to Sleep.
+        if prepared?.mayContainSleep != false {
+            try await commitDirectSleepIfPending(
+                descriptor: descriptor, item: item, sleepStore: sleepStore(),
+                validate: {
+                    try validate()
+                    guard try self.outbox.pendingItem(id: descriptor.itemID) == item else {
+                        throw CancellationError()
+                    }
+                    if let item { _ = try self.outbox.preparedNutritionPayload(for: item) }
+                }
+            )
+        }
+        try Task.checkCancellation()
+        try validate()
+        let record = try outbox.recordDirectUploadAcceptance(
+            itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID,
+            onNewAcceptance: { onNewAcceptance() }
+        )
+        if let record { try finalize(record) }
+        return record != nil
+    }
+
+    @MainActor
+    private func commitDirectSleepIfPending(
+        descriptor: DirectUploadCompletionDescriptor,
+        item: FileOutboxItem?,
+        sleepStore: any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void
+    ) async throws {
+        let revision = try sleepStore.revisionForSync()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try validate()
+            guard try sleepStore.revisionForSync() == revision else { throw CancellationError() }
+        }
+        if let pending = try await sleepStore.loadPendingForSync(validate: check) {
+            let matches = try await SleepSyncValueWork.run {
+                guard let item else { return false }
+                return try Data(contentsOf: item.fileURL) == pending.payload
+            }
+            try check()
+            if pending.outboxItemID == descriptor.itemID, !matches {
+                throw OutboxDeliveryCoordinatorError.ownershipMismatch
+            }
+            if matches {
+                guard pending.receiverBindingID == descriptor.receiverBindingID,
+                      pending.connectionGeneration == descriptor.receiverGeneration,
+                      item?.receiverIdentity == descriptor.receiverBindingID else {
+                    throw OutboxDeliveryCoordinatorError.ownershipMismatch
+                }
+                // An ACK can arrive before the caller journals its assigned FIFO ID.
+                // Exact accepted bytes plus binding/generation still identify that transition.
+                let committedRevision = try await sleepStore.saveManifestForSync(
+                    pending.manifest, validate: check
+                )
+                let checkCommitted = { @MainActor in
+                    try Task.checkCancellation()
+                    try validate()
+                    guard try sleepStore.revisionForSync() == committedRevision else {
+                        throw CancellationError()
+                    }
+                }
+                _ = try await sleepStore.clearPendingForSync(id: pending.id, validate: checkCommitted)
+            }
+        }
+        try Task.checkCancellation()
+        try validate()
+    }
+
+    @discardableResult
+    @MainActor
+    public func recordDirectReceiverAcceptanceForSync(
         itemID: String,
         receiverBindingID: String,
         validate: @MainActor () throws -> Void
@@ -89,6 +173,22 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     private func finalize(_ record: FileOutboxFinalizationRecord) throws {
         if let checkpoint = record.cursorCheckpoint {
             try finalizeCursor(checkpoint)
+            if let start = checkpoint.workoutHistoryStart {
+                let kind = AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+                let previous = try cursorStore.cursorValue(
+                    receiverBindingID: checkpoint.receiverIdentity,
+                    sourceKey: checkpoint.sourceKey,
+                    cursorKind: kind
+                ).flatMap(HealthBridgeUTCFormatter.date(from:))
+                if previous.map({ start < $0 }) ?? true {
+                    try cursorStore.saveCursorValue(
+                        HealthBridgeUTCFormatter.string(from: start),
+                        receiverBindingID: checkpoint.receiverIdentity,
+                        sourceKey: checkpoint.sourceKey,
+                        cursorKind: kind
+                    )
+                }
+            }
         }
         let retirements = record.eligiblePendingGenerationRetirements
         if !retirements.isEmpty {
