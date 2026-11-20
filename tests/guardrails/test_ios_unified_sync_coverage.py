@@ -195,14 +195,34 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
         "sleepManifestStore.savePendingForSync(pendingTransition, validate: validate)"
     )
     delivery = body.index("deliverPendingSleepTransition(", journal)
-    prefix = "try await store."
-    manifest_commit = body.index(
-        f"{prefix}saveManifestForSync(pendingTransition.manifest, validate: validate)"
-    )
-    journal_clear = body.index(
-        f"{prefix}clearPendingForSync(id: pendingTransition.id, validate: validate)"
-    )
-    assert reservation < journal < delivery < manifest_commit < journal_clear
+    assert reservation < journal < delivery
+    # Mailbox proof must belong to this receiver, generation and reset epoch.
+    proof = body.split(
+        "guard let state = try outbox.deliveryState(for: outboxItemID)", 1
+    )[1]
+    guard = proof.split("else {", 1)[0]
+    for condition in (
+        "state.phase == .committedFinalized",
+        "state.ownership?.receiverGeneration == pendingTransition.connectionGeneration",
+        "state.ownership?.receiverBindingID == pendingTransition.receiverBindingID",
+        "state.ownership?.resetEpoch == pendingTransition.manifest.baselineResetEpoch",
+    ):
+        assert condition in guard
+    # The shared Direct finalizer validates accepted bytes and receiver scope
+    # before persisting the manifest; the foreground reader no longer writes it.
+    finalizers = (
+        ROOT
+        / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore"
+        / "OutboxDeliveryFinalizers.swift"
+    ).read_text()
+    commit = finalizers.split("private func commitDirectSleepIfPending(", 1)[1]
+    match = commit.index("if matches {")
+    write = commit.index("sleepStore.saveManifestForSync(")
+    binding = commit[match:write]
+    assert "pending.receiverBindingID == descriptor.receiverBindingID" in binding
+    assert "pending.connectionGeneration == descriptor.receiverGeneration" in binding
+    assert "item?.receiverIdentity == descriptor.receiverBindingID" in binding
+    assert "throw OutboxDeliveryCoordinatorError.ownershipMismatch" in binding
 
 
 def test_ui_describes_one_supported_automatic_sync_scope() -> None:
