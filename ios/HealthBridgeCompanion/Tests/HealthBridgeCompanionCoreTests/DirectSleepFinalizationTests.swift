@@ -1,9 +1,52 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import HealthBridgeCompanionCore
 
 @MainActor
 final class DirectSleepFinalizationTests: XCTestCase {
+    func testLegacySleepCleanupInterruptionRetainsAcceptanceAcrossRestart() async throws {
+        for afterUnlink in [false, true] {
+            let f = try DirectSleepFinalizationFixture()
+            defer { f.remove() }
+            let d = f.descriptor
+            let manifest = f.root.appendingPathComponent("sleep.json")
+            let journal = f.root.appendingPathComponent("sleep.json.pending")
+            XCTAssertNotNil(try f.outbox.recordDirectUploadAccepted(itemID: d.itemID, receiverIdentity: d.receiverBindingID))
+            try f.sleep.saveManifest(f.pending.manifest)
+            let interrupted = try FileSleepSyncManifestStore(
+                fileURL: manifest, fileManager: JournalRemovalFault(journal, afterUnlink: afterUnlink)
+            )
+            do {
+                _ = try await f.finalizer.finalizeDirectAcknowledgments(
+                    receiverBindingID: d.receiverBindingID, receiverGeneration: d.receiverGeneration,
+                    sleepStore: interrupted, validate: {}
+                )
+                XCTFail("The injected journal removal interruption was not reached.")
+            } catch JournalRemovalFault.Interruption.stop {}
+
+            let outbox = try FileOutbox(directory: f.outbox.directoryURL)
+            let sleep = try FileSleepSyncManifestStore(fileURL: manifest)
+            XCTAssertEqual(try sleep.loadPendingTransition() != nil, !afterUnlink)
+            XCTAssertNotNil(try outbox.directFinalizationRecordReady(receiverIdentity: d.receiverBindingID))
+            XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
+            let recovered = OutboxDeliveryCursorFinalizer(
+                outbox: outbox, cursorStore: try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("cursors.json")),
+                pendingGenerationStore: f.background
+            )
+            let finished = try await recovered.finalizeDirectAcknowledgments(
+                receiverBindingID: d.receiverBindingID, receiverGeneration: d.receiverGeneration,
+                sleepStore: sleep, validate: {}
+            )
+            XCTAssertTrue(finished)
+            XCTAssertNil(try sleep.loadPendingTransition())
+            XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
+            XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: d.receiverBindingID))
+            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            XCTAssertTrue(try f.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        }
+    }
+
     func testAcceptedSleepCommitsManifestBeforeRetiringItsGeneration() async throws {
         let fixture = try DirectSleepFinalizationFixture()
         defer { fixture.remove() }
@@ -49,6 +92,90 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.pending.manifest)
         XCTAssertNil(try fixture.sleep.loadPendingTransition())
         XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+    }
+
+    func testMailboxBoundSleepRejectsDirectAcceptanceWithoutChangingSleepState() async throws {
+        let fixture = try DirectSleepFinalizationFixture()
+        defer { fixture.remove() }
+        let itemID = fixture.descriptor.itemID
+        let payload = fixture.pending.payload
+        let binding = try fixture.outbox.finalizeMailboxEnvelope(
+            itemID: itemID, envelope: Data("synthetic-envelope".utf8),
+            expectedPayloadSHA256: SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        )
+
+        do {
+            _ = try await fixture.finalizer.recordDirectReceiverAcceptanceForSync(
+                descriptor: fixture.descriptor, sleepStore: fixture.sleep, validate: {}
+            )
+            XCTFail("A retained Direct response cannot retire a Mailbox-bound item.")
+        } catch FileOutboxMailboxError.mailboxArtifactsRequireHold {}
+
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initial)
+        XCTAssertEqual(try fixture.sleep.loadPendingTransition(), fixture.pending)
+        let item = try XCTUnwrap(fixture.outbox.pendingItem(id: itemID))
+        XCTAssertEqual(item.mailboxBinding, binding)
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), payload)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+    }
+
+    func testLegacyAcknowledgmentStillChecksMalformedSleepJournalBeforeFinalization() async throws {
+        let fixture = try DirectSleepFinalizationFixture()
+        defer { fixture.remove() }
+        let descriptor = fixture.descriptor
+        // This writer records a Direct ACK without a Sleep check.
+        XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(
+            itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID
+        ))
+        let journal = fixture.root.appendingPathComponent("sleep.json.pending")
+        let originalJournal = try Data(contentsOf: journal)
+        let damaged = Data("{".utf8)
+        try damaged.write(to: journal)
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let finalizer = OutboxDeliveryCursorFinalizer(
+            outbox: reopened,
+            cursorStore: try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json")),
+            pendingGenerationStore: fixture.background
+        )
+
+        do {
+            _ = try await finalizer.recordDirectReceiverAcceptanceForSync(
+                descriptor: descriptor, sleepStore: fixture.sleep, validate: {}
+            )
+            XCTFail("A legacy ACK does not establish that Sleep finalization already ran.")
+        } catch is DecodingError {}
+
+        do {
+            let retired = try finalizer.finalizeDirectAcknowledgments(receiverBindingID: descriptor.receiverBindingID)
+            XCTAssertFalse(retired, "General recovery cannot retire an unchecked legacy ACK.")
+        } catch {
+            // Recovery may report the unreadable journal instead of deferring.
+        }
+        XCTAssertEqual(try Data(contentsOf: journal), damaged)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initial)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertNotNil(try reopened.directFinalizationRecordReady(receiverIdentity: descriptor.receiverBindingID))
+
+        try originalJournal.write(to: journal, options: .atomic)
+        do {
+            _ = try await finalizer.recordDirectReceiverAcceptanceForSync(
+                descriptor: descriptor, sleepStore: fixture.sleep, validate: {}
+            )
+            XCTFail("An unchecked ACK without the uploaded bytes cannot commit a new manifest.")
+        } catch OutboxDeliveryCoordinatorError.ownershipMismatch {}
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initial)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertNotNil(try reopened.directFinalizationRecordReady(receiverIdentity: descriptor.receiverBindingID))
+
+        // Model an upgrade after the matching manifest commit but before retirement.
+        try fixture.sleep.saveManifest(fixture.pending.manifest)
+        _ = try await finalizer.recordDirectReceiverAcceptanceForSync(
+            descriptor: descriptor, sleepStore: fixture.sleep, validate: {}
+        )
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.pending.manifest)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: descriptor.receiverBindingID))
     }
 
     func testCancellationAfterManifestCommitRetainsJournalAndGenerationForReplay() async throws {
@@ -128,6 +255,24 @@ final class DirectSleepFinalizationTests: XCTestCase {
             XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
             XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
         }
+    }
+}
+
+private final class JournalRemovalFault: FileManager, @unchecked Sendable {
+    enum Interruption: Error { case stop }
+    let journal: URL
+    let afterUnlink: Bool
+
+    init(_ journal: URL, afterUnlink: Bool) {
+        self.journal = journal
+        self.afterUnlink = afterUnlink
+        super.init()
+    }
+
+    override func removeItem(at url: URL) throws {
+        guard url == journal else { return try super.removeItem(at: url) }
+        if afterUnlink { try super.removeItem(at: url) }
+        throw Interruption.stop
     }
 }
 

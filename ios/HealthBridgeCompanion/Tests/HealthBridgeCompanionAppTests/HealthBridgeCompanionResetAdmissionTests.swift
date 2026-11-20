@@ -5952,6 +5952,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }, wait: { throw ExchangeFailure.responseUnavailable })
         let keysBefore = try fixture.keys.loadOrCreate()
         var rawBindings: [String] = []
+        var rawAnchors: [String?] = []
         let runtime = try fixture.makeRuntime(
             cleanup: nil, nativeMailboxIO: io, pairingStateStore: state,
             firstReaderOverride: { anchor, _, now in
@@ -5961,14 +5962,20 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
                 }
                 XCTAssertEqual(identity.opaqueBinding, peer.expectedBinding)
                 XCTAssertEqual(record.localScope.bindingID, identity.opaqueBinding)
-                XCTAssertNil(anchor, "The first raw read must use the new binding's absent cursor")
                 XCTAssertNil(try fixture.cursors.cursorValue(
                     receiverBindingID: identity.opaqueBinding,
                     sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
                     cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
                 ))
                 rawBindings.append(identity.opaqueBinding)
+                rawAnchors.append(anchor)
                 fixture.reads.append("raw")
+                if anchor == fixture.nextAnchor {
+                    return HealthKitAnchoredStepChanges(
+                        stepSamples: [], deletedStepSamples: [], anchorCursorValue: fixture.nextAnchor,
+                        windowStart: now, windowEnd: now
+                    )
+                }
                 return fixture.rawChanges(now: now, hasRecords: true)
             },
             deliveryOverride: { try fixture.nativeFlowDelivery(peer: peer) },
@@ -6079,6 +6086,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         _ = try XCTUnwrap(fixture.background.isEnabled ? true : nil,
             "NOT_REACHED: encrypted first payload and ACK until enable succeeds")
         XCTAssertEqual(rawBindings, [identity.opaqueBinding], "One first read on the authenticated new binding")
+        XCTAssertEqual(rawAnchors, [nil], "The first raw read starts without a shared or automatic anchor")
         XCTAssertGreaterThan(fixture.deliveryConstructions, 0)
         let beforeACK = try fixture.outbox.pendingItems()
         let item = try XCTUnwrap(beforeACK.first, "The real automatic owner must enqueue its first payload")
@@ -6120,6 +6128,14 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
             cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
         ))
+        let pendingSteps = try fixture.pending()
+        XCTAssertNotNil(pendingSteps["steps"])
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw"], "An unacknowledged raw head must block further collection")
+        XCTAssertEqual(try fixture.outbox.pendingItems(), beforeACK)
+        XCTAssertEqual(try fixture.pending(), pendingSteps)
+
         let unrelatedBytes = try beforeACK.dropFirst().map { try Data(contentsOf: $0.fileURL) }
         let ack = try DeliveryProtocolV1.sealAck(
             DeliveryReceiptV1(
@@ -6158,6 +6174,22 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         XCTAssertTrue(runtime.viewModel.receiverURLString.isEmpty)
         XCTAssertTrue(runtime.viewModel.bearerToken.isEmpty)
         XCTAssertTrue(fixture.background.isEnabled)
+        XCTAssertEqual(try fixture.pending(), pendingSteps, "Raw ACK must leave daily Steps work pending")
+
+        fixture.offerData = true
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await fixture.join(runtime)
+        XCTAssertEqual(rawAnchors, [nil, fixture.nextAnchor], "Raw collection must resume at the signed ACK's anchor")
+        XCTAssertEqual(fixture.reads, ["raw", "raw", "daily"])
+        let nextItems = try fixture.outbox.pendingItems()
+        XCTAssertEqual(nextItems.count, 1)
+        let nextItem = try XCTUnwrap(nextItems.first)
+        let nextBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: nextItem.fileURL))
+        XCTAssertFalse(nextBatch.samples.isEmpty)
+        XCTAssertEqual(Set(nextBatch.samples.compactMap { $0.metadata["sample_kind"] }), ["daily_aggregate"])
+        XCTAssertEqual(try fixture.pending(), pendingSteps, "Publication must not retire the pending Steps generation")
+        XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: .steps, receiverBindingID: identity.opaqueBinding))
+
         #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
         // Only this isolated synthetic fixture's already-observed wire and keys.
         let witness: [String: Any] = [

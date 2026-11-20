@@ -52,18 +52,7 @@ final class CompanionPairingInputAppTests: XCTestCase {
         viewModel.pairingImportText = "not-a-link"
         await viewModel.importPairingText()
         XCTAssertEqual(viewModel.pairingInputError, .invalidJSON)
-        viewModel.pairingImportText = """
-        {
-          "schema_id": "health_bridge.receiver_pairing.v1",
-          "schema_version": "1.0.0",
-          "label": "Synthetic receiver",
-          "receiver_url": "http://127.0.0.1:8765/v1/batches",
-          "bearer_token": "synthetic-pairing-token",
-          "token_prefix": "synthetic",
-          "created_at": "2026-11-02T00:00:00Z",
-          "warning": "Synthetic test fixture only."
-        }
-        """
+        viewModel.pairingImportText = legacySetupMaterial
 
         await viewModel.importPairingText()
 
@@ -71,6 +60,59 @@ final class CompanionPairingInputAppTests: XCTestCase {
         XCTAssertTrue(viewModel.receiverSettingsSaved)
         XCTAssertFalse(viewModel.statusIsError)
     }
+
+    func testLegacyReplacementShowsCleanupFailureAndClearsItOnRetry() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let originalBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        var drainCanFinish = false
+        weak var observedViewModel: HealthBridgeCompanionViewModel?
+        let viewModel = try await fixture.makeViewModel(terminalBackgroundPayloadDrain: {
+            if drainCanFinish {
+                XCTAssertNil(observedViewModel?.setupLinkReplacementFailure)
+            }
+            return drainCanFinish
+        })
+        observedViewModel = viewModel
+        viewModel.pairingImportText = legacySetupMaterial
+
+        await viewModel.importPairingText()
+
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, originalBinding)
+        XCTAssertFalse(viewModel.hasPendingPairing)
+        XCTAssertNil(viewModel.pairingInputCorrection)
+        XCTAssertFalse(viewModel.isPairing)
+        let failure = try XCTUnwrap(viewModel.setupLinkReplacementFailure)
+        XCTAssertTrue(failure.contains("Background upload cleanup"))
+        XCTAssertTrue(failure.contains("saved connection was not replaced"))
+        XCTAssertFalse(failure.contains("synthetic-pairing-token"))
+        XCTAssertNil(viewModel.connectionCheckNotice)
+
+        await viewModel.checkConnection()
+        XCTAssertEqual(viewModel.connectionCheckNotice?.isError, false)
+        XCTAssertEqual(viewModel.setupLinkReplacementFailure, failure)
+
+        drainCanFinish = true
+        await viewModel.importPairingText()
+
+        XCTAssertNil(viewModel.setupLinkReplacementFailure)
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertNotEqual(try XCTUnwrap(fixture.settings.receiverBindingID), originalBinding)
+    }
+
+    private let legacySetupMaterial = """
+    {
+      "schema_id": "health_bridge.receiver_pairing.v1",
+      "schema_version": "1.0.0",
+      "label": "Synthetic receiver",
+      "receiver_url": "http://127.0.0.1:8765/v1/batches",
+      "bearer_token": "synthetic-pairing-token",
+      "token_prefix": "synthetic",
+      "created_at": "2026-11-02T00:00:00Z",
+      "warning": "Synthetic test fixture only."
+    }
+    """
 
     func testConnectionCheckReplacesStaleInputFeedback() async throws {
         let fixture = try NutritionFixture()

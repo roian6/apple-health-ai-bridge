@@ -43,14 +43,14 @@ Compatible iOS Companion: `<ios_version> (<build>)`
 
 Compatible Batch Protocol: `health_bridge.batch.v1 (<batch_version>)`
 
-Receiver-only publication contains the exact expected core files:
+The intermediate core packet contains four files and is not ready to publish:
 
 - `apple_health_ai_bridge-<receiver_version>-py3-none-any.whl`
 - `apple_health_ai_bridge-<receiver_version>.tar.gz`
 - `release-metadata.json`
 - `receiver-build-provenance.intoto.jsonl`
 
-For a complete native-helper release, list all eight assets, adding:
+For both Receiver-only and coordinated releases, publish the complete helper-bound final packet. List all eight published assets: the four core files above and these four:
 
 - `HealthBridgeMailboxAckPublisher-<receiver_version>.zip`
 - `HealthBridgeMailboxAckPublisher-<receiver_version>.manifest.json`

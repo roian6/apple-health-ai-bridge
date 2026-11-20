@@ -113,15 +113,27 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         bearerToken: String,
         receiverGeneration: String,
         receiverBindingID: String,
-        isUploadAllowed: @MainActor () -> Bool = { true }
+        isUploadAllowed: @escaping @MainActor () -> Bool = { true }
     ) async throws -> Int {
         rememberOutboxDirectory(outbox.directoryURL)
         await recoverPersistedTaskCompletions()
         try await outbox.prepareNutritionCompatibility {
             guard isUploadAllowed(), !Task.isCancelled else { throw CancellationError() }
         }
-        _ = try directCursorFinalizer(outbox: outbox).finalizeDirectAcknowledgments(
-            receiverBindingID: receiverBindingID
+        _ = try await directCursorFinalizer(outbox: outbox).finalizeDirectAcknowledgments(
+            receiverBindingID: receiverBindingID,
+            receiverGeneration: receiverGeneration,
+            sleepStore: try FileSleepSyncManifestStore(
+                fileURL: outbox.directoryURL.deletingLastPathComponent()
+                    .appendingPathComponent("sleep-sync-manifest-v1.json")
+            ),
+            validate: {
+                guard isUploadAllowed(), !Task.isCancelled,
+                      self.receiverSettingsStore.receiverSettingsGenerationToken == receiverGeneration,
+                      self.receiverSettingsStore.receiverBindingID == receiverBindingID else {
+                    throw CancellationError()
+                }
+            }
         )
         guard let taskOwnershipStore,
               (try? taskOwnershipStore.records().isEmpty) == true else {

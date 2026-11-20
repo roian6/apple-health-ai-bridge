@@ -59,8 +59,25 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
         let prepared = try item.flatMap { try outbox.preparedNutritionPayload(for: $0) }
-        // A missing payload on replay cannot prove this was unrelated to Sleep.
-        if prepared?.mayContainSleep != false {
+        if item == nil,
+           let record = try outbox.directFinalizationRecordReady(
+               receiverIdentity: descriptor.receiverBindingID,
+               where: { Self.isSleepRecord($0) && $1.contains(descriptor.itemID) }
+           ) {
+            guard try await recoverDirectSleepAcknowledgment(
+                record, receiverBindingID: descriptor.receiverBindingID,
+                receiverGeneration: descriptor.receiverGeneration, sleepStore: sleepStore(), validate: validate
+            ) else {
+                throw OutboxDeliveryCoordinatorError.ownershipMismatch
+            }
+            return true
+        }
+        // If the payload is gone, only a durable ACK from this path can prove
+        // that Sleep was checked before retirement.
+        if prepared?.mayContainSleep != false,
+           try !outbox.hasDirectAcknowledgmentWithSleepChecked(
+               itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID
+           ) {
             try await commitDirectSleepIfPending(
                 descriptor: descriptor, item: item, sleepStore: sleepStore(),
                 validate: {
@@ -76,10 +93,11 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         try validate()
         let record = try outbox.recordDirectUploadAcceptance(
             itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID,
+            sleepChecked: item != nil,
             onNewAcceptance: { onNewAcceptance() }
         )
-        if let record { try finalize(record) }
-        return record != nil
+        guard let record else { return false }
+        return try finalizeDirect(record)
     }
 
     @MainActor
@@ -112,12 +130,20 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
                 }
                 // An ACK can arrive before the caller journals its assigned FIFO ID.
                 // Exact accepted bytes plus binding/generation still identify that transition.
+                let checkRetirement = { @MainActor in
+                    try self.outbox.requireUploadAdmission()
+                    try self.outbox.requireDirectRetirementAllowed(itemID: descriptor.itemID)
+                }
                 let committedRevision = try await sleepStore.saveManifestForSync(
-                    pending.manifest, validate: check
+                    pending.manifest, validate: {
+                        try check()
+                        try checkRetirement()
+                    }
                 )
                 let checkCommitted = { @MainActor in
                     try Task.checkCancellation()
                     try validate()
+                    try checkRetirement()
                     guard try sleepStore.revisionForSync() == committedRevision else {
                         throw CancellationError()
                     }
@@ -147,14 +173,26 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         itemID: String,
         receiverBindingID: String
     ) throws -> Bool {
-        guard let record = try outbox.recordDirectUploadAccepted(
+        try recordDirectReceiverAcceptance(
+            itemID: itemID, receiverBindingID: receiverBindingID, sleepChecked: false
+        )
+    }
+
+    @discardableResult
+    func recordDirectReceiverAcceptance(
+        itemID: String,
+        receiverBindingID: String,
+        sleepChecked: Bool
+    ) throws -> Bool {
+        guard let record = try outbox.recordDirectUploadAcceptance(
             itemID: itemID,
-            receiverIdentity: receiverBindingID
+            receiverIdentity: receiverBindingID,
+            sleepChecked: sleepChecked,
+            onNewAcceptance: {}
         ) else {
             return false
         }
-        try finalize(record)
-        return true
+        return try finalizeDirect(record)
     }
 
     @discardableResult
@@ -162,12 +200,144 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         receiverBindingID: String
     ) throws -> Bool {
         guard let record = try outbox.directFinalizationRecordReady(
-            receiverIdentity: receiverBindingID
+            receiverIdentity: receiverBindingID,
+            where: { !Self.isSleepRecord($0) || $1.isEmpty }
         ) else {
+            return false
+        }
+        return try finalizeDirect(record)
+    }
+
+    @discardableResult
+    @MainActor
+    public func finalizeDirectAcknowledgments(
+        receiverBindingID: String,
+        receiverGeneration: String,
+        sleepStore: @autoclosure () throws -> any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void
+    ) async throws -> Bool {
+        try validate()
+        if try finalizeDirectAcknowledgments(receiverBindingID: receiverBindingID) { return true }
+        guard let record = try outbox.directFinalizationRecordReady(receiverIdentity: receiverBindingID) else {
+            return false
+        }
+        return try await recoverDirectSleepAcknowledgment(
+            record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
+            sleepStore: sleepStore(), validate: validate
+        )
+    }
+
+    @MainActor
+    func recoverDirectSleepAcknowledgment(
+        itemID: String,
+        receiverBindingID: String,
+        receiverGeneration: String,
+        sleepStore: any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void
+    ) async throws -> Bool {
+        guard let record = try outbox.directFinalizationRecordReady(
+            receiverIdentity: receiverBindingID,
+            where: { Self.isSleepRecord($0) && $1.contains(itemID) }
+        ) else { return false }
+        return try await recoverDirectSleepAcknowledgment(
+            record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
+            sleepStore: sleepStore, validate: validate
+        )
+    }
+
+    private static func isSleepRecord(_ record: FileOutboxFinalizationRecord) -> Bool {
+        let sleepCursorKinds = [
+            SleepSyncBatchFactory.foregroundCursorKind,
+            SleepSyncBatchFactory.anchoredCursorKind,
+            SleepSyncBatchFactory.baselineResetCursorKind,
+        ]
+        return record.pendingGenerationRetirements[HealthBridgeHealthType.sleepAnalysis.typeCode] != nil
+            || record.cursorCheckpoint.map({ sleepCursorKinds.contains($0.cursorKind) }) == true
+    }
+
+    private func finalizeDirect(_ record: FileOutboxFinalizationRecord) throws -> Bool {
+        if Self.isSleepRecord(record), try !outbox.uncheckedDirectAcknowledgmentIDs(for: record).isEmpty {
             return false
         }
         try finalize(record)
         return true
+    }
+
+    @MainActor
+    private func recoverDirectSleepAcknowledgment(
+        _ record: FileOutboxFinalizationRecord,
+        receiverBindingID: String,
+        receiverGeneration: String,
+        sleepStore: any SleepSyncManifestStoring,
+        validate: @escaping @MainActor () throws -> Void
+    ) async throws -> Bool {
+        let storedIntent = try outbox.directSleepCleanupIntent(for: record)
+        if let storedIntent,
+           storedIntent.receiverBindingID != receiverBindingID || storedIntent.receiverGeneration != receiverGeneration {
+            return false
+        }
+        let revision = try sleepStore.revisionForSync()
+        let check = { @MainActor in
+            try Task.checkCancellation()
+            try validate()
+            try self.outbox.requireUploadAdmission()
+            guard try sleepStore.revisionForSync() == revision else { throw CancellationError() }
+        }
+        let pending = try await sleepStore.loadPendingForSync(validate: check)
+        let intent: DirectSleepCleanupIntent
+        if let storedIntent {
+            intent = storedIntent
+        } else {
+            guard let pending, let itemID = pending.outboxItemID,
+                  try outbox.uncheckedDirectAcknowledgmentIDs(for: record) == Set([itemID]),
+                  pending.receiverBindingID == receiverBindingID,
+                  pending.connectionGeneration == receiverGeneration,
+                  pending.manifest.receiverSettingsGeneration == receiverGeneration,
+                  pending.rejectedMinimumResetEpoch == nil,
+                  let manifest = try await sleepStore.loadManifestForSync(validate: check) else {
+                return false
+            }
+            // The legacy ACK cannot prove the bytes, only the already committed transition.
+            let alreadyCommitted = try await SleepSyncValueWork.run { manifest == pending.manifest }
+            try check()
+            guard alreadyCommitted else { return false }
+            intent = DirectSleepCleanupIntent(
+                itemID: itemID, journalID: pending.id, receiverBindingID: receiverBindingID,
+                receiverGeneration: receiverGeneration
+            )
+            try outbox.beginDirectSleepCleanup(intent, for: record)
+        }
+        try check()
+        let cleanedRevision: SleepSyncStorageRevision
+        if let pending, pending.id == intent.journalID {
+            guard pending.outboxItemID == intent.itemID,
+                  pending.receiverBindingID == intent.receiverBindingID,
+                  pending.connectionGeneration == intent.receiverGeneration,
+                  pending.manifest.receiverSettingsGeneration == intent.receiverGeneration,
+                  pending.rejectedMinimumResetEpoch == nil else {
+                return false
+            }
+            cleanedRevision = try await sleepStore.clearPendingForSync(id: intent.journalID, validate: {
+                try check()
+                guard try self.outbox.directSleepCleanupIntent(for: record) == intent else {
+                    throw CancellationError()
+                }
+            })
+        } else {
+            // No exact journal remains. In particular, do not clear a replacement.
+            cleanedRevision = revision
+        }
+        try Task.checkCancellation()
+        try validate()
+        guard try sleepStore.revisionForSync() == cleanedRevision else { throw CancellationError() }
+        try outbox.finishDirectSleepCleanup(intent, for: record)
+        guard try outbox.directFinalizationRecordReady(
+            receiverIdentity: receiverBindingID,
+            where: { candidate, _ in candidate == record }
+        ) == record else {
+            return false
+        }
+        return try finalizeDirect(record)
     }
 
     private func finalize(_ record: FileOutboxFinalizationRecord) throws {

@@ -241,6 +241,13 @@ struct ConnectionSettingsView: View {
                     systemImage: "exclamationmark.circle.fill",
                     tint: .orange
                 )
+            } else if viewModel.receiverSettingsSaved,
+                      let failure = viewModel.setupLinkReplacementFailure {
+                InlineNotice(
+                    message: failure,
+                    systemImage: "exclamationmark.circle.fill",
+                    tint: .orange
+                )
             }
         } header: {
             if !viewModel.canSendConnectionTest {

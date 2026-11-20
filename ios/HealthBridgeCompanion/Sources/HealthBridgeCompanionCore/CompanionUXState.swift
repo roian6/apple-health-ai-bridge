@@ -169,6 +169,10 @@ public enum CompanionPrimaryStatusMessage {
         if message.contains("recorded") && message.contains("anchor cursor") {
             return "Sync progress saved"
         }
+        if message == "healthkit step anchor is unchanged. nothing sent."
+            || message == "healthkit workout anchor is unchanged. nothing sent." {
+            return "No new data to send"
+        }
         if message.contains("returned no") || message.contains("nothing sent") {
             return "No readable records returned"
         }
