@@ -1462,23 +1462,35 @@ def test_ios_pairing_bootstrap_precedes_all_automatic_sync_entrypoints() -> None
     assert "guard automaticSyncReady" in view_model
     assert "automaticSyncReady," in view_model
 
-    invitation_flow = view_model.index("case .invitation(let invitation):")
-    invitation_pause = view_model.index(
-        "pauseAutomaticSyncForPendingPairing()", invitation_flow
+    pairing_material = view_model.split("private func applyPairingMaterial(", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    invitation = pairing_material.split("case .invitation(let invitation):", 1)[1]
+    assert (
+        invitation.index("hasPendingPairing = true")
+        < invitation.index(
+            "performTerminalConnectionTransitionWhileHoldingRequestGate("
+        )
+        < invitation.index("try await self.pairingCoordinator.pair(")
     )
-    invitation_barrier = view_model.index(
-        "performTerminalConnectionTransitionWhileHoldingRequestGate(", invitation_flow
-    )
-    invitation_redeem = view_model.index("pairingCoordinator.pair(", invitation_flow)
-    assert invitation_pause < invitation_barrier < invitation_redeem
+    sync_readiness = view_model.split("private var automaticSyncReady: Bool", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    enable_prerequisites = view_model.split(
+        "private var automaticSyncEnablePrerequisitesReady: Bool", 1
+    )[1].split("\n    }", 1)[0]
+    assert "automaticSyncEnablePrerequisitesReady" in sync_readiness
+    assert "&& !hasPendingPairing" in enable_prerequisites
 
     terminal_start = view_model.index(TERMINAL_TRANSITION_HELPER)
     terminal_end = view_model.index(
         "private func cancelAndAwaitForegroundPayloadTasks()", terminal_start
     )
     terminal_body = view_model[terminal_start:terminal_end]
-    assert "await self.cancelAndAwaitForegroundPayloadTasks()" in terminal_body
-    assert "await self.drainBackgroundPayloadCancellation()" in terminal_body
+    close_admission = terminal_body.split("closeAdmission: {", 1)[1].split(
+        "cancelAndAwaitPairing:", 1
+    )[0]
+    assert "automaticSyncRuntime?.stopAdmission()" in close_admission
 
 
 def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> None:
@@ -1504,15 +1516,16 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
         "private func requireCurrentConnectionGeneration", terminal_start
     )
     terminal_body = view_model[terminal_start:terminal_end]
-    pre_cancel = terminal_body.index("await cancelPairingOperationIfNeeded()")
-    barrier_call = terminal_body.index("connectionTerminalBarrier.perform(")
-    foreground_join = terminal_body.index(
-        "await self.cancelAndAwaitForegroundPayloadTasks()"
+    assert (
+        terminal_body.index("await cancelPairingOperationIfNeeded()")
+        < terminal_body.index("transition = try await connectionTerminalBarrier.")
+        < terminal_body.index("cancelAndAwaitForegroundPayloads:")
+        < terminal_body.index("await self.cancelAndAwaitForegroundPayloadTasks()")
+        < terminal_body.index("drainBackgroundPayloads:")
+        < terminal_body.index("await self.drainBackgroundPayloadCancellation()")
+        < terminal_body.index("commit: {")
+        < terminal_body.index("try await commit(expectedGeneration)")
     )
-    background_drain = terminal_body.index(
-        "await self.drainBackgroundPayloadCancellation()"
-    )
-    assert pre_cancel < barrier_call < foreground_join < background_drain
 
     upload_start = view_model.index("private func uploadPayloadsWithOutbox(")
     upload_end = view_model.index("private func uploadPendingOutbox(", upload_start)

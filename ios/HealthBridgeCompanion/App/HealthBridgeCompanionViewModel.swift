@@ -471,7 +471,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var outboxIdentityMigrationReady: Bool
     private var privateStorageAdmissionReady = false
     private let directOutboxTransferGate = AsyncExclusiveAccessGate()
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    let terminalTransitionRequestGateForTesting = AsyncExclusiveAccessGate()
+    private lazy var terminalTransitionRequestCoordinator = TerminalRequestCoordinator(gate: terminalTransitionRequestGateForTesting)
+    #else
     private let terminalTransitionRequestCoordinator = TerminalRequestCoordinator()
+    #endif
     @Published private(set) var terminalTransitionRequestIsActive = false
     private let connectionTerminalBarrier = ReceiverConnectionTerminalBarrier()
     private let encoder = HealthBridgeBatchEncoder()
@@ -2401,7 +2406,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         let pendingItemCount: Int
         do {
-            pendingItemCount = try outbox.pendingItems().count
+            let payloadCount = try outbox.pendingItems().count
+            if payloadCount == 0, try outbox.hasPendingDirectSleepCleanup() {
+                // Accepted Sleep still belongs to this receiver after its payload is gone.
+                pendingItemCount = 1
+            } else {
+                pendingItemCount = payloadCount
+            }
         } catch {
             if diagnosePairingCommitBarriers {
                 throw ReceiverPairingCommitBarrierError.outboxUnreadable
@@ -2497,33 +2508,36 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         committedGeneration: String,
         postCommitRecoveryRequired: Bool
     ) {
+        let outboxIdentityAdmissionWasReady = outboxIdentityMigrationReady
+        let originalGeneration = settingsStore.receiverSettingsGenerationToken
+        // Reject known queued work before stopping a writer that can still finish
+        // a receiver-accepted response under the current generation.
+        do {
+            try requireTrustedEmptyOutboxForConnectionTransition(
+                outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady,
+                expectedGeneration: originalGeneration,
+                recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval,
+                diagnosePairingCommitBarriers: diagnosePairingCommitBarriers
+            )
+        } catch {
+            if (try? outbox?.hasPendingDirectSleepCleanup()) == true {
+                await restorePrivateStorageAdmissionAfterFailedConnectionTransition()
+            }
+            throw error
+        }
         beginTerminalTaskUIPublicationSuppression()
         if cancelPairingOperation {
             await cancelPairingOperationIfNeeded()
         }
-        let outboxIdentityAdmissionWasReady = outboxIdentityMigrationReady
         var previousBindingID: String?
         let transition: (result: Result, committedGeneration: String)
         do {
-            transition = try await connectionTerminalBarrier.perform(
+            transition = try await connectionTerminalBarrier.performRecovery(
             closeAdmission: {
                 previousBindingID = self.settingsStore.receiverBindingID
                 self.privateStorageAdmissionReady = false
                 self.outboxIdentityMigrationReady = false
                 self.automaticSyncRuntime?.stopAdmission()
-            },
-            invalidateGeneration: {
-                do {
-                    if advanceGeneration {
-                        return try self.settingsStore.invalidateReceiverSettingsGeneration()
-                    }
-                    return self.settingsStore.receiverSettingsGenerationToken
-                } catch {
-                    if diagnosePairingCommitBarriers {
-                        throw ReceiverPairingCommitBarrierError.generationInvalidationFailed
-                    }
-                    throw error
-                }
             },
             cancelAndAwaitPairing: {
                 if cancelPairingOperation {
@@ -2539,13 +2553,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 }
                 return await self.drainBackgroundPayloadCancellation()
             },
-            commit: { expectedGeneration in
+            commit: {
+                guard self.settingsStore.receiverSettingsGenerationToken == originalGeneration,
+                      self.settingsStore.receiverBindingID == previousBindingID else {
+                    throw ReceiverSettingsGenerationError.staleGeneration
+                }
                 try self.requireTrustedEmptyOutboxForConnectionTransition(
                     outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady,
-                    expectedGeneration: expectedGeneration,
+                    expectedGeneration: originalGeneration,
                     recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval,
                     diagnosePairingCommitBarriers: diagnosePairingCommitBarriers
                 )
+                // With admission closed and drained, keep this check and any
+                // preliminary generation write in the same MainActor turn.
+                let expectedGeneration: String
+                if advanceGeneration {
+                    do {
+                        expectedGeneration = try self.settingsStore.invalidateReceiverSettingsGeneration(
+                            expectedGeneration: originalGeneration
+                        )
+                    } catch {
+                        if diagnosePairingCommitBarriers {
+                            throw ReceiverPairingCommitBarrierError.generationInvalidationFailed
+                        }
+                        throw error
+                    }
+                } else {
+                    expectedGeneration = originalGeneration
+                }
                 let result = try await commit(expectedGeneration)
                 let committedBindingID = self.settingsStore.receiverBindingID
                 if committedBindingID != previousBindingID {
@@ -2724,11 +2759,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
-    private func pauseAutomaticSyncForPendingPairing() {
-        hasPendingPairing = true
-        automaticSyncRuntime?.stopAdmission()
-    }
-
     private func activateAutomaticSyncIfReady(scheduleOutbox: Bool = true) {
         automaticSyncRuntime?.activateIfReady(scheduleOutbox: scheduleOutbox)
     }
@@ -2886,7 +2916,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             statusIsError = false
             statusMessage = "Redeeming temporary pairing invitation..."
-            pauseAutomaticSyncForPendingPairing()
+            hasPendingPairing = true
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                 cancelPairingOperation: false,
@@ -2966,7 +2996,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 && invitation.mailboxBootstrap != nil
             statusIsError = false
             statusMessage = "Redeeming temporary pairing invitation..."
-            pauseAutomaticSyncForPendingPairing()
+            hasPendingPairing = true
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                 cancelPairingOperation: false,
@@ -5664,6 +5694,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     )
                 }
                 try validate()
+                let matchesCurrentConnection =
+                    settingsStore.receiverSettingsGenerationToken == pendingTransition.connectionGeneration
+                    && settingsStore.receiverBindingID == pendingTransition.receiverBindingID
+                    && target.generation == pendingTransition.connectionGeneration
+                    && target.bindingID == pendingTransition.receiverBindingID
+                if (needsMigration || !matchesCurrentConnection),
+                   try outbox.hasUncheckedDirectSleepAcknowledgment(for: pendingTransition) {
+                    // The absent payload does not make an accepted journal obsolete.
+                    // Only its original live scope can authorize cleanup.
+                    refreshPendingOutboxCount()
+                    statusIsError = true
+                    statusMessage = "An accepted Sleep upload could not be finalized for this connection. Its recovery state was retained."
+                    return false
+                }
                 if needsMigration {
                     if let itemID = pendingTransition.outboxItemID,
                        let obsoleteItem = try outbox.pendingItem(id: itemID) {
@@ -5678,12 +5722,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     snapshot.fifo = try outbox.pendingItems()
                     refreshPendingOutboxCount()
                 } else {
-                    let matchesCurrentConnection =
-                        settingsStore.receiverSettingsGenerationToken
-                            == pendingTransition.connectionGeneration
-                        && settingsStore.receiverBindingID == pendingTransition.receiverBindingID
-                        && target.generation == pendingTransition.connectionGeneration
-                        && target.bindingID == pendingTransition.receiverBindingID
                     if matchesCurrentConnection {
                         failureStage = .transport
                         let delivered = try await deliverPendingSleepTransition(
@@ -6032,11 +6070,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return false
         }
         if target.route == .mailbox {
-            guard let state = try outbox.deliveryState(for: outboxItemID),
-                  state.phase == .committedFinalized,
-                  state.ownership?.receiverGeneration == pendingTransition.connectionGeneration,
-                  state.ownership?.receiverBindingID == pendingTransition.receiverBindingID,
-                  state.ownership?.resetEpoch == pendingTransition.manifest.baselineResetEpoch else {
+            guard pendingTransition.hasFinalizedMailboxProof(
+                try outbox.deliveryState(for: outboxItemID)
+            ) else {
                 throw CancellationError()
             }
         } else {
@@ -6590,6 +6626,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard try capturePayloadDeliveryTarget() == target else { throw CancellationError() }
     }
 
+    private func requireCurrentAcceptedDirectTarget(_ target: PayloadDeliveryTarget) throws {
+        try requireCurrentConnectionGeneration(target.generation)
+        // A response already accepted by the receiver belongs to the committed
+        // connection, not to the URL draft used to request a settings change.
+        guard !terminalRecoveryRequestIsActive, !taskUIPublicationIsSuppressed,
+              case .directHTTP(let url) = target.route,
+              settingsStore.activeTransport == .directHTTP,
+              settingsStore.receiverBindingID == target.bindingID,
+              settingsStore.receiverURLString == url.absoluteString else {
+            throw CancellationError()
+        }
+    }
+
     private struct PayloadDelivery {
         let directUpload: ReceiverUploadResult?
         let connectionGeneration: String
@@ -6949,8 +6998,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         _ = try await sleepManifestStore.loadManifestForSync(validate: validate)
         try validate()
-        if let loadedTransition = try await sleepManifestStore.loadPendingForSync(validate: validate) {
-            try validate()
+        let loadedTransition = try await sleepManifestStore.loadPendingForSync(validate: validate)
+        try validate()
+        if let loadedTransition {
             var pendingTransition = loadedTransition
             if loadedTransition.outboxItemID == nil,
                let item = try await matchingPendingSleepOutboxItems(loadedTransition, in: outbox).first {
@@ -6962,6 +7012,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 try validate()
             }
             if let rejectedFloor = pendingTransition.rejectedMinimumResetEpoch {
+                guard try !outbox.hasUncheckedDirectSleepAcknowledgment(for: pendingTransition) else {
+                    throw FileOutboxCursorCheckpointError.pendingCommit
+                }
                 try await recoverRejectedSleepBaseline(
                     RejectedSleepBaselineOutboxItem(
                         itemID: pendingTransition.outboxItemID ?? "",
@@ -6981,14 +7034,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try validate()
             if needsMigration {
-                _ = try sleepResetEpochStore.reserveEpoch(
-                    after: pendingTransition.manifest.baselineResetEpoch ?? 0
-                )
                 let matchingItems = try await matchingPendingSleepOutboxItems(
                     pendingTransition,
                     in: outbox
                 )
                 try validate()
+                guard try !outbox.hasUncheckedDirectSleepAcknowledgment(for: pendingTransition) else {
+                    throw FileOutboxCursorCheckpointError.pendingCommit
+                }
+                _ = try sleepResetEpochStore.reserveEpoch(
+                    after: pendingTransition.manifest.baselineResetEpoch ?? 0
+                )
                 for item in matchingItems {
                     try outbox.markUploaded(item)
                     outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .retired)
@@ -7007,6 +7063,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try validate()
             if needsMigration {
+                if let loadedTransition,
+                   try outbox.hasUncheckedDirectSleepAcknowledgment(for: loadedTransition) {
+                    throw FileOutboxCursorCheckpointError.pendingCommit
+                }
                 _ = try sleepResetEpochStore.reserveEpoch(after: manifest.baselineResetEpoch ?? 0)
                 try sleepManifestStore.resetSynchronizationState()
                 snapshot.storage = try sleepManifestStore.revisionForSync()
@@ -7149,7 +7209,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     to: url,
                     bearerToken: uploadBearerToken
                 )
-                try requireCurrentPayloadDeliveryTarget(target)
+                let mayContainSleep = prepared?.mayContainSleep != false
+                if mayContainSleep {
+                    try requireCurrentAcceptedDirectTarget(target)
+                } else {
+                    try requireCurrentPayloadDeliveryTarget(target)
+                }
                 guard try outbox.preparedNutritionPayload(for: item)?.revision == prepared?.revision else {
                     throw CancellationError()
                 }
@@ -7158,7 +7223,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         bindingID: receiverIdentity, generation: expectedGeneration, evidenceKind: .directResponse
                     )
                 }
-                if prepared?.mayContainSleep == false {
+                if !mayContainSleep {
                     _ = try cursorFinalizer.recordDirectReceiverAcceptance(
                         itemID: item.id, receiverBindingID: receiverIdentity, sleepChecked: true,
                         onNewAcceptance: recordAcceptance
@@ -7179,8 +7244,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             ),
                             sleepStore: store,
                             validate: {
-                                try self.requireCurrentPayloadDeliveryTarget(target)
-                                try self.validateSleepOperationContext(snapshot, store: store, outbox: outbox)
+                                try self.requireCurrentAcceptedDirectTarget(target)
+                                // A reservation excludes new work but does not revoke
+                                // this response before the terminal barrier closes.
+                                try self.validateSleepOperationAuthority(snapshot, store: store, outbox: outbox)
                             }, validatePending: {
                                 guard try outbox.pendingItems() == snapshot.fifo,
                                       try outbox.preparedNutritionPayload(for: item)?.revision == prepared?.revision else {
@@ -7340,6 +7407,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         store: SleepSyncManifestStoring,
         outbox: FileOutbox
     ) throws {
+        guard terminalTransitionRequestIsActive == snapshot.terminalRequest else {
+            throw CancellationError()
+        }
+        try validateSleepOperationAuthority(snapshot, store: store, outbox: outbox)
+    }
+
+    private func validateSleepOperationAuthority(
+        _ snapshot: SleepOperationSnapshot,
+        store: SleepSyncManifestStoring,
+        outbox: FileOutbox
+    ) throws {
         try Task.checkCancellation()
         guard sleepManifestStore === store, self.outbox === outbox,
               settingsStore.receiverSettingsGenerationToken == snapshot.generation,
@@ -7348,7 +7426,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               bootstrapRetryGeneration == snapshot.retryGeneration,
               backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration,
               terminalRecoveryRequestIsActive == snapshot.recovery,
-              terminalTransitionRequestIsActive == snapshot.terminalRequest,
               taskUIPublicationIsSuppressed == snapshot.publicationSuppressed,
               connectionTerminalBarrier.admissionIsOpen == snapshot.admissionOpen,
               !snapshot.automatic || backgroundSyncEnabled else { throw CancellationError() }

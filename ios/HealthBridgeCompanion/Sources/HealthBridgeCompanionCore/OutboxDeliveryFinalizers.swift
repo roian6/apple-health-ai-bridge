@@ -69,7 +69,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         ) ?? outbox.directFinalizationRecordReady(
                receiverIdentity: descriptor.receiverBindingID,
                where: { record, unchecked, _ in
-                   item == nil && Self.isSleepRecord(record) && unchecked.contains(descriptor.itemID)
+                   item == nil && record.isDirectSleepRecord && unchecked.contains(descriptor.itemID)
                }
            ) {
             guard try await recoverDirectSleepAcknowledgment(
@@ -229,7 +229,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         guard let record = try outbox.directFinalizationRecordReady(
             receiverIdentity: receiverBindingID,
             where: { record, unchecked, intent in
-                intent == nil && (!Self.isSleepRecord(record) || unchecked.isEmpty)
+                intent == nil && (!record.isDirectSleepRecord || unchecked.isEmpty)
             }
         ) else {
             return false
@@ -269,7 +269,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             ?? outbox.directFinalizationRecordReady(
             receiverIdentity: receiverBindingID,
             where: { record, unchecked, _ in
-                unchecked.contains(itemID) && Self.isSleepRecord(record)
+                unchecked.contains(itemID) && record.isDirectSleepRecord
             }
         ) else { return false }
         return try await recoverDirectSleepAcknowledgment(
@@ -278,19 +278,9 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         )
     }
 
-    private static func isSleepRecord(_ record: FileOutboxFinalizationRecord) -> Bool {
-        let sleepCursorKinds = [
-            SleepSyncBatchFactory.foregroundCursorKind,
-            SleepSyncBatchFactory.anchoredCursorKind,
-            SleepSyncBatchFactory.baselineResetCursorKind,
-        ]
-        return record.pendingGenerationRetirements[HealthBridgeHealthType.sleepAnalysis.typeCode] != nil
-            || record.cursorCheckpoint.map({ sleepCursorKinds.contains($0.cursorKind) }) == true
-    }
-
     private func finalizeDirect(_ record: FileOutboxFinalizationRecord) throws -> Bool {
         guard try outbox.directSleepCleanupIntent(for: record) == nil else { return false }
-        if Self.isSleepRecord(record), try !outbox.uncheckedDirectAcknowledgmentIDs(for: record).isEmpty {
+        if record.isDirectSleepRecord, try !outbox.uncheckedDirectAcknowledgmentIDs(for: record).isEmpty {
             return false
         }
         try finalize(record)

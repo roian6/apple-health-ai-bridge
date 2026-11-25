@@ -163,11 +163,12 @@ final class NutritionMailboxFixture {
         )
     }
 
-    func delivery() -> ProductionMailboxDelivery {
+    func delivery(sleepStore: FileSleepSyncManifestStore? = nil) -> ProductionMailboxDelivery {
         let components = components()
         return ProductionMailboxDelivery(
             settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
             pendingGenerationStore: BackgroundSyncSettingsStore(userDefaults: base.defaults),
+            sleepStore: sleepStore,
             keyStore: keys, componentsFactory: { components }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
         )
     }

@@ -176,12 +176,19 @@ final class NutritionFixture {
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredWorkoutChanges)? = nil,
         readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])? = nil,
+        readAnchoredSleepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
         requestReadAuthorization: @escaping @MainActor ([String]) async throws -> Void = { _ in },
         terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
-        reopenStorage: Bool = false
+        reopenStorage: Bool = false,
+        outboxFileManager: FileManager = .default
     ) async throws -> HealthBridgeCompanionViewModel {
-        let deliveryOutbox = reopenStorage ? try FileOutbox(directory: outbox.directoryURL) : outbox
+        let deliveryOutbox = reopenStorage
+            ? try FileOutbox(directory: outbox.directoryURL, fileManager: outboxFileManager) : outbox
         let deliveryCursors = reopenStorage ? try FileSyncCursorStore(fileURL: cursors.fileURL) : cursors
+        let sleepStore = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
+        let mailboxSleepStore = readAnchoredSleepChanges == nil ? nil : sleepStore
         let vm = HealthBridgeCompanionViewModel(
             receiverClient: client, settingsStore: settings,
             pairingStateStore: ReceiverPairingStateStore(
@@ -198,10 +205,11 @@ final class NutritionFixture {
             acceptedTransferStore: acceptedTransferStore,
             outbox: deliveryOutbox, outboxDirectoryURL: outbox.directoryURL,
             cursorStore: deliveryCursors, cursorStoreFileURL: cursors.fileURL,
-            sleepManifestStore: try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json")),
+            sleepManifestStore: sleepStore,
             sleepManifestFileURL: root.appendingPathComponent("sleep.json"),
             sleepResetEpochStore: SleepResetEpochStore(tokenStore: NutritionTokenStore(), epochFloorProvider: { 1 }),
             mailboxKeyStore: mailbox?.keys ?? MailboxKeyStore(service: suite, keychain: NutritionKeychain()),
+            readAnchoredSleepChanges: readAnchoredSleepChanges,
             readAnchoredStepChanges: readAnchoredStepChanges,
             readAnchoredWorkoutChanges: readAnchoredWorkoutChanges,
             readWorkoutHistory: readWorkoutHistory,
@@ -214,7 +222,7 @@ final class NutritionFixture {
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             platformBackgroundPayloadDrain: { true },
             productionMailboxDelivery: mailbox.map { fixture in
-                { @MainActor @Sendable in fixture.delivery() }
+                { @MainActor in fixture.delivery(sleepStore: mailboxSleepStore) }
             },
             readAnchoredQuantityChanges: { [self] type, previous, start, now in
                 reads.append(type)

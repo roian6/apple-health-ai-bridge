@@ -416,6 +416,81 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(observation.bindingID, fixture.identity.opaqueBinding)
     }
 
+    func testForegroundMailboxSleepRequiresProofForTheTrackedItem() async throws {
+        for input in ForegroundSleepCompletionInput.allCases where input != .pendingJournal {
+            try await checkForegroundMailboxSleepCompletion(input)
+        }
+    }
+
+    func testForegroundMailboxSleepRejectsMatchingProofWithPendingJournal() async throws {
+        try await checkForegroundMailboxSleepCompletion(.pendingJournal)
+    }
+
+    private func checkForegroundMailboxSleepCompletion(_ input: ForegroundSleepCompletionInput) async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let probe = ForegroundSleepCompletionFiles(directory: fixture.base.outbox.directoryURL)
+        let suite = fixture.base.suite + ".foreground-sleep-completion"
+        let defaults = try XCTUnwrap(ForegroundSleepCommitDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
+        let anchor = fixture.base.anchor
+        let viewModel = try await fixture.base.makeViewModel(
+            mailbox: fixture,
+            readAnchoredSleepChanges: { _, _, now in
+                HealthKitAnchoredSleepChanges(
+                    addedSamples: [HealthKitSleepChildSample(
+                        uuid: UUID(), stage: "core", start: now.addingTimeInterval(-3600), end: now
+                    )],
+                    deletedSamples: [], anchorCursorValue: anchor, receivedAt: now
+                )
+            },
+            reopenStorage: true,
+            outboxFileManager: probe
+        )
+        _ = await viewModel.syncRecentSleepSessions(executionMode: .foreground)
+        let store = try FileSleepSyncManifestStore(fileURL: fixture.base.root.appendingPathComponent("sleep.json"))
+        let pending = try XCTUnwrap(store.loadPendingTransition(), input.rawValue)
+        let itemID = try XCTUnwrap(pending.outboxItemID, input.rawValue)
+        let item = try XCTUnwrap(fixture.base.outbox.pendingItem(id: itemID), input.rawValue)
+        let binding = try XCTUnwrap(item.mailboxBinding, input.rawValue)
+        XCTAssertEqual(item.deliveryState?.phase, .providerObserved, input.rawValue)
+        let envelopeURL = probe.directory.appendingPathComponent(binding.envelopeFilename)
+        let payload = try Data(contentsOf: item.fileURL)
+        let envelope = try Data(contentsOf: envelopeURL)
+        _ = try fixture.receiveAndAcknowledge(item)
+
+        defaults.afterCommit = {
+            probe.afterForegroundFIFORefresh {
+                let state = try XCTUnwrap(fixture.base.outbox.deliveryState(for: itemID), input.rawValue)
+                XCTAssertEqual(state.phase, .committedFinalized, input.rawValue)
+                XCTAssertEqual(state.ownership?.receiverGeneration, pending.connectionGeneration, input.rawValue)
+                XCTAssertEqual(state.ownership?.receiverBindingID, pending.receiverBindingID, input.rawValue)
+                XCTAssertEqual(state.ownership?.resetEpoch, pending.manifest.baselineResetEpoch, input.rawValue)
+                XCTAssertEqual(try store.loadManifest(), pending.manifest, input.rawValue)
+                XCTAssertNil(try store.loadPendingTransition(), input.rawValue)
+                try probe.present(
+                    input, pending: pending, store: store,
+                    artifacts: (payload, envelopeURL, envelope)
+                )
+                // Reject invalid fixture bytes here rather than counting a
+                // FileOutbox reconciliation error as proof-gate rejection.
+                _ = try fixture.base.outbox.deliveryState(for: itemID)
+            }
+        }
+        let completed = await viewModel.syncRecentSleepSessions(executionMode: .foreground)
+
+        XCTAssertTrue(probe.presented, "Did not reach the post-FIFO proof window: \(input.rawValue)")
+        if input == .ackVerified {
+            XCTAssertTrue(probe.readVerifiedArtifacts, "The real lookup did not read the ACK-verified entry")
+        }
+        XCTAssertEqual(completed, input == .matching, input.rawValue)
+        XCTAssertEqual(viewModel.statusIsError, input != .matching, input.rawValue)
+    }
+
     func testUnavailableObservationWriteCannotChangeDirectAcceptance() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }
@@ -502,6 +577,131 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
             cursorKind: GenericQuantitySyncBatchFactory.anchoredCursorKind(for: "dietary_protein")
         ))
         XCTAssertEqual(viewModel.lastAcceptedTransferObservation, current)
+    }
+}
+
+private enum ForegroundSleepCompletionInput: String, CaseIterable {
+    case matching, missingTrackedItem, ackVerified, wrongGeneration, wrongBinding, wrongResetEpoch, pendingJournal
+}
+
+private final class ForegroundSleepCommitDefaults: UserDefaults, @unchecked Sendable {
+    var afterCommit: (() -> Void)?
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        super.set(value, forKey: defaultName)
+        guard defaultName == "healthBridge.lastAcceptedTransferObservation",
+              let callback = afterCommit else { return }
+        afterCommit = nil
+        callback()
+    }
+}
+
+private final class ForegroundSleepCompletionFiles: FileManager, @unchecked Sendable {
+    let directory: URL
+    private var remainingListings = 0
+    private var afterListings: (() throws -> Void)?
+    private var restoreVerifiedArtifacts: (path: String, restore: () throws -> Void)?
+    private(set) var presented = false
+    private(set) var readVerifiedArtifacts = false
+
+    init(directory: URL) {
+        self.directory = directory
+        super.init()
+    }
+
+    func afterForegroundFIFORefresh(_ callback: @escaping () throws -> Void) {
+        // After the ACK commit, the VM snapshots pendingItems and refreshes the
+        // visible count. Each read lists payloads, envelopes, then FIFO payloads.
+        remainingListings = 6
+        afterListings = callback
+    }
+
+    override func contentsOfDirectory(
+        at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?,
+        options mask: FileManager.DirectoryEnumerationOptions = []
+    ) throws -> [URL] {
+        let children = try super.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: mask)
+        if url == directory, let callback = afterListings {
+            remainingListings -= 1
+            if remainingListings == 0 {
+                afterListings = nil
+                try callback()
+                presented = true
+            }
+        }
+        return children
+    }
+
+    func present(
+        _ input: ForegroundSleepCompletionInput,
+        pending: SleepSyncPendingTransition,
+        store: FileSleepSyncManifestStore,
+        artifacts: (payload: Data, envelopeURL: URL, envelope: Data)
+    ) throws {
+        switch input {
+        case .matching: return
+        case .pendingJournal:
+            try store.savePendingTransition(pending)
+            return
+        case .missingTrackedItem, .ackVerified, .wrongGeneration, .wrongBinding, .wrongResetEpoch:
+            break
+        }
+        let itemID = try XCTUnwrap(pending.outboxItemID)
+        let sequenceURL = directory.appendingPathComponent(".fifo-sequence")
+        let original = try Data(contentsOf: sequenceURL)
+        var sequence = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        var entries = try XCTUnwrap(sequence["entries"] as? [[String: Any]])
+        let index = try XCTUnwrap(entries.firstIndex { $0["id"] as? String == itemID })
+        var entry = entries[index]
+        var state = try XCTUnwrap(entry["deliveryState"] as? [String: Any])
+        var ownership = try XCTUnwrap(state["ownership"] as? [String: Any])
+        switch input {
+        case .missingTrackedItem:
+            // Leave another matching proof so an unscoped lookup cannot pass.
+            let otherID = UUID().uuidString.lowercased()
+            var binding = try XCTUnwrap(entry["mailboxBinding"] as? [String: Any])
+            binding["envelopeFilename"] = "\(otherID).hbe"
+            entry["id"] = otherID
+            entry["mailboxBinding"] = binding
+        case .ackVerified:
+            state["phase"] = OutboxDeliveryPhase.ackVerified.rawValue
+            let payloadURL = directory.appendingPathComponent(itemID).appendingPathExtension("json")
+            try artifacts.payload.write(to: payloadURL, options: .atomic)
+            try artifacts.envelope.write(to: artifacts.envelopeURL, options: .atomic)
+            // A non-finalized entry must own real artifacts for FileOutbox to
+            // return it. Restore after lookup validates the envelope so later
+            // FIFO validation, if reached, still sees the original snapshot.
+            restoreVerifiedArtifacts = (artifacts.envelopeURL.path, {
+                try original.write(to: sequenceURL, options: .atomic)
+                try FileManager.default.removeItem(at: payloadURL)
+                try FileManager.default.removeItem(at: artifacts.envelopeURL)
+            })
+        case .wrongGeneration:
+            ownership["receiverGeneration"] = "unrelated-generation"
+        case .wrongBinding:
+            let otherBinding = "unrelated-binding"
+            ownership["receiverBindingID"] = otherBinding
+            entry["receiverIdentity"] = otherBinding // Keep the persisted entry valid.
+        case .wrongResetEpoch:
+            ownership["resetEpoch"] = try XCTUnwrap(pending.manifest.baselineResetEpoch) + 1
+        case .matching, .pendingJournal:
+            return
+        }
+        state["ownership"] = ownership
+        entry["deliveryState"] = state
+        entries[index] = entry
+        sequence["entries"] = entries
+        try JSONSerialization.data(withJSONObject: sequence).write(to: sequenceURL, options: .atomic)
+    }
+
+    override func setAttributes(_ attributes: [FileAttributeKey: Any], ofItemAtPath path: String) throws {
+        try super.setAttributes(attributes, ofItemAtPath: path)
+        if let restoration = restoreVerifiedArtifacts, restoration.path == path,
+           attributes[.posixPermissions] != nil {
+            restoreVerifiedArtifacts = nil
+            try restoration.restore()
+            readVerifiedArtifacts = true
+        }
     }
 }
 

@@ -177,30 +177,61 @@ def test_terminal_request_reservation_precancels_pairing() -> None:
         transition_start,
     )
     body = source[transition_start:transition_end]
+    preflight = body[: body.index("beginTerminalTaskUIPublicationSuppression()")]
     assert (
-        body.index("await cancelPairingOperationIfNeeded()")
-        < body.index(
+        preflight.index(
             "let outboxIdentityAdmissionWasReady = outboxIdentityMigrationReady"
         )
-        < body.index("connectionTerminalBarrier.perform(")
+        < preflight.index("try requireTrustedEmptyOutboxForConnectionTransition(")
+        < preflight.index("throw error")
     )
-    close = body[body.index("closeAdmission:") : body.index("invalidateGeneration:")]
+    assert "cancelPairingOperationIfNeeded()" not in preflight
+    barrier_call = "transition = try await connectionTerminalBarrier."
+    assert (
+        len(preflight)
+        < body.index("await cancelPairingOperationIfNeeded()")
+        < body.index(barrier_call)
+        < body.index("try await preparePrivateStorageForUploadAdmission()")
+    )
+    _, _, barrier_arguments = body.partition(barrier_call)
+    barrier_method = barrier_arguments.split("(", 1)[0]
+    before_commit, commit = barrier_arguments.split("commit: {", 1)
+    close = before_commit.split("closeAdmission:", 1)[1].split(
+        "cancelAndAwaitPairing:", 1
+    )[0]
     assert "privateStorageAdmissionReady = false" in close
     assert "outboxIdentityMigrationReady = false" in close
-    commit = body[body.index("commit: { expectedGeneration in") :]
-    assert commit.index(
-        "try self.requireTrustedEmptyOutboxForConnectionTransition("
-    ) < commit.index("let result = try await commit(expectedGeneration)")
-    assert body.index("connectionTerminalBarrier.perform(") < body.index(
-        "try await preparePrivateStorageForUploadAdmission()"
+    assert (
+        "invalidateReceiverSettingsGeneration(" not in body[: body.index("commit: {")]
     )
+    recheck = commit.index("try self.requireTrustedEmptyOutboxForConnectionTransition(")
+    advance = commit.index(
+        "try self.settingsStore.invalidateReceiverSettingsGeneration("
+    )
+    assert (
+        recheck
+        < advance
+        < commit.index("let result = try await commit(expectedGeneration)")
+    )
+    assert "await " not in commit[recheck:advance]
     assert "postCommitRecoveryRequired: true" in body
     assert "postCommitRecoveryRequired: false" in body
 
     barrier = RECEIVER_CLIENT.read_text()
     assert "transitionWaiters: [CheckedContinuation<Void, Never>]" in barrier
-    assert "await acquireTransition()" in barrier
-    assert "defer { releaseTransition() }" in barrier
+    implementation = barrier.split(f"public func {barrier_method}<Result>(", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    assert (
+        implementation.index("await acquireTransition()")
+        < implementation.index("defer { releaseTransition() }")
+        < implementation.index("closeAdmission()")
+        < implementation.index("await cancelAndAwaitPairing()")
+        < implementation.index("await cancelAndAwaitForegroundPayloads()")
+        < implementation.index("guard await drainBackgroundPayloads()")
+        < implementation.index("return try await commit(")
+    )
+    assert "invalidateGeneration()" not in implementation
     assert "guard admissionIsOpen else" not in barrier
 
 
@@ -385,7 +416,8 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
     begin = transition.index("beginTerminalTaskUIPublicationSuppression()")
     first_cancel = transition.index("cancelPairingOperationIfNeeded()")
     decisive_check = transition.index(
-        "requireTrustedEmptyOutboxForConnectionTransition("
+        "requireTrustedEmptyOutboxForConnectionTransition(",
+        transition.index("commit: {"),
     )
     assert begin < first_cancel < decisive_check
     coordinator_source = FILE_OUTBOX.read_text()
@@ -406,10 +438,15 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
         < coordinator.rindex("isActive = false")
     )
     assert transition.count("endTerminalTaskUIPublicationSuppression()") == 2
-    assert transition.index(
-        "endTerminalTaskUIPublicationSuppression()"
-    ) < transition.index(
-        "restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+    barrier_failure = transition.split(
+        "transition = try await connectionTerminalBarrier.", 1
+    )[1].split("\n        } catch {", 1)[1]
+    assert (
+        barrier_failure.index("endTerminalTaskUIPublicationSuppression()")
+        < barrier_failure.index(
+            "await restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+        )
+        < barrier_failure.index("\n            throw error")
     )
     assert transition.rindex(
         "endTerminalTaskUIPublicationSuppression()"
@@ -652,10 +689,14 @@ def test_failed_terminal_transition_reopens_trusted_admission() -> None:
     end = source.index("private func cancelAndAwaitForegroundPayloadTasks()", start)
     body = source[start:end]
 
-    assert "restorePrivateStorageAdmissionAfterFailedConnectionTransition()" in body
-    assert body.index("connectionTerminalBarrier.perform(") < body.index(
-        "restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+    barrier_failure = (
+        body.split("transition = try await connectionTerminalBarrier.", 1)[1]
+        .split("\n        } catch {", 1)[1]
+        .split("\n        }\n", 1)[0]
     )
+    assert barrier_failure.index(
+        "await restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+    ) < barrier_failure.index("\n            throw error")
     restore_start = source.index(
         "private func restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
     )
@@ -663,8 +704,12 @@ def test_failed_terminal_transition_reopens_trusted_admission() -> None:
         "private func cancelAndAwaitForegroundPayloadTasks()", restore_start
     )
     restore = source[restore_start:restore_end]
-    assert restore.index("hasPendingCancellationRecovery()") < restore.index(
-        "preparePrivateStorageForUploadAdmission()"
+    assert (
+        restore.index("if try pairingCoordinator.hasPendingCancellationRecovery()")
+        < restore.index("privateStorageAdmissionReady = false")
+        < restore.index("outboxIdentityMigrationReady = false")
+        < restore.index("return")
+        < restore.index("try await preparePrivateStorageForUploadAdmission()")
     )
     assert "if let outboxError = error as? ReceiverOutboxIdentityError" in source
     assert "code=transition_requires_empty_outbox" in source

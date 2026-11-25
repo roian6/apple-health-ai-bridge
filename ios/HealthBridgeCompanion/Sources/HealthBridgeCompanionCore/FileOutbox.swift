@@ -381,6 +381,18 @@ public struct FileOutboxFinalizationRecord: Equatable, Sendable {
         }
     }
 
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    var isDirectSleepRecord: Bool {
+        let sleepCursorKinds = [
+            SleepSyncBatchFactory.foregroundCursorKind,
+            SleepSyncBatchFactory.anchoredCursorKind,
+            SleepSyncBatchFactory.baselineResetCursorKind,
+        ]
+        return pendingGenerationRetirements[HealthBridgeHealthType.sleepAnalysis.typeCode] != nil
+            || cursorCheckpoint.map({ sleepCursorKinds.contains($0.cursorKind) }) == true
+    }
+    #endif
+
     public init(
         itemIDs: [String] = [],
         cursorCheckpoint: FileOutboxCursorCheckpoint?,
@@ -1399,6 +1411,20 @@ public final class FileOutbox {
     func directSleepCleanupIntent(for record: FileOutboxFinalizationRecord) throws -> DirectSleepCleanupIntent? {
         try loadEnqueueTransactions().first { $0.finalizationRecord == record }?.directSleepCleanupIntent
     }
+
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    func hasPendingDirectSleepCleanup() throws -> Bool {
+        try loadEnqueueTransactions().contains {
+            $0.directSleepCleanupIntent != nil
+                || ($0.finalizationRecord?.isDirectSleepRecord == true && !$0.uncheckedDirectAcknowledgmentIDs.isEmpty)
+        }
+    }
+
+    func hasUncheckedDirectSleepAcknowledgment(for transition: SleepSyncPendingTransition) throws -> Bool {
+        guard let itemID = transition.outboxItemID else { return false }
+        return try hasUncheckedDirectAcknowledgment(itemID: itemID, receiverBindingID: transition.receiverBindingID)
+    }
+    #endif
 
     func directSleepCleanupRecord(
         receiverBindingID: String, itemID: String? = nil
@@ -3429,6 +3455,14 @@ public struct SleepSyncPendingTransition: Codable, Equatable, Sendable {
         self.rejectedMinimumResetEpoch = rejectedMinimumResetEpoch
     }
 
+    public func hasFinalizedMailboxProof(_ state: FileOutboxDeliveryStateV1?) -> Bool {
+        guard let state else { return false }
+        return state.phase == .committedFinalized
+            && state.ownership?.receiverGeneration == connectionGeneration
+            && state.ownership?.receiverBindingID == receiverBindingID
+            && state.ownership?.resetEpoch == manifest.baselineResetEpoch
+    }
+
     public func assigningOutboxItemID(_ outboxItemID: String) -> SleepSyncPendingTransition {
         SleepSyncPendingTransition(
             id: id,
@@ -4997,8 +5031,11 @@ public final class ReceiverSettingsStore {
     }
 
     @discardableResult
-    public func invalidateReceiverSettingsGeneration() throws -> String {
+    public func invalidateReceiverSettingsGeneration(expectedGeneration: String? = nil) throws -> String {
         let current = try authoritativeRecordForMutation()
+        guard expectedGeneration == nil || expectedGeneration == "g\(current.localScope.generation)" else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
         let record = ReceiverConnectionRecordV2(
             localScope: ReceiverLocalConnectionScopeV1(
                 generation: try Self.nextGeneration(after: current.localScope.generation),

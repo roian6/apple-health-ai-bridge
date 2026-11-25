@@ -196,18 +196,20 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     )
     delivery = body.index("deliverPendingSleepTransition(", journal)
     assert reservation < journal < delivery
-    # Mailbox proof must belong to this receiver, generation and reset epoch.
-    proof = body.split(
-        "guard let state = try outbox.deliveryState(for: outboxItemID)", 1
-    )[1]
-    guard = proof.split("else {", 1)[0]
-    for condition in (
-        "state.phase == .committedFinalized",
-        "state.ownership?.receiverGeneration == pendingTransition.connectionGeneration",
-        "state.ownership?.receiverBindingID == pendingTransition.receiverBindingID",
-        "state.ownership?.resetEpoch == pendingTransition.manifest.baselineResetEpoch",
-    ):
-        assert condition in guard
+    # Swift tests own the proof predicates. Here, verify the Mailbox caller
+    # requires the evaluator's result for the tracked item before completion.
+    completion = body.split("private func deliverPendingSleepTransition(", 1)[1].split(
+        "let manifest = try await store.loadManifestForSync(validate: validate)", 1
+    )[0]
+    _, mailbox_route, route_body = completion.partition("if target.route == .mailbox {")
+    assert mailbox_route
+    mailbox_guard, direct_route, _ = route_body.partition("} else {")
+    assert direct_route
+    assert " ".join(mailbox_guard.split()) == (
+        "guard pendingTransition.hasFinalizedMailboxProof("
+        " try outbox.deliveryState(for: outboxItemID) ) else {"
+        " throw CancellationError() }"
+    )
     # The shared Direct finalizer validates accepted bytes and receiver scope
     # before persisting the manifest; the foreground reader no longer writes it.
     finalizers = (
