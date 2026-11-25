@@ -64,12 +64,12 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
         let prepared = try item.flatMap { try outbox.preparedNutritionPayload(for: $0) }
-        if let record = try outbox.directFinalizationRecordReady(
+        if let record = try outbox.directSleepCleanupRecord(
+            receiverBindingID: descriptor.receiverBindingID, itemID: descriptor.itemID
+        ) ?? outbox.directFinalizationRecordReady(
                receiverIdentity: descriptor.receiverBindingID,
-               where: { record, unchecked, intent in
-                   unchecked.contains(descriptor.itemID) && (
-                       intent != nil || (item == nil && Self.isSleepRecord(record))
-                   )
+               where: { record, unchecked, _ in
+                   item == nil && Self.isSleepRecord(record) && unchecked.contains(descriptor.itemID)
                }
            ) {
             guard try await recoverDirectSleepAcknowledgment(
@@ -247,7 +247,8 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     ) async throws -> Bool {
         try validate()
         if try finalizeDirectAcknowledgments(receiverBindingID: receiverBindingID) { return true }
-        guard let record = try outbox.directFinalizationRecordReady(receiverIdentity: receiverBindingID) else {
+        guard let record = try outbox.directSleepCleanupRecord(receiverBindingID: receiverBindingID)
+            ?? outbox.directFinalizationRecordReady(receiverIdentity: receiverBindingID) else {
             return false
         }
         return try await recoverDirectSleepAcknowledgment(
@@ -264,10 +265,11 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         sleepStore: any SleepSyncManifestStoring,
         validate: @escaping @MainActor () throws -> Void
     ) async throws -> Bool {
-        guard let record = try outbox.directFinalizationRecordReady(
+        guard let record = try outbox.directSleepCleanupRecord(receiverBindingID: receiverBindingID, itemID: itemID)
+            ?? outbox.directFinalizationRecordReady(
             receiverIdentity: receiverBindingID,
-            where: { record, unchecked, intent in
-                unchecked.contains(itemID) && (intent != nil || Self.isSleepRecord(record))
+            where: { record, unchecked, _ in
+                unchecked.contains(itemID) && Self.isSleepRecord(record)
             }
         ) else { return false }
         return try await recoverDirectSleepAcknowledgment(
@@ -362,7 +364,10 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         try Task.checkCancellation()
         try validate()
         guard try sleepStore.revisionForSync() == cleanedRevision else { throw CancellationError() }
-        return try finishDirectSleepCleanup(intent, for: record)
+        // Recovering the item releases its FIFO barrier even when a sibling
+        // must still be accepted before the transaction checkpoint can advance.
+        _ = try finishDirectSleepCleanup(intent, for: record)
+        return true
     }
 
     private func finishDirectSleepCleanup(

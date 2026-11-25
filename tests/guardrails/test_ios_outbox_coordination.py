@@ -121,7 +121,7 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
         "public func directFinalizationRecordReady(", accepted_start
     )
     accepted = outbox[accepted_start:accepted_end]
-    assert "finalizationRecord.cursorCheckpoint?.receiverIdentity" in accepted
+    assert "transaction.cursorCheckpoint?.receiverIdentity" in accepted
     assert "item.receiverIdentity == receiverIdentity" in accepted
 
 

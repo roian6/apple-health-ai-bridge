@@ -56,6 +56,136 @@ final class PlainDirectAcceptanceTests: XCTestCase {
         XCTAssertEqual(try reopened.pendingItems().map(\.id), [fixture.next.id])
     }
 
+    #if os(iOS)
+    @MainActor
+    func testTransactionACKReportsExactlyOnceDespitePostWriteAttributeFailure() async throws {
+        for lane in TransactionLane.allCases {
+            try await checkTransactionACK(lane, fault: .afterPublication)
+        }
+    }
+    #endif
+
+    @MainActor
+    func testTransactionACKDoesNotReportWhenAtomicWriteCannotPublish() async throws {
+        for lane in TransactionLane.allCases {
+            try await checkTransactionACK(lane, fault: .beforePublication)
+        }
+    }
+
+    private enum TransactionLane: CaseIterable {
+        case plain, sleep
+    }
+
+    @MainActor
+    private func checkTransactionACK(
+        _ lane: TransactionLane, fault: TransactionACKFileManager.Fault
+    ) async throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let directory = root.appendingPathComponent("outbox")
+        let journal = directory.appendingPathComponent(".enqueue-transaction")
+        addTeardownBlock { try files.removeItem(at: root) }
+        let manager = TransactionACKFileManager(journal: journal, fault: fault)
+        let outbox = try FileOutbox(directory: directory, fileManager: manager)
+        let payload = try makeTransactionPayload(for: lane)
+        let item = try outbox.enqueue(payload, receiverIdentity: binding)
+        let next = try outbox.enqueue(makeTransactionPayload(for: .plain), receiverIdentity: binding)
+        let generation = "synthetic-generation"
+        let descriptor = DirectUploadCompletionDescriptor(
+            itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+        )
+        let sleep = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
+        let cursors = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
+        if lane == .sleep {
+            try sleep.savePendingTransition(.init(
+                payload: payload,
+                manifest: SleepSyncBatchFactory.makeManifestReservation(
+                    receiverSettingsGeneration: generation, historyDepth: .allAvailable, historyStartDate: nil
+                ),
+                receiverBindingID: binding, connectionGeneration: generation, outboxItemID: item.id
+            ))
+        }
+
+        func hasScopedACK(in queue: FileOutbox) throws -> Bool {
+            switch lane {
+            case .plain:
+                return try queue.hasDirectAcknowledgmentWithSleepChecked(itemID: item.id, receiverIdentity: binding)
+            case .sleep:
+                return try queue.hasDirectSleepCleanupIntent(
+                    itemID: item.id, receiverBindingID: binding, receiverGeneration: generation
+                )
+            }
+        }
+
+        var reports = 0
+        @MainActor func accept(in queue: FileOutbox) async throws -> Bool {
+            try await OutboxDeliveryCursorFinalizer(outbox: queue, cursorStore: cursors)
+                .recordDirectReceiverAcceptanceForSync(
+                    descriptor: descriptor, sleepStore: sleep, validate: {},
+                    onNewAcceptance: {
+                        do {
+                            let scopedACK = try hasScopedACK(in: queue)
+                            XCTAssertTrue(scopedACK, "\(lane): reported before the scoped ACK was visible")
+                        } catch {
+                            XCTFail("\(lane): reported before the scoped ACK was readable: \(error)")
+                        }
+                        reports += 1
+                    }
+                )
+        }
+
+        XCTAssertFalse(try hasScopedACK(in: outbox))
+        if fault == .beforePublication {
+            // Hide only this empty obstruction from journal readers, not from the real atomic write.
+            try files.createDirectory(at: journal, withIntermediateDirectories: false)
+        }
+        manager.armed = true
+        do {
+            _ = try await accept(in: outbox)
+            XCTFail("\(lane): the \(fault) error must propagate")
+        } catch {
+            switch fault {
+            case .afterPublication:
+                XCTAssertEqual(error as? TransactionACKFileManager.Fault, .afterPublication, "\(lane)")
+            case .beforePublication:
+                let cocoa = error as NSError
+                XCTAssertEqual(cocoa.domain, NSCocoaErrorDomain, "\(lane)")
+                XCTAssertEqual(cocoa.userInfo[NSFilePathErrorKey] as? String, journal.path, "\(lane)")
+            }
+        }
+
+        let published = fault == .afterPublication
+        XCTAssertEqual(try hasScopedACK(in: outbox), published, "\(lane): journal visibility at the failure boundary")
+        XCTAssertEqual(reports, published ? 1 : 0, "\(lane): callback count at the ACK publication boundary")
+        let reportsBeforeRetry = reports
+        if !published {
+            XCTAssertEqual(try Data(contentsOf: item.fileURL), payload, "\(lane): failed write must retain payload")
+            try files.removeItem(at: journal)
+        }
+
+        let reopened = try FileOutbox(directory: directory)
+        let finalized = try await accept(in: reopened)
+        XCTAssertTrue(finalized, "\(lane): retry should finish the accepted item")
+        XCTAssertEqual(reports, published ? reportsBeforeRetry : 1, "\(lane): retry must not duplicate the ACK")
+        let replayed = try await accept(in: reopened)
+        XCTAssertFalse(replayed, "\(lane): the retired item should not finalize again")
+        XCTAssertEqual(reports, published ? reportsBeforeRetry : 1, "\(lane): replay must not report another ACK")
+        XCTAssertEqual(try reopened.pendingItems().map(\.id), [next.id], "\(lane): only the scoped item may retire")
+        XCTAssertNil(try sleep.loadPendingTransition())
+    }
+
+    private func makeTransactionPayload(for lane: TransactionLane) throws -> Data {
+        let start = "2026-01-01T00:00:00Z"
+        let end = "2026-01-02T00:00:00Z"
+        let window = HealthBridgeTimeWindow(startTime: start, endTime: end)
+        return try HealthBridgeBatchEncoder().encode(.init(
+            generatedAt: end, exportWindow: window, sources: [],
+            healthTypes: lane == .sleep ? [.sleepAnalysis] : [.steps],
+            samples: [], workouts: [], sleepSessions: [], deletedRecords: [],
+            sync: .init(syncWindow: window, cursors: [])
+        ))
+    }
+
     private let binding = "synthetic-direct-binding"
 
     private func makePlainQueue() throws -> (directory: URL, first: FileOutboxItem, next: FileOutboxItem) {
@@ -102,5 +232,35 @@ private final class AcceptanceFaultFileManager: FileManager, @unchecked Sendable
             throw fault
         }
         return try super.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: mask)
+    }
+}
+
+private final class TransactionACKFileManager: FileManager {
+    enum Fault: Error {
+        case beforePublication, afterPublication
+    }
+
+    private let journal: URL
+    private let fault: Fault
+    var armed = false
+
+    init(journal: URL, fault: Fault) {
+        self.journal = journal
+        self.fault = fault
+        super.init()
+    }
+
+    override func fileExists(atPath path: String) -> Bool {
+        if armed, fault == .beforePublication, path == journal.path { return false }
+        return super.fileExists(atPath: path)
+    }
+
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+        let attributes = try super.attributesOfItem(atPath: path)
+        if armed, fault == .afterPublication, path == journal.path {
+            armed = false
+            throw fault
+        }
+        return attributes
     }
 }

@@ -307,6 +307,18 @@ final class FileOutboxTests: XCTestCase {
             try firstLaunch.uploadablePendingItems(for: "receiver-a").map(\.id),
             items.map(\.id)
         )
+        let journalURL = directory.appendingPathComponent(".enqueue-transaction")
+        let journalBefore = try Data(contentsOf: journalURL)
+        XCTAssertThrowsError(try firstFinalizer.recordDirectReceiverAcceptance(
+            itemID: items[0].id, receiverBindingID: "receiver-b"
+        )) {
+            XCTAssertEqual($0 as? ReceiverOutboxIdentityError, .oldestItemBelongsToDifferentReceiver)
+        }
+        XCTAssertEqual(try Data(contentsOf: journalURL), journalBefore)
+        XCTAssertEqual(try initial.pendingItems().map(\.id), items.map(\.id))
+        XCTAssertNil(try cursorStore.cursorValue(
+            receiverBindingID: "receiver-a", sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        ))
         XCTAssertFalse(try firstFinalizer.recordDirectReceiverAcceptance(
             itemID: items[0].id,
             receiverBindingID: "receiver-a"

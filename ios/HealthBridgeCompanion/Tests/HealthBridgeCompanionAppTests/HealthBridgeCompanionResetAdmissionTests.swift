@@ -4453,39 +4453,70 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         let fixture = try SleepStoreFaultFixture(point: point)
         defer { fixture.cleanUp() }
         let runtime = try await makeSleepStoreFaultRuntime(fixture)
+        let posts: (automaticFault: Int, foregroundFault: Int, recovery: Int)
+        switch point {
+        case .pendingSave: posts = (0, 0, 1)
+        case .manifestSave: posts = (1, 2, 3) // HTTP 200 arrives before the app can persist its ACK.
+        case .pendingClear: posts = (1, 1, 1) // The durable ACK and cleanup intent prevent another POST.
+        case .rejectionPendingSave, .rejectionReset:
+            XCTFail("Rejection faults are exercised separately.")
+            return
+        }
+        let hasCleanupIntent = point == .pendingClear
+        let faultedManifest = hasCleanupIntent ? fixture.pending.manifest : fixture.reservation
+        let binding = fixture.pending.receiverBindingID
+
+        func assertPosts(_ count: Int, phase: String) {
+            XCTAssertEqual(fixture.recorder.invocationCount, count, phase)
+            XCTAssertEqual(fixture.recorder.acceptedPayloads, Array(repeating: fixture.pending.payload, count: count), phase)
+        }
+
+        func assertFaultedStorage(_ itemID: String, phase: String) throws {
+            XCTAssertEqual(try fixture.store.loadPendingTransition(), fixture.pending, phase)
+            XCTAssertEqual(try fixture.store.loadManifest(), faultedManifest, phase)
+            XCTAssertEqual(try fixture.outbox.hasUncheckedDirectAcknowledgment(
+                itemID: itemID, receiverBindingID: binding
+            ), hasCleanupIntent, phase)
+            let record = try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding)
+            let intent = try record.flatMap { try fixture.outbox.directSleepCleanupIntent(for: $0) }
+            XCTAssertEqual(intent, hasCleanupIntent ? DirectSleepCleanupIntent(
+                itemID: itemID, journalID: fixture.pending.id,
+                receiverBindingID: binding, receiverGeneration: fixture.pending.connectionGeneration
+            ) : nil, phase)
+        }
         fixture.store.faultEnabled = true
         await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["sleep_analysis"]))
         XCTAssertEqual(recordedSleepFailure(runtime.viewModel), AutomaticSyncDiagnosticFailure(
             stage: .store, category: .operationFailed
         ))
         XCTAssertGreaterThan(fixture.store.faultCount, 0)
-        XCTAssertEqual(try fixture.store.loadPendingTransition(), fixture.pending)
-        XCTAssertEqual(try fixture.store.loadManifest(), point == .pendingClear
-            ? fixture.pending.manifest : fixture.reservation)
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
         XCTAssertTrue(runtime.viewModel.canSyncSleep)
-        XCTAssertEqual(fixture.recorder.invocationCount, point == .pendingSave ? 0 : 1)
-        XCTAssertEqual(fixture.recorder.acceptedPayloads, point == .pendingSave ? [] : [fixture.pending.payload])
+        assertPosts(posts.automaticFault, phase: "automatic while faulted")
         XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
         XCTAssertFalse(fixture.diagnostics.latestRecord?.latestLaneSummary.contains(SleepStoreFaultFixture.privateMarker) ?? true)
         let item = try XCTUnwrap(try fixture.outbox.pendingItems().first)
         XCTAssertEqual(try Data(contentsOf: item.fileURL), fixture.pending.payload)
+        try assertFaultedStorage(item.id, phase: "automatic while faulted")
+        let automaticFaultCount = fixture.store.faultCount
         _ = await runtime.viewModel.syncRecentSleepSessions()
+        assertPosts(posts.foregroundFault, phase: "foreground retry while faulted")
+        try assertFaultedStorage(item.id, phase: "foreground retry while faulted")
+        XCTAssertGreaterThan(fixture.store.faultCount, automaticFaultCount)
         XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
         fixture.store.faultEnabled = false
-        let expectedManifest = try fixture.store.loadManifest()
         fixture.recorder.setBeforeResponse { payload, _ in
             XCTAssertEqual(payload, fixture.pending.payload)
-            XCTAssertEqual(try fixture.store.base.loadManifest(), expectedManifest)
+            XCTAssertEqual(try fixture.store.base.loadManifest(), faultedManifest)
             XCTAssertNotNil(try fixture.store.base.loadPendingTransition())
         }
         _ = await runtime.viewModel.syncRecentSleepSessions()
         XCTAssertNil(try fixture.store.loadPendingTransition())
         XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
-        XCTAssertEqual(fixture.recorder.invocationCount, point == .pendingSave ? 1 : 2)
-        XCTAssertEqual(fixture.recorder.acceptedPayloads, point == .pendingSave
-            ? [fixture.pending.payload] : [fixture.pending.payload, fixture.pending.payload])
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        assertPosts(posts.recovery, phase: "foreground recovery")
+        XCTAssertEqual(fixture.recorder.responseInspectionCount, posts.recovery - posts.foregroundFault)
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
         if point == .pendingSave {
             await runtime.automaticSyncRuntime.cancelAndWait()
@@ -4495,7 +4526,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             await next.automaticSyncRuntime.cancelAndWait()
             XCTAssertTrue(freshReadAttempted, "Old-journal replay must retain the next fresh-read obligation.")
             XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
-            XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload])
+            assertPosts(posts.recovery, phase: "next fresh read")
         }
     }
 

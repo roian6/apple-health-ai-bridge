@@ -1400,6 +1400,23 @@ public final class FileOutbox {
         try loadEnqueueTransactions().first { $0.finalizationRecord == record }?.directSleepCleanupIntent
     }
 
+    func directSleepCleanupRecord(
+        receiverBindingID: String, itemID: String? = nil
+    ) throws -> FileOutboxFinalizationRecord? {
+        try requireUploadAdmission()
+        let transactions = try loadEnqueueTransactions()
+        for (index, transaction) in transactions.enumerated() {
+            guard let intent = transaction.directSleepCleanupIntent,
+                  intent.receiverBindingID == receiverBindingID,
+                  itemID == nil || intent.itemID == itemID,
+                  transaction.cursorCheckpoint.map({ $0.receiverIdentity == receiverBindingID }) != false,
+                  try canFinalizeNutritionIndependentTransaction(index, in: transactions) else { continue }
+            // The validated intent proves this item, not its unaccepted siblings.
+            return transaction.finalizationRecord
+        }
+        return nil
+    }
+
     func hasDirectSleepCleanupIntent(itemID: String, receiverBindingID: String, receiverGeneration: String) throws -> Bool {
         try loadEnqueueTransactions().contains {
             guard let intent = $0.directSleepCleanupIntent else { return false }
@@ -1459,8 +1476,7 @@ public final class FileOutbox {
         guard let record = transactions[index].finalizationRecord else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
-        try persistEnqueueTransactions(transactions)
-        onNewAcceptance()
+        try persistEnqueueTransactions(transactions, onPublished: onNewAcceptance)
         return record
     }
 
@@ -1525,8 +1541,9 @@ public final class FileOutbox {
             let updated = transaction.recordingDirectAcknowledgment(for: itemID, sleepChecked: sleepChecked)
             if updated != transaction {
                 transactions[transactionIndex] = updated
-                try persistEnqueueTransactions(transactions)
-                if isNewAcceptance { onNewAcceptance() }
+                try persistEnqueueTransactions(transactions) {
+                    if isNewAcceptance { onNewAcceptance() }
+                }
             }
             let manifest = try reconciledManifest()
             guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
@@ -2724,7 +2741,8 @@ public final class FileOutbox {
     }
 
     private func persistEnqueueTransactions(
-        _ transactions: [EnqueueTransaction]
+        _ transactions: [EnqueueTransaction],
+        onPublished: () -> Void = {}
     ) throws {
         guard !transactions.isEmpty else {
             try removeIfExists(enqueueTransactionURL)
@@ -2741,6 +2759,7 @@ public final class FileOutbox {
             to: enqueueTransactionURL,
             options: [.atomic]
         )
+        onPublished()
         try Self.applySensitiveFileAttributes(
             to: enqueueTransactionURL,
             fileManager: fileManager
