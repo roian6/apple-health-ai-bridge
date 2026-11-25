@@ -560,12 +560,26 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
     }
 
     func testMailboxArtifactCleanupRecoveryRequiresExactCommittedProof() async throws {
+        try await checkMailboxArtifactCleanupRecovery(manualOnly: false)
+    }
+
+    func testManualMailboxItemFailureRetriesEmptyFIFOUsingOnlyMatchingReceipt() async throws {
+        try await checkMailboxArtifactCleanupRecovery(manualOnly: true)
+    }
+
+    private func checkMailboxArtifactCleanupRecovery(manualOnly: Bool) async throws {
         let files = MailboxEnvelopeRemovalFailure()
         let fixture = try NutritionMailboxFixture(nativePairing: true, outboxFileManager: files)
         defer { fixture.base.cleanup() }
         try fixture.writeCapabilities()
+        let suite = fixture.base.suite + ".receipt-count"
+        let defaults = try XCTUnwrap(ForegroundSleepCommitDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
         let background = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
-        try background.setEnabledDurably(true)
+        try background.setEnabledDurably(!manualOnly)
         CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
             runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
                 forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
@@ -576,13 +590,25 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         let unrelated = try outbox.enqueue(JSONEncoder().encode(fixture.base.mixedBatch()), receiverIdentity: bindingID)
         _ = try await fixture.delivery().publishPendingFIFOHead()
         _ = try fixture.receiveAndAcknowledge(unrelated)
-        let viewModel = try await fixture.base.makeViewModel(mailbox: fixture, eligibleTypeCodes: [])
+        let viewModel = try await fixture.base.makeViewModel(
+            mailbox: fixture, eligibleTypeCodes: [],
+            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) }
+        )
+        XCTAssertEqual(viewModel.automaticSyncRuntimeIsReady, !manualOnly)
         let runtime = AutomaticSyncRuntime(
             viewModel: viewModel, platform: .init(beginBackgroundOwner: { _ in {} })
         )
-        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        func runOpportunity() async {
+            if manualOnly {
+                await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
+            } else {
+                await runtime.runAutomaticSync(reason: .scheduledRefresh)
+            }
+        }
+        await runOpportunity()
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
         let unrelatedAcceptance = try XCTUnwrap(viewModel.lastAcceptedTransferObservation)
+        XCTAssertEqual(defaults.commitWrites, 1)
         let manifestURL = outbox.directoryURL.appendingPathComponent(".fifo-sequence")
         let unrelatedOnly = try Data(contentsOf: manifestURL)
 
@@ -590,15 +616,24 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         _ = try await fixture.delivery().publishPendingFIFOHead()
         let published = try XCTUnwrap(outbox.pendingItem(id: failed.id))
         _ = try fixture.receiveAndAcknowledge(published)
+        let providerAck: URL?
+        if manualOnly {
+            let envelopeID = try fixture.components().transport.finalizedEnvelopeID(itemID: published.id)
+            let name = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .acknowledgment)
+            providerAck = try XCTUnwrap(fixture.locator.lanes[.acks]).appendingPathComponent(name)
+        } else {
+            providerAck = nil
+        }
         let binding = try XCTUnwrap(published.mailboxBinding)
         let envelope = outbox.directoryURL.appendingPathComponent(binding.envelopeFilename)
         let receiptCount = fixture.base.receiver.batches.count
         files.rejectNextRemoval = envelope
-        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        await runOpportunity()
 
         XCTAssertEqual(files.rejectedRemoval, envelope)
         let failure = try XCTUnwrap(viewModel.activityMailboxFailureMessage)
         XCTAssertTrue(failure.contains("phase=consume_ack"))
+        XCTAssertEqual(viewModel.pendingOutboxCount, 0)
         XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
         XCTAssertEqual(viewModel.lastAcceptedTransferObservation, unrelatedAcceptance)
 
@@ -611,20 +646,36 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(committed.ownership?.receiverGeneration, fixture.base.settings.receiverSettingsGenerationToken)
         XCTAssertEqual(committed.committedReceipt?.payloadSHA256, binding.payloadSHA256)
         let repaired = try Data(contentsOf: manifestURL)
+        if let providerAck {
+            // Recovery must use the local receipt, not a replay of the provider ACK.
+            // Replay cleanup would run its own full scan to revalidate before unlinking.
+            try FileManager.default.removeItem(at: providerAck)
+        }
+        var fullScanCount = 0
+        fixture.ackScanFault = { boundary in
+            if boundary == .laneOpened { fullScanCount += 1 }
+        }
 
         // An older local snapshot contains an authentic commit for the same receiver,
         // but not for the failed item. The FIFO is empty in both snapshots.
         try unrelatedOnly.write(to: manifestURL, options: .atomic)
         XCTAssertNil(try reopened.deliveryState(for: failed.id))
         XCTAssertEqual(try reopened.deliveryState(for: unrelated.id)?.phase, .committedFinalized)
-        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        await runOpportunity()
         XCTAssertEqual(viewModel.activityMailboxFailureMessage, failure)
+        if manualOnly {
+            XCTAssertEqual(fullScanCount, 1, "The unrelated receipt must be a no-op after actually retrying")
+        }
 
         try repaired.write(to: manifestURL, options: .atomic)
-        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        await runOpportunity()
+        if manualOnly {
+            XCTAssertEqual(fullScanCount, 2, "The matching receipt must be checked by manual delivery")
+        }
         XCTAssertNil(viewModel.activityMailboxFailureMessage)
         XCTAssertTrue(try reopened.pendingItems().isEmpty)
         XCTAssertEqual(viewModel.lastAcceptedTransferObservation, unrelatedAcceptance)
+        XCTAssertEqual(defaults.commitWrites, 1, "Recovery must not record a second accepted transfer")
         XCTAssertEqual(fixture.base.receiver.batches.count, receiptCount)
     }
 
@@ -757,6 +808,249 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertNil(vm.activityMailboxFailureMessage)
         XCTAssertEqual(vm.lastAcceptedTransferObservation, observation)
         XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+    }
+
+    func testMailboxFreshScanCheckpointSupersedesStoredFailedCheckpoint() async throws {
+        try await checkStoredMailboxCheckpointRecovery(.freshScan)
+    }
+
+    func testMailboxStoredCheckpointRetriesExactValueWithoutNewScanToken() async throws {
+        try await checkStoredMailboxCheckpointRecovery(.noNewToken)
+    }
+
+    func testMailboxStoredCheckpointRetryLeavesConflictingPositionAlone() async throws {
+        try await checkStoredMailboxCheckpointRecovery(.conflictingPosition)
+    }
+
+    func testMailboxStoredCheckpointRetryCannotCrossReceiverGeneration() async throws {
+        try await checkStoredMailboxCheckpointRecovery(.newGeneration)
+    }
+
+    private func checkStoredMailboxCheckpointRecovery(_ recovery: StoredMailboxCheckpointRecovery) async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let suite = fixture.base.suite + ".stored-checkpoint-fault"
+        let defaults = try XCTUnwrap(ScanCheckpointRejectingDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        fixture.base.acceptedTransferStore = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let outbox = fixture.base.outbox
+        let item = try fixture.base.enqueueMixed()
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let head = try XCTUnwrap(outbox.pendingItem(id: item.id))
+        XCTAssertEqual(head.deliveryState?.phase, .providerObserved)
+        let vm = try await fixture.base.makeViewModel(
+            mailbox: fixture, backgroundSyncStore: background, eligibleTypeCodes: []
+        )
+        let generation = fixture.base.settings.receiverSettingsGenerationToken
+        XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+        XCTAssertNil(background.mailboxAckScanCheckpoint(receiverGeneration: generation))
+        _ = try fixture.receiveAndAcknowledge(head)
+        let skipExactProbe = OSAllocatedUnfairLock(initialState: true)
+        fixture.prepareAckCandidate = { url in
+            let skip = skipExactProbe.withLock { pending in
+                defer { pending = false }
+                return pending
+            }
+            return !skip && MailboxAckScanner.prepareCandidateForBoundedRead(url)
+        }
+        defaults.rejectScanCheckpoint = true
+        defaults.storeRejectedCheckpoint = true
+
+        func reconcile() async {
+            vm.noteSceneLeftActive()
+            vm.runForegroundMailboxReconciliationIfNeeded()
+            await vm.waitForBootstrapAndForegroundWork()
+        }
+        await reconcile()
+
+        let b = try XCTUnwrap(defaults.rejectedCheckpoint, "The bounded scan must attempt a checkpoint write")
+        XCTAssertEqual(defaults.rejectedSynchronizations, 1)
+        XCTAssertEqual(defaults.checkpointWrites, [b])
+        XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), b)
+        let failure = try XCTUnwrap(vm.activityMailboxFailureMessage)
+        XCTAssertTrue(vm.backgroundSyncStatus.contains("mailbox reconciliation failed"))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try outbox.deliveryState(for: item.id)?.phase, .committedFinalized)
+        XCTAssertEqual(defaults.commitWrites, 1)
+        let observation = try XCTUnwrap(vm.lastAcceptedTransferObservation)
+        XCTAssertEqual(observation.evidenceKind, .mailboxCommit)
+        let receiverBatchCount = fixture.base.receiver.batches.count
+        XCTAssertEqual(receiverBatchCount, 1)
+        defaults.rejectScanCheckpoint = false
+        fixture.prepareAckCandidate = MailboxAckScanner.prepareCandidateForBoundedRead
+
+        switch recovery {
+        case .freshScan:
+            let waiting = try fixture.base.enqueueMixed(workoutEnergy: 20)
+            _ = try await fixture.delivery().publishPendingFIFOHead()
+            XCTAssertEqual(try outbox.pendingItem(id: waiting.id)?.deliveryState?.phase, .providerObserved)
+            let lane = try XCTUnwrap(fixture.locator.lanes[.acks])
+            for index in 0 ... ProductionMailboxDelivery.backgroundAcknowledgmentFileLimit {
+                try Data().write(to: lane.appendingPathComponent("synthetic-window-entry-\(index)"))
+            }
+            let window = try fixture.components().scanner.candidateWindow(
+                maximumEntries: ProductionMailboxDelivery.backgroundAcknowledgmentFileLimit, afterCheckpoint: b
+            )
+            let c = try XCTUnwrap(window.nextCheckpoint)
+            guard c != b else { return XCTFail("Fixture did not produce distinct B and C scan positions") }
+
+            await reconcile()
+
+            XCTAssertEqual(defaults.checkpointWrites, [b, c], "Fresh scan progress must supersede the B retry")
+            XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), c)
+            XCTAssertNil(vm.activityMailboxFailureMessage)
+            XCTAssertEqual(try outbox.pendingItems().map(\.id), [waiting.id])
+        case .noNewToken:
+            // With no FIFO head the reconciliation returns no new scan token.
+            await reconcile()
+            XCTAssertEqual(defaults.checkpointWrites, [b, b])
+            XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), b)
+            XCTAssertNil(vm.activityMailboxFailureMessage)
+        case .conflictingPosition:
+            let competing = "synthetic-competing-checkpoint"
+            try background.persistMailboxAckScanCheckpoint(competing, receiverGeneration: generation)
+            await reconcile()
+            XCTAssertEqual(defaults.checkpointWrites, [b, competing])
+            XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), competing)
+            XCTAssertEqual(vm.activityMailboxFailureMessage, failure)
+        case .newGeneration:
+            let replacement = try fixture.base.settings.invalidateReceiverSettingsGeneration(expectedGeneration: generation)
+            XCTAssertNotEqual(replacement, generation)
+            XCTAssertEqual(fixture.base.settings.receiverBindingID, fixture.identity.opaqueBinding)
+            let failedStatus = vm.backgroundSyncStatus
+            await reconcile()
+            XCTAssertNotEqual(vm.backgroundSyncStatus, failedStatus, "The new generation must run reconciliation")
+            XCTAssertEqual(defaults.checkpointWrites, [b])
+            XCTAssertNil(background.mailboxAckScanCheckpoint(receiverGeneration: replacement))
+            XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), b)
+            XCTAssertNil(vm.activityMailboxFailureMessage)
+            XCTAssertNil(vm.lastAcceptedTransferObservation)
+        }
+        if recovery != .newGeneration {
+            XCTAssertEqual(vm.lastAcceptedTransferObservation, observation)
+        }
+        XCTAssertEqual(defaults.commitWrites, 1, "Checkpoint activity is not a new accepted transfer")
+        XCTAssertEqual(fixture.base.receiver.batches.count, receiverBatchCount)
+    }
+
+    func testForegroundDirectSleepRejectsSiblingOnlyAcceptance() async throws {
+        try await checkForegroundDirectSleepCompletion(.siblingOnly)
+    }
+
+    func testForegroundDirectSleepRejectsTrackedACKWithPendingJournal() async throws {
+        try await checkForegroundDirectSleepCompletion(.pendingJournal)
+    }
+
+    func testForegroundDirectSleepRejectsTrackedACKWithDifferentManifest() async throws {
+        try await checkForegroundDirectSleepCompletion(.differentManifest)
+    }
+
+    func testForegroundDirectSleepCompletesWithTrackedACKAndFinalizedManifest() async throws {
+        try await checkForegroundDirectSleepCompletion(.matching)
+    }
+
+    private func checkForegroundDirectSleepCompletion(_ input: ForegroundDirectSleepCompletionInput) async throws {
+        let files = ForegroundDirectSleepCompletionFiles()
+        let fixture = try NutritionFixture(outboxFileManager: files)
+        defer { fixture.cleanup() }
+        let anchor = fixture.anchor
+        let viewModel = try await fixture.makeViewModel(readAnchoredSleepChanges: { _, _, now in
+            HealthKitAnchoredSleepChanges(
+                addedSamples: [HealthKitSleepChildSample(
+                    uuid: UUID(), stage: "core", start: now.addingTimeInterval(-3600), end: now
+                )],
+                deletedSamples: [], anchorCursorValue: anchor, receivedAt: now
+            )
+        })
+        fixture.receiver.status = 503
+        let initiallyCompleted = await viewModel.syncRecentSleepSessions(executionMode: .foreground)
+        XCTAssertFalse(initiallyCompleted)
+        let firstRequests = fixture.receiver.batches.count
+        XCTAssertEqual(firstRequests, 1)
+
+        let store = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        let pending = try XCTUnwrap(store.loadPendingTransition())
+        let trackedID = try XCTUnwrap(pending.outboxItemID)
+        let tracked = try XCTUnwrap(fixture.outbox.pendingItem(id: trackedID))
+        let trackedBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pending.payload)
+        XCTAssertFalse(trackedBatch.sleepSessions.isEmpty)
+        let expectedPOST: HealthBridgeBatchV1
+        let expectedManifest: SleepSyncManifest
+        let expectedJournal: SleepSyncPendingTransition?
+        let manifest = pending.manifest
+
+        switch input {
+        case .siblingOnly:
+            let start = Date(timeIntervalSince1970: 1_700_000_000)
+            let end = start.addingTimeInterval(60)
+            let batch = StepCountSyncBatchFactory.makeAnchoredStepBatch(
+                changes: HealthKitAnchoredStepChanges(
+                    stepSamples: [HealthKitStepSampleSummary(uuid: UUID(), start: start, end: end, count: 17)],
+                    deletedStepSamples: [], anchorCursorValue: anchor, windowStart: start, windowEnd: end
+                ),
+                generatedAt: end
+            )
+            let sibling = try fixture.outbox.enqueue(
+                HealthBridgeBatchEncoder().encode(batch), receiverIdentity: pending.receiverBindingID
+            )
+            XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [trackedID, sibling.id])
+            files.afterNutritionPreparation = (fixture.outbox.directoryURL, {
+                // Model a tracked item disappearing after the caller's FIFO gate,
+                // with matching disk state but no acceptance of that item in this flush.
+                try FileManager.default.removeItem(at: tracked.fileURL)
+                try store.saveManifest(manifest)
+                try store.clearPendingTransition(id: pending.id)
+            })
+            fixture.outbox.observeNutritionCodec = { files.armNutritionBoundary() }
+            expectedPOST = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: sibling.fileURL))
+            expectedManifest = manifest
+            expectedJournal = nil
+        case .pendingJournal, .differentManifest, .matching:
+            let differentManifest = SleepSyncManifest(
+                receiverSettingsGeneration: manifest.receiverSettingsGeneration,
+                historyDepth: manifest.historyDepth, historyStartDate: manifest.historyStartDate,
+                sourceKey: manifest.sourceKey, baselineResetEpoch: manifest.baselineResetEpoch,
+                identityNamespace: manifest.identityNamespace, nextRevisionSequence: manifest.nextRevisionSequence,
+                anchorCursorValue: try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 41)),
+                activeChildSamples: manifest.activeChildSamples, publishedSessions: manifest.publishedSessions,
+                baselineResetPending: manifest.baselineResetPending
+            )
+            XCTAssertNotEqual(differentManifest, manifest)
+            files.afterPayloadRemoval = (tracked.fileURL, {
+                // Observe real Direct finalization before changing one durable input.
+                XCTAssertEqual(try store.loadManifest(), manifest)
+                XCTAssertNil(try store.loadPendingTransition())
+                switch input {
+                case .pendingJournal: try store.savePendingTransition(pending)
+                case .differentManifest: try store.saveManifest(differentManifest)
+                case .matching, .siblingOnly: break
+                }
+            })
+            expectedPOST = trackedBatch
+            expectedManifest = input == .differentManifest ? differentManifest : manifest
+            expectedJournal = input == .pendingJournal ? pending : nil
+        }
+
+        fixture.receiver.status = 202
+        let completed = await viewModel.syncRecentSleepSessions(executionMode: .foreground)
+
+        XCTAssertTrue(files.presented, "Did not reach the Direct completion fixture boundary")
+        XCTAssertEqual(Array(fixture.receiver.batches.dropFirst(firstRequests)), [expectedPOST])
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try store.loadManifest(), expectedManifest)
+        XCTAssertEqual(try store.loadPendingTransition(), expectedJournal)
+        XCTAssertEqual(completed, input == .matching)
+        XCTAssertEqual(viewModel.statusIsError, input != .matching)
     }
 
     func testForegroundMailboxSleepRequiresProofForTheTrackedItem() async throws {
@@ -923,17 +1217,62 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
     }
 }
 
+private enum ForegroundDirectSleepCompletionInput: Equatable {
+    case siblingOnly, pendingJournal, differentManifest, matching
+}
+
+private final class ForegroundDirectSleepCompletionFiles: FileManager, @unchecked Sendable {
+    private let nutritionPrepared = OSAllocatedUnfairLock(initialState: false)
+    var afterNutritionPreparation: (directory: URL, apply: () throws -> Void)?
+    var afterPayloadRemoval: (file: URL, apply: () throws -> Void)?
+    private(set) var presented = false
+
+    func armNutritionBoundary() {
+        nutritionPrepared.withLock { $0 = true }
+    }
+
+    override func contentsOfDirectory(
+        at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?,
+        options mask: FileManager.DirectoryEnumerationOptions = []
+    ) throws -> [URL] {
+        // The codec's revision check uses FileManager.default. The next
+        // injected listing is the Direct finalizer's FIFO reconciliation.
+        if let boundary = afterNutritionPreparation, url == boundary.directory,
+           nutritionPrepared.withLock({ $0 }) {
+            afterNutritionPreparation = nil
+            try boundary.apply()
+            presented = true
+        }
+        return try super.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: mask)
+    }
+
+    override func removeItem(at url: URL) throws {
+        try super.removeItem(at: url)
+        if let boundary = afterPayloadRemoval, url == boundary.file {
+            afterPayloadRemoval = nil
+            try boundary.apply()
+            presented = true
+        }
+    }
+}
+
 private enum ForegroundSleepCompletionInput: String, CaseIterable {
     case matching, missingTrackedItem, ackVerified, wrongGeneration, wrongBinding, wrongResetEpoch, pendingJournal
 }
 
+private enum StoredMailboxCheckpointRecovery: Equatable {
+    case freshScan, noNewToken, conflictingPosition, newGeneration
+}
+
 private final class ForegroundSleepCommitDefaults: UserDefaults, @unchecked Sendable {
     var afterCommit: (() -> Void)?
+    private(set) var commitWrites = 0
 
     override func set(_ value: Any?, forKey defaultName: String) {
         super.set(value, forKey: defaultName)
-        guard defaultName == "healthBridge.lastAcceptedTransferObservation",
-              let callback = afterCommit else { return }
+        guard defaultName == "healthBridge.lastAcceptedTransferObservation" else { return }
+        commitWrites += 1
+        guard let callback = afterCommit else { return }
         afterCommit = nil
         callback()
     }
@@ -1075,15 +1414,24 @@ private final class MailboxEnvelopeRemovalFailure: FileManager, @unchecked Senda
 private final class ScanCheckpointRejectingDefaults: UserDefaults, @unchecked Sendable {
     static let checkpointKey = "healthBridge.backgroundSync.mailboxAckScanCheckpoint"
     var rejectScanCheckpoint = false
+    var storeRejectedCheckpoint = false
     private var hasRejectedCheckpointWrite = false
     private(set) var rejectedCheckpoint: String?
     private(set) var rejectedSynchronizations = 0
+    private(set) var checkpointWrites: [String] = []
+    private(set) var commitWrites = 0
 
     override func set(_ value: Any?, forKey defaultName: String) {
-        if rejectScanCheckpoint, defaultName == Self.checkpointKey {
-            hasRejectedCheckpointWrite = true
-            rejectedCheckpoint = value as? String
-            return
+        if defaultName == "healthBridge.lastAcceptedTransferObservation" {
+            commitWrites += 1
+        }
+        if defaultName == Self.checkpointKey, let checkpoint = value as? String {
+            checkpointWrites.append(checkpoint)
+            if rejectScanCheckpoint {
+                hasRejectedCheckpointWrite = true
+                rejectedCheckpoint = checkpoint
+                if !storeRejectedCheckpoint { return }
+            }
         }
         super.set(value, forKey: defaultName)
     }

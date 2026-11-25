@@ -7406,7 +7406,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private var hasPendingManualMailboxRetry: Bool {
-        usesMailboxTransport && currentMailboxDeliveryFailures.contains { $0.scope == .operation(.manualDelivery) }
+        usesMailboxTransport && currentMailboxDeliveryFailures.contains { failure in
+            switch failure.scope {
+            case .operation(.manualDelivery), .item:
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     private var pendingMailboxCheckpointWrite: MailboxAckCheckpointWrite? {
@@ -7432,11 +7439,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         startingCheckpoint: String?, nextCheckpoint: String?, generation: String
     ) -> MailboxAckCheckpointWrite? {
         let current = backgroundSyncStore.mailboxAckScanCheckpoint(receiverGeneration: generation)
+        if let nextCheckpoint {
+            guard current == startingCheckpoint else { return nil }
+            return MailboxAckCheckpointWrite(startingCheckpoint: startingCheckpoint, checkpoint: nextCheckpoint)
+        }
         if let retry = pendingMailboxCheckpointWrite, retry.canRetry(from: current) {
             return retry
         }
-        guard let nextCheckpoint, current == startingCheckpoint else { return nil }
-        return MailboxAckCheckpointWrite(startingCheckpoint: startingCheckpoint, checkpoint: nextCheckpoint)
+        return nil
     }
 
     @discardableResult

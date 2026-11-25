@@ -318,6 +318,7 @@ public enum FileOutboxDowngradeHoldReason: String, Codable, Equatable, Sendable 
     case v4Manifest
     case finalizationIntent
     case envelopeArtifact
+    case incompatibleEnqueueJournal
 }
 
 public enum FileOutboxDowngradeReadiness: Equatable, Sendable {
@@ -793,7 +794,7 @@ public final class FileOutbox {
             throw FileOutboxClearIntentError.clearIntentRequired
         }
         if !allowsMailboxArtifacts,
-           try downgradeReadiness(directory: directory, fileManager: fileManager) != .ready {
+           try mailboxArtifactReadiness(directory: directory, fileManager: fileManager) != .ready {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let children = try fileManager.contentsOfDirectory(
@@ -2001,7 +2002,7 @@ public final class FileOutbox {
 
     public func beginClearIntent() throws {
         if clearIntentIsActive { return }
-        guard try downgradeReadiness() == .ready else {
+        guard try Self.mailboxArtifactReadiness(directory: directory, fileManager: fileManager) == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         try Data("clear".utf8).write(to: clearIntentURL, options: [.atomic])
@@ -2012,7 +2013,7 @@ public final class FileOutbox {
         guard clearIntentIsActive else {
             throw FileOutboxClearIntentError.clearIntentRequired
         }
-        guard try downgradeReadiness() == .ready else {
+        guard try Self.mailboxArtifactReadiness(directory: directory, fileManager: fileManager) == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let payloadURLs = try payloadFileURLs()
@@ -2311,6 +2312,25 @@ public final class FileOutbox {
     public static func downgradeReadiness(
         directory: URL,
         fileManager: FileManager = .default
+    ) throws -> FileOutboxDowngradeReadiness {
+        let readiness = try mailboxArtifactReadiness(directory: directory, fileManager: fileManager)
+        guard readiness == .ready else { return readiness }
+        let journalURL = directory.appendingPathComponent(enqueueTransactionFilename)
+        guard fileManager.fileExists(atPath: journalURL.path) else { return .ready }
+        let transactions = try decodeEnqueueTransactions(at: journalURL)
+        // V3 ignores the Sleep fields and rejects ACKs without a cursor or retirement.
+        if transactions.contains(where: {
+            !$0.directAcknowledgedIDs.isEmpty && $0.cursorCheckpoint == nil
+                && $0.pendingGenerationRetirements?.isEmpty != false
+        }) {
+            return .hold(.incompatibleEnqueueJournal)
+        }
+        return .ready
+    }
+
+    private static func mailboxArtifactReadiness(
+        directory: URL,
+        fileManager: FileManager
     ) throws -> FileOutboxDowngradeReadiness {
         let manifestURL = directory.appendingPathComponent(sequenceFilename)
         if fileManager.fileExists(atPath: manifestURL.path) {
@@ -2853,19 +2873,21 @@ public final class FileOutbox {
         guard fileManager.fileExists(atPath: enqueueTransactionURL.path) else {
             return []
         }
-        let data = try Data(contentsOf: enqueueTransactionURL)
+        let transactions = try Self.decodeEnqueueTransactions(at: enqueueTransactionURL)
+        try validateEnqueueTransactions(transactions)
+        return transactions
+    }
+
+    private static func decodeEnqueueTransactions(at url: URL) throws -> [EnqueueTransaction] {
+        let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
-        let transactions: [EnqueueTransaction]
         if let journal = try? decoder.decode(EnqueueTransactionJournal.self, from: data) {
             guard journal.version == EnqueueTransactionJournal.currentVersion else {
                 throw SequenceError.invalidManifest
             }
-            transactions = journal.transactions
-        } else {
-            transactions = [try decoder.decode(EnqueueTransaction.self, from: data)]
+            return journal.transactions
         }
-        try validateEnqueueTransactions(transactions)
-        return transactions
+        return [try decoder.decode(EnqueueTransaction.self, from: data)]
     }
 
     private func validateEnqueueTransactions(

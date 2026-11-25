@@ -392,8 +392,15 @@ def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:
 
 
 def _assert_scoped_mailbox_summary(success: str, message: str) -> None:
-    call_prefix = rf"\bpublishMailboxDeliverySummary\(\s*{re.escape(message)}\b"
-    assert re.search(call_prefix + r"[^()]*\bsummary\.finalizedItemIDs\b", success), (
+    calls = list(re.finditer(r"\bpublishMailboxDeliverySummary\s*\(", success))
+    unchanged_ids = "".join(
+        (
+            rf"\s*{re.escape(message)}\s*,",
+            r"\s*finalizedItemIDs:\s*summary\.finalizedItemIDs\s*(?:,|\))",
+        )
+    )
+    assert calls, "Expected a Mailbox summary publication"
+    assert all(re.match(unchanged_ids, success[call.end() :]) for call in calls), (
         "Mailbox summary publication must carry the exact finalized item IDs"
     )
     assert not _MAILBOX_DIAGNOSTIC_WRITE.search(success)
@@ -435,11 +442,25 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
     cancellation_catch = mailbox.index("catch let cancellation as CancellationError {")
     failure_catch = mailbox.index("} catch {", cancellation_catch)
     success = mailbox[:cancellation_catch]
-    delivery = success.index("deliverPending()")
-    assert success.index("try await") < delivery
-    target_check = "try requireCurrentPayloadDeliveryTarget(target)"
-    post_await_target_check = success.find(target_check, delivery)
-    _assert_mailbox_publication_after(success, post_await_target_check)
+    # Both exits from delivery must revalidate in their own straight-line path.
+    # A check nested inside a conditional no longer protects later publication.
+    target_check = r"try requireCurrentPayloadDeliveryTarget\(target\)[ \t]*\n"
+    success_check = re.match(
+        str.join(
+            "",
+            (
+                r"if target\.route == \.mailbox \{\s*do \{\s*",
+                r"let summary = try await makeProductionMailboxDelivery\(\)",
+                r"\.deliverPending\(\)\s*",
+                target_check,
+            ),
+        ),
+        success,
+    )
+    assert success_check is not None, (
+        "Manual Mailbox success must revalidate unconditionally after delivery"
+    )
+    _assert_mailbox_publication_after(success, success_check.end())
     assert "mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine" in success
     _assert_scoped_mailbox_summary(
         success, "flushSummary.mailboxDeliveryDiagnosticLine"
@@ -448,7 +469,11 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
         "throw cancellation"
     )
     failure = mailbox[failure_catch:]
-    _assert_mailbox_publication_after(failure, failure.find(target_check))
+    failure_check = re.match(r"\}\s*catch \{\s*" + target_check, failure)
+    assert failure_check is not None, (
+        "Manual Mailbox failure must revalidate unconditionally before publication"
+    )
+    _assert_mailbox_publication_after(failure, failure_check.end())
     assert re.search(r"\bpublishMailboxDeliveryFailure\(\s*error\b", failure)
     assert "throw error" in failure
 
@@ -642,6 +667,11 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
     cancellation_catch = helper.index("catch is CancellationError {", generation_check)
     failure_catch = helper.index("} catch {", cancellation_catch)
     _assert_mailbox_publication_after(helper[:cancellation_catch], generation_check)
+    checkpoint_failure, completed = helper[checkpoint_write:cancellation_catch].split(
+        "refreshPendingOutboxCount()", 1
+    )
+    for path in (checkpoint_failure, completed):
+        _assert_scoped_mailbox_summary(path, "summary.diagnosticLine")
     assert helper[cancellation_catch:failure_catch].split("{", 1)[1].strip() == (
         "return .cancelled"
     )

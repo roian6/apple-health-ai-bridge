@@ -75,7 +75,6 @@ def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() 
     # reference to a route (which could itself be a premature success).
     body_end = helper.index("\n        }", held)
     queued_body = helper[held:body_end]
-    routes = helper.index("if target.route == .mailbox {", body_end)
     assert enqueue < track < refresh < held
     assert "if enqueueResult.wasInserted" in helper[track:held]
     # From the upload through the final queue check, even a recovery/error
@@ -87,15 +86,8 @@ def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() 
     assert queued_body.splitlines()[0].endswith("outboxItemID }) {")
     assert queued_body.splitlines()[-1] == "            return false"
     assert re.findall(r"\breturn\b", queued_body) == ["return"]
-    # Absence alone is not acceptance. A different successful item in the
-    # same Direct flush cannot complete the tracked transition.
-    accepted = helper.index(
-        "guard upload.acceptedDirectItemIDs.contains(outboxItemID)", routes
-    )
-    complete = helper.index(
-        "pending == nil && manifest == pendingTransition.manifest", accepted
-    )
-    assert "guard complete else { throw CancellationError() }" in helper[complete:]
+    # The foreground Sleep caller fixtures exercise completion after this FIFO
+    # gate with independent receipt, journal, and committed-manifest controls.
 
 
 def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None:

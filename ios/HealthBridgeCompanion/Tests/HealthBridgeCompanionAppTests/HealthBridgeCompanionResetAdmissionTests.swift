@@ -269,7 +269,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [items[1].id])
         XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding))
         XCTAssertNil(try cursor(for: binding, in: cursors))
+        let attemptsBeforeReplacement = fixture.recorder.payloads
+        XCTAssertEqual(attemptsBeforeReplacement, [sleepPayload, siblingPayload])
         await replaceReceiver(initial)
+        XCTAssertEqual(fixture.recorder.payloads, attemptsBeforeReplacement, "Replacement must not POST the pending sibling")
         XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), oldConnection)
         XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
 
