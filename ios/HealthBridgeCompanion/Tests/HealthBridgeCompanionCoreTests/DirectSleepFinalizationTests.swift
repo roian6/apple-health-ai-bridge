@@ -352,6 +352,32 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
     }
 
+    func testEqualBytesCannotTakeAnotherPendingItemsAssignedJournal() async throws {
+        let fixture = try DirectSleepFinalizationFixture()
+        defer { fixture.remove() }
+        let descriptor = fixture.descriptor
+        let other = try fixture.outbox.enqueue(fixture.pending.payload, receiverIdentity: descriptor.receiverBindingID)
+        let journal = fixture.pending.assigningOutboxItemID(other.id)
+        try fixture.sleep.savePendingTransition(journal)
+        var acknowledgments = 0
+        do {
+            _ = try await fixture.finalizer.recordDirectReceiverAcceptanceForSync(
+                descriptor: descriptor, sleepStore: fixture.sleep, validate: {},
+                onNewAcceptance: { acknowledgments += 1 }
+            )
+            XCTFail("Matching bytes cannot transfer an existing FIFO item's Sleep journal.")
+        } catch OutboxDeliveryCoordinatorError.ownershipMismatch {}
+
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let sleep = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        XCTAssertEqual(acknowledgments, 0)
+        XCTAssertEqual(try sleep.loadPendingTransition(), journal)
+        XCTAssertEqual(try sleep.loadManifest(), fixture.initial)
+        XCTAssertEqual(try reopened.pendingItems().map(\.id), [descriptor.itemID, other.id])
+        XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: descriptor.receiverBindingID))
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+    }
+
     func testAcceptedExactPayloadCanFinalizeBeforeJournalTracksItsNewItem() async throws {
         let previousIDs: [String?] = [
             nil,

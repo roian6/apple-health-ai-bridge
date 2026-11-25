@@ -2407,8 +2407,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let pendingItemCount: Int
         do {
             let payloadCount = try outbox.pendingItems().count
-            if payloadCount == 0, try outbox.hasPendingDirectSleepCleanup() {
-                // Accepted Sleep still belongs to this receiver after its payload is gone.
+            if payloadCount == 0,
+               try outbox.hasPendingDirectSleepCleanup() || outbox.hasPendingAcknowledgedDirectFinalization() {
+                // Accepted work still belongs to this receiver after its payload is gone.
                 pendingItemCount = 1
             } else {
                 pendingItemCount = payloadCount

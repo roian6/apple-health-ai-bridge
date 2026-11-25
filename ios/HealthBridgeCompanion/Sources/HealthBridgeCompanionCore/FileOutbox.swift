@@ -1316,6 +1316,16 @@ public final class FileOutbox {
         }
     }
 
+    func hasPendingAcknowledgedDirectFinalization() throws -> Bool {
+        try loadEnqueueTransactions().contains {
+            // Readiness is not required: a partial collection still owns accepted progress.
+            guard !$0.directAcknowledgedIDs.isEmpty, let record = $0.finalizationRecord else {
+                return false
+            }
+            return record.cursorCheckpoint != nil || !record.eligiblePendingGenerationRetirements.isEmpty
+        }
+    }
+
     public func acknowledgeFinalizationRecord(
         _ record: FileOutboxFinalizationRecord
     ) throws {
@@ -1413,6 +1423,12 @@ public final class FileOutbox {
     }
 
     #if !HEALTH_BRIDGE_MAILBOX_QA
+    func retainsSleepJournalItem(_ itemID: String) throws -> Bool {
+        if try pendingItem(id: itemID) != nil { return true }
+        // The payload can be gone while its checkpoint or observer work is still owned.
+        return try loadEnqueueTransactions().contains { $0.entries.contains { $0.id == itemID } }
+    }
+
     func hasPendingDirectSleepCleanup() throws -> Bool {
         try loadEnqueueTransactions().contains {
             $0.directSleepCleanupIntent != nil

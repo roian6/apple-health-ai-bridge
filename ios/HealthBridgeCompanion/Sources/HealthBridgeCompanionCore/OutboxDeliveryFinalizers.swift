@@ -144,11 +144,16 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
                     throw OutboxDeliveryCoordinatorError.ownershipMismatch
                 }
                 // An ACK can arrive before the caller journals its assigned FIFO ID.
-                // Exact accepted bytes plus binding/generation still identify that transition.
+                // A missing former item can be replaced, but another owner's
+                // live payload or durable finalization work must not be adopted.
                 let checkRetirement = { @MainActor in
                     try check()
                     try self.outbox.requireUploadAdmission()
                     try self.outbox.requireDirectRetirementAllowed(itemID: descriptor.itemID)
+                    if let prior = pending.outboxItemID, prior != descriptor.itemID,
+                       try self.outbox.retainsSleepJournalItem(prior) {
+                        throw OutboxDeliveryCoordinatorError.ownershipMismatch
+                    }
                 }
                 if pending.outboxItemID != descriptor.itemID {
                     revision = try await sleepStore.savePendingForSync(
