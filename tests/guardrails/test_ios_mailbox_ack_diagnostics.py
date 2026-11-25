@@ -1,6 +1,16 @@
 import re
 from pathlib import Path
-from typing import Final
+
+from tests.guardrails.mailbox_publication_effect_contract import (
+    MAILBOX_DIAGNOSTIC_WRITE,
+    MailboxLane,
+)
+from tests.guardrails.mailbox_publication_guard import (
+    CONNECTION_FENCE,
+    TARGET_FENCE,
+    assert_failed_mailbox_publication,
+    assert_successful_mailbox_publication,
+)
 
 VIEW_MODEL = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift")
 APP = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionApp.swift")
@@ -9,16 +19,6 @@ AUTOMATIC_SYNC_RUNTIME = Path(
 )
 BACKGROUND_SYNC = Path(
     "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/BackgroundSync.swift"
-)
-_MAILBOX_DIAGNOSTIC_WRITE: Final = re.compile(
-    r"""
-    \bmailboxDeliveryDiagnosticLines\s*
-    (?:
-        (?:\[[^\]\n]+\]\s*)?\+?=(?!=)
-        | \.\s*(?:remove\w*|append|insert|replaceSubrange)\s*\(
-    )
-    """,
-    re.VERBOSE,
 )
 
 
@@ -257,35 +257,6 @@ def _assert_shared_engine_ack_backpressure(
     assert re.search(r"case \.blocked:\s*return false", pending_result)
 
 
-def _assert_mailbox_publication_after(branch: str, authority_check: int) -> None:
-    # Look for bypasses of the shared publisher as well as calls to it.
-    publisher = r"\bpublishMailboxDelivery(?:Summary|Failure)\s*\("
-    status_write = r"\bbackgroundSyncStatus\s*=(?!=)"
-    publication = f"{publisher}|{status_write}|{_MAILBOX_DIAGNOSTIC_WRITE.pattern}"
-    publications = list(re.finditer(publication, branch, re.VERBOSE))
-    assert publications, "Expected a Mailbox diagnostic or status publication"
-    assert 0 <= authority_check < publications[0].start(), (
-        "Mailbox publication must follow the current receiver authority check"
-    )
-    authorized_region = branch[authority_check : publications[-1].start()]
-    assert not re.search(r"\bawait\b", authorized_region), (
-        "Mailbox publication must not suspend again after checking authority"
-    )
-
-
-def _assert_mailbox_failure_after_generation_recheck(
-    failure: str, stale_result: str = ""
-) -> None:
-    generation_check = "try requireCurrentConnectionGeneration(expectedGeneration)"
-    stale_check = rf"\bdo\s*\{{\s*{re.escape(generation_check)}\s*\}}\s*"
-    return_statement = re.escape(f"return {stale_result}".rstrip())
-    stale_return = re.search(
-        stale_check + rf"catch\s*\{{\s*{return_statement}\s*\}}", failure
-    )
-    assert stale_return is not None, "Stale Mailbox delivery must not publish"
-    _assert_mailbox_publication_after(failure, stale_return.end())
-
-
 def _assert_retained_mailbox_reconciliation(source: str) -> None:
     mailbox_entry_start = source.index(
         "func runForegroundMailboxReconciliationIfNeeded()"
@@ -309,12 +280,6 @@ def _assert_retained_mailbox_reconciliation(source: str) -> None:
     assert "requestHealthPermissions" not in mailbox_entry
 
     bounded_phase = helper.index("reconcileMailboxDeliveryIfNeeded(")
-    point = helper.index("at: .beforePayloadGeneration", bounded_phase)
-    post_await_generation_check = helper.find(
-        "try requireCurrentConnectionGeneration(expectedGeneration)", point
-    )
-
-    assert bounded_phase < point < post_await_generation_check
     assert "deliverPending()" not in helper
     assert "runBackgroundRefreshSync" not in helper
     assert "syncRecentStepCounts" not in helper
@@ -325,12 +290,18 @@ def _assert_retained_mailbox_reconciliation(source: str) -> None:
 
     cancellation_catch = helper.index("catch is CancellationError {")
     failure_catch = helper.index("} catch {", cancellation_catch)
+    success = helper[:cancellation_catch]
     assert "await " in helper[:bounded_phase]
-    assert post_await_generation_check < cancellation_catch
-    _assert_mailbox_publication_after(helper, post_await_generation_check)
+    assert_successful_mailbox_publication(
+        success,
+        CONNECTION_FENCE,
+        "at: .beforePayloadGeneration",
+        MailboxLane.FOREGROUND,
+        publication_required=False,
+    )
     assert helper[cancellation_catch:failure_catch].split("{", 1)[1].strip() == "return"
     failure = helper[failure_catch:]
-    _assert_mailbox_failure_after_generation_recheck(failure)
+    assert_failed_mailbox_publication(failure, CONNECTION_FENCE, stale_return="")
     assert re.search(
         r"\bbackgroundSyncStatus\s*=\s*publishMailboxDeliveryFailure\(\s*error\b",
         failure,
@@ -403,7 +374,7 @@ def _assert_scoped_mailbox_summary(success: str, message: str) -> None:
     assert all(re.match(unchanged_ids, success[call.end() :]) for call in calls), (
         "Mailbox summary publication must carry the exact finalized item IDs"
     )
-    assert not _MAILBOX_DIAGNOSTIC_WRITE.search(success)
+    assert not MAILBOX_DIAGNOSTIC_WRITE.search(success)
 
 
 def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -> None:
@@ -442,25 +413,9 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
     cancellation_catch = mailbox.index("catch let cancellation as CancellationError {")
     failure_catch = mailbox.index("} catch {", cancellation_catch)
     success = mailbox[:cancellation_catch]
-    # Both exits from delivery must revalidate in their own straight-line path.
-    # A check nested inside a conditional no longer protects later publication.
-    target_check = r"try requireCurrentPayloadDeliveryTarget\(target\)[ \t]*\n"
-    success_check = re.match(
-        str.join(
-            "",
-            (
-                r"if target\.route == \.mailbox \{\s*do \{\s*",
-                r"let summary = try await makeProductionMailboxDelivery\(\)",
-                r"\.deliverPending\(\)\s*",
-                target_check,
-            ),
-        ),
-        success,
+    assert_successful_mailbox_publication(
+        success, TARGET_FENCE, ".deliverPending()", MailboxLane.MANUAL
     )
-    assert success_check is not None, (
-        "Manual Mailbox success must revalidate unconditionally after delivery"
-    )
-    _assert_mailbox_publication_after(success, success_check.end())
     assert "mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine" in success
     _assert_scoped_mailbox_summary(
         success, "flushSummary.mailboxDeliveryDiagnosticLine"
@@ -469,11 +424,7 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
         "throw cancellation"
     )
     failure = mailbox[failure_catch:]
-    failure_check = re.match(r"\}\s*catch \{\s*" + target_check, failure)
-    assert failure_check is not None, (
-        "Manual Mailbox failure must revalidate unconditionally before publication"
-    )
-    _assert_mailbox_publication_after(failure, failure_check.end())
+    assert_failed_mailbox_publication(failure, TARGET_FENCE)
     assert re.search(r"\bpublishMailboxDeliveryFailure\(\s*error\b", failure)
     assert "throw error" in failure
 
@@ -496,15 +447,16 @@ def test_background_mailbox_failure_checks_generation_before_publication() -> No
     success = mailbox[:cancellation_catch]
     publish = success.index(".publishPendingFIFOHead()")
     assert success.index("try await") < publish
-    generation_check = "try requireCurrentConnectionGeneration(expectedGeneration)"
-    _assert_mailbox_publication_after(success, success.find(generation_check, publish))
+    assert_successful_mailbox_publication(
+        success, CONNECTION_FENCE, ".publishPendingFIFOHead()", MailboxLane.SCHEDULER
+    )
     assert "backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage(" in success
     _assert_scoped_mailbox_summary(success, "summary.diagnosticLine")
     assert (
         mailbox[cancellation_catch:failure_catch].split("{", 1)[1].strip() == "return"
     )
     failure = mailbox[failure_catch:]
-    _assert_mailbox_failure_after_generation_recheck(failure)
+    assert_failed_mailbox_publication(failure, CONNECTION_FENCE, stale_return="")
     assert re.search(r"\bpublishMailboxDeliveryFailure\(\s*error\b", failure)
     assert (
         'backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed:' in failure
@@ -656,18 +608,17 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
     assert "deliverPending()" not in helper
     assert "Task {" not in helper
     acknowledgment = helper.index("reconcilePendingFIFOHeadAcknowledgment(")
-    generation_check = helper.index(
-        "try requireCurrentConnectionGeneration(expectedGeneration)",
-        acknowledgment,
+    cancellation_catch = helper.index("catch is CancellationError {", acknowledgment)
+    success = helper[:cancellation_catch]
+    assert_successful_mailbox_publication(
+        success,
+        CONNECTION_FENCE,
+        "reconcilePendingFIFOHeadAcknowledgment(",
+        MailboxLane.BOUNDED,
     )
-    checkpoint_write = helper.index(
-        "persistMailboxAckScanCheckpoint(", generation_check
-    )
-    assert acknowledgment < generation_check < checkpoint_write
-    cancellation_catch = helper.index("catch is CancellationError {", generation_check)
+    checkpoint_write = success.index("persistMailboxAckScanCheckpoint(")
     failure_catch = helper.index("} catch {", cancellation_catch)
-    _assert_mailbox_publication_after(helper[:cancellation_catch], generation_check)
-    checkpoint_failure, completed = helper[checkpoint_write:cancellation_catch].split(
+    checkpoint_failure, completed = success[checkpoint_write:].split(
         "refreshPendingOutboxCount()", 1
     )
     for path in (checkpoint_failure, completed):
@@ -675,8 +626,8 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
     assert helper[cancellation_catch:failure_catch].split("{", 1)[1].strip() == (
         "return .cancelled"
     )
-    _assert_mailbox_failure_after_generation_recheck(
-        helper[failure_catch:], stale_result=".cancelled"
+    assert_failed_mailbox_publication(
+        helper[failure_catch:], CONNECTION_FENCE, stale_return=".cancelled"
     )
 
     delivery = Path(

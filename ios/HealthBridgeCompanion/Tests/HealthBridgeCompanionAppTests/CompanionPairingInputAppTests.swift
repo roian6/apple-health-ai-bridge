@@ -106,6 +106,146 @@ final class CompanionPairingInputAppTests: XCTestCase {
         try await assertReplacementDoesNotPromoteSupersededCommit(legacySetupMaterial)
     }
 
+    func testConfirmedPrivateResetClearsReplacementWarningAndKeepsSavedReceiver() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        var drainCanFinish = false
+        weak var observedViewModel: HealthBridgeCompanionViewModel?
+        let (viewModel, warning) = try await makeReplacementWarning(fixture) {
+            if drainCanFinish {
+                XCTAssertNotNil(observedViewModel?.setupLinkReplacementFailure)
+            }
+            return drainCanFinish
+        }
+        observedViewModel = viewModel
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let payload = try fixture.enqueueMixed()
+        XCTAssertEqual(viewModel.setupLinkReplacementFailure, warning)
+
+        drainCanFinish = true
+        await viewModel.clearPendingOutbox()
+
+        XCTAssertFalse(viewModel.statusIsError)
+        XCTAssertTrue(viewModel.statusMessage.contains("Cleared 1 queued upload(s)"))
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        XCTAssertNil(try reopened.pendingItem(id: payload.id))
+        XCTAssertFalse(reopened.destructiveRecoveryIsRequested)
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+        XCTAssertNil(viewModel.pairingInputCorrection)
+        XCTAssertNil(viewModel.setupLinkReplacementFailure)
+    }
+
+    func testFailedPrivateResetKeepsReplacementWarning() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        var drainCanFinish = false
+        let (viewModel, warning) = try await makeReplacementWarning(fixture) { drainCanFinish }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let payload = try fixture.enqueueMixed()
+        let bytes = try Data(contentsOf: payload.fileURL)
+        // A file occupying the reset-epoch directory prevents durable transfer-evidence invalidation.
+        try Data().write(to: fixture.acceptedTransferResetEpochURL.deletingLastPathComponent())
+
+        drainCanFinish = true
+        await viewModel.clearPendingOutbox()
+
+        XCTAssertTrue(viewModel.statusIsError)
+        XCTAssertTrue(viewModel.statusMessage.contains("Clearing queued uploads failed"))
+        XCTAssertTrue(FileOutbox.destructiveRecoveryIsRequested(directory: fixture.outbox.directoryURL))
+        XCTAssertEqual(try Data(contentsOf: payload.fileURL), bytes)
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(viewModel.setupLinkReplacementFailure, warning)
+    }
+
+    func testDeferredPrivateResetKeepsReplacementWarning() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let (viewModel, warning) = try await makeReplacementWarning(fixture) { false }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let payload = try fixture.enqueueMixed()
+        let bytes = try Data(contentsOf: payload.fileURL)
+
+        await viewModel.clearPendingOutbox()
+
+        XCTAssertTrue(viewModel.statusIsError)
+        XCTAssertTrue(viewModel.statusMessage.contains("iOS is still finalizing a background transfer"))
+        XCTAssertTrue(FileOutbox.destructiveRecoveryIsRequested(directory: fixture.outbox.directoryURL))
+        XCTAssertEqual(try Data(contentsOf: payload.fileURL), bytes)
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(viewModel.setupLinkReplacementFailure, warning)
+    }
+
+    func testBootstrapFinishesDeferredResetAndClearsReplacementWarning() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        var drainCanFinish = false
+        let (viewModel, warning) = try await makeReplacementWarning(fixture) { drainCanFinish }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let payload = try fixture.enqueueMixed()
+
+        await viewModel.clearPendingOutbox()
+        XCTAssertTrue(FileOutbox.destructiveRecoveryIsRequested(directory: fixture.outbox.directoryURL))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payload.fileURL.path))
+        XCTAssertEqual(viewModel.setupLinkReplacementFailure, warning)
+
+        drainCanFinish = true
+        await viewModel.retryPrivateStorage()
+
+        XCTAssertFalse(viewModel.statusIsError)
+        XCTAssertTrue(viewModel.statusMessage.contains("Finished the interrupted deletion of 1 queued upload(s)"))
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        XCTAssertNil(try reopened.pendingItem(id: payload.id))
+        XCTAssertFalse(reopened.destructiveRecoveryIsRequested)
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+        XCTAssertNil(viewModel.setupLinkReplacementFailure)
+    }
+
+    func testUnconfirmedPrivateResetLeavesReplacementWarningAndQueueIntact() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        var drains = 0
+        let (viewModel, warning) = try await makeReplacementWarning(fixture) {
+            drains += 1
+            return false
+        }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let payload = try fixture.enqueueMixed()
+
+        // Dismissing the Settings dialog never calls clearPendingOutbox().
+        // Ordinary recovery and connection actions must not infer confirmation.
+        await viewModel.retryPrivateStorage()
+        await viewModel.checkConnection()
+
+        XCTAssertEqual(drains, 1, "Only the attempted replacement may drain")
+        XCTAssertFalse(FileOutbox.destructiveRecoveryIsRequested(directory: fixture.outbox.directoryURL))
+        XCTAssertNotNil(try fixture.outbox.pendingItem(id: payload.id))
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(viewModel.setupLinkReplacementFailure, warning)
+    }
+
+    private func makeReplacementWarning(
+        _ fixture: NutritionFixture,
+        drain: @escaping @MainActor () async -> Bool
+    ) async throws -> (HealthBridgeCompanionViewModel, String) {
+        let viewModel = try await fixture.makeViewModel(terminalBackgroundPayloadDrain: drain)
+        viewModel.pairingImportText = legacySetupMaterial
+        await viewModel.importPairingText()
+        let warning = try XCTUnwrap(viewModel.setupLinkReplacementFailure)
+        XCTAssertTrue(warning.contains("saved connection was not replaced"))
+        XCTAssertTrue(viewModel.receiverSettingsSaved)
+        XCTAssertNil(viewModel.pairingInputCorrection)
+        return (viewModel, warning)
+    }
+
     func testInvitationReplacementDoesNotPromoteSupersededCommit() async throws {
         try await assertReplacementDoesNotPromoteSupersededCommit("""
         {

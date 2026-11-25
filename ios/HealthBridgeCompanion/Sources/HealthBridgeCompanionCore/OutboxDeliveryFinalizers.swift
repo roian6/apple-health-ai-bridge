@@ -68,13 +68,14 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             receiverBindingID: descriptor.receiverBindingID, itemID: descriptor.itemID
         ) ?? outbox.directFinalizationRecordReady(
                receiverIdentity: descriptor.receiverBindingID,
-               where: { record, unchecked, _ in
-                   item == nil && record.isDirectSleepRecord && unchecked.contains(descriptor.itemID)
+               where: { record, unchecked, intent in
+                   item == nil && intent == nil && record.isDirectSleepRecord && unchecked.contains(descriptor.itemID)
                }
            ) {
             guard try await recoverDirectSleepAcknowledgment(
                 record, receiverBindingID: descriptor.receiverBindingID,
-                receiverGeneration: descriptor.receiverGeneration, sleepStore: sleepStore(), validate: validate
+                receiverGeneration: descriptor.receiverGeneration, itemID: descriptor.itemID,
+                sleepStore: sleepStore(), validate: validate
             ) else {
                 throw OutboxDeliveryCoordinatorError.ownershipMismatch
             }
@@ -273,12 +274,12 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         guard let record = try outbox.directSleepCleanupRecord(receiverBindingID: receiverBindingID, itemID: itemID)
             ?? outbox.directFinalizationRecordReady(
             receiverIdentity: receiverBindingID,
-            where: { record, unchecked, _ in
-                unchecked.contains(itemID) && record.isDirectSleepRecord
+            where: { record, unchecked, intent in
+                intent == nil && unchecked.contains(itemID) && record.isDirectSleepRecord
             }
         ) else { return false }
         return try await recoverDirectSleepAcknowledgment(
-            record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
+            record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration, itemID: itemID,
             sleepStore: sleepStore, validate: validate
         )
     }
@@ -297,12 +298,14 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         _ record: FileOutboxFinalizationRecord,
         receiverBindingID: String,
         receiverGeneration: String,
+        itemID expectedItemID: String? = nil,
         sleepStore: any SleepSyncManifestStoring,
         validate: @escaping @MainActor () throws -> Void
     ) async throws -> Bool {
         let storedIntent = try outbox.directSleepCleanupIntent(for: record)
         if let storedIntent,
-           storedIntent.receiverBindingID != receiverBindingID || storedIntent.receiverGeneration != receiverGeneration {
+           storedIntent.receiverBindingID != receiverBindingID || storedIntent.receiverGeneration != receiverGeneration
+               || expectedItemID.map({ $0 != storedIntent.itemID }) == true {
             return false
         }
         let revision = try sleepStore.revisionForSync()
@@ -318,7 +321,8 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             intent = storedIntent
         } else {
             guard let pending, let itemID = pending.outboxItemID,
-                  try outbox.uncheckedDirectAcknowledgmentIDs(for: record) == Set([itemID]),
+                  expectedItemID.map({ $0 == itemID }) != false,
+                  try outbox.uncheckedDirectAcknowledgmentIDs(for: record).contains(itemID),
                   pending.receiverBindingID == receiverBindingID,
                   pending.connectionGeneration == receiverGeneration,
                   pending.manifest.receiverSettingsGeneration == receiverGeneration,

@@ -485,9 +485,17 @@ health-bridge mailbox helper install \
 health-bridge mailbox helper status --json
 ```
 
-No helper `upgrade` command exists. Continue only when helper status reports
-`{"code": "ready"}` and any required database initialization has succeeded.
-Restart the original foreground command or restore the service with its
+No helper `upgrade` command exists. Wait for helper status to report
+`{"code": "ready"}`. For the [Receiver/CLI 1.1.5 to 1.2.0 upgrade](setup.md#existing-users-receivercli-120-upgrade),
+keep the Receiver stopped and initialize the **existing** database with the
+updated CLI. Use the same `HEALTH_BRIDGE_DB` path you backed up before upgrading:
+
+```bash
+health-bridge init --db "$HEALTH_BRIDGE_DB"
+```
+
+If initialization fails, leave the Receiver stopped. Only after the required
+initialization succeeds, restart the original foreground command or restore the service with its
 original or intentionally updated values:
 
 ```bash

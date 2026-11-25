@@ -1844,6 +1844,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
         try acceptedTransferStore.clear()
         let recovery = try FileOutbox.completeConfirmedTerminalReset(directory: outboxDirectoryURL)
+        setupLinkReplacementFailure = nil
         mailboxDeliveryDiagnosticLines = []
         return recovery
     }

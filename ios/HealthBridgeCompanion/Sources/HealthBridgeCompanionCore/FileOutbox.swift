@@ -1497,7 +1497,8 @@ public final class FileOutbox {
         var transactions = try loadEnqueueTransactions()
         guard let index = transactions.firstIndex(where: { $0.finalizationRecord == record }),
               transactions[index].directSleepCleanupIntent == nil,
-              transactions[index].uncheckedDirectAcknowledgmentIDs == Set([intent.itemID]) else {
+              transactions[index].uncheckedDirectAcknowledgmentIDs.contains(intent.itemID),
+              try canFinalizeNutritionIndependentTransaction(index, in: transactions) else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         transactions[index].directSleepCleanupIntent = intent
@@ -2318,7 +2319,11 @@ public final class FileOutbox {
         let journalURL = directory.appendingPathComponent(enqueueTransactionFilename)
         guard fileManager.fileExists(atPath: journalURL.path) else { return .ready }
         let transactions = try decodeEnqueueTransactions(at: journalURL)
-        // V3 ignores the Sleep fields and rejects ACKs without a cursor or retirement.
+        // V3 ignores an active Sleep cleanup obligation even on a journal it can decode.
+        if transactions.contains(where: { $0.directSleepCleanupIntent != nil }) {
+            return .hold(.finalizationIntent)
+        }
+        // V3 rejects ACKs without a cursor or retirement.
         if transactions.contains(where: {
             !$0.directAcknowledgedIDs.isEmpty && $0.cursorCheckpoint == nil
                 && $0.pendingGenerationRetirements?.isEmpty != false
@@ -2904,9 +2909,11 @@ public final class FileOutbox {
             let sequences = Set(transaction.entries.map(\.sequence))
             let acknowledgedIDs = transaction.directAcknowledgedIDs
             if let intent = transaction.directSleepCleanupIntent {
+                // An intent owns one unchecked ACK, not the status of its siblings.
                 guard !intent.journalID.isEmpty, !intent.receiverBindingID.isEmpty, !intent.receiverGeneration.isEmpty,
-                      transaction.uncheckedDirectAcknowledgmentIDs == Set([intent.itemID]),
-                      transaction.entries.allSatisfy({ $0.receiverIdentity == intent.receiverBindingID }) else {
+                      transaction.uncheckedDirectAcknowledgmentIDs.contains(intent.itemID),
+                      transaction.entries.allSatisfy({ $0.receiverIdentity == intent.receiverBindingID }),
+                      transaction.cursorCheckpoint.map({ $0.receiverIdentity == intent.receiverBindingID }) != false else {
                     throw SequenceError.invalidManifest
                 }
             }
