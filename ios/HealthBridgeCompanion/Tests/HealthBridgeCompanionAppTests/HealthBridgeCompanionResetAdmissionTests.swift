@@ -17,6 +17,162 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try await runOnlineManualQueuedRetry(pendingSleep: true)
     }
 
+    func testReceiverReplacementRequiresOldOwnerToUnlinkRetiredPlainACKBeforeNewCheckpoint() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let oldBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let oldGeneration = fixture.settings.receiverSettingsGenerationToken
+        let oldConnection = try fixture.settings.currentConnectionRecordV2()
+        let directory = fixture.outbox.directoryURL
+        let journal = directory.appendingPathComponent(".enqueue-transaction")
+        let fault = SleepJournalUnlinkInterruption(journalURL: journal, afterUnlink: false)
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let oldPayload = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make(now: date))
+        let oldItem = try fixture.outbox.enqueue(oldPayload, receiverIdentity: oldBinding)
+        let observations = makeResetTestTransferStore(root: fixture.root, defaults: fixture.defaults)
+        let cursors = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json"))
+        let sourceKey = "synthetic-replacement-source"
+        let cursorKind = "synthetic-replacement-kind"
+        let oldCursor = "synthetic-old-cursor"
+        try cursors.saveCursorValue(oldCursor, receiverBindingID: oldBinding, sourceKey: sourceKey, cursorKind: cursorKind)
+        var replacementDrainCount = 0
+        var requestedFreshReadAuthorization: [[String]] = []
+
+        func cursor(for binding: String) throws -> String? {
+            try cursors.cursorValue(receiverBindingID: binding, sourceKey: sourceKey, cursorKind: cursorKind)
+        }
+
+        func open(_ outbox: FileOutbox) async throws -> HealthBridgeCompanionViewModel {
+            let model = try makeViewModel(
+                root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+                pairingStateStore: ReceiverPairingStateStore(
+                    pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                    cancellationStore: MemoryReceiverTokenStore(),
+                    installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+                ),
+                outbox: outbox, receiverClient: ReceiverClient(session: fixture.session),
+                automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(
+                    fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+                ),
+                readAnchoredStepChanges: { _, _, _ in
+                    XCTFail("This fixture must not execute a fresh Steps read.")
+                    throw CocoaError(.featureUnsupported)
+                },
+                scheduleDirectBackgroundUploads: { 0 },
+                terminalBackgroundPayloadDrain: {
+                    replacementDrainCount += 1
+                    XCTAssertEqual(fixture.settings.receiverBindingID, oldBinding)
+                    XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, oldGeneration)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+                    XCTAssertEqual(try? cursor(for: oldBinding), oldCursor)
+                    return true
+                },
+                platformBackgroundPayloadDrain: { true },
+                requestProjectionReadAuthorization: { types in
+                    // Sync Now offers fresh Steps only after a successful FIFO flush.
+                    requestedFreshReadAuthorization.append(types)
+                    XCTAssertEqual(fixture.recorder.acceptedPayloads.count, 2)
+                    XCTAssertTrue(try outbox.pendingItems().isEmpty)
+                    throw CocoaError(.featureUnsupported)
+                }
+            )
+            await model.bootstrap()
+            return model
+        }
+
+        let writer = try await open(FileOutbox(directory: directory, fileManager: fault))
+        await writer.performManualSyncOpportunity(processPendingTypes: { false })
+        XCTAssertEqual(fault.interruptions, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldItem.fileURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload])
+        XCTAssertTrue(requestedFreshReadAuthorization.isEmpty)
+        let networkInvocationsAfterOldUpload = fixture.recorder.invocationCount
+        let oldObservation = try XCTUnwrap(observations.load(bindingID: oldBinding, generation: oldGeneration))
+
+        let outbox = try FileOutbox(directory: directory, fileManager: fault)
+        let oldRecord = try XCTUnwrap(outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertEqual(oldRecord.itemIDs, [oldItem.id])
+        XCTAssertNil(oldRecord.cursorCheckpoint)
+        XCTAssertTrue(oldRecord.pendingGenerationRetirements.isEmpty)
+        XCTAssertNil(try outbox.directSleepCleanupIntent(for: oldRecord))
+        XCTAssertTrue(try outbox.uncheckedDirectAcknowledgmentIDs(for: oldRecord).isEmpty)
+        XCTAssertTrue(try outbox.hasDirectAcknowledgmentWithSleepChecked(
+            itemID: oldItem.id, receiverIdentity: oldBinding
+        ))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+
+        let reopened = try await open(outbox)
+        XCTAssertEqual(fault.interruptions, 2, "Bootstrap retries the journal unlink under the old binding.")
+        func replaceReceiver() async {
+            reopened.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+            reopened.bearerToken = "synthetic-plain-ack-replacement"
+            await reopened.saveReceiverSettings()
+        }
+        await replaceReceiver()
+        XCTAssertTrue(reopened.statusIsError)
+        XCTAssertEqual(fault.interruptions, 3, "The replacement attempted local cleanup while still under the old authority.")
+        XCTAssertEqual(replacementDrainCount, 0)
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), oldConnection)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, oldGeneration)
+        XCTAssertEqual(try cursor(for: oldBinding), oldCursor)
+        XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding), oldRecord)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload])
+        XCTAssertEqual(fixture.recorder.invocationCount, networkInvocationsAfterOldUpload)
+        guard fixture.settings.receiverBindingID == oldBinding else { return }
+
+        fault.stopInterrupting()
+        await replaceReceiver()
+        let newBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let newGeneration = fixture.settings.receiverSettingsGenerationToken
+        XCTAssertNotEqual(newBinding, oldBinding)
+        XCTAssertNotEqual(newGeneration, oldGeneration)
+        XCTAssertEqual(replacementDrainCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertNil(try cursor(for: newBinding))
+        XCTAssertEqual(observations.load(bindingID: oldBinding, generation: oldGeneration), oldObservation)
+        XCTAssertNil(observations.load(bindingID: newBinding, generation: newGeneration))
+        XCTAssertNil(reopened.lastAcceptedTransferObservation)
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload], "Replacement must not resend accepted bytes.")
+        XCTAssertEqual(fixture.recorder.invocationCount, networkInvocationsAfterOldUpload)
+        XCTAssertTrue(requestedFreshReadAuthorization.isEmpty)
+        guard newBinding != oldBinding else { return }
+
+        let newPayload = try HealthBridgeBatchEncoder().encode(
+            ConnectionTestBatchFactory.make(now: date.addingTimeInterval(60))
+        )
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: newBinding, sourceKey: sourceKey, cursorKind: cursorKind, cursorValue: "synthetic-new-cursor"
+        )
+        let newItems = try outbox.enqueueSequence([newPayload], receiverIdentity: newBinding, cursorCheckpoint: checkpoint)
+        let newItem = try XCTUnwrap(newItems.first)
+        await reopened.performManualSyncOpportunity(processPendingTypes: { false })
+
+        XCTAssertEqual(try cursor(for: newBinding), checkpoint.cursorValue)
+        XCTAssertNil(try cursor(for: oldBinding))
+        XCTAssertNil(try outbox.pendingCursorCheckpoint())
+        XCTAssertFalse(try outbox.hasDirectAcknowledgmentWithSleepChecked(itemID: newItem.id, receiverIdentity: newBinding))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fault.interruptions, 3)
+        XCTAssertNil(observations.load(bindingID: oldBinding, generation: oldGeneration))
+        XCTAssertEqual(observations.load(bindingID: newBinding, generation: newGeneration)?.evidenceKind, .directResponse)
+        XCTAssertEqual(requestedFreshReadAuthorization, [["steps"]])
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload, newPayload])
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [oldPayload, newPayload])
+        #endif
+    }
+
     func testReceiverReplacementWaitsForCheckedSleepCollectionFinalization() async throws {
         let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }
@@ -6115,6 +6271,7 @@ private final class SleepJournalUnlinkInterruption: FileManager, @unchecked Send
     private let afterUnlink: Bool
     private let lock = NSLock()
     private var faultCount = 0
+    private var faultEnabled = true
 
     init(journalURL: URL, afterUnlink: Bool) {
         self.journalURL = journalURL
@@ -6124,9 +6281,18 @@ private final class SleepJournalUnlinkInterruption: FileManager, @unchecked Send
 
     var interruptions: Int { lock.withLock { faultCount } }
 
+    func stopInterrupting() {
+        lock.withLock { faultEnabled = false }
+    }
+
     override func removeItem(at url: URL) throws {
         guard url == journalURL else { return try super.removeItem(at: url) }
-        lock.withLock { faultCount += 1 }
+        let shouldInterrupt = lock.withLock {
+            guard faultEnabled else { return false }
+            faultCount += 1
+            return true
+        }
+        guard shouldInterrupt else { return try super.removeItem(at: url) }
         if afterUnlink { try super.removeItem(at: url) }
         throw Fault.interrupted
     }

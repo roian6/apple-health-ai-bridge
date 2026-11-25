@@ -1316,14 +1316,38 @@ public final class FileOutbox {
         }
     }
 
-    func hasPendingAcknowledgedDirectFinalization() throws -> Bool {
-        try loadEnqueueTransactions().contains {
-            // Readiness is not required: a partial collection still owns accepted progress.
-            guard !$0.directAcknowledgedIDs.isEmpty, let record = $0.finalizationRecord else {
-                return false
-            }
-            return record.cursorCheckpoint != nil || !record.eligiblePendingGenerationRetirements.isEmpty
+    func retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: String?) throws -> Bool {
+        let transactions = try loadEnqueueTransactions()
+        guard transactions.contains(where: { !$0.directAcknowledgedIDs.isEmpty }) else { return true }
+        guard let receiverBindingID, !receiverBindingID.isEmpty, let manifest = try loadManifest(),
+              transactions.allSatisfy({
+                  isRetiredPlainDirectTransaction($0, in: manifest, receiverBindingID: receiverBindingID)
+              }) else { return false }
+        try requireUploadAdmission()
+        try persistEnqueueTransactions([])
+        return true
+    }
+
+    private func isRetiredPlainDirectTransaction(
+        _ transaction: EnqueueTransaction, in manifest: SequenceManifest, receiverBindingID: String
+    ) -> Bool {
+        // A checked standalone ACK can outlive its payload if journal unlink failed.
+        // Only remove receipts for the current binding and never skip another transaction.
+        guard transaction.cursorCheckpoint == nil,
+              transaction.pendingGenerationRetirements?.isEmpty != false,
+              transaction.directSleepCleanupIntent == nil,
+              transaction.entries.count == 1, let entry = transaction.entries.first,
+              entry.receiverIdentity == receiverBindingID,
+              entry.mailboxBinding == nil, entry.deliveryState == nil,
+              transaction.directAcknowledgedIDs == Set([entry.id]),
+              Set(transaction.directSleepCheckedItemIDs ?? []) == Set([entry.id]),
+              manifest.nextSequence > entry.sequence,
+              !manifest.entries.contains(where: { $0.id == entry.id }),
+              manifest.nutritionSplits?.contains(where: { $0.parentID == entry.id }) != true else {
+            return false
         }
+        return !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
+            && !fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
     }
 
     public func acknowledgeFinalizationRecord(
@@ -2108,6 +2132,23 @@ public final class FileOutbox {
         guard Self.isSafeItemID(itemID) else { return nil }
         return try reconciledManifest().entries.first(where: { $0.id == itemID })?
             .deliveryState
+    }
+
+    func recoveredMailboxFinalizationIDs(
+        matching expectedOwnership: [String: OutboxDeliveryOwnershipV1]
+    ) throws -> Set<String> {
+        try requireUploadAdmission()
+        // Reconciliation must finish artifact cleanup before a tombstone is recovery proof.
+        let manifest = try reconciledManifest()
+        return Set(manifest.entries.compactMap { entry in
+            guard let expected = expectedOwnership[entry.id],
+                  entry.receiverIdentity == expected.receiverBindingID,
+                  let state = entry.deliveryState, state.phase == .committedFinalized,
+                  state.ownership == expected,
+                  let binding = entry.mailboxBinding,
+                  state.committedReceipt?.payloadSHA256 == binding.payloadSHA256 else { return nil }
+            return entry.id
+        })
     }
 
     func compareAndSetDeliveryState(

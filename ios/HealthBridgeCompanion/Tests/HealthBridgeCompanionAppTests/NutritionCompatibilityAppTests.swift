@@ -6,6 +6,64 @@ import XCTest
 @testable import HealthBridgeCompanion
 
 @MainActor
+final class NutritionMailboxBackgroundStoreAppTests: XCTestCase {
+    func testForegroundMailboxACKRetiresObserverOnlyInInjectedStore() async throws {
+        let mailbox = try NutritionMailboxFixture(nativePairing: true)
+        let fixture = mailbox.base
+        defer { fixture.cleanup() }
+        try mailbox.writeCapabilities()
+        let injectedSuite = fixture.suite + ".injected-background"
+        let injectedDefaults = try XCTUnwrap(UserDefaults(suiteName: injectedSuite))
+        defer { injectedDefaults.removePersistentDomain(forName: injectedSuite) }
+        let injected = BackgroundSyncSettingsStore(userDefaults: injectedDefaults)
+        let fixtureStore = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        let typeCode = "dietary_protein"
+        try injected.setEnabledDurably(true)
+        try injected.markPendingObserverTypeCodes([typeCode])
+        try fixtureStore.markPendingObserverTypeCodes([typeCode, "weight"])
+        try fixtureStore.markPendingObserverTypeCodes([typeCode])
+        let generation = try XCTUnwrap(injected.loadPendingObserverTypeCodeGenerations()[typeCode])
+        let otherGenerations = try fixtureStore.loadPendingObserverTypeCodeGenerations()
+        XCTAssertNotNil(otherGenerations["weight"])
+        XCTAssertNotEqual(try XCTUnwrap(otherGenerations[typeCode]), generation)
+        XCTAssertFalse(fixtureStore.isEnabled)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let item = try XCTUnwrap(fixture.outbox.enqueueSequence(
+            [JSONEncoder().encode(fixture.mixedBatch())], receiverIdentity: binding,
+            cursorCheckpoint: FileOutboxCursorCheckpoint(
+                receiverIdentity: binding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: GenericQuantitySyncBatchFactory.anchoredCursorKind(for: typeCode),
+                cursorValue: fixture.anchor
+            ),
+            pendingGenerationRetirements: [typeCode: generation]
+        ).first)
+        _ = try await mailbox.delivery().publishPendingFIFOHead()
+        let published = try XCTUnwrap(fixture.outbox.pendingItem(id: item.id))
+        XCTAssertEqual(published.deliveryState?.phase, .providerObserved)
+        let vm = try await fixture.makeViewModel(mailbox: mailbox, backgroundSyncStore: injected)
+        XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+        XCTAssertNil(try fixture.cursor(typeCode))
+        XCTAssertEqual(try injected.loadPendingObserverTypeCodeGenerations(), [typeCode: generation])
+        _ = try mailbox.receiveAndAcknowledge(published)
+
+        vm.runForegroundMailboxReconciliationIfNeeded()
+        await vm.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(vm.lastAcceptedTransferObservation?.evidenceKind, .mailboxCommit)
+        XCTAssertNil(try fixture.outbox.pendingItem(id: item.id))
+        XCTAssertEqual(try fixture.cursor(typeCode), fixture.anchor)
+        XCTAssertEqual(try injected.loadPendingObserverTypeCodeGenerations(), [:],
+                       "The real Mailbox ACK must retire the injected observer generation")
+        XCTAssertEqual(try fixtureStore.loadPendingObserverTypeCodeGenerations(), otherGenerations)
+    }
+}
+
+@MainActor
 final class NutritionCompatibilityAppTests: XCTestCase {
     func testManualSyncDoesNotCollectBehindFailedRetainedWorkoutHistory() async throws {
         let fixture = try NutritionFixture()

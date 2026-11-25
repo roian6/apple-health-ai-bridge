@@ -141,7 +141,7 @@ final class NutritionFixture {
     )
     private var ids: [String: UUID] = [:]
 
-    init(directPairing: Bool = true) throws {
+    init(directPairing: Bool = true, outboxFileManager: FileManager = .default) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         settings = ReceiverSettingsStore(
@@ -152,7 +152,7 @@ final class NutritionFixture {
             try settings.save(receiverURLString: "http://127.0.0.1:8765/v1/batches",
                               bearerToken: "synthetic-nutrition")
         }
-        outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"), fileManager: outboxFileManager)
         cursors = try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json"))
         anchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 42))
         let configuration = URLSessionConfiguration.ephemeral
@@ -189,13 +189,14 @@ final class NutritionFixture {
         let deliveryCursors = reopenStorage ? try FileSyncCursorStore(fileURL: cursors.fileURL) : cursors
         let sleepStore = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
         let mailboxSleepStore = readAnchoredSleepChanges == nil ? nil : sleepStore
+        let backgroundSyncStore = backgroundSyncStore ?? BackgroundSyncSettingsStore(userDefaults: defaults)
         let vm = HealthBridgeCompanionViewModel(
             receiverClient: client, settingsStore: settings,
             pairingStateStore: ReceiverPairingStateStore(
                 pendingStore: NutritionTokenStore(), installationIDStore: NutritionTokenStore(),
                 cancellationStore: NutritionTokenStore()
             ),
-            backgroundSyncStore: backgroundSyncStore ?? BackgroundSyncSettingsStore(userDefaults: defaults),
+            backgroundSyncStore: backgroundSyncStore,
             automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json")),
             healthPermissionRequestStore: CompanionHealthPermissionRequestStore(userDefaults: defaults),
             healthHistoryDepthStore: HealthHistoryDepthSelectionStore(userDefaults: defaults),
@@ -222,7 +223,9 @@ final class NutritionFixture {
             terminalBackgroundPayloadDrain: terminalBackgroundPayloadDrain,
             platformBackgroundPayloadDrain: { true },
             productionMailboxDelivery: mailbox.map { fixture in
-                { @MainActor in fixture.delivery(sleepStore: mailboxSleepStore) }
+                { @MainActor in
+                    fixture.delivery(pendingGenerationStore: backgroundSyncStore, sleepStore: mailboxSleepStore)
+                }
             },
             readAnchoredQuantityChanges: { [self] type, previous, start, now in
                 reads.append(type)

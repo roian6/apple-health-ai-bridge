@@ -43,25 +43,61 @@ private enum CompanionPrivateStorageError: LocalizedError {
     }
 }
 
-private struct MailboxDeliveryDiagnosticLine {
-    let message: String
-    let isFailure: Bool
+private enum MailboxDeliveryOperation: Hashable {
+    case manualDelivery
+    case selectFIFOHeadPhase
+    case publishFIFOHead
+    case reconcileFIFOHeadAcknowledgment
+    case persistScanCheckpoint
+}
 
-    static func summary(_ message: String) -> Self {
-        Self(message: message, isFailure: false)
+private struct MailboxAckCheckpointWrite: Error {
+    let startingCheckpoint: String?
+    let checkpoint: String
+
+    func canRetry(from current: String?) -> Bool {
+        // A failed synchronization may already have changed the in-memory defaults.
+        current == startingCheckpoint || current == checkpoint
+    }
+}
+
+private struct MailboxDeliveryDiagnosticLine {
+    enum FailureScope: Equatable {
+        case item(String)
+        case operation(MailboxDeliveryOperation)
+        case unattributed
     }
 
-    static func failure(for error: Error) -> Self {
-        if let phaseError = error as? ProductionMailboxDeliveryPhaseError {
-            return Self(
-                message: "Mailbox ACK diagnostics failed: phase=\(phaseError.diagnosticCode).",
-                isFailure: true
-            )
+    let message: String
+    let failureGeneration: String?
+    let scope: FailureScope?
+    let checkpointWrite: MailboxAckCheckpointWrite?
+    let itemOwnership: OutboxDeliveryOwnershipV1?
+
+    static func summary(_ message: String) -> Self {
+        Self(message: message, failureGeneration: nil, scope: nil, checkpointWrite: nil, itemOwnership: nil)
+    }
+
+    static func failure(
+        for error: Error, generation: String, operation: MailboxDeliveryOperation?
+    ) -> Self {
+        let itemError = error as? ProductionMailboxItemDeliveryError
+        let checkpointWrite = error as? MailboxAckCheckpointWrite
+        let phase = itemError?.phase ?? (error as? ProductionMailboxDeliveryPhaseError)
+        let reason = phase.map { "phase=\($0.diagnosticCode)" } ?? "error=mailbox_delivery_failed"
+        let scope: FailureScope
+        if let itemError {
+            scope = .item(itemError.itemID)
+        } else if checkpointWrite != nil {
+            scope = .operation(.persistScanCheckpoint)
+        } else if let operation {
+            scope = .operation(operation)
+        } else {
+            scope = .unattributed
         }
-        return Self(
-            message: "Mailbox ACK diagnostics failed: error=mailbox_delivery_failed.",
-            isFailure: true
-        )
+        return Self(message: "Mailbox ACK diagnostics failed: \(reason).",
+                    failureGeneration: generation, scope: scope, checkpointWrite: checkpointWrite,
+                    itemOwnership: itemError?.ownership)
     }
 }
 
@@ -188,7 +224,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
 
         private func performManualSync() async {
-            if viewModel.pendingOutboxCount > 0 {
+            if viewModel.pendingOutboxCount > 0 || viewModel.hasPendingManualMailboxRetry {
                 guard await viewModel.flushPendingOutbox(executionMode: .foreground) else {
                     viewModel.statusMessage = "Sync stopped: \(viewModel.statusMessage)"
                     return
@@ -418,7 +454,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var historicalBackfillState: HealthHistoricalBackfillState
     @Published private(set) var activityLogMessages: [String]
     @Published private(set) var mailboxKeyDiagnosticState: MailboxKeyDiagnosticState
-    @Published private var mailboxDeliveryDiagnosticLine: MailboxDeliveryDiagnosticLine?
+    @Published private var mailboxDeliveryDiagnosticLines: [MailboxDeliveryDiagnosticLine] = []
     @Published private(set) var automaticSyncLaneDiagnosticLine: String
 
     private var foregroundCatchUpTask: Task<Void, Never>?
@@ -950,8 +986,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     var activityMailboxFailureMessage: String? {
-        guard usesMailboxTransport, let diagnostic = mailboxDeliveryDiagnosticLine,
-              diagnostic.isFailure else { return nil }
+        guard usesMailboxTransport, let diagnostic = mailboxDeliveryDiagnosticLines.last,
+              diagnostic.failureGeneration == settingsStore.receiverSettingsGenerationToken else { return nil }
         return diagnostic.message
     }
 
@@ -1235,7 +1271,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             receiverSettingsSaved = false
             hasPendingPairing = ((try? pairingCoordinator.hasPendingPairing()) ?? false)
                 || cancellationCleanupRecoveryRequired
-            mailboxDeliveryDiagnosticLine = nil
+            mailboxDeliveryDiagnosticLines = []
             setupLinkReplacementFailure = nil
             backgroundSyncStatus = "Automatic sync is off. Sync Now still works."
             refreshPendingOutboxCount()
@@ -1807,7 +1843,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
         try acceptedTransferStore.clear()
-        return try FileOutbox.completeConfirmedTerminalReset(directory: outboxDirectoryURL)
+        let recovery = try FileOutbox.completeConfirmedTerminalReset(directory: outboxDirectoryURL)
+        mailboxDeliveryDiagnosticLines = []
+        return recovery
     }
 
     private func performClearPendingOutbox() async -> Bool {
@@ -2407,10 +2445,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let pendingItemCount: Int
         do {
             let payloadCount = try outbox.pendingItems().count
-            if payloadCount == 0,
-               try outbox.hasPendingDirectSleepCleanup() || outbox.hasPendingAcknowledgedDirectFinalization() {
-                // Accepted work still belongs to this receiver after its payload is gone.
-                pendingItemCount = 1
+            if payloadCount == 0 {
+                let mayRetirePlainDirectReceipts = outboxIdentityAdmissionWasReady
+                    && !outbox.destructiveRecoveryIsRequested
+                    && !recoverCommittedReceiverRemoval
+                    && settingsStore.activeTransport == .directHTTP
+                    && (expectedGeneration == nil || expectedGeneration == settingsStore.receiverSettingsGenerationToken)
+                // This runs before invalidating the old generation, and is checked again after drain.
+                let receiptsCleared = try outbox.retirePlainDirectReceiptsForConnectionTransition(
+                    receiverBindingID: mayRetirePlainDirectReceipts ? settingsStore.receiverBindingID : nil
+                )
+                pendingItemCount = receiptsCleared ? 0 : 1
             } else {
                 pendingItemCount = payloadCount
             }
@@ -3522,7 +3567,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func reschedulePendingBackgroundOutboxUploadsAfterReceiverChange() {
-        mailboxDeliveryDiagnosticLine = nil
+        mailboxDeliveryDiagnosticLines = []
         guard terminalPayloadActionAdmissionIsOpen,
               automaticSyncReady,
               directOutboxTransferRequestCount == 0 else { return }
@@ -3621,7 +3666,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     summary,
                     pendingCount: pendingOutboxCount
                 )
-                mailboxDeliveryDiagnosticLine = .summary(summary.diagnosticLine)
+                publishMailboxDeliverySummary(
+                    summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                    completedOperations: [.publishFIFOHead]
+                )
                 if summary.terminalCount > 0 {
                     statusIsError = true
                     statusMessage = "Receiver rejected a secure mailbox item. Review the connection before retrying."
@@ -3636,7 +3684,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 }
                 refreshPendingOutboxCount()
                 let description = describe(error)
-                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                publishMailboxDeliveryFailure(error, generation: expectedGeneration, operation: .publishFIFOHead)
                 backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed: \(description)"
             }
             return
@@ -3820,9 +3868,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } catch {
                 return
             }
-            let diagnostic = MailboxDeliveryDiagnosticLine.failure(for: error)
-            mailboxDeliveryDiagnosticLine = diagnostic
-            backgroundSyncStatus = diagnostic.message
+            backgroundSyncStatus = publishMailboxDeliveryFailure(error, generation: expectedGeneration)
         }
     }
 
@@ -3837,28 +3883,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
         let expectedBindingID = settingsStore.receiverBindingID
+        var operation: MailboxDeliveryOperation = requestedPhase == .publishFIFOHead
+            ? .publishFIFOHead : .selectFIFOHeadPhase
+        var completedOperations: Set<MailboxDeliveryOperation> = []
         do {
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(expectedGeneration)
             let delivery = try makeProductionMailboxDelivery()
+            let startingCheckpoint = backgroundSyncStore.mailboxAckScanCheckpoint(receiverGeneration: expectedGeneration)
             let summary: ProductionMailboxBackgroundDeliverySummary
             switch requestedPhase {
             case .publishFIFOHead:
                 summary = try await delivery.publishPendingFIFOHead()
             case .advanceOrReconcileFIFOHead:
-                switch try await delivery.pendingFIFOHeadBackgroundPhase() {
+                let pendingPhase = try await delivery.pendingFIFOHeadBackgroundPhase()
+                completedOperations.insert(.selectFIFOHeadPhase)
+                switch pendingPhase {
                 case .reconcileFIFOHeadAcknowledgment:
+                    operation = .reconcileFIFOHeadAcknowledgment
                     summary = try await delivery.reconcilePendingFIFOHeadAcknowledgment(
-                        afterAcknowledgmentCheckpoint: backgroundSyncStore
-                            .mailboxAckScanCheckpoint(
-                                receiverGeneration: expectedGeneration
-                            )
+                        afterAcknowledgmentCheckpoint: startingCheckpoint
                     )
                 case .none, .publishFIFOHead:
+                    operation = .publishFIFOHead
                     summary = try await delivery.publishPendingFIFOHead()
                 }
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
+            completedOperations.insert(operation)
             if summary.finalizedCount > 0, let expectedBindingID {
                 recordAcceptedTransfer(
                     bindingID: expectedBindingID,
@@ -3866,18 +3918,35 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     evidenceKind: .mailboxCommit
                 )
             }
-            if let checkpoint = summary.nextAcknowledgmentCheckpoint {
-                try backgroundSyncStore.persistMailboxAckScanCheckpoint(
-                    checkpoint,
-                    receiverGeneration: expectedGeneration
-                )
+            if requestedPhase == .advanceOrReconcileFIFOHead,
+               let write = mailboxCheckpointWrite(
+                   startingCheckpoint: startingCheckpoint,
+                   nextCheckpoint: summary.nextAcknowledgmentCheckpoint,
+                   generation: expectedGeneration
+               ) {
+                do {
+                    try backgroundSyncStore.persistMailboxAckScanCheckpoint(
+                        write.checkpoint, receiverGeneration: expectedGeneration
+                    )
+                    completedOperations.insert(.persistScanCheckpoint)
+                } catch {
+                    // Item finalization and scan completion still happened even though this write failed.
+                    publishMailboxDeliverySummary(
+                        summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                        completedOperations: completedOperations
+                    )
+                    throw write
+                }
             }
             refreshPendingOutboxCount()
             backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage(
                 summary,
                 pendingCount: pendingOutboxCount
             )
-            mailboxDeliveryDiagnosticLine = .summary(summary.diagnosticLine)
+            publishMailboxDeliverySummary(
+                summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                completedOperations: completedOperations
+            )
             if summary.terminalCount > 0 {
                 statusIsError = true
                 statusMessage = "Receiver rejected a secure mailbox item. Review the connection before retrying."
@@ -3894,7 +3963,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 return .cancelled
             }
             refreshPendingOutboxCount()
-            mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+            publishMailboxDeliveryFailure(error, generation: expectedGeneration, operation: operation)
             backgroundSyncStatus = "Encrypted iCloud mailbox reconciliation failed: \(describe(error))"
             return .failed
         }
@@ -4596,7 +4665,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             diagnostic.noteCompletion(.failed)
             return
         }
-        if pendingOutbox > 0, settingsStore.activeTransport == .mailbox {
+        if settingsStore.activeTransport == .mailbox,
+           pendingOutbox > 0 || pendingMailboxCheckpointWrite != nil
+               || currentMailboxDeliveryFailures.contains(where: { $0.itemOwnership != nil }) {
             _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
         }
         var processedAllPending: Bool?
@@ -7142,7 +7213,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         : [],
                     mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine
                 )
-                mailboxDeliveryDiagnosticLine = .summary(flushSummary.mailboxDeliveryDiagnosticLine)
+                publishMailboxDeliverySummary(
+                    flushSummary.mailboxDeliveryDiagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                    completedOperations: [.manualDelivery]
+                )
                 return (
                     summary: flushSummary,
                     lastDirectUploadResult: nil,
@@ -7152,7 +7226,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 throw cancellation
             } catch {
                 try requireCurrentPayloadDeliveryTarget(target)
-                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                publishMailboxDeliveryFailure(error, generation: expectedGeneration, operation: .manualDelivery)
                 throw error
             }
         }
@@ -7324,6 +7398,81 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             sleepStore: sleepManifestStore,
             receiverClient: receiverClient
         )
+    }
+
+    private var currentMailboxDeliveryFailures: [MailboxDeliveryDiagnosticLine] {
+        let generation = settingsStore.receiverSettingsGenerationToken
+        return mailboxDeliveryDiagnosticLines.filter { $0.failureGeneration == generation }
+    }
+
+    private var hasPendingManualMailboxRetry: Bool {
+        usesMailboxTransport && currentMailboxDeliveryFailures.contains { $0.scope == .operation(.manualDelivery) }
+    }
+
+    private var pendingMailboxCheckpointWrite: MailboxAckCheckpointWrite? {
+        currentMailboxDeliveryFailures.last { $0.checkpointWrite != nil }?.checkpointWrite
+    }
+
+    private func recoveredMailboxFailureIDs(
+        _ failures: [MailboxDeliveryDiagnosticLine]
+    ) -> Set<String> {
+        guard usesMailboxTransport, let outbox, let bindingID = settingsStore.receiverBindingID else { return [] }
+        let generation = settingsStore.receiverSettingsGenerationToken
+        var expected: [String: OutboxDeliveryOwnershipV1] = [:]
+        for failure in failures {
+            guard case .item(let itemID) = failure.scope, let ownership = failure.itemOwnership,
+                  ownership.receiverBindingID == bindingID, ownership.receiverGeneration == generation else { continue }
+            expected[itemID] = ownership
+        }
+        guard !expected.isEmpty else { return [] }
+        return (try? outbox.recoveredMailboxFinalizationIDs(matching: expected)) ?? []
+    }
+
+    private func mailboxCheckpointWrite(
+        startingCheckpoint: String?, nextCheckpoint: String?, generation: String
+    ) -> MailboxAckCheckpointWrite? {
+        let current = backgroundSyncStore.mailboxAckScanCheckpoint(receiverGeneration: generation)
+        if let retry = pendingMailboxCheckpointWrite, retry.canRetry(from: current) {
+            return retry
+        }
+        guard let nextCheckpoint, current == startingCheckpoint else { return nil }
+        return MailboxAckCheckpointWrite(startingCheckpoint: startingCheckpoint, checkpoint: nextCheckpoint)
+    }
+
+    @discardableResult
+    private func publishMailboxDeliveryFailure(
+        _ error: Error, generation: String, operation: MailboxDeliveryOperation? = nil
+    ) -> String {
+        let diagnostic = MailboxDeliveryDiagnosticLine.failure(
+            for: error, generation: generation, operation: operation
+        )
+        let earlier = currentMailboxDeliveryFailures.filter { $0.scope != diagnostic.scope }
+        // A delivery pass can commit an earlier item and then throw before returning a summary.
+        let recovered = recoveredMailboxFailureIDs(earlier)
+        mailboxDeliveryDiagnosticLines = earlier.filter {
+            if case .item(let itemID) = $0.scope { return !recovered.contains(itemID) }
+            return true
+        } + [diagnostic]
+        return diagnostic.message
+    }
+
+    private func publishMailboxDeliverySummary(
+        _ message: String, finalizedItemIDs: Set<String>, completedOperations: Set<MailboxDeliveryOperation>
+    ) {
+        let failures = currentMailboxDeliveryFailures
+        let recovered = recoveredMailboxFailureIDs(failures)
+        let unresolved = failures.filter { diagnostic in
+            switch diagnostic.scope {
+            case .item(let itemID):
+                if diagnostic.itemOwnership != nil { return !recovered.contains(itemID) }
+                return !finalizedItemIDs.contains(itemID)
+            case .operation(let operation):
+                return !completedOperations.contains(operation)
+            case .unattributed, nil:
+                return true
+            }
+        }
+        mailboxDeliveryDiagnosticLines = unresolved.isEmpty ? [.summary(message)] : unresolved
     }
 
     private static func mailboxDeliveryMessage(
@@ -7700,6 +7849,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func describe(_ error: Error) -> String {
+        if error is MailboxAckCheckpointWrite {
+            return describe(BackgroundSyncSettingsStoreError.persistenceFailed)
+        }
+        if let mailboxError = error as? ProductionMailboxItemDeliveryError {
+            return describe(mailboxError.phase)
+        }
         if error is SleepStorageOperationFailure {
             return "Private Sleep synchronization state could not be persisted. Retry when private storage is available."
         }

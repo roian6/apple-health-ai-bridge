@@ -322,6 +322,195 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         }
     }
 
+    func testScheduledMailboxPassRetainsReconciliationFailureUntilMatchingCommit() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let bindingID = fixture.identity.opaqueBinding
+        let headType = "dietary_protein"
+        let tailType = "weight"
+        try background.markPendingObserverTypeCodes([headType, tailType])
+        let debt = try background.loadPendingObserverTypeCodeGenerations()
+        let headGeneration = try XCTUnwrap(debt[headType])
+        let tailGeneration = try XCTUnwrap(debt[tailType])
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: bindingID, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: GenericQuantitySyncBatchFactory.anchoredCursorKind(for: headType),
+            cursorValue: fixture.base.anchor
+        )
+        let outbox = fixture.base.outbox
+        let head = try XCTUnwrap(outbox.enqueueSequence(
+            [JSONEncoder().encode(fixture.base.mixedBatch())], receiverIdentity: bindingID,
+            cursorCheckpoint: checkpoint, pendingGenerationRetirements: [headType: headGeneration]
+        ).first)
+        let tail = try XCTUnwrap(outbox.enqueueSequence(
+            [JSONEncoder().encode(fixture.base.mixedBatch(workoutEnergy: 20))], receiverIdentity: bindingID,
+            pendingGenerationRetirements: [tailType: tailGeneration]
+        ).first)
+        fixture.beforeTransportLocate = {
+            if try outbox.pendingItem(id: head.id)?.deliveryState?.phase == .published {
+                throw MailboxLocatorError.symbolicLink
+            }
+        }
+        do {
+            _ = try await fixture.delivery().publishPendingFIFOHead()
+            XCTFail("Expected the provider lookup to fail after durable publication")
+        } catch let error as ProductionMailboxItemDeliveryError {
+            XCTAssertEqual(error.phase, .initialAdvance)
+            XCTAssertEqual(error.itemID, head.id)
+        }
+        let published = try XCTUnwrap(outbox.pendingItem(id: head.id))
+        XCTAssertEqual(published.deliveryState?.phase, .published)
+        let viewModel = try await fixture.base.makeViewModel(mailbox: fixture, eligibleTypeCodes: [])
+        XCTAssertTrue(viewModel.automaticSyncRuntimeIsReady)
+        viewModel.runForegroundMailboxReconciliationIfNeeded()
+        await viewModel.waitForBootstrapAndForegroundWork()
+        let failure = try XCTUnwrap(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(failure.contains("phase=initial_advance"))
+
+        fixture.beforeTransportLocate = nil
+        let envelopeID = try fixture.components().transport.finalizedEnvelopeID(itemID: head.id)
+        let ackName = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .acknowledgment)
+        let ackURL = try XCTUnwrap(fixture.locator.lanes[.acks]).appendingPathComponent(ackName)
+        try Data("unverifiable synthetic receipt".utf8).write(to: ackURL, options: .atomic)
+        let inspectedHeadCandidate = OSAllocatedUnfairLock(initialState: false)
+        fixture.prepareAckCandidate = { url in
+            if url.lastPathComponent == ackName {
+                inspectedHeadCandidate.withLock { $0 = true }
+            }
+            return MailboxAckScanner.prepareCandidateForBoundedRead(url)
+        }
+        // Drive the scheduled opportunity on the already bootstrapped model, without
+        // activating a foreground catch-up or re-running bootstrap's outbox scheduler.
+        let runtime = AutomaticSyncRuntime(
+            viewModel: viewModel, platform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+
+        XCTAssertTrue(inspectedHeadCandidate.withLock { $0 }, "The scheduled pass must reach ACK reconciliation")
+        let run = try XCTUnwrap(background.lastRun)
+        XCTAssertNotNil(run.finishedAt)
+        XCTAssertEqual(run.outcome, .interrupted)
+        XCTAssertEqual(viewModel.activityMailboxFailureMessage, failure)
+        XCTAssertEqual(viewModel.activityStatusDetail, failure)
+        XCTAssertEqual(viewModel.syncPresentation.phase, .mailboxConfirmationWaiting)
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [head.id, tail.id])
+        let waiting = try XCTUnwrap(outbox.pendingItem(id: head.id))
+        XCTAssertEqual(waiting.deliveryState?.phase, .providerObserved)
+        XCTAssertEqual(waiting.mailboxBinding, published.mailboxBinding)
+        XCTAssertNil(try outbox.pendingItem(id: tail.id)?.mailboxBinding)
+        XCTAssertEqual(try outbox.pendingCursorCheckpoint(), checkpoint)
+        XCTAssertNil(try fixture.base.cursor(headType))
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), debt)
+
+        _ = try fixture.receiveAndAcknowledge(waiting)
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+
+        XCTAssertNil(viewModel.activityMailboxFailureMessage)
+        let observation = try XCTUnwrap(viewModel.lastAcceptedTransferObservation)
+        XCTAssertEqual(observation.evidenceKind, .mailboxCommit)
+        XCTAssertEqual(observation.bindingID, bindingID)
+        XCTAssertEqual(observation.generation, fixture.base.settings.receiverSettingsGenerationToken)
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [tail.id])
+        XCTAssertNil(try outbox.pendingCursorCheckpoint())
+        XCTAssertEqual(try fixture.base.cursor(headType), fixture.base.anchor)
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), [tailType: tailGeneration])
+    }
+
+    func testScheduledMailboxCommitDoesNotClearAnotherItemsManualFailure() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let outbox = fixture.base.outbox
+        let bindingID = fixture.identity.opaqueBinding
+        let head = try outbox.enqueue(JSONEncoder().encode(fixture.base.mixedBatch()), receiverIdentity: bindingID)
+        let tail = try outbox.enqueue(
+            JSONEncoder().encode(fixture.base.mixedBatch(workoutEnergy: 20)), receiverIdentity: bindingID
+        )
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let waitingHead = try XCTUnwrap(outbox.pendingItem(id: head.id))
+        XCTAssertEqual(waitingHead.deliveryState?.phase, .providerObserved)
+        XCTAssertNil(try outbox.pendingItem(id: tail.id)?.mailboxBinding)
+
+        let viewModel = try await fixture.base.makeViewModel(mailbox: fixture, eligibleTypeCodes: [])
+        XCTAssertTrue(viewModel.automaticSyncRuntimeIsReady)
+        XCTAssertNil(viewModel.activityMailboxFailureMessage)
+        fixture.beforeTransportLocate = {
+            if try outbox.pendingItem(id: tail.id)?.deliveryState?.phase == .published {
+                throw MailboxLocatorError.symbolicLink
+            }
+        }
+        await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        let failure = try XCTUnwrap(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(failure.contains("phase=initial_advance"))
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [head.id, tail.id])
+        let failedTail = try XCTUnwrap(outbox.pendingItem(id: tail.id))
+        XCTAssertEqual(failedTail.deliveryState?.phase, .published)
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+
+        fixture.beforeTransportLocate = nil
+        _ = try fixture.receiveAndAcknowledge(waitingHead)
+        let runtime = AutomaticSyncRuntime(
+            viewModel: viewModel, platform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        fixture.ackScanFault = { boundary in
+            if boundary == .beforeCandidateOpen { throw MailboxAckScannerError.unsafeMailbox }
+        }
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+
+        let headFailure = try XCTUnwrap(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(headFailure.contains("phase=scan_ack"))
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [head.id, tail.id])
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+
+        fixture.ackScanFault = { _ in }
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+
+        let headAcceptance = try XCTUnwrap(viewModel.lastAcceptedTransferObservation)
+        XCTAssertEqual(headAcceptance.evidenceKind, .mailboxCommit)
+        XCTAssertEqual(headAcceptance.bindingID, bindingID)
+        XCTAssertEqual(headAcceptance.generation, fixture.base.settings.receiverSettingsGenerationToken)
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [tail.id])
+        let waitingTail = try XCTUnwrap(outbox.pendingItem(id: tail.id))
+        XCTAssertEqual(waitingTail.deliveryState?.phase, .providerObserved)
+        XCTAssertEqual(waitingTail.mailboxBinding, failedTail.mailboxBinding)
+        XCTAssertEqual(viewModel.activityMailboxFailureMessage, failure,
+                       "A committed, but B has only been observed by the provider")
+
+        let previousAcceptance = LastAcceptedTransferObservation(
+            bindingID: bindingID, generation: headAcceptance.generation,
+            observedAt: Date(timeIntervalSinceReferenceDate: 234_567), evidenceKind: .mailboxCommit
+        )
+        fixture.base.acceptedTransferStore.record(previousAcceptance)
+        _ = try fixture.receiveAndAcknowledge(waitingTail)
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+
+        XCTAssertNil(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let tailAcceptance = try XCTUnwrap(viewModel.lastAcceptedTransferObservation)
+        XCTAssertNotEqual(tailAcceptance, previousAcceptance)
+        XCTAssertEqual(tailAcceptance.evidenceKind, .mailboxCommit)
+        XCTAssertEqual(tailAcceptance.bindingID, bindingID)
+        XCTAssertEqual(tailAcceptance.generation, headAcceptance.generation)
+    }
+
     func testAuthenticatedMailboxCommitRecordsAcceptedTransfer() async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
@@ -370,6 +559,131 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(fixture.base.receiver.batches.count, batches)
     }
 
+    func testMailboxArtifactCleanupRecoveryRequiresExactCommittedProof() async throws {
+        let files = MailboxEnvelopeRemovalFailure()
+        let fixture = try NutritionMailboxFixture(nativePairing: true, outboxFileManager: files)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let outbox = fixture.base.outbox
+        let bindingID = fixture.identity.opaqueBinding
+        let unrelated = try outbox.enqueue(JSONEncoder().encode(fixture.base.mixedBatch()), receiverIdentity: bindingID)
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        _ = try fixture.receiveAndAcknowledge(unrelated)
+        let viewModel = try await fixture.base.makeViewModel(mailbox: fixture, eligibleTypeCodes: [])
+        let runtime = AutomaticSyncRuntime(
+            viewModel: viewModel, platform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let unrelatedAcceptance = try XCTUnwrap(viewModel.lastAcceptedTransferObservation)
+        let manifestURL = outbox.directoryURL.appendingPathComponent(".fifo-sequence")
+        let unrelatedOnly = try Data(contentsOf: manifestURL)
+
+        let failed = try fixture.base.enqueueMixed(workoutEnergy: 20)
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let published = try XCTUnwrap(outbox.pendingItem(id: failed.id))
+        _ = try fixture.receiveAndAcknowledge(published)
+        let binding = try XCTUnwrap(published.mailboxBinding)
+        let envelope = outbox.directoryURL.appendingPathComponent(binding.envelopeFilename)
+        let receiptCount = fixture.base.receiver.batches.count
+        files.rejectNextRemoval = envelope
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+
+        XCTAssertEqual(files.rejectedRemoval, envelope)
+        let failure = try XCTUnwrap(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(failure.contains("phase=consume_ack"))
+        XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
+        XCTAssertEqual(viewModel.lastAcceptedTransferObservation, unrelatedAcceptance)
+
+        let reopened = try FileOutbox(directory: outbox.directoryURL)
+        XCTAssertTrue(try reopened.pendingItems().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: envelope.path))
+        let committed = try XCTUnwrap(reopened.deliveryState(for: failed.id))
+        XCTAssertEqual(committed.phase, .committedFinalized)
+        XCTAssertEqual(committed.ownership?.receiverBindingID, bindingID)
+        XCTAssertEqual(committed.ownership?.receiverGeneration, fixture.base.settings.receiverSettingsGenerationToken)
+        XCTAssertEqual(committed.committedReceipt?.payloadSHA256, binding.payloadSHA256)
+        let repaired = try Data(contentsOf: manifestURL)
+
+        // An older local snapshot contains an authentic commit for the same receiver,
+        // but not for the failed item. The FIFO is empty in both snapshots.
+        try unrelatedOnly.write(to: manifestURL, options: .atomic)
+        XCTAssertNil(try reopened.deliveryState(for: failed.id))
+        XCTAssertEqual(try reopened.deliveryState(for: unrelated.id)?.phase, .committedFinalized)
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        XCTAssertEqual(viewModel.activityMailboxFailureMessage, failure)
+
+        try repaired.write(to: manifestURL, options: .atomic)
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        XCTAssertNil(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(try reopened.pendingItems().isEmpty)
+        XCTAssertEqual(viewModel.lastAcceptedTransferObservation, unrelatedAcceptance)
+        XCTAssertEqual(fixture.base.receiver.batches.count, receiptCount)
+    }
+
+    func testManualMailboxScanFailureRequiresSuccessfulFullScanEvenWithEmptyFIFO() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try background.setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let item = try fixture.base.enqueueMixed()
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let pending = try XCTUnwrap(fixture.base.outbox.pendingItem(id: item.id))
+        _ = try fixture.receiveAndAcknowledge(pending)
+        let viewModel = try await fixture.base.makeViewModel(
+            mailbox: fixture, eligibleTypeCodes: [],
+            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) }
+        )
+        var rejectFullScan = true
+        var fullScanOpened = false
+        fixture.ackScanFault = { boundary in
+            guard boundary == .laneOpened else { return }
+            fullScanOpened = true
+            if rejectFullScan { throw MailboxAckScannerError.unsafeMailbox }
+        }
+        await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertTrue(fullScanOpened)
+        let failure = try XCTUnwrap(viewModel.activityMailboxFailureMessage)
+        XCTAssertTrue(failure.contains("phase=scan_ack"))
+        XCTAssertEqual(try fixture.base.outbox.pendingItems().map(\.id), [item.id])
+        XCTAssertNil(viewModel.lastAcceptedTransferObservation)
+
+        fullScanOpened = false
+        let runtime = AutomaticSyncRuntime(
+            viewModel: viewModel, platform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        XCTAssertFalse(fullScanOpened, "The successful exact-head ACK is not a full scan retry")
+        XCTAssertEqual(viewModel.activityMailboxFailureMessage, failure)
+        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+        let acceptance = try XCTUnwrap(viewModel.lastAcceptedTransferObservation)
+        XCTAssertEqual(acceptance.evidenceKind, .mailboxCommit)
+
+        rejectFullScan = false
+        await viewModel.performManualSyncOpportunity(processPendingTypes: { false })
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertTrue(fullScanOpened, "Retry must execute the full scan even with an empty FIFO")
+        XCTAssertNil(viewModel.activityMailboxFailureMessage)
+        XCTAssertEqual(viewModel.lastAcceptedTransferObservation, acceptance)
+        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
+    }
+
     func testMailboxCommitRecordsAcceptedTransferWhenScanCheckpointWriteFails() async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
@@ -388,9 +702,13 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         _ = try await fixture.delivery().publishPendingFIFOHead()
         let pending = try XCTUnwrap(fixture.base.outbox.pendingItem(id: item.id))
         XCTAssertEqual(pending.deliveryState?.phase, .providerObserved)
-        let vm = try await fixture.base.makeViewModel(mailbox: fixture, backgroundSyncStore: background)
+        let vm = try await fixture.base.makeViewModel(
+            mailbox: fixture, backgroundSyncStore: background, eligibleTypeCodes: []
+        )
         XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
         XCTAssertNil(vm.lastAcceptedTransferObservation)
+        let generation = fixture.base.settings.receiverSettingsGenerationToken
+        XCTAssertNil(background.mailboxAckScanCheckpoint(receiverGeneration: generation))
         _ = try fixture.receiveAndAcknowledge(pending)
         // Simulate the ACK becoming readable between the exact probe and the bounded scan.
         let skipExactProbe = OSAllocatedUnfairLock(initialState: true)
@@ -414,6 +732,31 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         let observation = try XCTUnwrap(vm.lastAcceptedTransferObservation)
         XCTAssertEqual(observation.evidenceKind, .mailboxCommit)
         XCTAssertEqual(observation.bindingID, fixture.identity.opaqueBinding)
+        let failure = try XCTUnwrap(vm.activityMailboxFailureMessage)
+        let rejectedCheckpoint = try XCTUnwrap(defaults.rejectedCheckpoint)
+        XCTAssertNil(background.mailboxAckScanCheckpoint(receiverGeneration: generation))
+
+        defaults.rejectScanCheckpoint = false
+        vm.schedulePendingBackgroundOutboxUploadsIfAllowed()
+        await vm.waitForBootstrapAndForegroundWork()
+        XCTAssertEqual(vm.activityMailboxFailureMessage, failure, "Publication is not a checkpoint retry")
+        XCTAssertNil(background.mailboxAckScanCheckpoint(receiverGeneration: generation))
+
+        let runtime = AutomaticSyncRuntime(
+            viewModel: vm, platform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        let competingCheckpoint = "synthetic-different-scan-position"
+        try background.persistMailboxAckScanCheckpoint(competingCheckpoint, receiverGeneration: generation)
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), competingCheckpoint)
+        XCTAssertEqual(vm.activityMailboxFailureMessage, failure, "A retry must not overwrite a changed scan position")
+
+        defaults.removeObject(forKey: ScanCheckpointRejectingDefaults.checkpointKey)
+        await runtime.runAutomaticSync(reason: .scheduledRefresh)
+        XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), rejectedCheckpoint)
+        XCTAssertNil(vm.activityMailboxFailureMessage)
+        XCTAssertEqual(vm.lastAcceptedTransferObservation, observation)
+        XCTAssertTrue(try fixture.base.outbox.pendingItems().isEmpty)
     }
 
     func testForegroundMailboxSleepRequiresProofForTheTrackedItem() async throws {
@@ -715,14 +1058,31 @@ private final class UnavailableObservationDefaults: UserDefaults, @unchecked Sen
     }
 }
 
+private final class MailboxEnvelopeRemovalFailure: FileManager, @unchecked Sendable {
+    var rejectNextRemoval: URL?
+    private(set) var rejectedRemoval: URL?
+
+    override func removeItem(at url: URL) throws {
+        if url == rejectNextRemoval {
+            rejectNextRemoval = nil
+            rejectedRemoval = url
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        try super.removeItem(at: url)
+    }
+}
+
 private final class ScanCheckpointRejectingDefaults: UserDefaults, @unchecked Sendable {
+    static let checkpointKey = "healthBridge.backgroundSync.mailboxAckScanCheckpoint"
     var rejectScanCheckpoint = false
     private var hasRejectedCheckpointWrite = false
+    private(set) var rejectedCheckpoint: String?
     private(set) var rejectedSynchronizations = 0
 
     override func set(_ value: Any?, forKey defaultName: String) {
-        if rejectScanCheckpoint, defaultName == "healthBridge.backgroundSync.mailboxAckScanCheckpoint" {
+        if rejectScanCheckpoint, defaultName == Self.checkpointKey {
             hasRejectedCheckpointWrite = true
+            rejectedCheckpoint = value as? String
             return
         }
         super.set(value, forKey: defaultName)

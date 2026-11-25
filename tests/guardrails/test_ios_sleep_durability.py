@@ -66,14 +66,27 @@ def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() 
     track = helper.index(
         "try await store.savePendingForSync(trackedTransition, validate: validate)"
     )
-    refresh = helper.index("snapshot.fifo = try outbox.pendingItems()", track)
+    flush = helper.index("upload = try await uploadPendingOutbox(", track)
+    refresh = helper.index("snapshot.fifo = try outbox.pendingItems()", flush)
     held = helper.index(
         "if snapshot.fifo.contains(where: { $0.id == outboxItemID })", refresh
     )
-    routes = helper.index("if target.route == .mailbox {", held)
+    # Stop at the queued branch's own closing brace, not at the first
+    # reference to a route (which could itself be a premature success).
+    body_end = helper.index("\n        }", held)
+    queued_body = helper[held:body_end]
+    routes = helper.index("if target.route == .mailbox {", body_end)
     assert enqueue < track < refresh < held
     assert "if enqueueResult.wasInserted" in helper[track:held]
-    assert "return false" in helper[held:routes]
+    # From the upload through the final queue check, even a recovery/error
+    # branch may report only noncompletion.
+    assert all(
+        outcome.group(1).strip() == "false"
+        for outcome in re.finditer(r"\breturn\b([^\n]*)", helper[flush:held])
+    )
+    assert queued_body.splitlines()[0].endswith("outboxItemID }) {")
+    assert queued_body.splitlines()[-1] == "            return false"
+    assert re.findall(r"\breturn\b", queued_body) == ["return"]
     # Absence alone is not acceptance. A different successful item in the
     # same Direct flush cannot complete the tracked transition.
     accepted = helper.index(
@@ -160,7 +173,7 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
     helper = source[end:perform_start]
     destructive_intent = helper.index("try FileOutbox.beginDestructiveRecovery(")
     invalidate_evidence = helper.index("try acceptedTransferStore.clear()")
-    finish = helper.index("return try FileOutbox.completeConfirmedTerminalReset(")
+    finish = helper.index("try FileOutbox.completeConfirmedTerminalReset(")
     assert destructive_intent < invalidate_evidence < finish
     for required_reset in (
         "try sleepManifestStore.resetSynchronizationState()",

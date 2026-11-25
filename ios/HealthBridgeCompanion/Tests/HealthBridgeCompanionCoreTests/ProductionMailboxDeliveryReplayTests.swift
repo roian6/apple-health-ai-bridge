@@ -310,7 +310,9 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
             assertCancelled(result)
         } else {
             XCTAssertThrowsError(try result.get()) { error in
-                XCTAssertEqual(error as? ProductionMailboxDeliveryPhaseError, .initialAdvance)
+                let failure = error as? ProductionMailboxItemDeliveryError
+                XCTAssertEqual(failure?.phase, .initialAdvance)
+                XCTAssertEqual(failure?.itemID, fixture.first.id)
             }
         }
         XCTAssertTrue(barrier.observation().entered)
@@ -1432,8 +1434,9 @@ final class ProductionMailboxPerformanceTests: XCTestCase {
         do {
             _ = try await fixture.delivery().publishPendingFIFOHead()
             XCTFail("Stale ownership must reject before observation")
-        } catch let error as ProductionMailboxDeliveryPhaseError {
-            XCTAssertEqual(error, .initialAdvance)
+        } catch let error as ProductionMailboxItemDeliveryError {
+            XCTAssertEqual(error.phase, .initialAdvance)
+            XCTAssertEqual(error.itemID, fixture.first.id)
         }
         XCTAssertEqual(observations, 0)
         XCTAssertEqual(try fixture.outbox.pendingItems(), before)
@@ -1460,8 +1463,9 @@ final class ProductionMailboxPerformanceTests: XCTestCase {
         do {
             _ = try await fixture.delivery().publishPendingFIFOHead()
             XCTFail("Observation must not replace a competing state write")
-        } catch let error as ProductionMailboxDeliveryPhaseError {
-            XCTAssertEqual(error, .initialAdvance)
+        } catch let error as ProductionMailboxItemDeliveryError {
+            XCTAssertEqual(error.phase, .initialAdvance)
+            XCTAssertEqual(error.itemID, fixture.first.id)
         }
         XCTAssertEqual(observations, 1)
         XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id), competing)

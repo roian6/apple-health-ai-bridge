@@ -5,6 +5,58 @@ import XCTest
 
 @MainActor
 final class DirectSleepFinalizationTests: XCTestCase {
+    func testRetiredPlainDirectJournalCleanupRequiresMatchingBinding() throws {
+        let f = try DirectSleepFinalizationFixture()
+        defer { f.remove() }
+        let directory = f.root.appendingPathComponent("plain-outbox")
+        let journal = directory.appendingPathComponent(".enqueue-transaction")
+        let oldBinding = "receiver-a"
+        let newBinding = "receiver-b"
+        let payload = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make(
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        let writer = try FileOutbox(directory: directory)
+        let item = try writer.enqueue(payload, receiverIdentity: oldBinding)
+        let cursors = try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("cursors.json"))
+        let interrupted = OutboxDeliveryCursorFinalizer(
+            outbox: try FileOutbox(
+                directory: directory, fileManager: JournalRemovalFault(journal, afterUnlink: false)
+            ),
+            cursorStore: cursors, pendingGenerationStore: f.background
+        )
+        var observedAcceptances = 0
+        XCTAssertThrowsError(try interrupted.recordDirectReceiverAcceptance(
+            itemID: item.id, receiverBindingID: oldBinding, sleepChecked: true,
+            onNewAcceptance: { observedAcceptances += 1 }
+        )) { XCTAssertTrue($0 is JournalRemovalFault.Interruption) }
+        XCTAssertEqual(observedAcceptances, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.fileURL.path))
+
+        let outbox = try FileOutbox(directory: directory)
+        let recovered = OutboxDeliveryCursorFinalizer(
+            outbox: outbox, cursorStore: cursors, pendingGenerationStore: f.background
+        )
+        let receipt = try XCTUnwrap(outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertEqual(receipt.itemIDs, [item.id])
+        XCTAssertNil(receipt.cursorCheckpoint)
+        XCTAssertTrue(receipt.pendingGenerationRetirements.isEmpty)
+        XCTAssertNil(try outbox.directSleepCleanupIntent(for: receipt))
+        XCTAssertTrue(try outbox.hasDirectAcknowledgmentWithSleepChecked(itemID: item.id, receiverIdentity: oldBinding))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let journalBefore = try Data(contentsOf: journal)
+        XCTAssertFalse(try recovered.finalizeDirectAcknowledgments(receiverBindingID: newBinding))
+        XCTAssertFalse(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: nil))
+        XCTAssertFalse(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: newBinding))
+        XCTAssertEqual(try Data(contentsOf: journal), journalBefore)
+
+        XCTAssertTrue(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: oldBinding))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
+        XCTAssertEqual(try f.sleep.loadPendingTransition(), f.pending)
+    }
+
     func testDirectRecoveryCleansAcceptedSleepBeforeNextItemInCheckpointTransaction() async throws {
         let checkpoint = FileOutboxCursorCheckpoint(
             receiverIdentity: "receiver-a", sourceKey: "synthetic-source",
@@ -76,6 +128,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
         XCTAssertEqual(try outbox.pendingItems().map(\.id), [b.id])
         XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: a.receiverBindingID))
+        XCTAssertFalse(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: a.receiverBindingID))
         XCTAssertEqual(try cursorValue(), previousCursor)
         XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), f.generations)
         let uploadableIDs = try outbox.uploadablePendingItems(for: a.receiverBindingID).map(\.id)
@@ -116,6 +169,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
             pendingGenerationStore: f.background
         )
         XCTAssertNil(try sleep.loadPendingTransition())
+        XCTAssertFalse(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: d.receiverBindingID))
         let finished = try await recovered.finalizeDirectAcknowledgments(
             receiverBindingID: d.receiverBindingID, receiverGeneration: d.receiverGeneration,
             sleepStore: sleep, validate: {}

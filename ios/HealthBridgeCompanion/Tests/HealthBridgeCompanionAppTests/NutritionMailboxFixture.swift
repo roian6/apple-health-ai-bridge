@@ -49,10 +49,11 @@ final class NutritionMailboxFixture {
     var envelopeNumber: UInt8 = 0
     var capabilityReadIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in })
     var beforeTransportLocate: (() throws -> Void)?
+    var ackScanFault: MailboxAckScanner.Fault = { _ in }
     var prepareAckCandidate = MailboxAckScanner.prepareCandidateForBoundedRead
 
-    init(nativePairing: Bool = false) throws {
-        base = try NutritionFixture(directPairing: !nativePairing)
+    init(nativePairing: Bool = false, outboxFileManager: FileManager = .default) throws {
+        base = try NutritionFixture(directPairing: !nativePairing, outboxFileManager: outboxFileManager)
         keys = MailboxKeyStore(service: base.suite, keychain: NutritionKeychain())
         let device = try keys.loadOrCreate()
         let receiverID = Data(repeating: 0x71, count: 16)
@@ -156,18 +157,21 @@ final class NutritionMailboxFixture {
             identity: identity, deviceSigningPublicKey: context.deviceSigningPublicKey, ackContext: context,
             transport: transport, ackLookup: lookup,
             scanner: MailboxAckScanner(
-                context: context, lookup: lookup, locate: { location }, fault: { _ in },
+                context: context, lookup: lookup, locate: { location }, fault: ackScanFault,
                 prepareCandidate: prepareAckCandidate
             ),
             locate: { location }
         )
     }
 
-    func delivery(sleepStore: FileSleepSyncManifestStore? = nil) -> ProductionMailboxDelivery {
+    func delivery(
+        pendingGenerationStore: BackgroundSyncSettingsStore? = nil,
+        sleepStore: FileSleepSyncManifestStore? = nil
+    ) -> ProductionMailboxDelivery {
         let components = components()
         return ProductionMailboxDelivery(
             settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
-            pendingGenerationStore: BackgroundSyncSettingsStore(userDefaults: base.defaults),
+            pendingGenerationStore: pendingGenerationStore ?? BackgroundSyncSettingsStore(userDefaults: base.defaults),
             sleepStore: sleepStore,
             keyStore: keys, componentsFactory: { components }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
         )
