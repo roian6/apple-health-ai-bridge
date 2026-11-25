@@ -4192,7 +4192,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
-    private static let mailboxStepsProjectionTurnCursorKind = "mailbox_steps_projection_turn"
+    private struct MailboxStepsProjectionTurn {
+        static let cursorKind = "mailbox_steps_projection_turn"
+        static let rawYieldSuffix = "\nraw"
+
+        let store: FileSyncCursorStore
+        let scope: ReceiverSyncProgressScope
+        let acknowledgedValue: String
+        let yieldsToRaw: Bool
+
+        func save(_ value: String) throws {
+            try store.saveCursorValue(
+                value, receiverBindingID: scope.receiverBindingID,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: Self.cursorKind
+            )
+        }
+    }
 
     private func processAutomaticStepRepresentations(
         pendingGeneration: Int
@@ -4230,7 +4245,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
 
-            let acknowledgedMailboxTurn = mailbox ? try takeMailboxStepsProjectionTurn() : false
+            let mailboxTurn = mailbox ? try mailboxStepsProjectionTurn() : nil
+            let acknowledgedMailboxTurn = mailboxTurn?.yieldsToRaw == false
+            if let mailboxTurn, mailboxTurn.yieldsToRaw {
+                // Offer raw one attempt. A failed raw read must leave daily eligible;
+                // a newly enqueued raw payload still has to clear FIFO before daily can run.
+                try mailboxTurn.save(mailboxTurn.acknowledgedValue)
+            }
             // A raw ACK from this opportunity covers only the generation that produced it.
             if !acknowledgedMailboxTurn, automaticDirectRawStepsGeneration != pendingGeneration {
                 let raw = await performRecentStepCounts(executionMode: .automatic)
@@ -4274,6 +4295,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 stepsRawAndDailyCoverage: !acknowledgedMailboxTurn
             )
             try requireCurrentConnectionGeneration(expectedGeneration)
+            if let mailboxTurn {
+                try requireCurrentReceiverSyncProgressScope(mailboxTurn.scope)
+                switch daily {
+                case .noPayload, .accepted, .queued:
+                    // Even empty statistics enqueue a durable observation.
+                    try mailboxTurn.save("")
+                case .failed:
+                    try mailboxTurn.save(mailboxTurn.acknowledgedValue + MailboxStepsProjectionTurn.rawYieldSuffix)
+                }
+            }
             switch daily {
             case .noPayload:
                 return .unknownAvailabilityCovering(pendingGenerationRetirements)
@@ -4290,27 +4321,28 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
-    private func takeMailboxStepsProjectionTurn() throws -> Bool {
+    private func mailboxStepsProjectionTurn() throws -> MailboxStepsProjectionTurn? {
         let (store, scope) = try captureReceiverSyncProgressScope()
         let binding = scope.receiverBindingID
         let source = HealthBridgeAppleHealthSource.phone.sourceKey
-        let turnKind = Self.mailboxStepsProjectionTurnCursorKind
         guard let turn = try store.cursorValue(
-            receiverBindingID: binding, sourceKey: source, cursorKind: turnKind
-        ), !turn.isEmpty else { return false }
+            receiverBindingID: binding, sourceKey: source, cursorKind: MailboxStepsProjectionTurn.cursorKind
+        ), !turn.isEmpty else { return nil }
         for kind in [
             StepCountSyncBatchFactory.anchoredCursorKind,
             GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps"),
         ] {
             guard let acknowledged = try store.cursorValue(
                 receiverBindingID: binding, sourceKey: source, cursorKind: kind
-            ), turn == "\(scope.connectionGeneration)\n\(kind)\n\(acknowledged)" else { continue }
-            // Spend the scheduling turn even if statistics are unavailable so the
-            // next opportunity can read raw. Projection repair still requires its ACK.
-            try store.saveCursorValue("", receiverBindingID: binding, sourceKey: source, cursorKind: turnKind)
-            return true
+            ) else { continue }
+            let acknowledgedValue = "\(scope.connectionGeneration)\n\(kind)\n\(acknowledged)"
+            let yieldsToRaw = turn == acknowledgedValue + MailboxStepsProjectionTurn.rawYieldSuffix
+            guard turn == acknowledgedValue || yieldsToRaw else { continue }
+            return MailboxStepsProjectionTurn(
+                store: store, scope: scope, acknowledgedValue: acknowledgedValue, yieldsToRaw: yieldsToRaw
+            )
         }
-        return false
+        return nil
     }
 
     private func automaticStepReadFailureResult(
@@ -4977,7 +5009,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 try cursorStore.saveCursorValue(
                     "\(target.generation)\n\(cursorCheckpoint.cursorKind)\n\(cursorCheckpoint.cursorValue)",
                     receiverBindingID: receiverBindingID, sourceKey: sourceKey,
-                    cursorKind: Self.mailboxStepsProjectionTurnCursorKind
+                    cursorKind: MailboxStepsProjectionTurn.cursorKind
                 )
             }
             failureStage = .transport
@@ -5929,15 +5961,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         try validate()
         var trackedTransition = pendingTransition
         let trackedItemExists = snapshot.fifo.contains { $0.id == pendingTransition.outboxItemID }
-        // A retired item with an unchecked ACK must go through recovery, even before
-        // a cleanup intent exists. If the journal cannot be verified, keep it for recovery.
-        if case .directHTTP = target.route, !trackedItemExists,
+        // A scoped cleanup intent still owns its place in the FIFO. An older,
+        // unchecked ACK can also need recovery after its payload was removed.
+        if case .directHTTP = target.route,
            let itemID = pendingTransition.outboxItemID,
            try (outbox.hasDirectSleepCleanupIntent(
                itemID: itemID, receiverBindingID: target.bindingID, receiverGeneration: target.generation
-           ) || outbox.hasUncheckedDirectAcknowledgment(
+           ) || (!trackedItemExists && outbox.hasUncheckedDirectAcknowledgment(
                itemID: itemID, receiverBindingID: target.bindingID
-           )) {
+           ))) {
             try await finishAcceptedSleep(itemID: itemID)
             refreshPendingOutboxCount()
             statusIsError = false
@@ -7121,9 +7153,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 guard try outbox.preparedNutritionPayload(for: item)?.revision == prepared?.revision else {
                     throw CancellationError()
                 }
+                let recordAcceptance = { @MainActor in
+                    self.recordAcceptedTransfer(
+                        bindingID: receiverIdentity, generation: expectedGeneration, evidenceKind: .directResponse
+                    )
+                }
                 if prepared?.mayContainSleep == false {
                     _ = try cursorFinalizer.recordDirectReceiverAcceptance(
-                        itemID: item.id, receiverBindingID: receiverIdentity, sleepChecked: true
+                        itemID: item.id, receiverBindingID: receiverIdentity, sleepChecked: true,
+                        onNewAcceptance: recordAcceptance
                     )
                 } else {
                     guard let store = sleepManifestStore else {
@@ -7143,20 +7181,16 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             validate: {
                                 try self.requireCurrentPayloadDeliveryTarget(target)
                                 try self.validateSleepOperationContext(snapshot, store: store, outbox: outbox)
+                            }, validatePending: {
                                 guard try outbox.pendingItems() == snapshot.fifo,
                                       try outbox.preparedNutritionPayload(for: item)?.revision == prepared?.revision else {
                                     throw CancellationError()
                                 }
-                            }
+                            }, onNewAcceptance: recordAcceptance
                         )
                     }
                 }
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .accepted)
-                recordAcceptedTransfer(
-                    bindingID: receiverIdentity,
-                    generation: expectedGeneration,
-                    evidenceKind: .directResponse
-                )
                 acceptedDirectItemIDs.insert(item.id)
             } catch let cancellation as CancellationError {
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .cancelled)

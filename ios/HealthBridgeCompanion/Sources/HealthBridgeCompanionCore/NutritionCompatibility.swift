@@ -298,7 +298,7 @@ extension FileOutbox {
         guard first.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        let owned = pending.prefix { $0.receiverIdentity == receiverIdentity }
+        let owned = try pendingItemsBeforeDirectSleepCleanup(pending).prefix { $0.receiverIdentity == receiverIdentity }
         for item in owned {
             guard let value = try preparedNutritionPayload(for: item) else { throw CancellationError() }
             if !value.permits(support), let projection = value.projection,
