@@ -272,6 +272,19 @@ public final class ProductionMailboxDelivery {
         maximumAcknowledgmentFiles: Int = ProductionMailboxDelivery
             .backgroundAcknowledgmentFileLimit
     ) async throws -> ProductionMailboxBackgroundDeliverySummary {
+        try await reconcilePendingFIFOHeadAcknowledgment(
+            afterAcknowledgmentCheckpoint: afterAcknowledgmentCheckpoint,
+            maximumAcknowledgmentFiles: maximumAcknowledgmentFiles,
+            onNewFinalization: { _ in }
+        )
+    }
+
+    @MainActor
+    func reconcilePendingFIFOHeadAcknowledgment(
+        afterAcknowledgmentCheckpoint: String?,
+        maximumAcknowledgmentFiles: Int = ProductionMailboxDelivery.backgroundAcknowledgmentFileLimit,
+        onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void
+    ) async throws -> ProductionMailboxBackgroundDeliverySummary {
         try Task.checkCancellation()
         try await refreshNutritionSupport()
         let components = try backgroundComponents()
@@ -306,7 +319,9 @@ public final class ProductionMailboxDelivery {
         if phase == .ackVerified {
             do {
                 try Task.checkCancellation()
-                _ = try await coordinator.finalizeCommitted(itemID: item.id)
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }
                 return backgroundSummary(
                     phase: .reconcileFIFOHeadAcknowledgment,
                     attemptedCount: 1,
@@ -451,7 +466,9 @@ public final class ProductionMailboxDelivery {
                     let disposition = try coordinator.consume(event, itemID: item.id)
                     if disposition == .ackVerified {
                         try Task.checkCancellation()
-                        _ = try await coordinator.finalizeCommitted(itemID: item.id)
+                        _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                            onNewFinalization(coordinator.ownership)
+                        }
                         finalizedItemIDs.insert(item.id)
                     }
                     if try coordinator.state(itemID: item.id)?.phase == .committedFinalized,
@@ -492,6 +509,13 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     public func deliverPending() async throws -> ProductionMailboxDeliverySummary {
+        try await deliverPending(onNewFinalization: { _ in })
+    }
+
+    @MainActor
+    func deliverPending(
+        onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void
+    ) async throws -> ProductionMailboxDeliverySummary {
         try await refreshNutritionSupport()
         let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         let components: ProductionMailboxComponents
@@ -544,7 +568,9 @@ public final class ProductionMailboxDelivery {
                 throw ProductionMailboxDeliveryPhaseError.initialAdvance.forItem(item.id, ownership: ownership)
             }
         }
-        var finalizedItemIDs = try await finalizeVerifiedForegroundHeads(components: components)
+        var finalizedItemIDs = try await finalizeVerifiedForegroundHeads(
+            components: components, onNewFinalization: onNewFinalization
+        )
         let ackLane: URL
         do {
             let locator = try components.locate()
@@ -565,12 +591,12 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.hydrateAck
         }
+        try Task.checkCancellation()
+        guard settingsStore.receiverSettingsGenerationToken == receiverGeneration else {
+            throw ProductionMailboxDeliveryPhaseError.scanAck
+        }
         var report: MailboxAckScanReport
         do {
-            try Task.checkCancellation()
-            guard settingsStore.receiverSettingsGenerationToken == receiverGeneration else {
-                throw ProductionMailboxDeliveryError.inactive
-            }
             report = try components.scanner.scan()
         } catch is CancellationError {
             throw CancellationError()
@@ -700,7 +726,9 @@ public final class ProductionMailboxDelivery {
                 switch event.classification {
                 case .committed, .duplicateIdentical:
                     _ = try coordinator.consume(event, itemID: itemID)
-                    finalizedItemIDs.formUnion(try await finalizeVerifiedForegroundHeads(components: components))
+                    finalizedItemIDs.formUnion(try await finalizeVerifiedForegroundHeads(
+                        components: components, onNewFinalization: onNewFinalization
+                    ))
                     if try coordinator.state(itemID: itemID)?.phase == .committedFinalized {
                         let deleted = Self.deleteAcknowledgmentAfterDurableCommit {
                             try coordinator.deleteAcknowledgment(for: event, itemID: itemID)
@@ -758,7 +786,8 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     private func finalizeVerifiedForegroundHeads(
-        components: ProductionMailboxComponents
+        components: ProductionMailboxComponents,
+        onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void
     ) async throws -> Set<String> {
         var finalizedItemIDs: Set<String> = []
         while true {
@@ -778,7 +807,9 @@ public final class ProductionMailboxDelivery {
             }
             do {
                 let coordinator = try await coordinator(components: components, itemID: item.id)
-                _ = try await coordinator.finalizeCommitted(itemID: item.id)
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }
                 finalizedItemIDs.insert(item.id)
             } catch is CancellationError {
                 throw CancellationError()

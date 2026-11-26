@@ -106,6 +106,41 @@ final class CompanionPairingInputAppTests: XCTestCase {
         try await assertReplacementDoesNotPromoteSupersededCommit(legacySetupMaterial)
     }
 
+    func testManualSaveClearsReplacementWarningOnlyAfterVerifiedBindingChange() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        var drainReady = false
+        let (model, warning) = try await makeReplacementWarning(fixture) { drainReady }
+        let original = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let oldURL = fixture.settings.receiverURLString
+        let oldToken = try fixture.settings.loadBearerToken()
+        let newURL = "http://127.0.0.1:9173/v1/batches"
+        model.receiverURLString = newURL
+        model.bearerToken = "synthetic-manual-change"
+        await model.saveReceiverSettings()
+        XCTAssertTrue(model.statusIsError)
+        XCTAssertEqual(fixture.settings.receiverBindingID, original)
+        XCTAssertEqual(model.setupLinkReplacementFailure, warning)
+
+        drainReady = true
+        model.receiverURLString = oldURL
+        model.bearerToken = oldToken
+        await model.saveReceiverSettings()
+        XCTAssertFalse(model.statusIsError)
+        XCTAssertEqual(fixture.settings.receiverBindingID, original)
+        XCTAssertEqual(model.setupLinkReplacementFailure, warning)
+
+        model.receiverURLString = newURL
+        model.bearerToken = "synthetic-manual-change"
+        await model.saveReceiverSettings()
+        XCTAssertFalse(model.statusIsError)
+        XCTAssertTrue(model.receiverSettingsSaved)
+        XCTAssertNotEqual(try XCTUnwrap(fixture.settings.receiverBindingID), original)
+        XCTAssertEqual(fixture.settings.receiverURLString, newURL)
+        XCTAssertEqual(try fixture.settings.loadBearerToken(), "synthetic-manual-change")
+        XCTAssertNil(model.setupLinkReplacementFailure)
+    }
+
     func testConfirmedPrivateResetClearsReplacementWarningAndKeepsSavedReceiver() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

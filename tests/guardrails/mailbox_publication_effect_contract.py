@@ -27,7 +27,8 @@ PUBLICATION: Final = re.compile(
     rf"""
     {MAILBOX_DIAGNOSTIC_WRITE.pattern}
     | \b(?:publishMailboxDelivery(?:Summary|Failure)|refreshPendingOutboxCount
-          |recordAcceptedTransfer|persistMailboxAckScanCheckpoint)\s*\(
+          |recordAcceptedTransfer|recordNewMailboxFinalization
+          |persistMailboxAckScanCheckpoint)\s*\(
     | \b(?:backgroundSyncStatus|statusMessage|statusIsError
           |pendingOutboxCount|hasPublishedMailboxItem)\s*\+?=(?!=)
     """,
@@ -36,7 +37,16 @@ PUBLICATION: Final = re.compile(
 _ADMISSION: Final = "try requireCurrentConnectionGeneration(expectedGeneration)"
 _DO_ADMISSION: Final = f"do {{ {_ADMISSION} }}"
 _OUTER_PREFIX: Final = {
-    MailboxLane.MANUAL: "if target.route == .mailbox { do ",
+    MailboxLane.MANUAL: """
+        if target.route == .mailbox {
+            var finalizedOwner: OutboxDeliveryOwnershipV1?
+            defer {
+                recordNewMailboxFinalization(
+                    finalizedOwner, for: target, outbox: outbox
+                )
+            }
+            do
+    """,
     MailboxLane.SCHEDULER: "if settingsStore.activeTransport == .mailbox { do ",
     MailboxLane.FOREGROUND: """
         private func reconcileForegroundMailboxDelivery(
@@ -54,7 +64,14 @@ _OUTER_PREFIX: Final = {
                     at: point
                 ) else { return .completed(pendingCount: pendingOutboxCount) }
             let expectedGeneration = settingsStore.receiverSettingsGenerationToken
-            let expectedBindingID = settingsStore.receiverBindingID
+            let acceptanceTarget = try? capturePayloadDeliveryTarget()
+            let deliveryOutbox = outbox
+            var finalizedOwner: OutboxDeliveryOwnershipV1?
+            defer {
+                recordNewMailboxFinalization(
+                    finalizedOwner, for: acceptanceTarget, outbox: deliveryOutbox
+                )
+            }
             var operation: MailboxDeliveryOperation = requestedPhase == .publishFIFOHead
                 ? .publishFIFOHead : .selectFIFOHeadPhase
             var completedOperations: Set<MailboxDeliveryOperation> = []
@@ -65,7 +82,11 @@ _OUTER_PREFIX: Final = {
 # progress. Match the entire statement, including arguments and switch bodies.
 _DELIVERY_PREFIX: Final = {
     MailboxLane.MANUAL: (
-        "let summary = try await makeProductionMailboxDelivery().deliverPending()",
+        """
+        let summary = try await makeProductionMailboxDelivery().deliverPending {
+            finalizedOwner = $0
+        }
+        """,
     ),
     MailboxLane.SCHEDULER: (
         _ADMISSION,
@@ -103,7 +124,7 @@ _DELIVERY_PREFIX: Final = {
                 operation = .reconcileFIFOHeadAcknowledgment
                 summary = try await delivery.reconcilePendingFIFOHeadAcknowledgment(
                     afterAcknowledgmentCheckpoint: startingCheckpoint
-                )
+                ) { finalizedOwner = $0 }
             case .none, .publishFIFOHead:
                 operation = .publishFIFOHead
                 summary = try await delivery.publishPendingFIFOHead()
@@ -142,12 +163,12 @@ AWAIT: Final = re.compile(r"\bawait\b")
 _DEFERRED_EXECUTION: Final = re.compile(r"\b(?:defer|async\s+let)\b")
 
 
-def _tokens(source: str) -> str:
+def swift_tokens(source: str) -> str:
     return " ".join(_TOKEN.findall(source))
 
 
 def _is_pure_local(structure: str, executable: str) -> bool:
-    shaped, evaluated = _tokens(structure), _tokens(executable)
+    shaped, evaluated = swift_tokens(structure), swift_tokens(executable)
     if shaped == evaluated:
         declaration = _PURE_LOCAL.fullmatch(shaped)
     else:
@@ -161,7 +182,7 @@ def _is_pure_local(structure: str, executable: str) -> bool:
 
 
 def assert_checked_outer_prefix(source: str, lane: MailboxLane) -> None:
-    assert _tokens(source) == _tokens(_OUTER_PREFIX[lane]), (
+    assert swift_tokens(source) == swift_tokens(_OUTER_PREFIX[lane]), (
         "Unsupported Swift before Mailbox authority: delivery branch admission"
     )
 
@@ -176,10 +197,10 @@ def _assert_checked_prefence_statements(
         "Mailbox publication must follow the checked transport prefix"
     )
     for structure, executable in statements:
-        actual = _tokens(structure)
-        if expected == _ADMISSION and actual == _tokens(_DO_ADMISSION):
-            actual = _tokens(_ADMISSION)
-        if expected is not None and actual == _tokens(expected):
+        actual = swift_tokens(structure)
+        if expected == _ADMISSION and actual == swift_tokens(_DO_ADMISSION):
+            actual = swift_tokens(_ADMISSION)
+        if expected is not None and actual == swift_tokens(expected):
             expected = next(reviewed, None)
         else:
             assert expected is None, unsupported
@@ -188,10 +209,10 @@ def _assert_checked_prefence_statements(
 
 
 def _accepts_after_suspension(structure: str, executable: str) -> bool:
-    tokens = _tokens(structure)
+    tokens = swift_tokens(structure)
     return _is_pure_local(structure, executable) or (
-        tokens == _tokens(executable)
-        and any(tokens == _tokens(statement) for statement in _AFTER_YIELD)
+        tokens == swift_tokens(executable)
+        and any(tokens == swift_tokens(statement) for statement in _AFTER_YIELD)
     )
 
 

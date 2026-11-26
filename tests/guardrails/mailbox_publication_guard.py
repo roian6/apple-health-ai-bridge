@@ -38,7 +38,7 @@ class _SwiftViews:
     executable: str
 
 
-class _SwiftLexer:
+class SwiftLexer:
     """Mask trivia, retaining code in interpolation and preserving offsets."""
 
     def __init__(self, source: str) -> None:
@@ -185,7 +185,7 @@ def _matching_edge(edges: Iterable[re.Match[str]], opener: str) -> re.Match[str]
     raise AssertionError(msg)
 
 
-def _branch_body(branch: _SwiftViews, lane: MailboxLane | None) -> _SwiftViews:
+def mailbox_branch_body(branch: _SwiftViews, lane: MailboxLane | None) -> _SwiftViews:
     structure = branch.structure
     if lane is None:
         opening = re.match(r"\s*\}\s*catch\s*(\{)", structure)
@@ -260,7 +260,7 @@ def assert_successful_mailbox_publication(
     *,
     publication_required: bool = True,
 ) -> None:
-    body = _branch_body(_SwiftLexer(branch).views(), lane)
+    body = mailbox_branch_body(SwiftLexer(branch).views(), lane)
     _assert_publication_order(
         body,
         fence,
@@ -276,5 +276,5 @@ def assert_failed_mailbox_publication(
     if stale_return is not None:
         return_statement = re.escape(f"return {stale_return}".rstrip())
         fence = rf"do\s*\{{\s*{fence}\s*\}}\s*catch\s*\{{\s*{return_statement}\s*\}}"
-    body = _branch_body(_SwiftLexer(branch).views(), None)
+    body = mailbox_branch_body(SwiftLexer(branch).views(), None)
     _assert_publication_order(body, fence, -1, lane=None, publication_required=True)

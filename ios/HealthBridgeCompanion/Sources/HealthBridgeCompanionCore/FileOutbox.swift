@@ -1799,7 +1799,9 @@ public final class FileOutbox {
         )
     }
 
-    func nutritionPendingGroups(for receiverIdentity: String) throws -> [NutritionPendingGroup] {
+    func nutritionPendingGroups(
+        for receiverIdentity: String, admittedItemIDs: Set<String>?
+    ) throws -> [NutritionPendingGroup] {
         guard let manifest = try loadManifest() else { return [] }
         let splits = manifest.nutritionSplits ?? []
         guard splits.allSatisfy({
@@ -1810,7 +1812,10 @@ public final class FileOutbox {
         let children = Set(splits.flatMap { [$0.supportedID, $0.remainderID] })
         var groups: [NutritionPendingGroup] = []
         for item in try pendingItemsBeforeDirectSleepCleanup(items).prefix(while: { $0.receiverIdentity == receiverIdentity }) {
+            // Bound selection by the logical parent; its prepared children can
+            // have later physical FIFO IDs without becoming newly admitted work.
             if children.contains(item.id) { continue }
+            if let admittedItemIDs, !admittedItemIDs.contains(item.id) { break }
             if let split = splits.first(where: { $0.parentID == item.id }) {
                 guard split.supportedAccepted || byID[split.supportedID] != nil,
                       split.remainderAccepted || byID[split.remainderID] != nil else {
@@ -2244,11 +2249,13 @@ public final class FileOutbox {
         return finalizationRecord
     }
 
+    @MainActor
     func finalizeCommittedMailboxDelivery(
         itemID: String,
         expected: FileOutboxDeliveryStateV1,
         committed: FileOutboxDeliveryStateV1,
-        fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void = { _ in }
+        fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void,
+        onNewFinalization: @MainActor () -> Void
     ) throws -> FileOutboxDeliveryStateV1 {
         try requireUploadAdmission()
         guard expected.phase == .ackVerified,
@@ -2276,6 +2283,7 @@ public final class FileOutbox {
         if let identity = manifest.entries[index].receiverIdentity {
             try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: identity)
         }
+        onNewFinalization()
         return committed
     }
 

@@ -54,11 +54,35 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         validatePending: @escaping @MainActor () throws -> Void = {},
         onNewAcceptance: @MainActor () -> Void = {}
     ) async throws -> Bool {
+        try await recordDirectReceiverAcceptanceForSync(
+            descriptor: descriptor, sleepStore: sleepStore(), acceptedSleepRevision: nil,
+            validate: validate, validatePending: validatePending, onNewAcceptance: onNewAcceptance
+        )
+    }
+
+    @discardableResult
+    @MainActor
+    func recordDirectReceiverAcceptanceForSync(
+        descriptor: DirectUploadCompletionDescriptor,
+        sleepStore: @autoclosure () throws -> any SleepSyncManifestStoring,
+        acceptedSleepRevision: SleepSyncStorageRevision?,
+        validate: @escaping @MainActor () throws -> Void,
+        validatePending: @escaping @MainActor () throws -> Void,
+        onNewAcceptance: @MainActor () -> Void
+    ) async throws -> Bool {
         let checkPending = { @MainActor in
             try validate()
             try validatePending()
         }
-        try await outbox.prepareNutritionCompatibility(validate: checkPending)
+        if let acceptedSleepRevision {
+            let store = try sleepStore()
+            try await outbox.prepareNutritionCompatibility(allowingTailAppend: true) {
+                try checkPending()
+                guard try store.revisionForSync() == acceptedSleepRevision else { throw CancellationError() }
+            }
+        } else {
+            try await outbox.prepareNutritionCompatibility(validate: checkPending)
+        }
         let item = try outbox.pendingItem(id: descriptor.itemID)
         if let item, item.receiverIdentity != descriptor.receiverBindingID {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver

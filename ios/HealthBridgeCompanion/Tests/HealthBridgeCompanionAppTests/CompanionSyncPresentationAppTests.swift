@@ -826,6 +826,14 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         try await checkStoredMailboxCheckpointRecovery(.newGeneration)
     }
 
+    func testManualSyncNowRetriesPendingMailboxCheckpointWithAutomaticSyncOffAndEmptyFIFO() async throws {
+        try await checkStoredMailboxCheckpointRecovery(.manualRetry)
+    }
+
+    func testManualSyncNowFullScanCannotClearConflictingMailboxCheckpoint() async throws {
+        try await checkStoredMailboxCheckpointRecovery(.manualConflict)
+    }
+
     private func checkStoredMailboxCheckpointRecovery(_ recovery: StoredMailboxCheckpointRecovery) async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
@@ -935,12 +943,230 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
             XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), b)
             XCTAssertNil(vm.activityMailboxFailureMessage)
             XCTAssertNil(vm.lastAcceptedTransferObservation)
+        case .manualRetry, .manualConflict:
+            let runtime = AutomaticSyncRuntime(
+                viewModel: vm, platform: .init(beginBackgroundOwner: { _ in {} })
+            )
+            vm.installAutomaticSyncRuntime(runtime)
+            vm.requestBackgroundSyncEnabled(false)
+            await vm.waitForAutomaticSyncDisableCleanup()
+            XCTAssertFalse(background.isEnabled)
+            XCTAssertFalse(vm.automaticSyncToggleIsOn)
+            XCTAssertFalse(vm.automaticSyncRuntimeIsReady)
+            XCTAssertEqual(vm.pendingOutboxCount, 0)
+            XCTAssertEqual(vm.activityMailboxFailureMessage, failure)
+
+            let competing = "synthetic-competing-manual-checkpoint"
+            if recovery == .manualConflict {
+                try background.persistMailboxAckScanCheckpoint(competing, receiverGeneration: generation)
+            }
+            // No provider ACK is needed for a local checkpoint retry.
+            let lane = try XCTUnwrap(fixture.locator.lanes[.acks])
+            XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: lane.path).isEmpty)
+            var fullScans = 0
+            fixture.ackScanFault = { boundary in
+                if boundary == .laneOpened { fullScans += 1 }
+            }
+
+            await vm.syncAllNow()
+
+            XCTAssertEqual(fullScans, 1, "Manual Sync Now must reconcile even without a FIFO head")
+            XCTAssertEqual(fixture.base.settings.receiverBindingID, observation.bindingID)
+            XCTAssertEqual(fixture.base.settings.receiverSettingsGenerationToken, generation)
+            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            if recovery == .manualConflict {
+                XCTAssertEqual(defaults.checkpointWrites, [b, competing])
+                XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), competing)
+                XCTAssertEqual(vm.activityMailboxFailureMessage, failure, "An unrelated scan cannot earn checkpoint credit")
+            } else {
+                XCTAssertEqual(defaults.checkpointWrites, [b, b])
+                XCTAssertEqual(background.mailboxAckScanCheckpoint(receiverGeneration: generation), b)
+                XCTAssertNil(vm.activityMailboxFailureMessage)
+            }
         }
         if recovery != .newGeneration {
             XCTAssertEqual(vm.lastAcceptedTransferObservation, observation)
         }
         XCTAssertEqual(defaults.commitWrites, 1, "Checkpoint activity is not a new accepted transfer")
         XCTAssertEqual(fixture.base.receiver.batches.count, receiverBatchCount)
+    }
+
+    func testManualMailboxObservesVerifiedHeadDespiteLaterFullScanFailure() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.verifiedHeadScanFailure)
+    }
+
+    func testManualMailboxDoesNotAttributeVerifiedHeadAfterGenerationChangesDuringFullScan() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.verifiedHeadConnectionChange)
+    }
+
+    func testManualMailboxFullScanFailureWithoutVerifiedHeadDoesNotRecordAcceptance() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.unverifiedHeadScanFailure)
+    }
+
+    func testManualMailboxObservesVerifiedHeadExactlyOnceAfterSuccessfulFullScan() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.verifiedHeadScanSuccess)
+    }
+
+    func testManualMailboxObservesVerifiedHeadDespiteLaterACKHydrationFailure() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.verifiedHeadHydrationFailure)
+    }
+
+    func testManualMailboxDoesNotAttributeRetiredHeadAfterGenerationChangesBeforeACKHydration() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.verifiedHeadStaleBeforeHydration)
+    }
+
+    func testManualMailboxACKHydrationFailureWithoutVerifiedHeadDoesNotRecordAcceptance() async throws {
+        try await checkManualMailboxAcceptanceAcrossFullScan(.unverifiedHeadHydrationFailure)
+    }
+
+    private func checkManualMailboxAcceptanceAcrossFullScan(_ scenario: ManualMailboxFullScan) async throws {
+        let files = MailboxEnvelopeRemovalFailure()
+        let fixture = try NutritionMailboxFixture(nativePairing: true, outboxFileManager: files)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let suite = fixture.base.suite + ".full-scan-observation"
+        let defaults = try XCTUnwrap(ForegroundSleepCommitDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let observations = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
+        fixture.base.acceptedTransferStore = observations
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults)
+        try background.setEnabledDurably(false)
+        let outbox = fixture.base.outbox
+        let settings = fixture.base.settings
+        let generation = settings.receiverSettingsGenerationToken
+        let bindingID = fixture.identity.opaqueBinding
+        let item = try fixture.base.enqueueMixed()
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let head = try XCTUnwrap(outbox.pendingItem(id: item.id))
+        XCTAssertEqual(head.deliveryState?.phase, .providerObserved)
+        let receipt: OutboxDeliveryCommittedReceiptV1?
+        if scenario == .unverifiedHeadScanFailure || scenario == .unverifiedHeadHydrationFailure {
+            receipt = nil
+        } else {
+            _ = try fixture.receiveAndAcknowledge(head)
+            let components = fixture.components()
+            let event = try XCTUnwrap(components.scanner.scan().events.first)
+            let ownership = try XCTUnwrap(head.deliveryState?.ownership)
+            let coordinator = OutboxDeliveryCoordinator(
+                outbox: outbox, transport: components.transport, scanner: components.scanner,
+                ownership: ownership,
+                finalizer: OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: fixture.base.cursors)
+            )
+            XCTAssertEqual(event.classification, .committed)
+            XCTAssertEqual(try coordinator.consume(event, itemID: item.id), .ackVerified)
+            let verified = try XCTUnwrap(outbox.deliveryState(for: item.id))
+            XCTAssertEqual(verified.phase, .ackVerified)
+            XCTAssertEqual(verified.ownership?.receiverBindingID, bindingID)
+            XCTAssertEqual(verified.ownership?.receiverGeneration, generation)
+            receipt = try XCTUnwrap(verified.committedReceipt)
+            // Start the observed run with only the authenticated local state.
+            // Avoid a replay of the provider ACK accounting for any observation.
+            let ackLane = try XCTUnwrap(fixture.locator.lanes[.acks])
+            let ackName = try MailboxLayoutV1.finalFileName(
+                identifier: event.envelopeID.hexV1, kind: .acknowledgment
+            )
+            try FileManager.default.removeItem(at: ackLane.appendingPathComponent(ackName))
+        }
+        let vm = try await fixture.base.makeViewModel(
+            mailbox: fixture, eligibleTypeCodes: [],
+            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) }
+        )
+        let runtime = AutomaticSyncRuntime(
+            viewModel: vm, platform: .init(beginBackgroundOwner: { _ in {} })
+        )
+        vm.installAutomaticSyncRuntime(runtime)
+        XCTAssertNil(try fixture.base.cursor("dietary_protein"))
+        XCTAssertEqual(defaults.commitWrites, 0)
+
+        var fullScans = 0
+        var deliberatelyThrown = false
+        var replacementGeneration: String?
+        let failsHydration: Bool
+        switch scenario {
+        case .verifiedHeadHydrationFailure, .verifiedHeadStaleBeforeHydration, .unverifiedHeadHydrationFailure:
+            failsHydration = true
+            let ackLane = try XCTUnwrap(fixture.locator.lanes[.acks])
+            if scenario == .unverifiedHeadHydrationFailure {
+                try FileManager.default.removeItem(at: ackLane)
+            } else {
+                let envelope = try XCTUnwrap(head.mailboxBinding).envelopeFilename
+                files.afterRemoval(of: outbox.directoryURL.appendingPathComponent(envelope)) {
+                    // Retire the actual authenticated head before breaking the provider lane.
+                    try FileManager.default.removeItem(at: ackLane)
+                    if scenario == .verifiedHeadStaleBeforeHydration {
+                        replacementGeneration = try settings.invalidateReceiverSettingsGeneration(
+                            expectedGeneration: generation
+                        )
+                    }
+                }
+            }
+        default:
+            failsHydration = false
+        }
+        fixture.ackScanFault = { boundary in
+            guard boundary == .laneOpened else { return }
+            fullScans += 1
+            if let receipt {
+                let committed = try XCTUnwrap(outbox.deliveryState(for: item.id))
+                XCTAssertEqual(committed.phase, .committedFinalized)
+                XCTAssertEqual(committed.committedReceipt, receipt)
+                XCTAssertTrue(try outbox.pendingItems().isEmpty)
+                XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
+            }
+            if scenario == .verifiedHeadConnectionChange {
+                replacementGeneration = try settings.invalidateReceiverSettingsGeneration(expectedGeneration: generation)
+            }
+            if scenario != .verifiedHeadScanSuccess {
+                deliberatelyThrown = true
+                throw MailboxAckScannerError.unsafeMailbox
+            }
+        }
+        defer { fixture.ackScanFault = { _ in } }
+
+        await vm.syncAllNow()
+
+        XCTAssertEqual(fullScans, failsHydration ? 0 : 1)
+        XCTAssertEqual(deliberatelyThrown, !failsHydration && scenario != .verifiedHeadScanSuccess)
+        if failsHydration, let receipt {
+            let committed = try XCTUnwrap(outbox.deliveryState(for: item.id))
+            XCTAssertEqual(committed.phase, .committedFinalized)
+            XCTAssertEqual(committed.committedReceipt, receipt)
+            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
+        }
+        let failurePhase = failsHydration ? "phase=hydrate_ack" : "phase=scan_ack"
+        switch scenario {
+        case .verifiedHeadScanFailure, .verifiedHeadScanSuccess, .verifiedHeadHydrationFailure:
+            if scenario != .verifiedHeadScanSuccess {
+                XCTAssertTrue(vm.statusIsError)
+                XCTAssertTrue(vm.activityMailboxFailureMessage?.contains(failurePhase) == true)
+            } else {
+                XCTAssertNil(vm.activityMailboxFailureMessage)
+            }
+            XCTAssertEqual(defaults.commitWrites, 1)
+            let observation = try XCTUnwrap(vm.lastAcceptedTransferObservation)
+            XCTAssertEqual(observation.evidenceKind, .mailboxCommit)
+            XCTAssertEqual(observation.bindingID, bindingID)
+            XCTAssertEqual(observation.generation, generation)
+            XCTAssertEqual(observations.load(bindingID: bindingID, generation: generation), observation)
+        case .verifiedHeadConnectionChange, .verifiedHeadStaleBeforeHydration:
+            let replacement = try XCTUnwrap(replacementGeneration)
+            XCTAssertNotEqual(replacement, generation)
+            XCTAssertEqual(settings.receiverBindingID, bindingID)
+            XCTAssertEqual(settings.receiverSettingsGenerationToken, replacement)
+            XCTAssertEqual(defaults.commitWrites, 0)
+            XCTAssertNil(observations.load(bindingID: bindingID, generation: generation))
+            XCTAssertNil(observations.load(bindingID: bindingID, generation: replacement))
+            XCTAssertNil(vm.lastAcceptedTransferObservation)
+        case .unverifiedHeadScanFailure, .unverifiedHeadHydrationFailure:
+            XCTAssertTrue(vm.activityMailboxFailureMessage?.contains(failurePhase) == true)
+            XCTAssertEqual(try outbox.pendingItem(id: item.id)?.deliveryState?.phase, .providerObserved)
+            XCTAssertNil(try fixture.base.cursor("dietary_protein"))
+            XCTAssertEqual(defaults.commitWrites, 0)
+            XCTAssertNil(vm.lastAcceptedTransferObservation)
+        }
     }
 
     func testForegroundDirectSleepRejectsSiblingOnlyAcceptance() async throws {
@@ -1262,6 +1488,12 @@ private enum ForegroundSleepCompletionInput: String, CaseIterable {
 
 private enum StoredMailboxCheckpointRecovery: Equatable {
     case freshScan, noNewToken, conflictingPosition, newGeneration
+    case manualRetry, manualConflict
+}
+
+private enum ManualMailboxFullScan: Equatable {
+    case verifiedHeadScanFailure, verifiedHeadConnectionChange, unverifiedHeadScanFailure, verifiedHeadScanSuccess
+    case verifiedHeadHydrationFailure, verifiedHeadStaleBeforeHydration, unverifiedHeadHydrationFailure
 }
 
 private final class ForegroundSleepCommitDefaults: UserDefaults, @unchecked Sendable {
@@ -1400,6 +1632,11 @@ private final class UnavailableObservationDefaults: UserDefaults, @unchecked Sen
 private final class MailboxEnvelopeRemovalFailure: FileManager, @unchecked Sendable {
     var rejectNextRemoval: URL?
     private(set) var rejectedRemoval: URL?
+    private var removalAction: (url: URL, perform: () throws -> Void)?
+
+    func afterRemoval(of url: URL, perform: @escaping () throws -> Void) {
+        removalAction = (url, perform)
+    }
 
     override func removeItem(at url: URL) throws {
         if url == rejectNextRemoval {
@@ -1408,6 +1645,10 @@ private final class MailboxEnvelopeRemovalFailure: FileManager, @unchecked Senda
             throw CocoaError(.fileWriteNoPermission)
         }
         try super.removeItem(at: url)
+        if let action = removalAction, action.url == url {
+            removalAction = nil
+            try action.perform()
+        }
     }
 }
 

@@ -33,8 +33,9 @@ class _InMemoryViewModel:
             guards.test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check,
             _MANUAL,
             (
-                "completedOperations: [.manualDelivery]",
-                "completedOperations: await MainActor.run { [.manualDelivery] }",
+                "completedOperations: completedOperations\n                )",
+                """completedOperations: await MainActor.run { completedOperations }
+                )""",
             ),
             _SUSPENSION,
             id="manual-summary-final-argument",
@@ -94,10 +95,10 @@ class _InMemoryViewModel:
             guards.test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check,
             _MANUAL,
             (
-                f"{_TARGET_FENCE}\n                if summary.finalizedCount",
+                f"{_TARGET_FENCE}\n                let flushSummary",
                 f"""{_TARGET_FENCE}
                 await Task.yield()
-                if summary.finalizedCount""",
+                let flushSummary""",
             ),
             _SUSPENSION,
             id="manual-intervening-await-control",
@@ -218,20 +219,25 @@ def test_guard_accepts_hoisted_argument_before_revalidation(
     operation: str,
 ) -> None:
     following = {
-        _MANUAL: "if summary.finalizedCount",
+        _MANUAL: "let flushSummary",
         _SCHEDULER: "refreshPendingOutboxCount()",
     }[scope]
     anchor = f"{fence}\n                {following}"
     argument = f"[.{operation}]"
-    hoist = f"""let operations: Set<MailboxDeliveryOperation> = await MainActor.run {{
+    name = "initialOperations" if scope == _MANUAL else "operations"
+    hoist = f"""let {name}: Set<MailboxDeliveryOperation> = await MainActor.run {{
                     {argument}
                 }}"""
-    passing = f"completedOperations: {argument}"
+    passing = (
+        f"var completedOperations: Set<MailboxDeliveryOperation> = {argument}"
+        if scope == _MANUAL
+        else f"completedOperations: {argument}"
+    )
     mutant = mutated_view_model(
         scope,
         (
             (anchor, f"{hoist}\n                {anchor}"),
-            (passing, passing.replace(argument, "operations")),
+            (passing, passing.replace(argument, name)),
         ),
     )
     monkeypatch.setattr(guards, "VIEW_MODEL", mutant)

@@ -56,11 +56,11 @@ _TRAILING_WRITE = 'statusMessage.append("Mailbox update")'
             _FLUSH,
             _MANUAL,
             (
-                f"{_TARGET_FENCE}\n                if summary.finalizedCount",
+                f"{_TARGET_FENCE}\n                let flushSummary",
                 f"""{_CAPTURED_REFRESH}
                 refresh()
                 {_TARGET_FENCE}
-                if summary.finalizedCount""",
+                let flushSummary""",
             ),
             id="manual-success-captured-method",
         ),
