@@ -2277,13 +2277,12 @@ public final class FileOutbox {
             throw FileOutboxMailboxError.deliveryTransitionConflict
         }
         manifest.entries[index].deliveryState = committed
-        try persistManifest(manifest)
+        try persistManifest(manifest) { onNewFinalization() }
         try fault(.statePersisted)
         try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
         if let identity = manifest.entries[index].receiverIdentity {
             try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: identity)
         }
-        onNewFinalization()
         return committed
     }
 
@@ -3210,12 +3209,16 @@ public final class FileOutbox {
         return manifest
     }
 
-    private func persistManifest(_ manifest: SequenceManifest) throws {
+    private func persistManifest(
+        _ manifest: SequenceManifest, onAtomicWrite: () -> Void = {}
+    ) throws {
         try Self.validate(manifest)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let bytes = try encoder.encode(manifest)
         try bytes.write(to: sequenceURL, options: [.atomic])
+        // The replacement is visible on disk even if hardening the new file fails.
+        onAtomicWrite()
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
         decodedManifest = (bytes, manifest)
     }

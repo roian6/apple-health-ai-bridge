@@ -435,31 +435,76 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.pending.manifest)
     }
 
-    func testWrongSleepGenerationCannotCommitOrRetireAndCorrectReplayCan() async throws {
+    func testMismatchedDirectSleepOwnershipCannotWriteAndMatchingReplayCan() async throws {
         let fixture = try DirectSleepFinalizationFixture()
         defer { fixture.remove() }
-        let wrong = DirectUploadCompletionDescriptor(
-            itemID: fixture.descriptor.itemID,
-            receiverGeneration: "superseded-generation",
-            receiverBindingID: fixture.descriptor.receiverBindingID
+        let pending = fixture.pending
+        let binding = pending.receiverBindingID
+        let generation = pending.connectionGeneration
+        let manifest = pending.manifest
+        let wrongManifest = SleepSyncManifest(
+            schemaVersion: manifest.schemaVersion, receiverSettingsGeneration: "superseded-generation",
+            historyDepth: manifest.historyDepth, historyStartDate: manifest.historyStartDate,
+            sourceKey: manifest.sourceKey, baselineResetEpoch: manifest.baselineResetEpoch,
+            identityNamespace: manifest.identityNamespace, nextRevisionSequence: manifest.nextRevisionSequence,
+            anchorCursorValue: manifest.anchorCursorValue, activeChildSamples: manifest.activeChildSamples,
+            publishedSessions: manifest.publishedSessions, baselineResetPending: manifest.baselineResetPending
         )
-        do {
-            _ = try await fixture.finalizer.recordDirectReceiverAcceptanceForSync(
-                descriptor: wrong, sleepStore: fixture.sleep, validate: {}
+        let wrongBinding = "different-receiver"
+        let cases: [(label: String, journalBinding: String, generation: String, manifest: SleepSyncManifest,
+                     descriptorBinding: String, rejectionEpoch: UInt64?)] = [
+            ("journal binding", wrongBinding, generation, manifest, binding, nil),
+            ("journal generation", binding, "superseded-generation", manifest, binding, nil),
+            ("manifest generation", binding, generation, wrongManifest, binding, nil),
+            ("FIFO owner", wrongBinding, generation, manifest, wrongBinding, nil),
+            ("rejected journal", binding, generation, manifest, binding, 57),
+        ]
+        for input in cases {
+            let journal = SleepSyncPendingTransition(
+                id: pending.id, payload: pending.payload, manifest: input.manifest,
+                receiverBindingID: input.journalBinding, connectionGeneration: input.generation,
+                outboxItemID: pending.outboxItemID, rejectedMinimumResetEpoch: input.rejectionEpoch
             )
-            XCTFail("A different generation cannot commit this Sleep transition.")
-        } catch OutboxDeliveryCoordinatorError.ownershipMismatch {}
+            try fixture.sleep.savePendingTransition(journal)
+            let revision = try fixture.sleep.revisionForSync()
+            let descriptor = DirectUploadCompletionDescriptor(
+                itemID: fixture.descriptor.itemID, receiverGeneration: generation,
+                receiverBindingID: input.descriptorBinding
+            )
+            var acknowledgments = 0
+            do {
+                _ = try await fixture.finalizer.recordDirectReceiverAcceptanceForSync(
+                    descriptor: descriptor, sleepStore: fixture.sleep, validate: {},
+                    onNewAcceptance: { acknowledgments += 1 }
+                )
+                XCTFail("Unexpected acceptance for \(input.label)")
+            } catch OutboxDeliveryCoordinatorError.ownershipMismatch {
+                XCTAssertEqual(input.descriptorBinding, binding, input.label)
+            } catch ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver {
+                XCTAssertNotEqual(input.descriptorBinding, binding, input.label)
+            }
+            let sleep = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+            let outbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+            XCTAssertEqual(acknowledgments, 0, input.label)
+            XCTAssertEqual(try sleep.revisionForSync(), revision, input.label)
+            XCTAssertEqual(try sleep.loadManifest(), fixture.initial, input.label)
+            XCTAssertEqual(try sleep.loadPendingTransition(), journal, input.label)
+            let items = try outbox.pendingItems()
+            XCTAssertEqual(items.map(\.id), [descriptor.itemID], input.label)
+            XCTAssertEqual(try Data(contentsOf: XCTUnwrap(items.first).fileURL), pending.payload, input.label)
+            XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: binding), input.label)
+            XCTAssertFalse(try outbox.hasPendingDirectSleepCleanup(), input.label)
+            XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations, input.label)
+        }
 
-        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initial)
-        XCTAssertEqual(try fixture.sleep.loadPendingTransition(), fixture.pending)
-        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [fixture.descriptor.itemID])
-        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
-
-        _ = try await fixture.finalizer.recordDirectReceiverAcceptanceForSync(
+        try fixture.sleep.savePendingTransition(pending)
+        let finalized = try await fixture.finalizer.recordDirectReceiverAcceptanceForSync(
             descriptor: fixture.descriptor, sleepStore: fixture.sleep, validate: {}
         )
-        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.pending.manifest)
+        XCTAssertTrue(finalized)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), manifest)
         XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
         XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
     }
 

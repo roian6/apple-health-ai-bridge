@@ -219,12 +219,19 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     ).read_text()
     commit = finalizers.split("private func commitDirectSleepIfPending(", 1)[1]
     match = commit.index("if matches {")
+    retirement = commit.index("let checkRetirement =")
     write = commit.index("sleepStore.saveManifestForSync(")
-    binding = commit[match:write]
-    assert "pending.receiverBindingID == descriptor.receiverBindingID" in binding
-    assert "pending.connectionGeneration == descriptor.receiverGeneration" in binding
-    assert "item?.receiverIdentity == descriptor.receiverBindingID" in binding
-    assert "throw OutboxDeliveryCoordinatorError.ownershipMismatch" in binding
+    assert match < retirement < write
+    binding = commit[match:retirement].split("//", 1)[0]
+    assert " ".join(binding.split()) == (
+        "if matches { "
+        "guard pending.receiverBindingID == descriptor.receiverBindingID, "
+        "pending.connectionGeneration == descriptor.receiverGeneration, "
+        "pending.manifest.receiverSettingsGeneration == descriptor.receiverGeneration, "
+        "pending.rejectedMinimumResetEpoch == nil, "
+        "item?.receiverIdentity == descriptor.receiverBindingID else { "
+        "throw OutboxDeliveryCoordinatorError.ownershipMismatch }"
+    )
 
 
 def test_ui_describes_one_supported_automatic_sync_scope() -> None:

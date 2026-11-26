@@ -196,7 +196,10 @@ extension OutboxDeliveryCoordinatorTests {
                 harness.publishCommittedAck(),
                 itemID: harness.fixture.item.id
             )
+            let itemID = harness.fixture.item.id
+            let verified = try XCTUnwrap(coordinator.state(itemID: itemID))
             var injected = false
+            var observations = 0
             coordinator = harness.coordinator(
                 sealer: NeverMailboxEnvelopeSealer(),
                 observed: true,
@@ -208,11 +211,23 @@ extension OutboxDeliveryCoordinatorTests {
                 }
             )
             do {
-                _ = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+                _ = try await coordinator.finalizeCommitted(itemID: itemID) {
+                    observations += 1
+                }
                 XCTFail("Expected injected failure at \(target)")
             } catch {
                 XCTAssertTrue(error is MailboxSyntheticFailure, "target=\(target)")
             }
+
+            let writtenBeforeFault = [
+                .afterStateWrite(.committedFinalized), .payloadRetired, .envelopeRetired,
+            ].contains(target)
+            let onDisk = try XCTUnwrap(harness.fixture.outbox.mailboxBoundItemsForAckScanning()
+                .first(where: { $0.id == itemID })?.deliveryState)
+            XCTAssertEqual(onDisk.phase, writtenBeforeFault ? .committedFinalized : .ackVerified, "\(target)")
+            XCTAssertEqual(onDisk.ownership, harness.ownership)
+            XCTAssertEqual(onDisk.committedReceipt, verified.committedReceipt)
+            XCTAssertEqual(observations, writtenBeforeFault ? 1 : 0, "\(target)")
 
             let restarted = try harness.restart()
             coordinator = harness.coordinator(
@@ -221,8 +236,11 @@ extension OutboxDeliveryCoordinatorTests {
                 observed: true,
                 finalizer: finalizer
             )
-            let recovered = try await coordinator.finalizeCommitted(itemID: harness.fixture.item.id)
+            let recovered = try await coordinator.finalizeCommitted(itemID: itemID) {
+                observations += 1
+            }
             XCTAssertEqual(recovered.phase, .committedFinalized, "target=\(target)")
+            XCTAssertEqual(observations, 1, "A retry only signals if it first persists the commit: \(target)")
             XCTAssertEqual(finalizer.finalizeCount, 1, "target=\(target)")
             XCTAssertNil(
                 try restarted.pendingItem(id: harness.fixture.item.id),
@@ -236,5 +254,79 @@ extension OutboxDeliveryCoordinatorTests {
                 "target=\(target)"
             )
         }
+    }
+
+    @MainActor
+    func testMailboxAtomicWriteFailureAndStaleAuthorityDoNotSignalFinalization() async throws {
+        let harness = try OutboxDeliveryHarness()
+        let finalizer = CountingOutboxDeliveryFinalizer()
+        let itemID = harness.fixture.item.id
+        let initial = try advanceToProviderObserved(
+            harness, sealer: CountingMailboxEnvelopeSealer(harness.fixture), finalizer: finalizer
+        )
+        let event = try harness.publishCommittedAck()
+        XCTAssertEqual(try initial.consume(event, itemID: itemID), .ackVerified)
+        let directory = harness.fixture.outboxDirectory
+        let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+        let verifiedBytes = try Data(contentsOf: manifestURL)
+        let files = FileManager.default
+        let mode = try XCTUnwrap(files.attributesOfItem(atPath: directory.path)[.posixPermissions])
+        var writeReached = false
+        var observations = 0
+        let blockedWriter = harness.coordinator(
+            sealer: NeverMailboxEnvelopeSealer(), observed: true, finalizer: finalizer,
+            fault: { boundary in
+                guard boundary == .beforeStateWrite(.committedFinalized) else { return }
+                // Deny the sibling temporary file/rename, not reads of the verified manifest.
+                try files.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+                writeReached = true
+            }
+        )
+        do {
+            defer {
+                do { try files.setAttributes([.posixPermissions: mode], ofItemAtPath: directory.path) }
+                catch { XCTFail("Could not restore fixture directory permissions: \(error)") }
+            }
+            do {
+                _ = try await blockedWriter.finalizeCommitted(itemID: itemID) { observations += 1 }
+                XCTFail("Expected atomic manifest replacement to fail")
+            } catch let error as CocoaError {
+                XCTAssertEqual(error.code, .fileWriteNoPermission)
+                XCTAssertEqual(error.filePath, manifestURL.path)
+            }
+        }
+        XCTAssertTrue(writeReached)
+        XCTAssertEqual(try Data(contentsOf: manifestURL), verifiedBytes)
+        XCTAssertEqual(observations, 0)
+
+        let reopened = try harness.restart()
+        for stale in [
+            harness.alternateOwnership(receiverGeneration: "replacement-generation"),
+            harness.alternateOwnership(resetEpoch: 42),
+        ] {
+            let staleWriter = harness.coordinator(
+                outbox: reopened, sealer: NeverMailboxEnvelopeSealer(), observed: true,
+                ownership: stale, finalizer: finalizer
+            )
+            do {
+                _ = try await staleWriter.finalizeCommitted(itemID: itemID) { observations += 1 }
+                XCTFail("Expected stale generation/epoch to be rejected")
+            } catch let error as OutboxDeliveryCoordinatorError {
+                XCTAssertEqual(error, .ownershipMismatch)
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: manifestURL), verifiedBytes)
+        XCTAssertEqual(observations, 0)
+
+        let current = harness.coordinator(
+            outbox: reopened, sealer: NeverMailboxEnvelopeSealer(), observed: true, finalizer: finalizer
+        )
+        let committed = try await current.finalizeCommitted(itemID: itemID) { observations += 1 }
+        XCTAssertEqual(committed.phase, .committedFinalized)
+        XCTAssertEqual(committed.ownership, harness.ownership)
+        XCTAssertEqual(try current.consume(event, itemID: itemID), .duplicateIdentical)
+        _ = try await current.finalizeCommitted(itemID: itemID) { observations += 1 }
+        XCTAssertEqual(observations, 1)
+        XCTAssertEqual(finalizer.finalizeCount, 1)
     }
 }

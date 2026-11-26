@@ -14,6 +14,17 @@ _GENERATION_FENCE = "try requireCurrentConnectionGeneration(expectedGeneration)"
 _SUSPENSION = "Mailbox publication must not suspend again"
 _EARLY_WRITE = "Mailbox publication must follow"
 _BOUNDED_PROGRESS = "            completedOperations.insert(operation)"
+_BOUNDED_SET = "var completedOperations: Set<MailboxDeliveryOperation> = "
+_SCHEDULER_TERMINAL = "\n                if summary.terminalCount > 0 {"
+_CHECKPOINT_FAILURE_ARGUMENT = (
+    "completedOperations: completedOperations\n" + " " * 20 + ")"
+)
+_CHECKPOINT_CREDIT = (
+    "                    completedOperations.insert(.persistScanCheckpoint)\n"
+)
+_CHECKPOINT_WRITE = (
+    " " * 20 + "try backgroundSyncStore.persistMailboxAckScanCheckpoint("
+)
 _SCHEDULE = guards.test_background_mailbox_failure_checks_generation_before_publication
 _FLUSH = guards.test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check
 
@@ -125,6 +136,16 @@ class _InMemoryViewModel:
             _EARLY_WRITE,
             id="bounded-visible-status-before-fence",
         ),
+        pytest.param(
+            guards.test_background_delivery_uses_separate_bounded_publish_and_ack_phases,
+            _BOUNDED,
+            (
+                f"{_BOUNDED_SET}[]",
+                f"{_BOUNDED_SET}[.persistScanCheckpoint]",
+            ),
+            "Unsupported Swift before Mailbox authority",
+            id="bounded-completion-set-must-start-empty",
+        ),
     ],
 )
 def test_guard_rejects_out_of_order_mailbox_publication(
@@ -151,6 +172,87 @@ def mutated_view_model(
         assert branch.count(before) == 1
         branch = branch.replace(before, after, 1)
     return _InMemoryViewModel(source[:start] + branch + source[end:])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "mailboxDeliveryDiagnosticLines.reverse()",
+        """if self.mailboxDeliveryDiagnosticLines.count == 2 {
+                    self.mailboxDeliveryDiagnosticLines.swapAt(0, 1)
+                }""",
+    ],
+    ids=["reverse", "swap-elements"],
+)
+def test_scheduler_rejects_reordering_retained_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    mutant = mutated_view_model(
+        _SCHEDULER,
+        ((_SCHEDULER_TERMINAL, f"\n                {mutation}{_SCHEDULER_TERMINAL}"),),
+    )
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
+
+    with pytest.raises(AssertionError, match="only through scoped Mailbox publishers"):
+        _SCHEDULE()
+
+
+@pytest.mark.parametrize(
+    "replacements",
+    [
+        pytest.param(
+            (
+                (
+                    _BOUNDED_PROGRESS,
+                    "            operation = .persistScanCheckpoint\n"
+                    + _BOUNDED_PROGRESS,
+                ),
+            ),
+            id="overwrite-selected-operation-before-credit",
+        ),
+        pytest.param(
+            (
+                (
+                    _CHECKPOINT_FAILURE_ARGUMENT,
+                    _CHECKPOINT_FAILURE_ARGUMENT.replace(
+                        "completedOperations\n",
+                        "completedOperations.union([.persistScanCheckpoint])\n",
+                    ),
+                ),
+            ),
+            id="credit-in-failure-argument",
+        ),
+        pytest.param(
+            (
+                (_CHECKPOINT_CREDIT, ""),
+                (_CHECKPOINT_WRITE, _CHECKPOINT_CREDIT + _CHECKPOINT_WRITE),
+            ),
+            id="credit-before-write",
+        ),
+        pytest.param(((_CHECKPOINT_CREDIT, ""),), id="no-credit-after-success"),
+        pytest.param(
+            (
+                (
+                    "throw write\n                }\n            }",
+                    """throw write
+                }
+            } else {
+                completedOperations.insert(.persistScanCheckpoint)
+            }""",
+                ),
+            ),
+            id="credit-when-no-write-is-admitted",
+        ),
+    ],
+)
+def test_bounded_checkpoint_credits_only_successful_persistence(
+    monkeypatch: pytest.MonkeyPatch, replacements: tuple[tuple[str, str], ...]
+) -> None:
+    mutant = mutated_view_model(_BOUNDED, replacements)
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
+
+    with pytest.raises(AssertionError, match="only after the bounded checkpoint write"):
+        guards.test_background_delivery_uses_separate_bounded_publish_and_ack_phases()
 
 
 @pytest.mark.parametrize("wrapper", ["conditional", "error-suppressed"])

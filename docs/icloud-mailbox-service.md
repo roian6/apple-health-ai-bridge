@@ -452,6 +452,14 @@ service, stop and remove it using the currently installed CLI first:
 health-bridge mailbox service uninstall --json
 ```
 
+With the Receiver stopped, confirm that no process is using the database at
+`$HEALTH_BRIDGE_DB`. Before updating the CLI or running `health-bridge init`,
+use your established SQLite backup procedure to create and verify an owner-only
+backup of that database, including any SQLite sidecar files that remain. Do not
+copy a live database. If you cannot verify the backup, stop here and leave the
+Receiver stopped. Keep the verified pre-upgrade backup for rollback; a copy
+made after schema migration is not a pre-upgrade backup.
+
 Update the Receiver/CLI from the verified matching wheel before the first
 helper verification command:
 

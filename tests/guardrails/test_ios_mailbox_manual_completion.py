@@ -224,7 +224,7 @@ def test_core_does_not_signal_from_scan_outcomes(before: str, after: str) -> Non
         """try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
             return committed""",
         "throw FileOutboxMailboxError.deliveryTransitionConflict",
-        "try persistManifest(manifest)",
+        "try persistManifest(manifest) { onNewFinalization() }",
     ],
     ids=["replay", "failed-cas", "before-durable-write"],
 )
@@ -240,6 +240,40 @@ def test_journal_does_not_signal_replay_or_uncommitted_write(before: str) -> Non
     mutant = owner.replace(before, f"onNewFinalization(); {before}", 1)
 
     with pytest.raises(AssertionError, match="Only a new durable finalization"):
+        assert_mailbox_journal_finalization_contract(
+            coordinator, source[:start] + mutant + source[end:]
+        )
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        pytest.param(
+            "try bytes.write(to: sequenceURL, options: [.atomic])",
+            id="signal-before-possible-write-failure",
+        ),
+        pytest.param(
+            "decodedManifest = (bytes, manifest)",
+            id="signal-after-throwing-hardening",
+        ),
+    ],
+)
+def test_journal_signals_between_atomic_write_and_hardening(before: str) -> None:
+    coordinator = (_CORE / "OutboxDeliveryCoordinatorAck.swift").read_text(
+        encoding="utf-8"
+    )
+    source = (_CORE / "FileOutbox.swift").read_text(encoding="utf-8")
+    start = source.index("private func persistManifest(")
+    end = source.index("private static func validate(", start)
+    persist = source[start:end]
+    callback = "        onAtomicWrite()\n"
+    assert persist.count(before) == 1
+    assert persist.count(callback) == 1
+    mutant = persist.replace(callback, "", 1).replace(
+        before, f"onAtomicWrite()\n        {before}", 1
+    )
+
+    with pytest.raises(AssertionError, match="after the atomic manifest write"):
         assert_mailbox_journal_finalization_contract(
             coordinator, source[:start] + mutant + source[end:]
         )

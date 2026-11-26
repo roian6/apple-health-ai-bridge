@@ -8,6 +8,7 @@ from tests.guardrails import test_ios_mailbox_ack_diagnostics as guards
 from tests.guardrails.test_ios_mailbox_publication_order import mutated_view_model
 
 _SUMMARY: Final = "func publishMailboxDeliverySummary("
+_FAILURE_PUBLISHER: Final = "func publishMailboxDeliveryFailure("
 _FORMATTER: Final = "static func failure("
 _PROJECTION: Final = "var activityMailboxFailureMessage:"
 _ASSIGNMENT: Final = "unresolved.isEmpty ? [.summary(message)] : unresolved"
@@ -31,6 +32,19 @@ def test_summary_guard_rejects_discarded_filter(
     monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
 
     with pytest.raises(AssertionError, match="must publish retained failures"):
+        guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
+
+
+def test_failure_publisher_guard_rejects_filtering_out_new_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated_view_model(
+        _FAILURE_PUBLISHER,
+        (("+ [diagnostic]", "+ [diagnostic].filter { _ in false }"),),
+    )
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
+
+    with pytest.raises(AssertionError, match="append the new diagnostic last"):
         guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
 
 

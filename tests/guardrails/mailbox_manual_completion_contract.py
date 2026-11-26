@@ -3,10 +3,58 @@
 import re
 
 from tests.guardrails.mailbox_publication_effect_contract import (
+    BOUNDED_OPERATION_CREDIT_PREFIX,
     MailboxLane,
     swift_tokens,
 )
 from tests.guardrails.mailbox_publication_guard import SwiftLexer, mailbox_branch_body
+
+
+def assert_bounded_mailbox_checkpoint_completion(success: str) -> None:
+    """Credit the checkpoint only on the branch where its write returns."""
+    body = mailbox_branch_body(SwiftLexer(success).views(), MailboxLane.BOUNDED)
+    # The checked outer prefix initializes the empty set. Consume the reviewed
+    # phase-selection grammar through the real credit; no overwrite, shadowing,
+    # or other write can intervene between the fence and insertion.
+    prefix = swift_tokens(BOUNDED_OPERATION_CREDIT_PREFIX)
+    checkpoint_and_summary = """
+        if requestedPhase == .advanceOrReconcileFIFOHead,
+           let write = mailboxCheckpointWrite(
+               startingCheckpoint: startingCheckpoint,
+               nextCheckpoint: summary.nextAcknowledgmentCheckpoint,
+               generation: expectedGeneration
+           ) {
+            do {
+                try backgroundSyncStore.persistMailboxAckScanCheckpoint(
+                    write.checkpoint, receiverGeneration: expectedGeneration
+                )
+                completedOperations.insert(.persistScanCheckpoint)
+            } catch {
+                publishMailboxDeliverySummary(
+                    summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                    completedOperations: completedOperations
+                )
+                throw write
+            }
+        }
+        refreshPendingOutboxCount()
+        backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage(
+            summary, pendingCount: pendingOutboxCount
+        )
+        publishMailboxDeliverySummary(
+            summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+            completedOperations: completedOperations
+        )
+    """
+    boundary = "Credit persistence only after the bounded checkpoint write succeeds"
+    executable = swift_tokens(body.executable)
+    selection = f"{boundary}; credit the selected operation"
+    assert executable.startswith(f"{prefix} "), selection
+    publication = swift_tokens(checkpoint_and_summary)
+    after_credit = executable[len(prefix) + 1 :]
+    assert after_credit.startswith(f"{publication} "), boundary
+    tail = after_credit[len(publication) :].split()
+    assert "completedOperations" not in tail, boundary
 
 
 def assert_manual_mailbox_checkpoint_completion(success: str) -> None:
@@ -152,7 +200,8 @@ def assert_mailbox_journal_finalization_contract(coordinator: str, outbox: str) 
     writer = _declaration(
         outbox, "func finalizeCommittedMailboxDelivery(", "public func "
     )
-    body = swift_tokens(SwiftLexer(writer).views().structure)
+    writer_views = SwiftLexer(writer).views()
+    body = swift_tokens(writer_views.structure)
     new_commit = """
         if manifest.entries[index].deliveryState == committed {
             try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
@@ -163,7 +212,7 @@ def assert_mailbox_journal_finalization_contract(coordinator: str, outbox: str) 
             throw FileOutboxMailboxError.deliveryTransitionConflict
         }
         manifest.entries[index].deliveryState = committed
-        try persistManifest(manifest)
+        try persistManifest(manifest) { onNewFinalization() }
         try fault(.statePersisted)
         try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
         if let identity = manifest.entries[index].receiverIdentity {
@@ -171,10 +220,33 @@ def assert_mailbox_journal_finalization_contract(coordinator: str, outbox: str) 
                 itemID: itemID, receiverIdentity: identity
             )
         }
-        onNewFinalization()
         return committed
+        }
     """
-    assert swift_tokens(new_commit) in body, (
-        "Only a new durable finalization may signal acceptance"
+    new_finalization = "Only a new durable finalization may signal acceptance"
+    assert body.endswith(swift_tokens(new_commit)), new_finalization
+    writer_tokens = swift_tokens(writer_views.executable).split()
+    assert writer_tokens.count("onNewFinalization") == 2, new_finalization
+
+    persist = _declaration(
+        outbox, "private func persistManifest(", "private static func validate("
     )
-    assert body.count(callback) == 1
+    atomic_write = """
+        private func persistManifest(
+            _ manifest: SequenceManifest, onAtomicWrite: () -> Void = {}
+        ) throws {
+            try Self.validate(manifest)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let bytes = try encoder.encode(manifest)
+            try bytes.write(to: sequenceURL, options: [.atomic])
+            onAtomicWrite()
+            try Self.applySensitiveFileAttributes(
+                to: sequenceURL, fileManager: fileManager
+            )
+            decodedManifest = (bytes, manifest)
+        }
+    """
+    assert swift_tokens(SwiftLexer(persist).views().structure) == swift_tokens(
+        atomic_write
+    ), "Signal after the atomic manifest write and before throwing hardening"

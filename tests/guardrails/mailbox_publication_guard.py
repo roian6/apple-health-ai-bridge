@@ -7,6 +7,7 @@ from typing import Final
 
 from tests.guardrails.mailbox_publication_effect_contract import (
     AWAIT,
+    MAILBOX_DIAGNOSTIC_STORAGE,
     PUBLICATION,
     MailboxLane,
     assert_checked_outer_prefix,
@@ -245,6 +246,11 @@ def _assert_publication_order(
             "Mailbox publication must not suspend again after checking authority"
         )
     assert_effect_windows(body.structure, body.executable, statements, checks, lane)
+    # The checked transport branches should not bypass the scoped publishers.
+    # A read-only projection belongs outside these branches.
+    assert not MAILBOX_DIAGNOSTIC_STORAGE.search(body.executable), (
+        "Write diagnostics only through scoped Mailbox publishers"
+    )
     for start, end in statements:
         if start > min(checks) and not AWAIT.search(body.executable, start, end):
             statement = body.structure[start:end]

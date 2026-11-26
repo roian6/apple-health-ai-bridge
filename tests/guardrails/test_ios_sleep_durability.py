@@ -67,6 +67,25 @@ def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() 
         "try await store.savePendingForSync(trackedTransition, validate: validate)"
     )
     flush = helper.index("upload = try await uploadPendingOutbox(", track)
+    # Scan the whole tracking-to-upload interval, excluding earlier accepted
+    # recovery. Count every return, and accept false only at the end of its
+    # block: a newline can continue the returned expression in Swift.
+    outcomes = re.finditer(r"\breturn\b(?:\s+(false)\s*\})?", helper[enqueue:flush])
+    assert [outcome.group(1) for outcome in outcomes] == ["false", "false"]
+    # A false exit in some *other* state cannot protect either queued state.
+    for predicate in (
+        "executionMode == .automatic, case .directHTTP = target.route",
+        "snapshot.fifo.first?.id != outboxItemID",
+    ):
+        start = helper.index(f"\n        if {predicate} {{\n", track, flush)
+        end = helper.index("\n        }", start, flush)
+        body = helper[start:end].splitlines()[2:]
+        assert body[-1] == "            return false"
+        assert all(
+            line.startswith("            ") and not line.startswith("             ")
+            for line in body
+        )
+
     refresh = helper.index("snapshot.fifo = try outbox.pendingItems()", flush)
     held = helper.index(
         "if snapshot.fifo.contains(where: { $0.id == outboxItemID })", refresh

@@ -14,6 +14,7 @@ final class NutritionReceiver: @unchecked Sendable {
     private var recordsValue: [String: HealthBridgeSample] = [:]
     private var workoutsValue: [String: HealthBridgeWorkout] = [:]
     private var credentialsValue: [String] = []
+    private var httpRequestsValue = 0
     private var responseProbeValue: NutritionCodecProbe?
     var responseProbe: NutritionCodecProbe? {
         get { lock.withLock { responseProbeValue } }
@@ -36,6 +37,9 @@ final class NutritionReceiver: @unchecked Sendable {
     var records: [HealthBridgeSample] { lock.withLock { Array(recordsValue.values) } }
     var workouts: [HealthBridgeWorkout] { lock.withLock { Array(workoutsValue.values) } }
     var credentials: [String] { lock.withLock { credentialsValue } }
+    var httpRequests: Int { lock.withLock { httpRequestsValue } }
+
+    func recordHTTPRequest() { lock.withLock { httpRequestsValue += 1 } }
 
     func respond(_ request: URLRequest, body: Data?) throws -> (Int, Data) {
         try lock.withLock {
@@ -89,6 +93,8 @@ final class NutritionURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         do {
+            let receiver = try XCTUnwrap(Self.receiver)
+            receiver.recordHTTPRequest()
             var body = request.httpBody
             if let stream = request.httpBodyStream {
                 stream.open()
@@ -103,7 +109,6 @@ final class NutritionURLProtocol: URLProtocol, @unchecked Sendable {
                 }
                 body = data
             }
-            let receiver = try XCTUnwrap(Self.receiver)
             let (status, data) = try receiver.respond(request, body: body)
             if body != nil { receiver.responseProbe?.record() }
             let response = try XCTUnwrap(HTTPURLResponse(

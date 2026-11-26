@@ -7,6 +7,7 @@ from tests.guardrails.mailbox_diagnostic_visibility_guard import (
     assert_mailbox_summary_visibility,
 )
 from tests.guardrails.mailbox_manual_completion_contract import (
+    assert_bounded_mailbox_checkpoint_completion,
     assert_live_mailbox_finalization_attribution,
     assert_mailbox_journal_finalization_contract,
     assert_manual_mailbox_checkpoint_completion,
@@ -14,13 +15,13 @@ from tests.guardrails.mailbox_manual_completion_contract import (
     assert_single_mailbox_finalization_observation,
 )
 from tests.guardrails.mailbox_publication_effect_contract import (
-    MAILBOX_DIAGNOSTIC_WRITE,
     MailboxLane,
     swift_tokens,
 )
 from tests.guardrails.mailbox_publication_guard import (
     CONNECTION_FENCE,
     TARGET_FENCE,
+    SwiftLexer,
     assert_failed_mailbox_publication,
     assert_successful_mailbox_publication,
 )
@@ -387,7 +388,6 @@ def _assert_scoped_mailbox_summary(success: str, message: str) -> None:
     assert all(re.match(unchanged_ids, success[call.end() :]) for call in calls), (
         "Mailbox summary publication must carry the exact finalized item IDs"
     )
-    assert not MAILBOX_DIAGNOSTIC_WRITE.search(success)
 
 
 def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -> None:
@@ -501,11 +501,12 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
         if re.search(r"\bmailboxDeliveryDiagnosticLines\s*=(?!=)", line)
     ]
 
-    publisher = _region(
+    failure_publisher = _region(
         source,
         "func publishMailboxDeliveryFailure(",
-        "func publishMailboxDeliverySummary(",
+        "private func publishMailboxDeliverySummary(",
     )
+    publisher = SwiftLexer(failure_publisher).views().structure
     failure_factory = r"MailboxDeliveryDiagnosticLine\.failure\(\s*for:\s*error\b"
     scope_inputs = r"[^()]*\bgeneration:\s*generation\b[^()]*\boperation:\s*operation\b"
     assert re.search(
@@ -524,7 +525,7 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
         r"\blet recovered\s*=\s*recoveredMailboxFailureIDs\(\s*earlier\s*\)",
         publisher[: writes[0].start()],
     ), "Revalidate earlier failures before publishing"
-    assert re.match(
+    assert re.fullmatch(
         r"""
         earlier\s*\.filter\s*\{
             \s*if\s+case\s+\.item\(let\s+itemID\)\s*=\s*\$0\.scope\s*\{
@@ -532,6 +533,7 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
             \}
             \s*return\s+true\s*
         \}\s*\+\s*\[diagnostic\]
+        \s+return\s+diagnostic\.message\s*\}\s*
         """,
         publisher[writes[0].end() :],
         re.VERBOSE,
@@ -561,7 +563,6 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
         r"\breturn\s+mailboxDeliveryDiagnosticLines\s*" + generation_filter,
         current_failures,
     )
-    assert re.search(r"(?m)^\s*return\s+diagnostic\.message\s*$", publisher)
     formatter = _region(
         source,
         "static func failure(",
@@ -630,13 +631,7 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
         "reconcilePendingFIFOHeadAcknowledgment(",
         MailboxLane.BOUNDED,
     )
-    checkpoint_write = success.index("persistMailboxAckScanCheckpoint(")
     failure_catch = helper.index("} catch {", cancellation_catch)
-    checkpoint_failure, completed = success[checkpoint_write:].split(
-        "refreshPendingOutboxCount()", 1
-    )
-    for path in (checkpoint_failure, completed):
-        _assert_scoped_mailbox_summary(path, "summary.diagnosticLine")
     assert swift_tokens(
         helper[cancellation_catch:failure_catch].split("{", 1)[1]
     ) == swift_tokens("finalizedOwner = nil\nreturn .cancelled"), (
@@ -651,6 +646,7 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
     assert_failed_mailbox_publication(helper[failure_catch:], stale_fence)
     assert_single_mailbox_finalization_observation(success, helper)
     assert_live_mailbox_finalization_attribution(source)
+    assert_bounded_mailbox_checkpoint_completion(success)
 
     delivery = Path(
         "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/ProductionMailboxDelivery.swift"

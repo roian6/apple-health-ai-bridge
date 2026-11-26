@@ -13,19 +13,10 @@ class MailboxLane(Enum):
     BOUNDED = auto()
 
 
-MAILBOX_DIAGNOSTIC_WRITE: Final = re.compile(
-    r"""
-    \bmailboxDeliveryDiagnosticLines\s*
-    (?:
-        (?:\[[^\]\n]+\]\s*)?\+?=(?!=)
-        | \.\s*(?:remove\w*|append|insert|replaceSubrange)\s*\(
-    )
-    """,
-    re.VERBOSE,
-)
+MAILBOX_DIAGNOSTIC_STORAGE: Final = re.compile(r"\bmailboxDeliveryDiagnosticLines\b")
 PUBLICATION: Final = re.compile(
     rf"""
-    {MAILBOX_DIAGNOSTIC_WRITE.pattern}
+    {MAILBOX_DIAGNOSTIC_STORAGE.pattern}
     | \b(?:publishMailboxDelivery(?:Summary|Failure)|refreshPendingOutboxCount
           |recordAcceptedTransfer|recordNewMailboxFinalization
           |persistMailboxAckScanCheckpoint)\s*\(
@@ -133,6 +124,13 @@ _DELIVERY_PREFIX: Final = {
         """,
     ),
 }
+BOUNDED_OPERATION_CREDIT_PREFIX: Final = "\n".join(
+    (
+        *_DELIVERY_PREFIX[MailboxLane.BOUNDED],
+        _ADMISSION,
+        "completedOperations.insert(operation)",
+    )
+)
 _AFTER_YIELD: Final = (
     "await Task.yield()",
     "return",
