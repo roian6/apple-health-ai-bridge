@@ -1249,10 +1249,17 @@ public final class FileOutbox {
 
     private func pendingItems(in manifest: SequenceManifest) throws -> [FileOutboxItem] {
         let payloadIDs = Set(try payloadFileURLs().map { payloadID(for: $0) })
+        let transactions = terminalResetRequestIsActive ? [] : try loadEnqueueTransactions()
+        let evidenceIDs = transactions.reduce(into: Set<String>()) { ids, transaction in
+            guard transaction.hasUncheckedDirectSleepAcknowledgment else { return }
+            ids.formUnion(transaction.uncheckedDirectAcknowledgmentIDs.filter {
+                $0 != transaction.directSleepCleanupIntent?.itemID
+            })
+        }
         return manifest.entries
             .sorted { $0.sequence < $1.sequence }
             .compactMap { entry in
-                guard payloadIDs.contains(entry.id) else { return nil }
+                guard payloadIDs.contains(entry.id), !evidenceIDs.contains(entry.id) else { return nil }
                 let fileURL = directory
                     .appendingPathComponent(entry.id)
                     .appendingPathExtension("json")
@@ -1474,12 +1481,23 @@ public final class FileOutbox {
     }
 
     public func acceptedFinalizationHold() throws -> AcceptedFinalizationHold? {
+        try acceptedFinalizationHold(matching: nil)
+    }
+
+    func acceptedFinalizationHold(
+        matching item: (id: String, receiverBindingID: String)?
+    ) throws -> AcceptedFinalizationHold? {
         let sleepTypes: Set<String> = [HealthBridgeHealthType.sleepAnalysis.typeCode]
         var cleanupPending = false
         for transaction in try loadEnqueueTransactions() {
             let intent = transaction.directSleepCleanupIntent
             guard transaction.hasUncheckedDirectSleepAcknowledgment else { continue }
-            for id in transaction.uncheckedDirectAcknowledgmentIDs {
+            if let item {
+                guard transaction.entries.allSatisfy({ $0.receiverIdentity == item.receiverBindingID }),
+                      transaction.cursorCheckpoint.map({ $0.receiverIdentity == item.receiverBindingID }) != false
+                else { continue }
+            }
+            for id in transaction.uncheckedDirectAcknowledgmentIDs where item == nil || id == item?.id {
                 // An intent proves only its own item. A missing sibling payload may
                 // still need independent proof from the domain finalizer.
                 if id != intent?.itemID,
@@ -3001,9 +3019,12 @@ public final class FileOutbox {
         var manifestEntries = Dictionary(
             uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
         )
+        var unreadableEvidence: Set<String> = []
         #if !HEALTH_BRIDGE_MAILBOX_QA
         if !destructiveRecoveryIsRequested {
-            let checked = transactions.map { recoverLegacyDirectStepsChecks($0, manifestEntries: manifestEntries) }
+            let checked = transactions.map {
+                recoverLegacyDirectStepsChecks($0, manifestEntries: manifestEntries, unreadableEvidence: &unreadableEvidence)
+            }
             if checked != transactions {
                 // Keep the classification durable before unlinking the only
                 // surviving evidence, including across a second restart.
@@ -3069,6 +3090,7 @@ public final class FileOutbox {
                     let stagedURL = stagedPayloadURL(for: entry.id)
                     let finalURL = finalPayloadURL(for: entry.id)
                     if acknowledgedIDs.contains(entry.id) {
+                        if unreadableEvidence.contains(entry.id) { continue }
                         try removeIfExists(stagedURL)
                         try removeIfExists(finalURL)
                         if let removed = manifestEntries.removeValue(forKey: entry.id) {
@@ -3142,7 +3164,7 @@ public final class FileOutbox {
 
     #if !HEALTH_BRIDGE_MAILBOX_QA
     private func recoverLegacyDirectStepsChecks(
-        _ transaction: EnqueueTransaction, manifestEntries: [String: SequenceEntry]
+        _ transaction: EnqueueTransaction, manifestEntries: [String: SequenceEntry], unreadableEvidence: inout Set<String>
     ) -> EnqueueTransaction {
         let unchecked = transaction.uncheckedDirectAcknowledgmentIDs
         guard !unchecked.isEmpty, transaction.finalizationRecord?.isDirectSleepRecord == true else {
@@ -3157,18 +3179,26 @@ public final class FileOutbox {
                   let current = manifestEntries[entry.id], Self.hasSameCollectionIdentity(current, entry),
                   current.mailboxBinding == nil, entry.mailboxBinding == nil,
                   current.deliveryState == nil, entry.deliveryState == nil,
-                  !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path),
-                  legacyPayloadIsStepsOnly(finalPayloadURL(for: entry.id)) else { continue }
-            checked = checked.recordingDirectAcknowledgment(for: entry.id, sleepChecked: true)
+                  !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path) else { continue }
+            do {
+                if try legacyPayloadIsStepsOnly(finalPayloadURL(for: entry.id)) {
+                    checked = checked.recordingDirectAcknowledgment(for: entry.id, sleepChecked: true)
+                }
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                continue
+            } catch {
+                unreadableEvidence.insert(entry.id)
+            }
         }
         return checked
     }
 
-    private func legacyPayloadIsStepsOnly(_ url: URL) -> Bool {
-        guard let file = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-              file.isRegularFile == true, file.isSymbolicLink == false,
-              let bytes = try? Data(contentsOf: url),
-              let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes),
+    private func legacyPayloadIsStepsOnly(_ url: URL) throws -> Bool {
+        let file = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard let regular = file.isRegularFile, let symlink = file.isSymbolicLink else { throw CocoaError(.fileReadUnknown) }
+        guard regular, !symlink else { return false }
+        let bytes = try Data(contentsOf: url)
+        guard let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes),
               batch.schemaID == "health_bridge.batch.v1", batch.schemaVersion == "1.0.0",
               batch.healthTypes == [.steps], batch.workouts.isEmpty, batch.sleepSessions.isEmpty,
               batch.samples.allSatisfy({ $0.typeCode == HealthBridgeHealthType.steps.typeCode }),

@@ -16,6 +16,10 @@ from tests.guardrails.mailbox_publication_effect_contract import (
 
 _LEXEME: Final = re.compile(r'//[^\n]*|/\*|\#*"{3}|\#*"|[/()]')
 _COMMENT_EDGE: Final = re.compile(r"/\*|\*/")
+_OPERAND_END: Final = re.compile(
+    r"(?:[)\]]|\b(?!(?:return|throw|try|await|yield|in|case|where|if|guard|"
+    r"while|switch|for|repeat|each|consume|copy|borrow)\b)\w+)\Z"
+)
 _DELIMITER: Final = re.compile(r"[][(){};\n]")
 _OPEN: Final = {"(": ")", "[": "]", "{": "}"}
 _CLOSE: Final = frozenset(_OPEN.values())
@@ -73,13 +77,18 @@ class SwiftLexer:
             elif lexeme.endswith('"'):
                 offset = self._string(token)
                 self.literals.append((token.start(), offset))
-            else:
-                # Slash may open a regex literal; this guard does not parse it.
-                assert lexeme != "/", "Unsupported Swift slash syntax in Mailbox branch"
-                if interpolation:
-                    depth += 1 if lexeme == "(" else -1
-                    if depth == 0:
-                        return offset
+            elif lexeme == "/":
+                # A bare regex cannot start with unescaped whitespace. A hash
+                # delimiter can, so continue to reject extended regex syntax.
+                division = self.source[token.start() - 1 : token.start()] != "#" and (
+                    self.source[offset : offset + 1].isspace()
+                    or _OPERAND_END.search(self.source, 0, token.start()) is not None
+                )
+                assert division, "Unsupported Swift slash syntax in Mailbox branch"
+            elif interpolation:
+                depth += 1 if lexeme == "(" else -1
+                if depth == 0:
+                    return offset
         assert not interpolation, "Unterminated Swift string interpolation"
         return len(self.source)
 

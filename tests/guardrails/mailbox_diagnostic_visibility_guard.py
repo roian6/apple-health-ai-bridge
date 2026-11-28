@@ -109,6 +109,6 @@ def assert_mailbox_failure_projection(projection: str) -> None:
         \s*return\s+diagnostic\.message\s*
         \}\s*
         """,
-        projection,
+        SwiftLexer(projection).views().structure,
         re.VERBOSE,
     ), "Activity must expose only the current-generation Mailbox failure message"

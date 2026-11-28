@@ -131,11 +131,12 @@ final class NutritionMailboxFixture {
         )
     }
 
-    func components() -> ProductionMailboxComponents {
+    func components(outbox selectedOutbox: FileOutbox? = nil) -> ProductionMailboxComponents {
+        let outbox = selectedOutbox ?? base.outbox
         let location = locator
-        let lookup = FileOutboxMailboxAckLookup(outbox: base.outbox, deviceSigningPublicKey: context.deviceSigningPublicKey)
+        let lookup = FileOutboxMailboxAckLookup(outbox: outbox, deviceSigningPublicKey: context.deviceSigningPublicKey)
         let transport = MailboxTransport(
-            outbox: base.outbox,
+            outbox: outbox,
             context: MailboxTransportContext(
                 receiverID: context.receiverID, deviceID: context.deviceID,
                 receiverBindingID: identity.opaqueBinding, connectionGeneration: 1,
@@ -166,12 +167,15 @@ final class NutritionMailboxFixture {
     }
 
     func delivery(
+        outbox selectedOutbox: FileOutbox? = nil,
+        cursorStore: FileSyncCursorStore? = nil,
         pendingGenerationStore: BackgroundSyncSettingsStore? = nil,
         sleepStore: FileSleepSyncManifestStore? = nil
     ) -> ProductionMailboxDelivery {
-        let components = components()
+        let outbox = selectedOutbox ?? base.outbox
+        let components = components(outbox: outbox)
         return ProductionMailboxDelivery(
-            settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
+            settingsStore: base.settings, outbox: outbox, cursorStore: cursorStore ?? base.cursors,
             pendingGenerationStore: pendingGenerationStore ?? BackgroundSyncSettingsStore(userDefaults: base.defaults),
             sleepStore: sleepStore,
             keyStore: keys, componentsFactory: { [self] in

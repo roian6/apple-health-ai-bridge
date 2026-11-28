@@ -229,7 +229,8 @@ final class NutritionFixture {
             platformBackgroundPayloadDrain: { true },
             productionMailboxDelivery: mailbox.map { fixture in
                 { @MainActor in
-                    fixture.delivery(pendingGenerationStore: backgroundSyncStore, sleepStore: mailboxSleepStore)
+                    fixture.delivery(outbox: deliveryOutbox, cursorStore: deliveryCursors,
+                                     pendingGenerationStore: backgroundSyncStore, sleepStore: mailboxSleepStore)
                 }
             },
             readAnchoredQuantityChanges: { [self] type, previous, start, now in

@@ -159,6 +159,9 @@ final class PlainDirectAcceptanceTests: XCTestCase {
         XCTAssertEqual(reports, published ? 1 : 0, "\(lane): callback count at the ACK publication boundary")
         let reportsBeforeRetry = reports
         if !published {
+            var isDirectory: ObjCBool = false
+            XCTAssertTrue(files.fileExists(atPath: journal.path, isDirectory: &isDirectory))
+            XCTAssertTrue(isDirectory.boolValue)
             XCTAssertEqual(try Data(contentsOf: item.fileURL), payload, "\(lane): failed write must retain payload")
             try files.removeItem(at: journal)
         }

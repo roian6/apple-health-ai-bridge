@@ -252,7 +252,17 @@ def assert_new_mailbox_finalization_contract(delivery: str) -> None:
     assert bounded_tokens.count(bounded_load) == 1, (
         "Core must not synthesize or duplicate durable finalization evidence"
     )
-    assert len(re.findall(r"\bcoordinator\b", bounded)) == 24, (
+    generation_fence = swift_tokens("""
+        guard settingsStore.receiverSettingsGenerationToken
+            == coordinator.ownership.receiverGeneration else {
+            throw CancellationError()
+        }
+        switch event.classification
+    """)
+    assert generation_fence in bounded_tokens, (
+        "Check the ACK owner's generation before consumption"
+    )
+    assert len(re.findall(r"\bcoordinator\b", bounded)) == 25, (
         "Core must not synthesize or duplicate durable finalization evidence"
     )
     coordinator_factories = _function_executables(delivery, "coordinator")

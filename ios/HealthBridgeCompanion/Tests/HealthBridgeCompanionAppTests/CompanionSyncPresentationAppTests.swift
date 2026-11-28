@@ -634,7 +634,7 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
 
     private func checkMailboxArtifactCleanupRecovery(manualOnly: Bool) async throws {
         let files = MailboxEnvelopeRemovalFailure()
-        let fixture = try NutritionMailboxFixture(nativePairing: true, outboxFileManager: files)
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
         try fixture.writeCapabilities()
         let suite = fixture.base.suite + ".receipt-count"
@@ -657,7 +657,8 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         _ = try fixture.receiveAndAcknowledge(unrelated)
         let viewModel = try await fixture.base.makeViewModel(
             mailbox: fixture, eligibleTypeCodes: [],
-            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) }
+            readAnchoredStepChanges: { _, _, _ in throw CocoaError(.featureUnsupported) },
+            reopenStorage: true, outboxFileManager: files
         )
         XCTAssertEqual(viewModel.automaticSyncRuntimeIsReady, !manualOnly)
         let runtime = AutomaticSyncRuntime(
@@ -1562,6 +1563,33 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         }
     }
 
+    func testBoundedACKRejectsGenerationChangeDuringExactScan() async throws {
+        let fixture = try NutritionMailboxFixture()
+        defer { fixture.base.cleanup() }
+        let item = try fixture.base.enqueueMixed()
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let head = try XCTUnwrap(fixture.base.outbox.pendingItem(id: item.id))
+        XCTAssertEqual(head.deliveryState?.phase, .providerObserved)
+        _ = try fixture.receiveAndAcknowledge(head)
+        let settings = fixture.base.settings
+        let generation = settings.receiverSettingsGenerationToken
+        fixture.ackScanFault = { boundary in
+            if boundary == .beforeCandidateOpen {
+                _ = try settings.invalidateReceiverSettingsGeneration(expectedGeneration: generation)
+            }
+        }
+        do {
+            _ = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(
+                afterAcknowledgmentCheckpoint: nil, onNewFinalization: { _ in XCTFail("Stale ACK finalized") }
+            )
+            XCTFail("Expected the superseded ACK scan to cancel")
+        } catch is CancellationError {}
+        XCTAssertNotEqual(settings.receiverSettingsGenerationToken, generation)
+        XCTAssertEqual(settings.receiverBindingID, fixture.identity.opaqueBinding)
+        XCTAssertEqual(try fixture.base.outbox.pendingItem(id: item.id), head)
+        XCTAssertNil(try fixture.base.cursor("dietary_protein"))
+    }
+
     func testManualSyncContinuesToQuantitiesWhileAcceptedSleepIsHeld() async throws {
         for evidence in ManualSleepHoldEvidence.allCases {
             try await checkManualSyncWithSleepHold(evidence: evidence)
@@ -1649,6 +1677,75 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(vm.statusMessage, try XCTUnwrap(vm.acceptedFinalizationRecoveryMessage))
         XCTAssertEqual(try fixture.outbox.acceptedFinalizationHold()?.reason, .proofMissing)
         XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), generations)
+    }
+
+    func testCurrentSleepJournalWithoutCommittedProofDefersManualSleep() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        try background.setEnabledDurably(false)
+        try background.markPendingObserverTypeCodes(["sleep_analysis"])
+        let debt = try background.loadPendingObserverTypeCodeGenerations()
+        let vm = try await fixture.makeViewModel(readAnchoredSleepChanges: { _, _, now in
+            HealthKitAnchoredSleepChanges(addedSamples: [], deletedSamples: [],
+                                          anchorCursorValue: fixture.anchor, receivedAt: now)
+        })
+        fixture.receiver.status = 503
+        _ = await vm.syncRecentSleepSessions(pendingGenerationRetirements: debt)
+        let store = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        let pending = try XCTUnwrap(store.loadPendingTransition())
+        let itemID = try XCTUnwrap(pending.outboxItemID)
+        let manifest = try store.loadManifest()
+        XCTAssertNotEqual(manifest, pending.manifest)
+        XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(
+            itemID: itemID, receiverIdentity: pending.receiverBindingID
+        ))
+        let requests = fixture.receiver.batches
+        _ = await vm.syncRecentSleepSessions(deferMissingProof: true)
+        XCTAssertFalse(vm.statusIsError)
+        XCTAssertEqual(vm.statusMessage, try XCTUnwrap(vm.acceptedFinalizationRecoveryMessage))
+        XCTAssertEqual(fixture.receiver.batches, requests)
+        XCTAssertEqual(try store.loadPendingTransition(), pending)
+        XCTAssertEqual(try store.loadManifest(), manifest)
+        XCTAssertTrue(try fixture.outbox.hasUncheckedDirectAcknowledgment(
+            itemID: itemID, receiverBindingID: pending.receiverBindingID
+        ))
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), debt)
+    }
+
+    func testForegroundSleepResponseAfterAutomaticDisableCommitsBeforeRetry() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        try BackgroundSyncSettingsStore(userDefaults: fixture.defaults).setEnabledDurably(true)
+        let vm = try await fixture.makeViewModel(readAnchoredSleepChanges: { anchor, _, now in
+            if let anchor {
+                XCTAssertEqual(anchor, fixture.anchor)
+                throw CocoaError(.featureUnsupported)
+            }
+            return HealthKitAnchoredSleepChanges(addedSamples: [], deletedSamples: [],
+                                                 anchorCursorValue: fixture.anchor, receivedAt: now)
+        })
+        let probe = NutritionCodecProbe(blocking: true)
+        defer { probe.release() }
+        fixture.receiver.responseProbe = probe
+        let sync = Task { @MainActor in await vm.syncRecentSleepSessions() }
+        await fulfillment(of: [probe.entered], timeout: 5)
+        let store = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        let pending = try XCTUnwrap(store.loadPendingTransition())
+        vm.requestBackgroundSyncEnabled(false)
+        probe.release()
+        _ = await sync.value
+        await vm.waitForAutomaticSyncDisableCleanup()
+        XCTAssertFalse(probe.watchdogExpired)
+        XCTAssertEqual(try store.loadManifest(), pending.manifest)
+        XCTAssertNil(try store.loadPendingTransition())
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: pending.receiverBindingID))
+        XCTAssertTrue(pending.manifest.baselineResetPending == true)
+        XCTAssertEqual(
+            fixture.receiver.batches,
+            [try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pending.payload)]
+        )
     }
 
     func testForegroundDirectSleepRejectsSiblingOnlyAcceptance() async throws {

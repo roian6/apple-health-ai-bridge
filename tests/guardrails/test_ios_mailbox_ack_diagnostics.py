@@ -526,7 +526,11 @@ def test_background_mailbox_failure_checks_generation_before_publication() -> No
     )
     failure = mailbox[failure_catch:]
     assert_failed_mailbox_publication(failure, CONNECTION_FENCE, stale_return="")
-    assert re.search(r"\bpublishMailboxDeliveryFailure\(\s*error\b", failure)
+    assert re.search(
+        r"\bpublishMailboxDeliveryFailure\s*\(\s*error\s*,\s*"
+        r"generation:\s*expectedGeneration\s*,\s*operation:\s*\.publishFIFOHead\s*\)",
+        SwiftLexer(failure).views().structure,
+    ), "Expected a scoped scheduler failure diagnostic"
     assert (
         'backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed:' in failure
     )
@@ -562,7 +566,7 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
     )
     assert len(writes) == 1
     assert re.search(
-        r"\blet recovered\s*=\s*recoveredMailboxFailureIDs\(\s*earlier\s*\)",
+        r"\blet recovered\s*=\s*recoveredMailboxFailureIDs\(\s*earlier\s*\)\s*\Z",
         publisher[: writes[0].start()],
     ), "Revalidate earlier failures before publishing"
     assert re.fullmatch(

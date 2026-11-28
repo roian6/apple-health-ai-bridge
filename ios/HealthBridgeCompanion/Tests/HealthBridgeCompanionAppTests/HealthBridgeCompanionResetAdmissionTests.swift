@@ -5932,6 +5932,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             XCTAssertEqual(committed, accepted.manifest)
             XCTAssertNil(pending)
             XCTAssertTrue(try reopened.uploadablePendingItems(for: accepted.receiverBindingID).isEmpty)
+            XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: accepted.receiverBindingID))
             let retry = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep, outbox: reopened,
                 requestProjectionReadAuthorization: { _ in throw CocoaError(.featureUnsupported) })
             await retry.viewModel.performManualSyncOpportunity { false }

@@ -32,6 +32,16 @@ _BOUNDED_GUARD = (
 )
 
 
+@pytest.mark.parametrize("expression", ["4 / 2", "numerator/denominator", "(4/2)/2"])
+def test_core_finalization_guard_accepts_unrelated_division(expression: str) -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text()
+    assert_new_mailbox_finalization_contract(
+        source
+        + "\nprivate let numerator = 4, denominator = 2\n"
+        + f"private let half = {expression}\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("before", "after"),
     [

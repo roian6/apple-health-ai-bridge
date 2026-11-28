@@ -286,6 +286,26 @@ def test_scheduler_success_rejects_non_dominating_sibling_fence(
         _SCHEDULE()
 
 
+@pytest.mark.parametrize("change", ["comment", "generation", "operation"])
+def test_scheduler_failure_requires_active_scoped_publisher(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    call = (
+        "publishMailboxDeliveryFailure(error, generation: expectedGeneration, "
+        "operation: .publishFIFOHead)"
+    )
+    replacement = {
+        "comment": "// " + call,
+        "generation": call.replace("expectedGeneration", "currentGeneration"),
+        "operation": call.replace(".publishFIFOHead", ".manualDelivery"),
+    }[change]
+    monkeypatch.setattr(
+        guards, "VIEW_MODEL", mutated_view_model(_SCHEDULER, ((call, replacement),))
+    )
+    with pytest.raises(AssertionError, match="scheduler failure"):
+        _SCHEDULE()
+
+
 @pytest.mark.parametrize("wrapper", ["conditional", "error-suppressed"])
 def test_scheduler_failure_requires_an_exiting_fence(
     monkeypatch: pytest.MonkeyPatch, wrapper: str

@@ -472,6 +472,9 @@ public final class ProductionMailboxDelivery {
             let event = report.events[index]
             do {
                 try Task.checkCancellation()
+                guard settingsStore.receiverSettingsGenerationToken == coordinator.ownership.receiverGeneration else {
+                    throw CancellationError()
+                }
                 switch event.classification {
                 case .committed, .duplicateIdentical:
                     let disposition = try coordinator.consume(event, itemID: item.id)

@@ -340,12 +340,16 @@ final class DirectSleepFinalizationTests: XCTestCase {
         try await assertMixedLegacyRecovery(stepsPayloadSurvives: false)
     }
 
+    func testMixedLegacyRecoveryRetainsUnreadableStepsForRetry() async throws {
+        try await assertMixedLegacyRecovery(stepsPayloadSurvives: true, temporarilyUnreadable: true)
+    }
+
     func testMixedLegacyRecoveryDoesNotTrustCorruptedSurvivingStepsPayload() async throws {
         try await assertMixedLegacyRecovery(stepsPayloadSurvives: true, corruptStepsPayload: true)
     }
 
     private func assertMixedLegacyRecovery(
-        stepsPayloadSurvives: Bool, corruptStepsPayload: Bool = false
+        stepsPayloadSurvives: Bool, corruptStepsPayload: Bool = false, temporarilyUnreadable: Bool = false
     ) async throws {
         let binding = "receiver-a"
         let checkpoint = FileOutboxCursorCheckpoint(
@@ -377,6 +381,15 @@ final class DirectSleepFinalizationTests: XCTestCase {
             try Data("{}".utf8).write(to: steps.fileURL)
         }
         let stepsProven = stepsPayloadSurvives && !corruptStepsPayload
+        if temporarilyUnreadable {
+            let files = FileManager.default
+            try files.setAttributes([.posixPermissions: 0], ofItemAtPath: steps.fileURL.path)
+            XCTAssertThrowsError(try Data(contentsOf: steps.fileURL))
+            XCTAssertTrue(try f.outbox.uploadablePendingItems(for: binding).isEmpty)
+            XCTAssertTrue(try f.outbox.hasUncheckedDirectAcknowledgment(itemID: steps.id, receiverBindingID: binding))
+            try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: steps.fileURL.path)
+            XCTAssertEqual(try Data(contentsOf: steps.fileURL), bytes)
+        }
         let outbox = try FileOutbox(directory: directory)
         let cursor = try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("cursors.json"))
         let sleep = try FileSleepSyncManifestStore(fileURL: f.root.appendingPathComponent("sleep.json"))

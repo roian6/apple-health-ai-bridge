@@ -717,8 +717,11 @@ final class FileOutboxTests: XCTestCase {
 
             if existingSequence == 1 {
                 let journal = try Data(contentsOf: fixture.journalURL)
+                let manifestURL = directory.appendingPathComponent(".fifo-sequence")
+                let manifest = try Data(contentsOf: manifestURL)
                 XCTAssertThrowsError(try outbox.pendingItems())
                 XCTAssertEqual(try Data(contentsOf: fixture.journalURL), journal)
+                XCTAssertEqual(try Data(contentsOf: manifestURL), manifest)
             } else {
                 XCTAssertEqual(try outbox.pendingItems().map(\.id), fixture.ids + [existingID])
                 XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.journalURL.path))

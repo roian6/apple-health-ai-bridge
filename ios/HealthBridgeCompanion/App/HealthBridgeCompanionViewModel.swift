@@ -6140,7 +6140,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     }
                 )
             }
-            guard finalized else { throw FileOutboxCursorCheckpointError.pendingCommit }
+            guard finalized else {
+                try validate()
+                if try outbox.acceptedFinalizationHold(matching: (itemID, target.bindingID))?.reason == .proofMissing,
+                   let hold = try sleepFinalizationHold(in: outbox), hold.reason == .proofMissing { throw hold }
+                throw FileOutboxCursorCheckpointError.pendingCommit
+            }
             snapshot.storage = try store.revisionForSync()
             snapshot.fifo = try outbox.pendingItems()
             try validate()
@@ -7737,7 +7742,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         store: SleepSyncManifestStoring,
         outbox: FileOutbox
     ) throws {
-        guard terminalTransitionRequestIsActive == snapshot.terminalRequest else {
+        guard terminalTransitionRequestIsActive == snapshot.terminalRequest,
+              backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration,
+              !snapshot.automatic || backgroundSyncEnabled else {
             throw CancellationError()
         }
         try validateSleepOperationAuthority(snapshot, store: store, outbox: outbox)
@@ -7754,11 +7761,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               settingsStore.receiverBindingID == snapshot.binding,
               settingsStore.receiverURLString == snapshot.url,
               bootstrapRetryGeneration == snapshot.retryGeneration,
-              backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration,
               terminalRecoveryRequestIsActive == snapshot.recovery,
               taskUIPublicationIsSuppressed == snapshot.publicationSuppressed,
-              connectionTerminalBarrier.admissionIsOpen == snapshot.admissionOpen,
-              !snapshot.automatic || backgroundSyncEnabled else { throw CancellationError() }
+              connectionTerminalBarrier.admissionIsOpen == snapshot.admissionOpen else { throw CancellationError() }
         try outbox.requireUploadAdmission()
     }
 

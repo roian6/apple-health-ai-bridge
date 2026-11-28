@@ -916,6 +916,9 @@ def test_terminal_request_prevents_post_opt_out_enqueue() -> None:
         "private static func sleepStorageMayNeedRecovery(", operation_start
     )
     context = source[context_start:operation_start]
+    authority_start = context.index("private func validateSleepOperationAuthority(")
+    assert "backgroundSyncPreferenceGeneration" not in context[authority_start:]
+    assert "backgroundSyncEnabled" not in context[authority_start:]
     for guard in (
         "try Task.checkCancellation()",
         "backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration",

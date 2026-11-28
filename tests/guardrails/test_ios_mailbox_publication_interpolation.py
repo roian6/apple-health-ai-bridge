@@ -66,10 +66,12 @@ def test_foreground_failure_accepts_safe_interpolation(
     _CATCH_UP()
 
 
+@pytest.mark.parametrize("literal", ["/pattern/", "#/pattern/#", "#/ spaced /#"])
 def test_foreground_failure_fails_closed_on_unsupported_interpolation(
     monkeypatch: pytest.MonkeyPatch,
+    literal: str,
 ) -> None:
-    expression = r'"\(String(reflecting: #/pattern/#))"'
+    expression = rf'"\(String(reflecting: {literal}))"'
     mutant = mutated_view_model(
         _FOREGROUND, ((_ARGUMENT, f"generation: {expression})"),)
     )

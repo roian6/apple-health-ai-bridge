@@ -247,6 +247,28 @@ def test_projection_guard_rejects_showing_failure_for_direct_transport(
         guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
 
 
+def test_projection_guard_accepts_comment_between_conditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    condition = "usesMailboxTransport, "
+    mutant = mutated_view_model(_PROJECTION, ((condition, condition + "/* scope */ "),))
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
+    guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
+
+
+def test_failure_guard_rejects_unproven_recovery_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery = "recoveredMailboxFailureIDs(earlier)"
+    mutant = mutated_view_model(
+        _FAILURE_PUBLISHER,
+        ((recovery, recovery + '.union(["item-a"])'),),
+    )
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
+    with pytest.raises(AssertionError, match="Revalidate earlier failures"):
+        guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
+
+
 def test_visibility_guard_accepts_renamed_filter_and_safe_copy_edits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
