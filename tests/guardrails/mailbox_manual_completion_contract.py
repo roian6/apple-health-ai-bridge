@@ -113,6 +113,33 @@ def _declaration(source: str, start: str, end: str) -> str:
     return source[start_at : source.index(end, start_at + len(start))]
 
 
+def _function_executables(source: str, name: str) -> tuple[str, ...]:
+    views = SwiftLexer(source).views()
+    matches = tuple(re.finditer(rf"\bfunc\s+{re.escape(name)}\s*\(", views.structure))
+    bodies: list[str] = []
+    for match in matches:
+        opening_brace = views.structure.index("{", match.end())
+        depth = 0
+        for offset in range(opening_brace, len(views.structure)):
+            if views.structure[offset] == "{":
+                depth += 1
+            elif views.structure[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    bodies.append(views.executable[match.start() : offset + 1])
+                    break
+        else:
+            message = f"Unterminated Swift function: {name}"
+            raise AssertionError(message)
+    return tuple(bodies)
+
+
+def _function_executable(source: str, name: str) -> str:
+    bodies = _function_executables(source, name)
+    assert len(bodies) == 1
+    return bodies[0]
+
+
 def assert_single_mailbox_finalization_observation(success: str, lane: str) -> None:
     structure = SwiftLexer(lane).views().structure
     assert len(re.findall(r"\brecordNewMailboxFinalization\s*\(", structure)) == 1, (
@@ -152,41 +179,110 @@ def assert_live_mailbox_finalization_attribution(view_model: str) -> None:
 
 
 def assert_new_mailbox_finalization_contract(delivery: str) -> None:
-    bounded = _declaration(
-        delivery,
-        "public func reconcilePendingFIFOHeadAcknowledgment(",
-        "public func deliverPending()",
-    )
-    manual = _declaration(
-        delivery,
-        "public func deliverPending()",
-        "static func orderedAcknowledgmentIndices(",
-    )
-    bounded_tokens = swift_tokens(SwiftLexer(bounded).views().structure)
-    manual_tokens = swift_tokens(SwiftLexer(manual).views().structure)
+    delivery_views = SwiftLexer(delivery).views()
+    assert (
+        re.search(r"(?m)^\s*#(?:if|elseif|else|endif)\b", delivery_views.structure)
+        is None
+    ), "Core must not synthesize or duplicate durable finalization evidence"
+    delivery_tokens = swift_tokens(delivery_views.executable)
     forwarded = swift_tokens(
         "onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void"
     )
-    for tokens in (bounded_tokens, manual_tokens):
-        assert forwarded in tokens
-        assert swift_tokens("onNewFinalization: { _ in }") in tokens
-    threading = swift_tokens(
-        "components: components, onNewFinalization: onNewFinalization"
-    )
-    assert manual_tokens.count(threading) == 2
+    no_op = swift_tokens("onNewFinalization: { _ in }")
     commit = swift_tokens("""
         try await coordinator.finalizeCommitted(itemID: item.id) {
             onNewFinalization(coordinator.ownership)
         }
     """)
-    callback = re.compile(r"\bonNewFinalization(?: \))* \(")
-    for tokens, invocations in ((bounded_tokens, 2), (manual_tokens, 1)):
-        assert tokens.count(commit) == invocations, (
-            "Core must forward evidence from the commit callback with the actual owner"
+    initial_foreground = swift_tokens("""
+        var finalizedItemIDs = try await finalizeVerifiedForegroundHeads(
+            components: components, onNewFinalization: onNewFinalization
         )
-        assert len(callback.findall(tokens)) == invocations, (
+    """)
+    additional_foreground = swift_tokens("""
+        finalizedItemIDs.formUnion(try await finalizeVerifiedForegroundHeads(
+            components: components, onNewFinalization: onNewFinalization
+        ))
+    """)
+    foreground_declaration = swift_tokens(
+        "private func finalizeVerifiedForegroundHeads("
+    )
+    assert delivery_tokens.count(foreground_declaration) == 1, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    foreground = _function_executable(delivery, "finalizeVerifiedForegroundHeads")
+    foreground_tokens = swift_tokens(foreground)
+    durable_sequence = swift_tokens(
+        """let coordinator = try await coordinator(
+            components: components, itemID: item.id
+        )
+        _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+            onNewFinalization(coordinator.ownership)
+        }
+        finalizedItemIDs.insert(item.id)"""
+    )
+    assert foreground_tokens.count(durable_sequence) == 1, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    assert len(re.findall(r"\bcoordinator\b", foreground)) == 4, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    bounded_candidates = tuple(
+        body
+        for body in _function_executables(
+            delivery, "reconcilePendingFIFOHeadAcknowledgment"
+        )
+        if re.search(r"\bcoordinator\b", body) is not None
+    )
+    assert len(bounded_candidates) == 1, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    bounded = bounded_candidates[0]
+    bounded_tokens = swift_tokens(bounded)
+    bounded_load = swift_tokens(
+        """coordinator = try await self.coordinator(
+            components: components, itemID: item.id
+        )
+        phase = try coordinator.state(itemID: item.id)?.phase"""
+    )
+    assert bounded_tokens.count(bounded_load) == 1, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    assert len(re.findall(r"\bcoordinator\b", bounded)) == 24, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    coordinator_factories = _function_executables(delivery, "coordinator")
+    assert len(coordinator_factories) == 1, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    coordinator_factory = swift_tokens(
+        """func coordinator(
+            components: ProductionMailboxComponents,
+            itemID: String
+        ) async throws -> OutboxDeliveryCoordinator {"""
+    )
+    assert swift_tokens(coordinator_factories[0]).startswith(coordinator_factory), (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    assert delivery_tokens.count("finalizeVerifiedForegroundHeads") == 3, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
+    allowed = delivery_tokens
+    callback_contracts = (
+        (commit, 3),
+        (forwarded, 3),
+        (no_op, 2),
+        (initial_foreground, 1),
+        (additional_foreground, 1),
+    )
+    for pattern, count in callback_contracts:
+        assert allowed.count(pattern) == count, (
             "Core must not synthesize or duplicate durable finalization evidence"
         )
+        allowed = allowed.replace(pattern, " ", count)
+    assert "onNewFinalization" not in allowed, (
+        "Core must not synthesize or duplicate durable finalization evidence"
+    )
 
 
 def assert_mailbox_journal_finalization_contract(coordinator: str, outbox: str) -> None:

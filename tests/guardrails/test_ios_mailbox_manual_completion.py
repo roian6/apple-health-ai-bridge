@@ -227,6 +227,344 @@ def test_core_does_not_signal_from_scan_outcomes(before: str, after: str) -> Non
         assert_new_mailbox_finalization_contract(source.replace(before, after, 1))
 
 
+def test_core_rejects_callback_alias_outside_durable_commit() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    commit = """_ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }"""
+    assert source.count(commit) == 2
+    mutant = source.replace(
+        commit,
+        """let duplicateFinalization = onNewFinalization
+                duplicateFinalization(coordinator.ownership)
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }""",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_callback_inside_string_interpolation() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    commit = """_ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }"""
+    assert source.count(commit) == 2
+    mutant = source.replace(
+        commit,
+        """_ = "\\(onNewFinalization(coordinator.ownership))"
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }""",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_tuple_alias_at_forwarding_seam() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    forwarding = str.join(
+        "",
+        (
+            "finalizedItemIDs.formUnion(try await ",
+            "finalizeVerifiedForegroundHeads(\n",
+            "                        components: components, ",
+            "onNewFinalization: onNewFinalization\n",
+            "                    ))",
+        ),
+    )
+    assert source.count(forwarding) == 1
+    mutant_forwarding = str.join(
+        "",
+        (
+            "let forwarded = (\n",
+            "                        components: components, ",
+            "onNewFinalization: onNewFinalization\n",
+            "                    )\n",
+            "                    forwarded.1(coordinator.ownership)\n",
+            "                    finalizedItemIDs.formUnion(try await ",
+            "finalizeVerifiedForegroundHeads(\n",
+            "                        components: forwarded.0\n",
+            "                    ) { owner in\n",
+            "                        forwarded.1(owner)\n",
+            "                    })",
+        ),
+    )
+    mutant = source.replace(forwarding, mutant_forwarding, 1)
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_comment_that_hides_callback_tail() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    tail = """onNewFinalization(coordinator.ownership)
+                }
+                finalizedItemIDs.insert(item.id)
+            } catch is CancellationError"""
+    assert source.count(tail) == 1
+    declaration = "static func orderedAcknowledgmentIndices("
+    assert source.count(declaration) == 1
+    mutant = source.replace(
+        declaration, "static  func orderedAcknowledgmentIndices(", 1
+    )
+    mutant = mutant.replace(
+        tail,
+        """onNewFinalization(coordinator.ownership)
+                }
+                // static func orderedAcknowledgmentIndices(
+                let duplicateFinalization = onNewFinalization
+                duplicateFinalization(coordinator.ownership)
+                finalizedItemIDs.insert(item.id)
+            } catch is CancellationError""",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_accepts_whitespace_in_following_declaration() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    declaration = "static func orderedAcknowledgmentIndices("
+    assert source.count(declaration) == 1
+    mutant = source.replace(
+        declaration, "static  func orderedAcknowledgmentIndices(", 1
+    )
+
+    assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_shadowed_foreground_finalizer() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    forwarding = str.join(
+        "",
+        (
+            "finalizedItemIDs.formUnion(try await ",
+            "finalizeVerifiedForegroundHeads(\n",
+            "                        components: components, ",
+            "onNewFinalization: onNewFinalization\n",
+            "                    ))",
+        ),
+    )
+    assert source.count(forwarding) == 1
+    mutant = source.replace(
+        forwarding,
+        """let finalizeVerifiedForegroundHeads = PrematureCallback(
+                        owner: coordinator.ownership
+                    )
+                    """
+        + forwarding,
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_shadow_that_replaces_real_foreground_finalizer() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    declaration = "private func finalizeVerifiedForegroundHeads("
+    assert source.count(declaration) == 1
+    forwarding = str.join(
+        "",
+        (
+            "finalizedItemIDs.formUnion(try await ",
+            "finalizeVerifiedForegroundHeads(\n",
+            "                        components: components, ",
+            "onNewFinalization: onNewFinalization\n",
+            "                    ))",
+        ),
+    )
+    assert source.count(forwarding) == 1
+    mutant = source.replace(
+        declaration,
+        "private func verifiedForegroundHeads(",
+        1,
+    ).replace(
+        forwarding,
+        """let finalizeVerifiedForegroundHeads = PrematureCallback(
+                        owner: coordinator.ownership
+                    )
+                    """
+        + forwarding,
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_rebound_foreground_coordinator() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    binding = (
+        "let coordinator = try await coordinator(components: components, "
+        "itemID: item.id)"
+    )
+    assert source.count(binding) == 1
+    wrapper = """
+private struct PrematureFinalizationCoordinator {
+    let base: OutboxDeliveryCoordinator
+
+    var ownership: OutboxDeliveryOwnershipV1 { base.ownership }
+
+    func finalizeCommitted(
+        itemID: String,
+        notify: @MainActor () -> Void
+    ) async throws -> FileOutboxDeliveryStateV1 {
+        notify()
+        return try await base.finalizeCommitted(itemID: itemID)
+    }
+}
+
+"""
+    mutant = wrapper + source.replace(
+        binding,
+        """let baseCoordinator = try await coordinator(
+                    components: components,
+                    itemID: item.id
+                )
+                let coordinator = PrematureFinalizationCoordinator(
+                    base: baseCoordinator
+                )""",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_chained_foreground_coordinator() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    binding = (
+        "let coordinator = try await coordinator(components: components, "
+        "itemID: item.id)"
+    )
+    assert source.count(binding) == 1
+    mutant = source.replace(
+        binding,
+        binding + ".wrappedForFinalization",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_newline_chained_foreground_coordinator() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    binding = (
+        "let coordinator = try await coordinator(components: components, "
+        "itemID: item.id)"
+    )
+    assert source.count(binding) == 1
+    mutant = source.replace(
+        binding,
+        binding + "\n                    .wrappedForFinalization",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_inactive_coordinator_factory_signature() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    signature = """private func coordinator(
+        components: ProductionMailboxComponents,
+        itemID: String
+    ) async throws -> OutboxDeliveryCoordinator {"""
+    assert source.count(signature) == 1
+    inactive = """#if false
+    private func coordinator(
+        components: ProductionMailboxComponents,
+        itemID: String
+    ) async throws -> OutboxDeliveryCoordinator {
+        fatalError("inactive")
+    }
+    #endif
+
+    """
+    mutant = inactive + source.replace(
+        signature,
+        signature.replace("OutboxDeliveryCoordinator", "PrematureCoordinator"),
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_rebound_bounded_coordinator() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    commit = """try Task.checkCancellation()
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }"""
+    assert source.count(commit) == 1
+    wrapper = """
+private struct PrematureFinalizer {
+    let base: OutboxDeliveryCoordinator
+
+    var ownership: OutboxDeliveryOwnershipV1 { base.ownership }
+
+    func finalizeCommitted(
+        itemID: String,
+        notify: @MainActor () -> Void
+    ) async throws -> FileOutboxDeliveryStateV1 {
+        notify()
+        return try await base.finalizeCommitted(itemID: itemID)
+    }
+}
+
+"""
+    mutant = wrapper + source.replace(
+        commit,
+        """try Task.checkCancellation()
+                let base = coordinator
+                let coordinator = PrematureFinalizer(base: base)
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }""",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_core_rejects_unrelated_coordinator_factory_declaration() -> None:
+    source = (_CORE / "ProductionMailboxDelivery.swift").read_text(encoding="utf-8")
+    signature = """private func coordinator(
+        components: ProductionMailboxComponents,
+        itemID: String
+    ) async throws -> OutboxDeliveryCoordinator {"""
+    assert source.count(signature) == 1
+    decoy = """private struct UnrelatedFactory {
+    private func coordinator(
+        components: ProductionMailboxComponents,
+        itemID: String
+    ) async throws -> OutboxDeliveryCoordinator {
+        fatalError("unrelated")
+    }
+}
+
+"""
+    mutant = decoy + source.replace(
+        signature,
+        signature.replace("OutboxDeliveryCoordinator", "PrematureCoordinator"),
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
+        assert_new_mailbox_finalization_contract(mutant)
+
+
 @pytest.mark.parametrize(
     "before",
     [
