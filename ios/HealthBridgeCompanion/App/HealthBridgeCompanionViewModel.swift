@@ -5820,11 +5820,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             if let pendingTransition = pending {
                 try validateSnapshot()
-                let needsMigration = try await SleepSyncValueWork.run {
-                    let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pendingTransition.payload)
-                    return SleepSyncBatchFactory.requiresInstallationSourceMigration(
-                        manifest: pendingTransition.manifest, pendingBatch: batch, expectedSourceKey: sleepSourceKey
-                    )
+                let needsMigration: Bool
+                do {
+                    needsMigration = try await SleepSyncValueWork.run {
+                        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pendingTransition.payload)
+                        return SleepSyncBatchFactory.requiresInstallationSourceMigration(
+                            manifest: pendingTransition.manifest, pendingBatch: batch, expectedSourceKey: sleepSourceKey
+                        )
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try validateSnapshot()
+                    if let hold = try sleepFinalizationHold(in: outbox), hold.reason == .proofMissing { throw hold }
+                    throw error
                 }
                 try validateSnapshot()
                 let matchesCurrentConnection =

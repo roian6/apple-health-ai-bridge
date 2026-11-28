@@ -5936,6 +5936,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 requestProjectionReadAuthorization: { _ in throw CocoaError(.featureUnsupported) })
             await retry.viewModel.performManualSyncOpportunity { false }
             XCTAssertEqual(fixture.recorder.acceptedPayloads, [accepted.payload])
+            XCTAssertEqual(fixture.recorder.payloads, [accepted.payload])
         } else {
             XCTAssertTrue(committed == fixture.initialManifest)
             switch scenario {

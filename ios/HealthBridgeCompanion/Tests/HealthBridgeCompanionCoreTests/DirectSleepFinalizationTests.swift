@@ -985,6 +985,82 @@ final class DirectSleepFinalizationTests: XCTestCase {
             XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
         }
     }
+
+    func testLegacySecondPendingReadFailureKeepsProofMissingSleepHeld() async throws {
+        let fixture = try DirectSleepFinalizationFixture()
+        defer { fixture.remove() }
+        let descriptor = fixture.descriptor
+        _ = try fixture.outbox.recordDirectUploadAccepted(
+            itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID
+        )
+        try fixture.sleep.saveManifest(fixture.pending.manifest)
+        let journalURL = fixture.root.appendingPathComponent("sleep.json.pending")
+        let journalBefore = try Data(contentsOf: journalURL)
+        let store = SecondPendingReadFaultStore(fixture.sleep)
+
+        let recovered = try await fixture.finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: descriptor.receiverBindingID,
+            receiverGeneration: descriptor.receiverGeneration,
+            sleepStore: store,
+            validate: {}
+        )
+
+        XCTAssertFalse(recovered)
+        XCTAssertEqual(store.pendingReadCount, 2)
+        XCTAssertEqual(try Data(contentsOf: journalURL), journalBefore)
+        XCTAssertTrue(try fixture.outbox.hasUncheckedDirectAcknowledgment(
+            itemID: descriptor.itemID, receiverBindingID: descriptor.receiverBindingID
+        ))
+        XCTAssertEqual(try fixture.outbox.acceptedFinalizationHold()?.reason, .proofMissing)
+        XCTAssertNil(try fixture.outbox.directSleepCleanupRecord(
+            receiverBindingID: descriptor.receiverBindingID, itemID: descriptor.itemID
+        ))
+    }
+}
+
+private final class SecondPendingReadFaultStore: SleepSyncManifestStoring {
+    enum ReadFailure: Error { case injected }
+
+    private let wrapped: SleepSyncManifestStoring
+    private(set) var pendingReadCount = 0
+
+    init(_ wrapped: SleepSyncManifestStoring) { self.wrapped = wrapped }
+
+    func loadManifest() throws -> SleepSyncManifest? { try wrapped.loadManifest() }
+    func saveManifest(_ manifest: SleepSyncManifest) throws { try wrapped.saveManifest(manifest) }
+    func loadPendingTransition() throws -> SleepSyncPendingTransition? { try wrapped.loadPendingTransition() }
+    func savePendingTransition(_ transition: SleepSyncPendingTransition) throws {
+        try wrapped.savePendingTransition(transition)
+    }
+    func clearPendingTransition(id: String) throws { try wrapped.clearPendingTransition(id: id) }
+    func resetSynchronizationState() throws { try wrapped.resetSynchronizationState() }
+    var recoveryMayBeNeeded: Bool { wrapped.recoveryMayBeNeeded }
+    func revisionForSync() throws -> SleepSyncStorageRevision { try wrapped.revisionForSync() }
+    func loadManifestForSync(validate: @MainActor () throws -> Void) async throws -> SleepSyncManifest? {
+        try await wrapped.loadManifestForSync(validate: validate)
+    }
+    func loadPendingForSync(
+        validate: @MainActor () throws -> Void
+    ) async throws -> SleepSyncPendingTransition? {
+        pendingReadCount += 1
+        if pendingReadCount == 2 { throw ReadFailure.injected }
+        return try await wrapped.loadPendingForSync(validate: validate)
+    }
+    func saveManifestForSync(
+        _ manifest: SleepSyncManifest, validate: @MainActor () throws -> Void
+    ) async throws -> SleepSyncStorageRevision {
+        try await wrapped.saveManifestForSync(manifest, validate: validate)
+    }
+    func savePendingForSync(
+        _ transition: SleepSyncPendingTransition, validate: @MainActor () throws -> Void
+    ) async throws -> SleepSyncStorageRevision {
+        try await wrapped.savePendingForSync(transition, validate: validate)
+    }
+    func clearPendingForSync(
+        id: String, validate: @MainActor () throws -> Void
+    ) async throws -> SleepSyncStorageRevision {
+        try await wrapped.clearPendingForSync(id: id, validate: validate)
+    }
 }
 
 private final class JournalRemovalFault: FileManager, @unchecked Sendable {

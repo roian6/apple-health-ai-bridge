@@ -1605,6 +1605,20 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
                 receiverSettingsGeneration: generation, historyDepth: .lastDays(30),
                 historyStartDate: nil, baselineResetEpoch: 1
             ))
+        case .readableWithMalformedPayload:
+            let generation = fixture.settings.receiverSettingsGenerationToken
+            let pendingManifest = SleepSyncBatchFactory.makeManifestReservation(
+                receiverSettingsGeneration: generation, historyDepth: .lastDays(30),
+                historyStartDate: nil, baselineResetEpoch: 2
+            )
+            try sleepStore.savePendingTransition(SleepSyncPendingTransition(
+                payload: damaged, manifest: pendingManifest, receiverBindingID: binding,
+                connectionGeneration: generation, outboxItemID: item.id
+            ))
+            try sleepStore.saveManifest(SleepSyncBatchFactory.makeManifestReservation(
+                receiverSettingsGeneration: generation, historyDepth: .lastDays(30),
+                historyStartDate: nil, baselineResetEpoch: 1
+            ))
         }
         let vm = try await fixture.makeViewModel(
             readAnchoredStepChanges: { _, start, now in
@@ -1628,7 +1642,7 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertFalse(fixture.receiver.batches.contains(try JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes)))
         XCTAssertTrue(try fixture.outbox.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding))
         if evidence == .malformed { XCTAssertEqual(try Data(contentsOf: journal), damaged) }
-        if evidence == .readableWithoutCommittedProof {
+        if evidence == .readableWithoutCommittedProof || evidence == .readableWithMalformedPayload {
             XCTAssertNotNil(try sleepStore.loadPendingTransition())
             XCTAssertNotEqual(try sleepStore.loadPendingTransition()?.manifest, try sleepStore.loadManifest())
         }
@@ -1917,7 +1931,7 @@ private enum MailboxCommitCancellation: Equatable {
 }
 
 private enum ManualSleepHoldEvidence: CaseIterable {
-    case missing, malformed, readableWithoutCommittedProof
+    case missing, malformed, readableWithoutCommittedProof, readableWithMalformedPayload
 }
 
 private enum ForegroundDirectSleepCompletionInput: Equatable {

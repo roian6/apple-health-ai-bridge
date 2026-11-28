@@ -296,7 +296,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         guard let tracked else { return false }
         return try await recoverDirectSleepAcknowledgment(
             itemID: tracked.itemID, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
-            sleepStore: tracked.store, validate: validate
+            sleepStore: tracked.store, tolerateMissingLegacyEvidence: true, validate: validate
         )
     }
 
@@ -323,6 +323,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         receiverBindingID: String,
         receiverGeneration: String,
         sleepStore: any SleepSyncManifestStoring,
+        tolerateMissingLegacyEvidence: Bool = false,
         validate: @escaping @MainActor () throws -> Void
     ) async throws -> Bool {
         guard let record = try outbox.directSleepCleanupRecord(receiverBindingID: receiverBindingID, itemID: itemID)
@@ -334,7 +335,8 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         ) else { return false }
         return try await recoverDirectSleepAcknowledgment(
             record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration, itemID: itemID,
-            sleepStore: sleepStore, validate: validate
+            sleepStore: sleepStore, tolerateMissingLegacyEvidence: tolerateMissingLegacyEvidence,
+            validate: validate
         )
     }
 
@@ -354,6 +356,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         receiverGeneration: String,
         itemID expectedItemID: String? = nil,
         sleepStore: any SleepSyncManifestStoring,
+        tolerateMissingLegacyEvidence: Bool = false,
         validate: @escaping @MainActor () throws -> Void
     ) async throws -> Bool {
         let storedIntent = try outbox.directSleepCleanupIntent(for: record)
@@ -369,7 +372,16 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
             try self.outbox.requireUploadAdmission()
             guard try sleepStore.revisionForSync() == revision else { throw CancellationError() }
         }
-        let pending = try await sleepStore.loadPendingForSync(validate: check)
+        let pending: SleepSyncPendingTransition?
+        if storedIntent == nil, tolerateMissingLegacyEvidence {
+            pending = try await readLegacySleepEvidence(validate: check) {
+                try await sleepStore.loadPendingForSync(validate: check)
+            }
+        } else {
+            // Once cleanup authority exists, a failed read must not be treated as
+            // proof that its exact journal was already removed.
+            pending = try await sleepStore.loadPendingForSync(validate: check)
+        }
         let intent: DirectSleepCleanupIntent
         if let storedIntent {
             intent = storedIntent
