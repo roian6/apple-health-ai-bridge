@@ -76,6 +76,23 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         automaticContinuationAdmissionIsOpen = isOpen
     }
 
+    @MainActor
+    func hasRetainedTaskOwnership(
+        itemID: String,
+        receiverGeneration: String,
+        receiverBindingID: String
+    ) -> Bool {
+        guard let taskOwnershipStore,
+              let records = try? taskOwnershipStore.records() else {
+            return true
+        }
+        return records.contains { record in
+            record.itemID == itemID
+                && record.receiverGeneration == receiverGeneration
+                && record.receiverBindingID == receiverBindingID
+        }
+    }
+
     private let sessionDelegateQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "dev.example.HealthBridgeCompanion.background-upload-delegate"

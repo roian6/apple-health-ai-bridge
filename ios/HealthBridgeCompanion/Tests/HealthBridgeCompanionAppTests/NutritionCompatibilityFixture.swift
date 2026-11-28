@@ -186,6 +186,9 @@ final class NutritionFixture {
         ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
         requestReadAuthorization: @escaping @MainActor ([String]) async throws -> Void = { _ in },
         terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)? = nil,
+        retainedBackgroundUploadOwnership: (@MainActor (
+            String, String, String
+        ) async -> Bool)? = nil,
         reopenStorage: Bool = false,
         outboxFileManager: FileManager = .default
     ) async throws -> HealthBridgeCompanionViewModel {
@@ -222,6 +225,7 @@ final class NutritionFixture {
             automaticSyncEligibleTypeCodesForTesting: eligibleTypeCodes,
             readDailyActivityAggregates: readDailyActivityAggregates ?? { _, _, _, _ in [] },
             scheduleDirectBackgroundUploads: { 0 },
+            retainedBackgroundUploadOwnership: retainedBackgroundUploadOwnership,
             cancelInheritedLegacyUploads: {
                 BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
             },

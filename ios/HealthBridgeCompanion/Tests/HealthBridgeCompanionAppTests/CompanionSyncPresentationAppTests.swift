@@ -1713,6 +1713,57 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), debt)
     }
 
+    func testRetainedBackgroundCompletionOwnershipBlocksSleepReenqueue() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        var retainedItemID: String?
+        var retainedGeneration: String?
+        var retainedBindingID: String?
+        let vm = try await fixture.makeViewModel(
+            readAnchoredSleepChanges: { _, _, now in
+                HealthKitAnchoredSleepChanges(
+                    addedSamples: [], deletedSamples: [],
+                    anchorCursorValue: fixture.anchor, receivedAt: now
+                )
+            },
+            retainedBackgroundUploadOwnership: { itemID, generation, bindingID in
+                retainedItemID = itemID
+                retainedGeneration = generation
+                retainedBindingID = bindingID
+                return true
+            }
+        )
+        fixture.receiver.status = 503
+        let initialSucceeded = await vm.syncRecentSleepSessions()
+        XCTAssertFalse(initialSucceeded)
+        let store = try FileSleepSyncManifestStore(
+            fileURL: fixture.root.appendingPathComponent("sleep.json")
+        )
+        let pending = try XCTUnwrap(store.loadPendingTransition())
+        let itemID = try XCTUnwrap(pending.outboxItemID)
+        let item = try XCTUnwrap(fixture.outbox.pendingItem(id: itemID))
+        try fixture.outbox.markUploaded(item)
+        let requests = fixture.receiver.batches
+
+        let retrySucceeded = await vm.syncRecentSleepSessions()
+        XCTAssertFalse(retrySucceeded)
+
+        XCTAssertEqual(retainedItemID, itemID)
+        XCTAssertEqual(retainedGeneration, pending.connectionGeneration)
+        XCTAssertEqual(retainedBindingID, pending.receiverBindingID)
+        XCTAssertEqual(fixture.receiver.batches, requests)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try store.loadPendingTransition(), pending)
+        XCTAssertTrue(vm.statusIsError)
+        XCTAssertTrue(vm.statusMessage.contains("Sleep upload is still owned"), vm.statusMessage)
+
+        let automaticSucceeded = await vm.syncRecentSleepSessions(executionMode: .automatic)
+        XCTAssertFalse(automaticSucceeded)
+        XCTAssertEqual(fixture.receiver.batches, requests)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try store.loadPendingTransition(), pending)
+    }
+
     func testForegroundSleepResponseAfterAutomaticDisableCommitsBeforeRetry() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

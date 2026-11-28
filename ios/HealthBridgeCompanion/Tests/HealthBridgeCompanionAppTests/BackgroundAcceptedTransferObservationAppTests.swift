@@ -460,6 +460,12 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
             receiverSettingsStore: fixture.settings, acceptedTransferStore: fixture.acceptedTransferStore,
             taskOwnershipStore: ownership
         )
+        XCTAssertTrue(uploader.hasRetainedTaskOwnership(
+            itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+        ))
+        XCTAssertFalse(uploader.hasRetainedTaskOwnership(
+            itemID: item.id, receiverGeneration: generation + "-other", receiverBindingID: binding
+        ))
         do {
             _ = try await uploader.schedulePendingUploads(
                 outbox: fixture.outbox, receiverURL: XCTUnwrap(URL(string: fixture.settings.receiverURLString)),
@@ -468,6 +474,9 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
             XCTFail("The independent Steps item must reach Direct request construction")
         } catch ReceiverUploadRequestFactoryError.emptyBearerToken {}
         XCTAssertEqual(try ownership.records().map(\.itemID), outboxHasReceipt ? [] : [item.id])
+        XCTAssertEqual(uploader.hasRetainedTaskOwnership(
+            itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+        ), !outboxHasReceipt)
         let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
         XCTAssertEqual(try reopened.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding), outboxHasReceipt)
         XCTAssertEqual(try reopened.acceptedFinalizationHold()?.reason, outboxHasReceipt ? .proofMissing : nil)
@@ -479,6 +488,9 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
             try FileOutbox.beginTerminalResetRequest(directory: reopened.directoryURL)
             await recoverWithoutScheduling(uploader, fixture: fixture)
             XCTAssertTrue(try ownership.records().isEmpty)
+            XCTAssertFalse(uploader.hasRetainedTaskOwnership(
+                itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+            ))
             XCTAssertTrue(reopened.terminalResetRequestIsActive)
             XCTAssertEqual(try sleep.loadPendingTransition(), pending)
         }

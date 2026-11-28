@@ -579,6 +579,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     ) async throws -> HealthKitAnchoredQuantityChanges)?
     private let requestProjectionReadAuthorization: (@MainActor ([String]) async throws -> Void)?
     private let scheduleDirectBackgroundUploads: (@MainActor () async throws -> Int)?
+    private let retainedBackgroundUploadOwnership: (@MainActor (
+        String, String, String
+    ) async -> Bool)?
     private let cancelInheritedLegacyUploads: @MainActor () async -> BackgroundUploadCancellationResult
     private let terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)?
     private let platformBackgroundPayloadDrain: (@MainActor () async -> Bool)?
@@ -636,6 +639,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             [String], Date, Date, Calendar
         ) async throws -> [HealthKitDailyActivityAggregate])? = nil,
         scheduleDirectBackgroundUploads: (@MainActor () async throws -> Int)? = nil,
+        retainedBackgroundUploadOwnership: (@MainActor (
+            String, String, String
+        ) async -> Bool)? = nil,
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             await BackgroundURLSessionOutboxUploader.shared.cancelInheritedLegacyUploads()
         },
@@ -720,6 +726,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.readAnchoredQuantityChanges = readAnchoredQuantityChanges
         self.requestProjectionReadAuthorization = requestProjectionReadAuthorization
         self.scheduleDirectBackgroundUploads = scheduleDirectBackgroundUploads
+        #if os(iOS)
+        self.retainedBackgroundUploadOwnership = retainedBackgroundUploadOwnership ?? {
+            itemID, receiverGeneration, receiverBindingID in
+            BackgroundURLSessionOutboxUploader.shared.hasRetainedTaskOwnership(
+                itemID: itemID,
+                receiverGeneration: receiverGeneration,
+                receiverBindingID: receiverBindingID
+            )
+        }
+        #else
+        self.retainedBackgroundUploadOwnership = retainedBackgroundUploadOwnership
+        #endif
         self.cancelInheritedLegacyUploads = cancelInheritedLegacyUploads
         self.terminalBackgroundPayloadDrain = terminalBackgroundPayloadDrain
         self.platformBackgroundPayloadDrain = platformBackgroundPayloadDrain
@@ -6176,6 +6194,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return uploadedRecords
         }
         if let hold = try sleepFinalizationHold(in: outbox) { throw hold }
+        if !trackedItemExists,
+           let trackedItemID = trackedTransition.outboxItemID,
+           let retainedBackgroundUploadOwnership,
+           await retainedBackgroundUploadOwnership(
+               trackedItemID,
+               trackedTransition.connectionGeneration,
+               trackedTransition.receiverBindingID
+           ) {
+            statusMessage = "The Sleep upload is still owned by background delivery. Waiting for durable finalization before retrying."
+            statusIsError = true
+            return false
+        }
         if !trackedItemExists {
             #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
             observeSleepEnqueueAttemptForTesting()
