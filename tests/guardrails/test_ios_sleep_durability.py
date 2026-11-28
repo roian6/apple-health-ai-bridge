@@ -1,5 +1,10 @@
 import re
+import sys
 from pathlib import Path
+
+import pytest
+
+from tests.guardrails.mailbox_publication_guard import SwiftLexer
 
 ROOT = Path(__file__).resolve().parents[2]
 VIEW_MODEL = ROOT / "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
@@ -56,7 +61,7 @@ def test_sleep_transition_is_journaled_before_delivery() -> None:
     assert create_start < journal < delivery
 
 
-def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> None:
+def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() -> None:
     source = VIEW_MODEL.read_text(encoding="utf-8")
     helper_start = source.index("private func deliverPendingSleepTransition(")
     helper_end = source.index("\n    func syncSupportedQuantityMetrics()", helper_start)
@@ -66,17 +71,92 @@ def test_sleep_manifest_commits_only_after_tracked_outbox_item_is_absent() -> No
     track = helper.index(
         "try await store.savePendingForSync(trackedTransition, validate: validate)"
     )
-    absence_gate = helper.index("if itemRemains {")
-    prefix = "try await store."
-    manifest_commit = helper.rindex(
-        f"{prefix}saveManifestForSync(pendingTransition.manifest, validate: validate)"
+    flush = helper.index("upload = try await uploadPendingOutbox(", track)
+    # Scan the whole tracking-to-upload interval, excluding earlier accepted
+    # recovery. Count every return, and accept false only at the end of its
+    # block: a newline can continue the returned expression in Swift.
+    structure = SwiftLexer(helper).views().structure
+    outcomes = re.finditer(r"\breturn\b(?:\s+(false)\s*\})?", structure[enqueue:flush])
+    assert [outcome.group(1) for outcome in outcomes] == ["false", "false"], (
+        "queued Sleep must return false"
     )
-    journal_clear = helper.rindex(
-        f"{prefix}clearPendingForSync(id: pendingTransition.id, validate: validate)"
+    # A false exit in some *other* state cannot protect either queued state.
+    for predicate in (
+        "executionMode == .automatic, case .directHTTP = target.route",
+        "snapshot.fifo.first?.id != outboxItemID",
+    ):
+        start = helper.index(f"\n        if {predicate} {{\n", track, flush)
+        end = helper.index("\n        }", start, flush)
+        body = [
+            line.rstrip()
+            for line in structure[start:end].splitlines()[2:]
+            if line.strip()
+        ]
+        assert body[-1] == "            return false"
+        assert all(
+            line.startswith("            ") and not line.startswith("             ")
+            for line in body
+        )
+
+    refresh = helper.index("snapshot.fifo = try outbox.pendingItems()", flush)
+    held = helper.index(
+        "if snapshot.fifo.contains(where: { $0.id == outboxItemID })", refresh
     )
-    acceptance = helper.index("guard lastDirectAcceptance.map(")
-    assert enqueue < track < absence_gate < acceptance < manifest_commit < journal_clear
-    assert "if enqueueResult.wasInserted" in helper[track:absence_gate]
+    # Stop at the queued branch's own closing brace, not at the first
+    # reference to a route (which could itself be a premature success).
+    body_end = helper.index("\n        }", held)
+    queued_body = structure[held:body_end]
+    assert enqueue < track < refresh < held
+    assert "if enqueueResult.wasInserted" in helper[track:held]
+    # From the upload through the final queue check, even a recovery/error
+    # branch may report only noncompletion.
+    pre_fifo = structure[flush:held]
+    exits = re.finditer(r"\breturn\b(?:\s+(false)\s*\})?", pre_fifo)
+    assert all(exit_.group(1) == "false" for exit_ in exits)
+    assert queued_body.splitlines()[0].endswith("outboxItemID }) {")
+    assert re.search(r"\breturn\s+false\s*\Z", queued_body), (
+        "queued Sleep must return false"
+    )
+    assert re.findall(r"\breturn\b", queued_body) == ["return"]
+    # The foreground Sleep caller fixtures exercise completion after this FIFO
+    # gate with independent receipt, journal, and committed-manifest controls.
+
+
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("safe", [False, True])
+def test_sleep_queue_exit_scan_ignores_trivia_and_rejects_continued_success(
+    *,
+    queued: bool,
+    safe: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = VIEW_MODEL.read_text()
+    marker = (
+        "if snapshot.fifo.contains(where: { $0.id == outboxItemID })"
+        if queued
+        else "if snapshot.fifo.first?.id != outboxItemID"
+    )
+    start = source.index(
+        marker, source.index("private func deliverPendingSleepTransition(")
+    )
+    end = source.index("\n        }", start)
+    body = source[start:end]
+    assert body.count("return false") == 1
+    changed = body.replace(
+        "return false",
+        "// Do not return success until upload.\n            return false"
+        if safe
+        else "return false\n                || true",
+    )
+    mutant = tmp_path / "ViewModel.swift"
+    _ = mutant.write_text(source[:start] + changed + source[end:])
+    monkeypatch.setattr(sys.modules[__name__], "VIEW_MODEL", mutant)
+    if safe:
+        test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued()
+    else:
+        with pytest.raises(AssertionError, match="queued"):
+            test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued()
 
 
 def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None:
@@ -154,7 +234,7 @@ def test_clear_pending_uploads_uses_durable_intent_and_removes_it_last() -> None
     helper = source[end:perform_start]
     destructive_intent = helper.index("try FileOutbox.beginDestructiveRecovery(")
     invalidate_evidence = helper.index("try acceptedTransferStore.clear()")
-    finish = helper.index("return try FileOutbox.completeConfirmedTerminalReset(")
+    finish = helper.index("try FileOutbox.completeConfirmedTerminalReset(")
     assert destructive_intent < invalidate_evidence < finish
     for required_reset in (
         "try sleepManifestStore.resetSynchronizationState()",
@@ -315,8 +395,17 @@ def test_private_store_retry_recovery_and_manifest_probe_are_explicit() -> None:
     preflight = source[preflight_start:preflight_end]
     manifest_read = preflight.index("await sleepManifestStore.loadManifestForSync")
     pending_read = preflight.index("await sleepManifestStore.loadPendingForSync")
-    ready = preflight.index("privateStorageAdmissionReady = true")
-    assert manifest_read < pending_read < ready
+    hold = preflight.index(
+        "if try sleepFinalizationHold(in: outbox)?.reason == .proofMissing {"
+    )
+    hold_end = preflight.index("\n        }", hold)
+    assert preflight[hold:hold_end].splitlines()[1:] == [
+        "            privateStorageAdmissionReady = true",
+        "            refreshPendingOutboxCount()",
+        "            return",
+    ]
+    ready = preflight.index("privateStorageAdmissionReady = true", hold_end)
+    assert manifest_read < pending_read < hold < hold_end < ready
 
     refresh_start = source.index("private func refreshPendingOutboxCount()")
     refresh_end = source.index(
@@ -435,7 +524,18 @@ def test_core_anchored_lanes_bind_durable_payloads_to_cursor_checkpoints() -> No
         checkpoint = body.index("FileOutboxCursorCheckpoint(")
         enqueue = body.index("cursorCheckpoint: cursorCheckpoint", checkpoint)
         assert checkpoint < enqueue
-        assert "cursorStore.saveCursorValue(" not in body[enqueue:]
+        writes = re.finditer(
+            r"cursorStore\.saveCursorValue\((.*?)\n\s*\)", body[enqueue:], re.DOTALL
+        )
+        expected = (
+            ["MailboxStepsProjectionTurn.cursorKind"]
+            if start_marker == "func syncRecentStepCounts("
+            else []
+        )
+        assert [
+            match[1].rpartition("cursorKind:")[2].strip() for match in writes
+        ] == expected
+        assert body[enqueue:].count("cursorStore.saveCursorValue(") == len(expected)
         assert "acknowledgeCursorCheckpoint(" not in body[enqueue:]
 
     behavior_tests = FILE_OUTBOX_TESTS.read_text(encoding="utf-8")

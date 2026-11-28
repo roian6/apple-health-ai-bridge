@@ -105,6 +105,38 @@ final class CompanionConnectionPresentationAppTests: XCTestCase {
         XCTAssertTrue(fixture.base.receiver.batches.isEmpty)
     }
 
+    func testHistoryRangeCannotChangeDuringDisconnectDrainAndReopensAfterRelease() async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let history = HealthHistoryDepthSelectionStore(userDefaults: fixture.defaults)
+        let optionID = "last_30_days"
+        weak var observedViewModel: HealthBridgeCompanionViewModel?
+        var attemptedEditDuringDrain = false
+        let viewModel = try await fixture.makeViewModel(terminalBackgroundPayloadDrain: {
+            guard let observedViewModel else {
+                XCTFail("Expected a terminal drain after bootstrap")
+                return false
+            }
+            attemptedEditDuringDrain = true
+            XCTAssertFalse(observedViewModel.canChangeHealthHistoryDepth)
+            observedViewModel.setHealthHistoryDepthOption(optionID)
+            XCTAssertEqual(observedViewModel.healthHistoryDepth, .allAvailable)
+            XCTAssertEqual(history.historyDepth, .allAvailable)
+            return true
+        })
+        observedViewModel = viewModel
+
+        XCTAssertTrue(viewModel.canChangeHealthHistoryDepth)
+        let outcome = await viewModel.disconnectReceiver()
+        XCTAssertEqual(outcome, .disconnected(pendingOutboxCount: 0))
+        XCTAssertTrue(attemptedEditDuringDrain)
+        XCTAssertTrue(viewModel.canChangeHealthHistoryDepth)
+        viewModel.setHealthHistoryDepthOption(optionID)
+
+        XCTAssertEqual(viewModel.healthHistoryDepthOptionID, optionID)
+        XCTAssertEqual(history.historyDepth, .lastDays(30))
+    }
+
     func testDisconnectReportsRecoveryAfterCommittedRemoval() async throws {
         let fixture = try NutritionFixture()
         defer { fixture.cleanup() }

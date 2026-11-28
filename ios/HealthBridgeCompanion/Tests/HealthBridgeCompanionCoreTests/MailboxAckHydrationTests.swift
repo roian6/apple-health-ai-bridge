@@ -125,7 +125,7 @@ final class MailboxAckHydrationTests: XCTestCase {
         quarantine.append(.stale)
         let summary = ProductionMailboxDeliverySummary(
             attemptedCount: 5,
-            finalizedCount: 3,
+            finalizedItemIDs: ["synthetic-first", "synthetic-second", "synthetic-third"],
             waitingCount: 2,
             terminalCount: 0,
             ackCleanupFailureCount: 1,

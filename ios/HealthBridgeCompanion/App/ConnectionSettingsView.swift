@@ -110,7 +110,7 @@ struct ConnectionSettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This permanently deletes unsent local Health payloads, pending pairing and local sync progress so the next connection can rebuild history, and removes any unreadable saved connection. This does not delete Apple Health data or revoke receiver enrollment.")
+            Text("This permanently deletes queued uploads, pending pairing, and sync progress on this iPhone and removes any unreadable saved connection. Future syncs may collect the same records again and send duplicates. Apple Health originals and permissions, receiver enrollment, and data already stored on the server are preserved.")
         }
         .confirmationDialog(
             "Reset lost mailbox connection key?",
@@ -241,6 +241,13 @@ struct ConnectionSettingsView: View {
                     systemImage: "exclamationmark.circle.fill",
                     tint: .orange
                 )
+            } else if viewModel.receiverSettingsSaved,
+                      let failure = viewModel.setupLinkReplacementFailure {
+                InlineNotice(
+                    message: failure,
+                    systemImage: "exclamationmark.circle.fill",
+                    tint: .orange
+                )
             }
         } header: {
             if !viewModel.canSendConnectionTest {
@@ -281,10 +288,14 @@ struct ConnectionSettingsView: View {
             || viewModel.mailboxKeyDiagnosticState == .lost
             || viewModel.pendingOutboxCount > 0
             || viewModel.hasPendingSleepTransition
+            || viewModel.acceptedFinalizationRecoveryMessage != nil
             || viewModel.hasPendingOutboxDeletion
             || viewModel.hasPendingPrivateStorageRecovery
             || viewModel.hasPendingPairing {
             Section("Recovery") {
+                if let message = viewModel.acceptedFinalizationRecoveryMessage {
+                    Text(message)
+                }
                 if viewModel.hasTransientPrivateStorageFailure {
                     Button("Retry Private Storage") {
                         Task { await viewModel.retryPrivateStorage() }
@@ -294,6 +305,7 @@ struct ConnectionSettingsView: View {
                 if (viewModel.usesMailboxTransport && viewModel.mailboxKeyDiagnosticState == .lost)
                     || viewModel.pendingOutboxCount > 0
                     || viewModel.hasPendingSleepTransition
+                    || viewModel.acceptedFinalizationRecoveryMessage != nil
                     || viewModel.hasPendingOutboxDeletion
                     || viewModel.hasPendingPrivateStorageRecovery
                     || viewModel.hasPendingPairing {

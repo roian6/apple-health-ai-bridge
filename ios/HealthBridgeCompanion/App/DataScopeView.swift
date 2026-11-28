@@ -62,6 +62,7 @@ struct DataScopeView: View {
                         Text(row.title).tag(row.id)
                     }
                 }
+                .disabled(!viewModel.canChangeHealthHistoryDepth)
 
                 VStack(alignment: .leading, spacing: 4) {
                     if let selectedRow = viewModel.healthHistoryDepthRows.first(where: \.isSelected) {

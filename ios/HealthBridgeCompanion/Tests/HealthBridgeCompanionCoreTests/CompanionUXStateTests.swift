@@ -125,10 +125,6 @@ final class CompanionUXStateTests: XCTestCase {
             "Sync progress saved"
         )
         XCTAssertEqual(
-            CompanionPrimaryStatusMessage.sanitized(from: "HealthKit returned no anchored step-count payload. Nothing sent.", isError: false),
-            "No readable records returned"
-        )
-        XCTAssertEqual(
             CompanionPrimaryStatusMessage.sanitized(from: "Opening Apple Health permissions...", isError: false),
             "Opening Apple Health permissions"
         )
@@ -213,6 +209,25 @@ final class CompanionUXStateTests: XCTestCase {
         XCTAssertEqual(
             CompanionPrimaryStatusMessage.sanitized(from: "Sync stopped: Sleep sync failed: HealthKit query failed unexpectedly", isError: true),
             "Apple Health Sleep sync failed. Review permissions or unlock this iPhone, then retry."
+        )
+    }
+
+    func testUnchangedAnchorsAndEmptyReadsHaveDifferentActivityMessages() {
+        for lane in ["step", "workout"] {
+            XCTAssertEqual(
+                CompanionPrimaryStatusMessage.sanitized(
+                    from: "HealthKit \(lane) anchor is unchanged. Nothing sent.",
+                    isError: false
+                ),
+                "No new data to send"
+            )
+        }
+        XCTAssertEqual(
+            CompanionPrimaryStatusMessage.sanitized(
+                from: "HealthKit returned no anchored step-count payload. Nothing sent.",
+                isError: false
+            ),
+            "No readable records returned"
         )
     }
 

@@ -253,7 +253,9 @@ final class ProductionMailboxPublicationSafetyTests: XCTestCase {
     }
 
     func testCurrentGenericPublicationErrorPreservesPhaseErrorAndRetryableArtifacts() async throws {
-        try await assertPublicationInterruption(background: true, genericError: true, cancel: false)
+        for background in [false, true] {
+            try await assertPublicationInterruption(background: background, genericError: true, cancel: false)
+        }
     }
 
     func testForegroundRejectsStaleGenerationAfterSuccessfulPublication() async throws {
@@ -1430,10 +1432,17 @@ final class ProductionMailboxPerformanceTests: XCTestCase {
         fixture.observe = { _, _ in observations += 1; return true }
 
         do {
-            _ = try await fixture.delivery().publishPendingFIFOHead()
+            _ = try await fixture.delivery().publishPendingFIFOHeadWithOwnership()
             XCTFail("Stale ownership must reject before observation")
-        } catch let error as ProductionMailboxDeliveryPhaseError {
-            XCTAssertEqual(error, .initialAdvance)
+        } catch let error as ProductionMailboxItemDeliveryError {
+            XCTAssertEqual(error.phase, .initialAdvance)
+            XCTAssertEqual(error.itemID, fixture.first.id)
+        }
+        do {
+            _ = try await fixture.delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+            XCTFail("Public reconciliation must reject stale ownership")
+        } catch let phase as ProductionMailboxDeliveryPhaseError {
+            XCTAssertEqual(phase, .initialAdvance)
         }
         XCTAssertEqual(observations, 0)
         XCTAssertEqual(try fixture.outbox.pendingItems(), before)
@@ -1458,10 +1467,11 @@ final class ProductionMailboxPerformanceTests: XCTestCase {
             return true
         }
         do {
-            _ = try await fixture.delivery().publishPendingFIFOHead()
+            _ = try await fixture.delivery().publishPendingFIFOHeadWithOwnership()
             XCTFail("Observation must not replace a competing state write")
-        } catch let error as ProductionMailboxDeliveryPhaseError {
-            XCTAssertEqual(error, .initialAdvance)
+        } catch let error as ProductionMailboxItemDeliveryError {
+            XCTAssertEqual(error.phase, .initialAdvance)
+            XCTAssertEqual(error.itemID, fixture.first.id)
         }
         XCTAssertEqual(observations, 1)
         XCTAssertEqual(try fixture.outbox.deliveryState(for: fixture.first.id), competing)

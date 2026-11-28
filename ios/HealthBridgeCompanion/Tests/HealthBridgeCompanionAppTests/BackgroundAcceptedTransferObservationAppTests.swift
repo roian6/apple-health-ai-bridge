@@ -264,6 +264,9 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertEqual(observed?.evidenceKind, .directResponse,
                        "The first durable ACK must confirm while cursor finalization is still failing")
 
+        let sleepJournal = fixture.root.appendingPathComponent("sleep-sync-manifest-v1.json.pending")
+        let damaged = Data("{".utf8)
+        try damaged.write(to: sleepJournal)
         guard chflags(cursorURL.path, 0) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
@@ -278,6 +281,7 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertEqual(try cursors.cursorValue(
             receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
         ), checkpoint.cursorValue)
+        XCTAssertEqual(try Data(contentsOf: sleepJournal), damaged)
         XCTAssertEqual(vm.lastAcceptedTransferObservation, observed,
                        "Replaying the durable ACK must not record it a second time")
         XCTAssertEqual(vm.lastAcceptedTransferObservation?.evidenceKind, .directResponse,
@@ -414,6 +418,82 @@ final class BackgroundAcceptedTransferObservationAppTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: path))
         XCTAssertEqual(viewModel.lastAcceptedTransferObservation, observed,
                        "Replaying cleanup must not refresh the original observation")
+    }
+
+    func testPayloadlessSleepACKOwnsObserverDebtAfterBackgroundReplay() async throws {
+        try await checkBackgroundSleepReplay(outboxHasReceipt: true)
+    }
+
+    func testPayloadlessSleepTaskCompletionAloneDoesNotBlockSteps() async throws {
+        try await checkBackgroundSleepReplay(outboxHasReceipt: false)
+    }
+
+    private func checkBackgroundSleepReplay(outboxHasReceipt: Bool) async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        try background.markPendingObserverTypeCodes(["sleep_analysis"])
+        let debt = try background.loadPendingObserverTypeCodeGenerations()
+        let bytes = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make())
+        let item = try XCTUnwrap(fixture.outbox.enqueueSequence(
+            [bytes], receiverIdentity: binding, pendingGenerationRetirements: debt
+        ).first)
+        let sleep = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep-sync-manifest-v1.json"))
+        let pending = SleepSyncPendingTransition(payload: bytes, manifest: SleepSyncBatchFactory.makeManifestReservation(
+            receiverSettingsGeneration: generation, historyDepth: .allAvailable, historyStartDate: nil
+        ), receiverBindingID: binding, connectionGeneration: generation, outboxItemID: item.id)
+        try sleep.savePendingTransition(pending)
+        if outboxHasReceipt {
+            XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(itemID: item.id, receiverIdentity: binding))
+        } else {
+            try FileManager.default.removeItem(at: item.fileURL)
+        }
+        let steps = try enqueueSteps(fixture)
+        let ownership = try FileBackgroundUploadTaskOwnershipStore(fileURL: fixture.root.appendingPathComponent("tasks.json"))
+        try ownership.begin(BackgroundUploadTaskOwnership(
+            taskID: 42, itemID: item.id, receiverGeneration: generation, receiverBindingID: binding,
+            completion: .init(statusCode: 202, hadTransportError: false, sleepMinimumResetEpoch: nil)
+        ))
+        let uploader = BackgroundURLSessionOutboxUploader(
+            receiverSettingsStore: fixture.settings, acceptedTransferStore: fixture.acceptedTransferStore,
+            taskOwnershipStore: ownership
+        )
+        XCTAssertTrue(uploader.hasRetainedTaskOwnership(
+            itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+        ))
+        XCTAssertFalse(uploader.hasRetainedTaskOwnership(
+            itemID: item.id, receiverGeneration: generation + "-other", receiverBindingID: binding
+        ))
+        do {
+            _ = try await uploader.schedulePendingUploads(
+                outbox: fixture.outbox, receiverURL: XCTUnwrap(URL(string: fixture.settings.receiverURLString)),
+                bearerToken: "", receiverGeneration: generation, receiverBindingID: binding
+            )
+            XCTFail("The independent Steps item must reach Direct request construction")
+        } catch ReceiverUploadRequestFactoryError.emptyBearerToken {}
+        XCTAssertEqual(try ownership.records().map(\.itemID), outboxHasReceipt ? [] : [item.id])
+        XCTAssertEqual(uploader.hasRetainedTaskOwnership(
+            itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+        ), !outboxHasReceipt)
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        XCTAssertEqual(try reopened.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding), outboxHasReceipt)
+        XCTAssertEqual(try reopened.acceptedFinalizationHold()?.reason, outboxHasReceipt ? .proofMissing : nil)
+        XCTAssertEqual(try reopened.uploadablePendingItems(for: binding), [steps])
+        XCTAssertEqual(try sleep.loadPendingTransition(), pending)
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), debt)
+        XCTAssertNil(fixture.acceptedTransferStore.load(bindingID: binding, generation: generation))
+        if !outboxHasReceipt {
+            try FileOutbox.beginTerminalResetRequest(directory: reopened.directoryURL)
+            await recoverWithoutScheduling(uploader, fixture: fixture)
+            XCTAssertTrue(try ownership.records().isEmpty)
+            XCTAssertFalse(uploader.hasRetainedTaskOwnership(
+                itemID: item.id, receiverGeneration: generation, receiverBindingID: binding
+            ))
+            XCTAssertTrue(reopened.terminalResetRequestIsActive)
+            XCTAssertEqual(try sleep.loadPendingTransition(), pending)
+        }
     }
 
     func testPersistedCompletionReplayPreservesAcceptedObservation() async throws {

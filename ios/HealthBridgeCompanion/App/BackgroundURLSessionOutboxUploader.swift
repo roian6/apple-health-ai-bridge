@@ -19,6 +19,12 @@ struct BackgroundUploadCancellationResult: Equatable, Sendable {
     let fullyFinalized: Bool
 }
 
+private extension BackgroundUploadTaskCompletion {
+    var isAcceptedResponse: Bool {
+        !hadTransportError && BackgroundOutboxUploadCompletionPolicy.shouldMarkUploaded(error: nil, httpStatusCode: statusCode)
+    }
+}
+
 final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, URLSessionTaskDelegate, URLSessionDataDelegate {
     static let shared = BackgroundURLSessionOutboxUploader()
     static let sessionIdentifier = HealthBridgeAppIdentity.backgroundUploadSessionIdentifier
@@ -70,6 +76,23 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         automaticContinuationAdmissionIsOpen = isOpen
     }
 
+    @MainActor
+    func hasRetainedTaskOwnership(
+        itemID: String,
+        receiverGeneration: String,
+        receiverBindingID: String
+    ) -> Bool {
+        guard let taskOwnershipStore,
+              let records = try? taskOwnershipStore.records() else {
+            return true
+        }
+        return records.contains { record in
+            record.itemID == itemID
+                && record.receiverGeneration == receiverGeneration
+                && record.receiverBindingID == receiverBindingID
+        }
+    }
+
     private let sessionDelegateQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "dev.example.HealthBridgeCompanion.background-upload-delegate"
@@ -113,25 +136,57 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
         bearerToken: String,
         receiverGeneration: String,
         receiverBindingID: String,
-        isUploadAllowed: @MainActor () -> Bool = { true }
+        isUploadAllowed: @escaping @MainActor () -> Bool = { true }
     ) async throws -> Int {
         rememberOutboxDirectory(outbox.directoryURL)
         await recoverPersistedTaskCompletions()
         try await outbox.prepareNutritionCompatibility {
             guard isUploadAllowed(), !Task.isCancelled else { throw CancellationError() }
         }
-        _ = try directCursorFinalizer(outbox: outbox).finalizeDirectAcknowledgments(
-            receiverBindingID: receiverBindingID
+        _ = try await directCursorFinalizer(outbox: outbox).finalizeDirectAcknowledgments(
+            receiverBindingID: receiverBindingID,
+            receiverGeneration: receiverGeneration,
+            sleepStore: try FileSleepSyncManifestStore(
+                fileURL: outbox.directoryURL.deletingLastPathComponent()
+                    .appendingPathComponent("sleep-sync-manifest-v1.json")
+            ),
+            validate: {
+                guard isUploadAllowed(), !Task.isCancelled,
+                      self.receiverSettingsStore.receiverSettingsGenerationToken == receiverGeneration,
+                      self.receiverSettingsStore.receiverBindingID == receiverBindingID else {
+                    throw CancellationError()
+                }
+            }
         )
-        guard let taskOwnershipStore,
-              (try? taskOwnershipStore.records().isEmpty) == true else {
-            return 0
+        guard let taskOwnershipStore, let ownership = try? taskOwnershipStore.records() else { return 0 }
+        let retainedIDs = Set(ownership.map(\.taskID))
+        let heldSleep: (store: FileSleepSyncManifestStore, revision: SleepSyncStorageRevision)?
+        if let first = ownership.first {
+            let descriptor = DirectUploadCompletionDescriptor(
+                itemID: first.itemID, receiverGeneration: receiverGeneration, receiverBindingID: receiverBindingID
+            )
+            guard ownership.allSatisfy({ record in
+                record.itemID == first.itemID && record.receiverGeneration == receiverGeneration
+                    && record.receiverBindingID == receiverBindingID && record.completion?.isAcceptedResponse == true
+            }) else { return 0 }
+            if try outbox.acceptedFinalizationHold(matching: (first.itemID, receiverBindingID))?.reason == .proofMissing {
+                heldSleep = nil
+            } else {
+                guard let held = try await payloadlessSleepOwner(descriptor, outbox: outbox) else { return 0 }
+                heldSleep = held
+            }
+        } else {
+            heldSleep = nil
+        }
+        func currentEventsAllowScheduling() -> Bool {
+            let state = eventFinalizationCoordinator.stateSnapshot()
+            return state.isIdle || (!state.pendingIDs.isEmpty && state.pendingIDs.isSubset(of: retainedIDs))
         }
         guard cancellationFlight == nil,
               legacyCancellationFlight == nil,
               pendingCancellationFinalizationTaskIDs.isEmpty,
               pendingLegacyCancellationFinalizationTaskIDs.isEmpty,
-              eventFinalizationCoordinator.pendingIDsSnapshot().isEmpty,
+              eventFinalizationCoordinator.pendingIDsSnapshot().isSubset(of: retainedIDs),
               legacyEventFinalizationCoordinator.pendingIDsSnapshot().isEmpty,
               let legacyTaskIDs = await currentLegacyTaskIDs(),
               legacyTaskIDs.isEmpty else {
@@ -141,7 +196,7 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
               legacyCancellationFlight == nil,
               pendingCancellationFinalizationTaskIDs.isEmpty,
               pendingLegacyCancellationFinalizationTaskIDs.isEmpty,
-              eventFinalizationCoordinator.stateSnapshot().isIdle,
+              currentEventsAllowScheduling(),
               legacyEventFinalizationCoordinator.stateSnapshot().isIdle else {
             return 0
         }
@@ -166,12 +221,27 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
               legacyCancellationFlight == nil,
               pendingCancellationFinalizationTaskIDs.isEmpty,
               pendingLegacyCancellationFinalizationTaskIDs.isEmpty,
-              eventFinalizationCoordinator.stateSnapshot().isIdle,
+              currentEventsAllowScheduling(),
               legacyEventFinalizationCoordinator.stateSnapshot().isIdle else {
             return 0
         }
-        guard isUploadAllowed() else { return 0 }
+        guard isUploadAllowed(), !Task.isCancelled, try taskOwnershipStore.records() == ownership else { return 0 }
         guard try outbox.pendingItems() == preparedPending else { throw CancellationError() }
+        if let first = ownership.first {
+            guard receiverSettingsStore.receiverSettingsGenerationToken == receiverGeneration,
+                  receiverSettingsStore.receiverBindingID == receiverBindingID,
+                  !preparedPending.contains(where: { $0.id == first.itemID }) else { return 0 }
+            if let heldSleep {
+                guard try heldSleep.store.revisionForSync() == heldSleep.revision,
+                      try outbox.acceptedFinalizationHold(matching: (first.itemID, receiverBindingID)) == nil else { return 0 }
+            } else {
+                guard try outbox.acceptedFinalizationHold(matching: (first.itemID, receiverBindingID))?.reason == .proofMissing else { return 0 }
+            }
+        }
+        if try !ownership.isEmpty || outbox.acceptedFinalizationHold()?.reason == .proofMissing,
+           try outbox.preparedNutritionPayload(for: pendingItems[0])?.mayContainSleep != false {
+            return 0
+        }
         let directTransport = DirectHTTPTransport(
             receiverURL: receiverURL,
             bearerToken: bearerToken,
@@ -204,6 +274,27 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
             DeliveryTransportInput(item: pendingItems[0])
         )
         return result == .published ? 1 : 0
+    }
+
+    @MainActor
+    private func payloadlessSleepOwner(
+        _ record: DirectUploadCompletionDescriptor, outbox: FileOutbox
+    ) async throws -> (store: FileSleepSyncManifestStore, revision: SleepSyncStorageRevision)? {
+        let store = try FileSleepSyncManifestStore(fileURL: outbox.directoryURL.deletingLastPathComponent()
+            .appendingPathComponent("sleep-sync-manifest-v1.json"))
+        let revision = try store.revisionForSync()
+        guard let pending = try await store.loadPendingForSync(validate: {
+            guard self.receiverSettingsStore.receiverSettingsGenerationToken == record.receiverGeneration,
+                  self.receiverSettingsStore.receiverBindingID == record.receiverBindingID else { throw CancellationError() }
+        }), try store.revisionForSync() == revision,
+           pending.outboxItemID == record.itemID, pending.receiverBindingID == record.receiverBindingID,
+           pending.connectionGeneration == record.receiverGeneration,
+           pending.manifest.receiverSettingsGeneration == record.receiverGeneration,
+           pending.rejectedMinimumResetEpoch == nil,
+           try outbox.pendingItem(id: record.itemID) == nil,
+           try outbox.acceptedFinalizationHold(matching: (record.itemID, record.receiverBindingID)) == nil
+        else { return nil }
+        return (store, revision)
     }
 
     private func directCursorFinalizer(
@@ -965,6 +1056,31 @@ final class BackgroundURLSessionOutboxUploader: NSObject, @unchecked Sendable, U
                       settingsStore.receiverBindingID == descriptor.receiverBindingID,
                       settingsStore.receiverURLString == receiverURL else {
                     throw CancellationError()
+                }
+            }
+            if completion.isAcceptedResponse, settingsStore.receiverSettingsGenerationToken == descriptor.receiverGeneration,
+               settingsStore.receiverBindingID == descriptor.receiverBindingID {
+                let scope = (descriptor.itemID, descriptor.receiverBindingID)
+                if try outbox.acceptedFinalizationHold(matching: scope)?.reason == .proofMissing {
+                    if !outbox.terminalResetRequestIsActive {
+                        let finalized = try await directCursorFinalizer(outbox: outbox).recoverDirectSleepAcknowledgment(
+                            itemID: descriptor.itemID, receiverBindingID: descriptor.receiverBindingID,
+                            receiverGeneration: descriptor.receiverGeneration,
+                            sleepStore: FileSleepSyncManifestStore(fileURL: outboxDirectory.deletingLastPathComponent()
+                                .appendingPathComponent("sleep-sync-manifest-v1.json")), validate: validate
+                        )
+                        try validate()
+                        guard try finalized || outbox.acceptedFinalizationHold(matching: scope)?.reason == .proofMissing else {
+                            return nil
+                        }
+                    }
+                    // The outbox owns any remaining ACK and observer debt.
+                    // Release only the duplicate URLSession completion.
+                    return .retired
+                }
+                if outbox.terminalResetRequestIsActive, try await payloadlessSleepOwner(descriptor, outbox: outbox) != nil,
+                   outbox.terminalResetRequestIsActive {
+                    return .retained
                 }
             }
             let outcome = try await DirectUploadFinalizer.finishForSync(

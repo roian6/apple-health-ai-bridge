@@ -54,6 +54,14 @@ extension OutboxDeliveryCoordinator {
     @discardableResult
     @MainActor
     public func finalizeCommitted(itemID: String) async throws -> FileOutboxDeliveryStateV1 {
+        try await finalizeCommitted(itemID: itemID, onNewFinalization: {})
+    }
+
+    @discardableResult
+    @MainActor
+    func finalizeCommitted(
+        itemID: String, onNewFinalization: @MainActor () -> Void
+    ) async throws -> FileOutboxDeliveryStateV1 {
         try validateCurrentOwnership()
         let current = try ownedState(itemID: itemID)
         if current.phase == .committedFinalized {
@@ -111,7 +119,8 @@ extension OutboxDeliveryCoordinator {
                 case .envelopeRetired:
                     try self.fault(.envelopeRetired)
                 }
-            }
+            },
+            onNewFinalization: onNewFinalization
         )
     }
 
