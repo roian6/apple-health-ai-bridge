@@ -213,9 +213,16 @@ public final class ProductionMailboxDelivery {
     }
 
     @MainActor
-    public func publishPendingFIFOHead() async throws
-        -> ProductionMailboxBackgroundDeliverySummary
-    {
+    public func publishPendingFIFOHead() async throws -> ProductionMailboxBackgroundDeliverySummary {
+        do {
+            return try await publishPendingFIFOHeadWithOwnership()
+        } catch let error as ProductionMailboxItemDeliveryError {
+            throw error.phase
+        }
+    }
+
+    @MainActor
+    func publishPendingFIFOHeadWithOwnership() async throws -> ProductionMailboxBackgroundDeliverySummary {
         try Task.checkCancellation()
         try await refreshNutritionSupport()
         let receiverGeneration = settingsStore.receiverSettingsGenerationToken
@@ -272,11 +279,15 @@ public final class ProductionMailboxDelivery {
         maximumAcknowledgmentFiles: Int = ProductionMailboxDelivery
             .backgroundAcknowledgmentFileLimit
     ) async throws -> ProductionMailboxBackgroundDeliverySummary {
-        try await reconcilePendingFIFOHeadAcknowledgment(
-            afterAcknowledgmentCheckpoint: afterAcknowledgmentCheckpoint,
-            maximumAcknowledgmentFiles: maximumAcknowledgmentFiles,
-            onNewFinalization: { _ in }
-        )
+        do {
+            return try await reconcilePendingFIFOHeadAcknowledgment(
+                afterAcknowledgmentCheckpoint: afterAcknowledgmentCheckpoint,
+                maximumAcknowledgmentFiles: maximumAcknowledgmentFiles,
+                onNewFinalization: { _ in }
+            )
+        } catch let error as ProductionMailboxItemDeliveryError {
+            throw error.phase
+        }
     }
 
     @MainActor
@@ -509,7 +520,11 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     public func deliverPending() async throws -> ProductionMailboxDeliverySummary {
-        try await deliverPending(onNewFinalization: { _ in })
+        do {
+            return try await deliverPending(onNewFinalization: { _ in })
+        } catch let error as ProductionMailboxItemDeliveryError {
+            throw error.phase
+        }
     }
 
     @MainActor

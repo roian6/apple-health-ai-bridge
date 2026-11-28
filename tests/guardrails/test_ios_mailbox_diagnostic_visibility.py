@@ -5,6 +5,9 @@ from typing import Final
 import pytest
 
 from tests.guardrails import test_ios_mailbox_ack_diagnostics as guards
+from tests.guardrails.mailbox_diagnostic_visibility_guard import (
+    assert_mailbox_summary_visibility,
+)
 from tests.guardrails.test_ios_mailbox_publication_order import mutated_view_model
 
 _SUMMARY: Final = "func publishMailboxDeliverySummary("
@@ -32,6 +35,36 @@ def test_summary_guard_rejects_discarded_filter(
     monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
 
     with pytest.raises(AssertionError, match="must publish retained failures"):
+        guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_summary_ignores_trailing_comment_brace(*, valid: bool) -> None:
+    source = guards.VIEW_MODEL.read_text(encoding="utf-8")
+    start = source.index(_SUMMARY)
+    end = source.index("private static func mailboxDeliveryMessage", start)
+    summary = source[start:end] + "// }"
+    if valid:
+        assert_mailbox_summary_visibility(summary)
+    else:
+        assert _ASSIGNMENT in summary
+        with pytest.raises(AssertionError, match="must publish retained failures"):
+            assert_mailbox_summary_visibility(
+                summary.replace(_ASSIGNMENT, "[.summary(message)]")
+            )
+
+
+@pytest.mark.parametrize("argument", ["generation", "operation"])
+def test_failure_publisher_requires_exact_scope_arguments(
+    monkeypatch: pytest.MonkeyPatch, argument: str
+) -> None:
+    before = f"{argument}: {argument}"
+    after = before + (
+        ' + "-stale"' if argument == "generation" else " ?? .manualDelivery"
+    )
+    mutant = mutated_view_model(_FAILURE_PUBLISHER, ((before, after),))
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutant)
+    with pytest.raises(AssertionError, match="exact diagnostic scope"):
         guards.test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text()
 
 

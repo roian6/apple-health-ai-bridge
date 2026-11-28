@@ -146,7 +146,10 @@ def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
     )
     assert (
         swift_tokens("""
-        try requireCurrentConnectionGeneration(target.generation)
+        guard connectionTerminalBarrier.allowsPostResponseMutation(
+            capturedGeneration: target.generation,
+            currentGeneration: settingsStore.receiverSettingsGenerationToken
+        ) else { throw CancellationError() }
         guard !terminalRecoveryRequestIsActive, !taskUIPublicationIsSuppressed,
               case .directHTTP(let url) = target.route,
               settingsStore.activeTransport == .directHTTP,
@@ -168,11 +171,12 @@ def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
                 try self.validateSleepOperationAuthority(
                     snapshot, store: store, outbox: outbox)
             }
+            _ = try await Task { @MainActor in
             try validateAcceptedOwner()
             guard try store.revisionForSync() == snapshot.storage else {
                 throw CancellationError()
             }
-            _ = try await withSleepStorageOrigin {
+            return try await withSleepStorageOrigin {
                 try await cursorFinalizer.recordDirectReceiverAcceptanceForSync(
     """) in swift_tokens(pending[response:])
     assert swift_tokens("""

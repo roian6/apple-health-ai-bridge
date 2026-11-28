@@ -299,7 +299,7 @@ def _assert_retained_mailbox_reconciliation(source: str) -> None:
     assert "syncRecentStepCounts" not in helper
     assert "requestHealthPermissions" not in helper
     assert "preparePrivateStorageForUploadAdmission" not in helper
-    assert "publishPendingFIFOHead()" not in helper
+    assert "publishPendingFIFOHeadWithOwnership()" not in helper
     assert "reconcilePendingFIFOHeadAcknowledgment(" not in helper
 
     cancellation_catch = helper.index("catch is CancellationError {")
@@ -376,19 +376,35 @@ def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:
     assert "foregroundMailboxOpportunityConsumed = false" in reset
 
 
-def _assert_scoped_mailbox_summary(success: str, message: str) -> None:
+def _assert_scoped_mailbox_summary(
+    success: str, message: str, *, scheduler: bool = False
+) -> None:
     success = SwiftLexer(success).views().structure
     calls = list(re.finditer(r"\bpublishMailboxDeliverySummary\s*\(", success))
     unchanged_ids = "".join(
         (
             rf"\s*{re.escape(message)}\s*,",
-            r"\s*finalizedItemIDs:\s*summary\.finalizedItemIDs\s*(?:,|\))",
+            r"\s*finalizedItemIDs:\s*summary\.finalizedItemIDs\s*,",
         )
     )
     assert calls, "Expected a Mailbox summary publication"
-    assert all(re.match(unchanged_ids, success[call.end() :]) for call in calls), (
-        "Mailbox summary publication must carry the exact finalized item IDs"
-    )
+    for call in calls:
+        args = success[call.end() :]
+        ids = re.match(unchanged_ids, args)
+        assert ids, (
+            "Mailbox summary publication must carry the exact finalized item IDs"
+        )
+        if scheduler:
+            operations = r"\[\s*\.publishFIFOHead\s*\]"
+            hoist = re.search(
+                rf"\blet\s+(\w+)\s*:\s*Set<MailboxDeliveryOperation>\s*=\s*await\s+MainActor\.run\s*\{{\s*{operations}\s*\}}",
+                success[: call.start()],
+            )
+            if hoist and len(re.findall(rf"\b{hoist[1]}\b", success)) == 2:
+                operations = rf"(?:{operations}|{hoist[1]})"
+            assert re.match(
+                rf"\s*completedOperations:\s*{operations}\s*\)", args[ids.end() :]
+            ), "Mailbox summary must credit the exact completed operations"
 
 
 def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -> None:
@@ -438,8 +454,9 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
     helper = source[helper_start:helper_end]
     mailbox_start = helper.index("if target.route == .mailbox")
     assert re.search(
-        r"\blet\s+expectedGeneration\s*=\s*target\.generation\b", helper[:mailbox_start]
-    )
+        r"\blet\s+expectedGeneration\s*=\s*target\.generation\s+try\s+requireCurrentPayloadDeliveryTarget\s*\(",
+        SwiftLexer(helper[:mailbox_start]).views().structure,
+    ), "Manual publication must use the captured generation"
     mailbox_end = helper.index(
         "guard case .directHTTP(let url) = target.route", mailbox_start
     )
@@ -489,18 +506,21 @@ def test_background_mailbox_failure_checks_generation_before_publication() -> No
     mailbox_end = helper.index("let committedReceiverURLString", mailbox_start)
     mailbox = helper[mailbox_start:mailbox_end]
 
-    assert "publishPendingFIFOHead()" in mailbox
+    assert "publishPendingFIFOHeadWithOwnership()" in mailbox
     assert "deliverPending()" not in mailbox
     cancellation_catch = mailbox.index("catch is CancellationError {")
     failure_catch = mailbox.index("} catch {", cancellation_catch)
     success = mailbox[:cancellation_catch]
-    publish = success.index(".publishPendingFIFOHead()")
+    publish = success.index(".publishPendingFIFOHeadWithOwnership()")
     assert success.index("try await") < publish
     assert_successful_mailbox_publication(
-        success, CONNECTION_FENCE, ".publishPendingFIFOHead()", MailboxLane.SCHEDULER
+        success,
+        CONNECTION_FENCE,
+        ".publishPendingFIFOHeadWithOwnership()",
+        MailboxLane.SCHEDULER,
     )
     assert "backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage(" in success
-    _assert_scoped_mailbox_summary(success, "summary.diagnosticLine")
+    _assert_scoped_mailbox_summary(success, "summary.diagnosticLine", scheduler=True)
     assert (
         mailbox[cancellation_catch:failure_catch].split("{", 1)[1].strip() == "return"
     )
@@ -527,10 +547,10 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
     )
     publisher = SwiftLexer(failure_publisher).views().structure
     failure_factory = r"MailboxDeliveryDiagnosticLine\.failure\(\s*for:\s*error\b"
-    scope_inputs = r"[^()]*\bgeneration:\s*generation\b[^()]*\boperation:\s*operation\b"
+    scope_inputs = r"\s*,\s*generation:\s*generation\s*,\s*operation:\s*operation\s*\)"
     assert re.search(
         r"\blet diagnostic\s*=\s*" + failure_factory + scope_inputs, publisher
-    )
+    ), "Use the exact diagnostic scope"
     scope_filter = r"\.filter\s*\{\s*\$0\.scope\s*!=\s*diagnostic\.scope\s*\}"
     earlier_assignment = r"\blet earlier\s*=\s*currentMailboxDeliveryFailures\s*"
     assert re.search(
@@ -647,7 +667,7 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
         "func performAutomaticSyncOpportunity(",
     )
 
-    assert "publishPendingFIFOHead()" in helper
+    assert "publishPendingFIFOHeadWithOwnership()" in helper
     assert "reconcilePendingFIFOHeadAcknowledgment(" in helper
     assert "deliverPending()" not in helper
     assert "Task {" not in helper
@@ -669,7 +689,8 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
     stale_fence = "".join(
         (
             rf"do\s*\{{\s*{CONNECTION_FENCE}\s*\}}\s*catch\s*\{{\s*",
-            r"finalizedOwner\s*=\s*nil\s+return\s+\.cancelled\s*\}",
+            r"if\s+settingsStore\.receiverSettingsGenerationToken\s*!=\s*expectedGeneration\s*\{\s*",
+            r"finalizedOwner\s*=\s*nil\s*\}\s*return\s+\.cancelled\s*\}",
         )
     )
     assert_failed_mailbox_publication(helper[failure_catch:], stale_fence)

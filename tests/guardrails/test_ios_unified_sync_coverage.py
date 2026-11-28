@@ -1,6 +1,16 @@
+import sys
 from pathlib import Path
 
+import pytest
+
+from tests.guardrails.mailbox_publication_guard import SwiftLexer, swift_block_end
+
 ROOT = Path(__file__).resolve().parents[2]
+DIRECT_FINALIZERS = (
+    ROOT
+    / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore"
+    / "OutboxDeliveryFinalizers.swift"
+)
 BACKGROUND_SYNC = (
     ROOT
     / "ios"
@@ -201,8 +211,18 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     completion = body.split("private func deliverPendingSleepTransition(", 1)[1].split(
         "let manifest = try await store.loadManifestForSync(validate: validate)", 1
     )[0]
-    _, mailbox_route, route_body = completion.partition("if target.route == .mailbox {")
+    structure = SwiftLexer(completion).views().structure
+    queued = structure.index(
+        "if snapshot.fifo.contains(where: { $0.id == outboxItemID }) {"
+    )
+    after_queue = swift_block_end(structure, structure.index("}) {", queued) + 3) + 1
+    prefix, mailbox_route, route_body = structure[after_queue:].partition(
+        "if target.route == .mailbox {"
+    )
     assert mailbox_route
+    assert not prefix.strip(), (
+        "An absent item requires route-specific proof before completion"
+    )
     mailbox_guard, direct_route, _ = route_body.partition("} else {")
     assert direct_route
     assert " ".join(mailbox_guard.split()) == (
@@ -212,17 +232,18 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     )
     # The shared Direct finalizer validates accepted bytes and receiver scope
     # before persisting the manifest; the foreground reader no longer writes it.
-    finalizers = (
-        ROOT
-        / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore"
-        / "OutboxDeliveryFinalizers.swift"
-    ).read_text()
-    commit = finalizers.split("private func commitDirectSleepIfPending(", 1)[1]
+    finalizers = DIRECT_FINALIZERS.read_text()
+    helper = finalizers.split("private func commitDirectSleepIfPending(", 1)[1]
+    commit = SwiftLexer(helper.split("@discardableResult", 1)[0]).views().structure
     match = commit.index("if matches {")
     retirement = commit.index("let checkRetirement =")
     write = commit.index("sleepStore.saveManifestForSync(")
     assert match < retirement < write
-    binding = commit[match:retirement].split("//", 1)[0]
+    write_args = commit[write : commit.index("try check()", write)].strip()
+    assert write_args == (
+        "sleepStore.saveManifestForSync(pending.manifest, validate: checkRetirement)"
+    ), "Direct Sleep manifest must use the retirement validator"
+    binding = commit[match:retirement]
     assert " ".join(binding.split()) == (
         "if matches { "
         "guard pending.receiverBindingID == descriptor.receiverBindingID, "
@@ -232,6 +253,43 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
         "item?.receiverIdentity == descriptor.receiverBindingID else { "
         "throw OutboxDeliveryCoordinatorError.ownershipMismatch }"
     )
+
+
+def test_sleep_caller_rejects_mailbox_success_before_proof(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = VIEW_MODEL.read_text()
+    before = (
+        "        if target.route == .mailbox {\n"
+        "            guard pendingTransition.hasFinalizedMailboxProof("
+    )
+    assert source.count(before) == 1
+    mutant = tmp_path / "ViewModel.swift"
+    _ = mutant.write_text(
+        source.replace(
+            before, "        if .mailbox == target.route { return true }\n" + before
+        )
+    )
+    monkeypatch.setattr(sys.modules[__name__], "VIEW_MODEL", mutant)
+    with pytest.raises(AssertionError, match="proof"):
+        test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery()
+
+
+def test_direct_sleep_manifest_requires_retirement_validator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = DIRECT_FINALIZERS.read_text()
+    write = (
+        "sleepStore.saveManifestForSync(pending.manifest, validate: checkRetirement)"
+    )
+    assert source.count(write) == 1
+    mutant = tmp_path / "Finalizers.swift"
+    _ = mutant.write_text(
+        source.replace(write, write.replace("checkRetirement", "check"))
+    )
+    monkeypatch.setattr(sys.modules[__name__], "DIRECT_FINALIZERS", mutant)
+    with pytest.raises(AssertionError, match="retirement validator"):
+        test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery()
 
 
 def test_ui_describes_one_supported_automatic_sync_scope() -> None:

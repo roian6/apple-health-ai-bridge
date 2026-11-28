@@ -360,7 +360,7 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
             }
         }
         do {
-            _ = try await fixture.delivery().publishPendingFIFOHead()
+            _ = try await fixture.delivery().publishPendingFIFOHeadWithOwnership()
             XCTFail("Expected the provider lookup to fail after durable publication")
         } catch let error as ProductionMailboxItemDeliveryError {
             XCTAssertEqual(error.phase, .initialAdvance)
@@ -882,6 +882,10 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         try await checkMailboxCancellationAtCommit(.committedBounded)
     }
 
+    func testBoundedMailboxCancellationAndCleanupFailurePreserveDurableAcceptance() async throws {
+        try await checkMailboxCancellationAtCommit(.cancelledWithCleanupError)
+    }
+
     func testCancelledMailboxCommitDoesNotCreditAuthoritativeReplacement() async throws {
         try await checkMailboxCancellationAtCommit(.replacedAfterCommit)
     }
@@ -891,7 +895,7 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         let fixture = try NutritionMailboxFixture(nativePairing: true, outboxFileManager: files)
         defer { fixture.base.cleanup() }
         try fixture.writeCapabilities()
-        let bounded = scenario == .committedBounded
+        let bounded = scenario == .committedBounded || scenario == .cancelledWithCleanupError
         try BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults).setEnabledDurably(bounded)
         if bounded {
             CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
@@ -939,7 +943,7 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
             withUnsafeCurrentTask { $0?.cancel() }
             XCTAssertTrue(Task.isCancelled)
             if scenario == .beforeCommit { try Task.checkCancellation() }
-            return false
+            return scenario == .cancelledWithCleanupError
         }
         defer { files.rejectManifestHardening = nil }
 
@@ -977,8 +981,12 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
             XCTAssertNil(observations.load(bindingID: replacementBinding, generation: replacementGeneration))
             XCTAssertNil(observation)
             XCTAssertEqual(defaults.commitWrites, 0)
-        case .committedManual, .committedBounded:
-            XCTAssertTrue(try reopened.pendingItems().isEmpty)
+        case .committedManual, .committedBounded, .cancelledWithCleanupError:
+            if scenario == .cancelledWithCleanupError {
+                XCTAssertTrue(files.didRejectManifestHardening)
+            } else {
+                XCTAssertTrue(try reopened.pendingItems().isEmpty)
+            }
             XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
             XCTAssertEqual(observation?.evidenceKind, .mailboxCommit)
             XCTAssertEqual(observation?.bindingID, bindingID)
@@ -1554,6 +1562,81 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         }
     }
 
+    func testManualSyncContinuesToQuantitiesWhileAcceptedSleepIsHeld() async throws {
+        for evidence in ManualSleepHoldEvidence.allCases {
+            try await checkManualSyncWithSleepHold(evidence: evidence)
+        }
+    }
+
+    private func checkManualSyncWithSleepHold(evidence: ManualSleepHoldEvidence) async throws {
+        let fixture = try NutritionFixture()
+        defer { fixture.cleanup() }
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        try background.setEnabledDurably(false)
+        try background.markPendingObserverTypeCodes(["sleep_analysis"])
+        let generations = try background.loadPendingObserverTypeCodeGenerations()
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let bytes = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make(
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        let item = try XCTUnwrap(fixture.outbox.enqueueSequence(
+            [bytes], receiverIdentity: binding, pendingGenerationRetirements: generations
+        ).first)
+        XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(itemID: item.id, receiverIdentity: binding))
+        let journal = fixture.root.appendingPathComponent("sleep.json.pending")
+        let damaged = Data("{".utf8)
+        let sleepStore = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        switch evidence {
+        case .missing:
+            break
+        case .malformed:
+            try damaged.write(to: journal, options: .atomic)
+        case .readableWithoutCommittedProof:
+            let generation = fixture.settings.receiverSettingsGenerationToken
+            let pendingManifest = SleepSyncBatchFactory.makeManifestReservation(
+                receiverSettingsGeneration: generation, historyDepth: .lastDays(30),
+                historyStartDate: nil, baselineResetEpoch: 2
+            )
+            try sleepStore.savePendingTransition(SleepSyncPendingTransition(
+                payload: bytes, manifest: pendingManifest, receiverBindingID: binding,
+                connectionGeneration: generation, outboxItemID: item.id
+            ))
+            try sleepStore.saveManifest(SleepSyncBatchFactory.makeManifestReservation(
+                receiverSettingsGeneration: generation, historyDepth: .lastDays(30),
+                historyStartDate: nil, baselineResetEpoch: 1
+            ))
+        }
+        let vm = try await fixture.makeViewModel(
+            readAnchoredStepChanges: { _, start, now in
+                HealthKitAnchoredStepChanges(stepSamples: [], deletedStepSamples: [], anchorCursorValue: fixture.anchor,
+                                            windowStart: start ?? now, windowEnd: now)
+            },
+            readAnchoredWorkoutChanges: { _, start, now in
+                HealthKitAnchoredWorkoutChanges(workouts: [], deletedWorkouts: [], anchorCursorValue: fixture.anchor,
+                                                windowStart: start ?? now, windowEnd: now)
+            },
+            readWorkoutHistory: { _, _ in [] },
+            readAnchoredSleepChanges: { _, _, _ in
+                XCTFail("A held Sleep lane must not read HealthKit")
+                throw CocoaError(.featureUnsupported)
+            },
+            requestReadAuthorization: { XCTAssertNotEqual($0, ["sleep_analysis"]) },
+            reopenStorage: true
+        )
+        await vm.performManualSyncOpportunity { false }
+        XCTAssertTrue(fixture.receiver.records.contains { $0.typeCode == "weight" })
+        XCTAssertFalse(fixture.receiver.batches.contains(try JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes)))
+        XCTAssertTrue(try fixture.outbox.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding))
+        if evidence == .malformed { XCTAssertEqual(try Data(contentsOf: journal), damaged) }
+        if evidence == .readableWithoutCommittedProof {
+            XCTAssertNotNil(try sleepStore.loadPendingTransition())
+            XCTAssertNotEqual(try sleepStore.loadPendingTransition()?.manifest, try sleepStore.loadManifest())
+        }
+        XCTAssertEqual(vm.statusMessage, try XCTUnwrap(vm.acceptedFinalizationRecoveryMessage))
+        XCTAssertEqual(try fixture.outbox.acceptedFinalizationHold()?.reason, .proofMissing)
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), generations)
+    }
+
     func testForegroundDirectSleepRejectsSiblingOnlyAcceptance() async throws {
         try await checkForegroundDirectSleepCompletion(.siblingOnly)
     }
@@ -1726,7 +1809,8 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
                 )
                 // Reject invalid fixture bytes here rather than counting a
                 // FileOutbox reconciliation error as proof-gate rejection.
-                _ = try fixture.base.outbox.deliveryState(for: itemID)
+                let visibleState = try fixture.base.outbox.deliveryState(for: itemID)
+                if input == .noFinalizedProof { XCTAssertNil(visibleState) }
             }
         }
         let completed = await viewModel.syncRecentSleepSessions(executionMode: .foreground)
@@ -1829,7 +1913,11 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
 }
 
 private enum MailboxCommitCancellation: Equatable {
-    case beforeCommit, committedManual, committedBounded, replacedAfterCommit
+    case beforeCommit, committedManual, committedBounded, cancelledWithCleanupError, replacedAfterCommit
+}
+
+private enum ManualSleepHoldEvidence: CaseIterable {
+    case missing, malformed, readableWithoutCommittedProof
 }
 
 private enum ForegroundDirectSleepCompletionInput: Equatable {
@@ -1872,7 +1960,7 @@ private final class ForegroundDirectSleepCompletionFiles: FileManager, @unchecke
 }
 
 private enum ForegroundSleepCompletionInput: String, CaseIterable {
-    case matching, missingTrackedItem, ackVerified, wrongGeneration, wrongBinding, wrongResetEpoch, pendingJournal
+    case matching, missingTrackedItem, noFinalizedProof, ackVerified, wrongGeneration, wrongBinding, wrongResetEpoch, pendingJournal
 }
 
 private enum StoredMailboxCheckpointRecovery: Equatable {
@@ -1946,6 +2034,9 @@ private final class ForegroundSleepCompletionFiles: FileManager, @unchecked Send
         case .pendingJournal:
             try store.savePendingTransition(pending)
             return
+        case .noFinalizedProof:
+            try FileManager.default.removeItem(at: directory.appendingPathComponent(".fifo-sequence"))
+            return
         case .missingTrackedItem, .ackVerified, .wrongGeneration, .wrongBinding, .wrongResetEpoch:
             break
         }
@@ -1987,7 +2078,7 @@ private final class ForegroundSleepCompletionFiles: FileManager, @unchecked Send
             entry["receiverIdentity"] = otherBinding // Keep the persisted entry valid.
         case .wrongResetEpoch:
             ownership["resetEpoch"] = try XCTUnwrap(pending.manifest.baselineResetEpoch) + 1
-        case .matching, .pendingJournal:
+        case .matching, .noFinalizedProof, .pendingJournal:
             return
         }
         state["ownership"] = ownership

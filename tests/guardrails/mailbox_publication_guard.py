@@ -176,6 +176,11 @@ def _assert_inline_effect(statement: str, effect: int) -> None:
         )
 
 
+def swift_block_end(structure: str, opening: int) -> int:
+    assert structure[opening] == "{"
+    return _matching_edge(_BRACE.finditer(structure, opening + 1), "{").start()
+
+
 def _matching_edge(edges: Iterable[re.Match[str]], opener: str) -> re.Match[str]:
     depth = 1
     for edge in edges:
@@ -192,7 +197,7 @@ def mailbox_branch_body(branch: _SwiftViews, lane: MailboxLane | None) -> _Swift
         opening = re.match(r"\s*\}\s*catch\s*(\{)", structure)
         assert opening is not None, "Expected the Mailbox failure catch"
         start = opening.start(1)
-        end = _matching_edge(_BRACE.finditer(structure, start + 1), "{").start()
+        end = swift_block_end(structure, start)
     else:
         end = len(structure.rstrip()) - 1
         assert structure[end] == "}", "Expected the Mailbox delivery do block"

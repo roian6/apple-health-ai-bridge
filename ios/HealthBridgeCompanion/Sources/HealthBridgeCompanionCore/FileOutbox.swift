@@ -392,17 +392,17 @@ public struct FileOutboxFinalizationRecord: Equatable, Sendable {
         }
     }
 
-    #if !HEALTH_BRIDGE_MAILBOX_QA
+    static let foregroundSleepCursorKind = "foreground_sleep_sync"
+    static let anchoredSleepCursorKind = "anchored_sleep_sync"
+    static let baselineResetSleepCursorKind = "anchored_sleep_baseline_reset"
+
     var isDirectSleepRecord: Bool {
         let sleepCursorKinds = [
-            SleepSyncBatchFactory.foregroundCursorKind,
-            SleepSyncBatchFactory.anchoredCursorKind,
-            SleepSyncBatchFactory.baselineResetCursorKind,
+            Self.foregroundSleepCursorKind, Self.anchoredSleepCursorKind, Self.baselineResetSleepCursorKind,
         ]
         return pendingGenerationRetirements[HealthBridgeHealthType.sleepAnalysis.typeCode] != nil
             || cursorCheckpoint.map({ sleepCursorKinds.contains($0.cursorKind) }) == true
     }
-    #endif
 
     public init(
         itemIDs: [String] = [],
@@ -656,6 +656,11 @@ public final class FileOutbox {
 
         var uncheckedDirectAcknowledgmentIDs: Set<String> {
             directAcknowledgedIDs.subtracting(directSleepCheckedItemIDs ?? [])
+        }
+
+        var hasUncheckedDirectSleepAcknowledgment: Bool {
+            !uncheckedDirectAcknowledgmentIDs.isEmpty
+                && (directSleepCleanupIntent != nil || finalizationRecord?.isDirectSleepRecord == true)
         }
 
         func recordingDirectAcknowledgment(for itemID: String, sleepChecked: Bool) -> EnqueueTransaction {
@@ -1375,7 +1380,7 @@ public final class FileOutbox {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
-        guard transaction.directSleepCleanupIntent == nil else {
+        guard transaction.directSleepCleanupIntent == nil, !transaction.hasUncheckedDirectSleepAcknowledgment else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         guard let manifest = try loadManifest() else {
@@ -1473,7 +1478,7 @@ public final class FileOutbox {
         var cleanupPending = false
         for transaction in try loadEnqueueTransactions() {
             let intent = transaction.directSleepCleanupIntent
-            guard intent != nil || transaction.finalizationRecord?.isDirectSleepRecord == true else { continue }
+            guard transaction.hasUncheckedDirectSleepAcknowledgment else { continue }
             for id in transaction.uncheckedDirectAcknowledgmentIDs {
                 // An intent proves only its own item. A missing sibling payload may
                 // still need independent proof from the domain finalizer.
@@ -2353,8 +2358,8 @@ public final class FileOutbox {
         let journalURL = directory.appendingPathComponent(enqueueTransactionFilename)
         guard fileManager.fileExists(atPath: journalURL.path) else { return .ready }
         let transactions = try decodeEnqueueTransactions(at: journalURL)
-        // V3 ignores an active Sleep cleanup obligation even on a journal it can decode.
-        if transactions.contains(where: { $0.directSleepCleanupIntent != nil }) {
+        // A legacy reader could release an unchecked Sleep ACK even with a readable cursor.
+        if transactions.contains(where: { $0.directSleepCleanupIntent != nil || $0.hasUncheckedDirectSleepAcknowledgment }) {
             return .hold(.finalizationIntent)
         }
         // V3 rejects ACKs without a cursor or retirement.

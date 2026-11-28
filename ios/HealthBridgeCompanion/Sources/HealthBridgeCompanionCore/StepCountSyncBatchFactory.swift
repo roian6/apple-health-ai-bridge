@@ -629,9 +629,9 @@ public struct AnchoredSleepSyncPreparer: Sendable {
 }
 
 public enum SleepSyncBatchFactory {
-    public static let foregroundCursorKind = "foreground_sleep_sync"
-    public static let anchoredCursorKind = "anchored_sleep_sync"
-    public static let baselineResetCursorKind = "anchored_sleep_baseline_reset"
+    public static let foregroundCursorKind = FileOutboxFinalizationRecord.foregroundSleepCursorKind
+    public static let anchoredCursorKind = FileOutboxFinalizationRecord.anchoredSleepCursorKind
+    public static let baselineResetCursorKind = FileOutboxFinalizationRecord.baselineResetSleepCursorKind
     private static let validSleepStages = Set(["in_bed", "awake", "core", "deep", "rem"])
 
     public static func requiresInstallationSourceMigration(

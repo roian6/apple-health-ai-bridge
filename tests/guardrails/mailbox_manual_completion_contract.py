@@ -7,7 +7,11 @@ from tests.guardrails.mailbox_publication_effect_contract import (
     MailboxLane,
     swift_tokens,
 )
-from tests.guardrails.mailbox_publication_guard import SwiftLexer, mailbox_branch_body
+from tests.guardrails.mailbox_publication_guard import (
+    SwiftLexer,
+    mailbox_branch_body,
+    swift_block_end,
+)
 
 
 def assert_bounded_mailbox_checkpoint_completion(success: str) -> None:
@@ -289,10 +293,24 @@ def assert_mailbox_journal_finalization_contract(coordinator: str, outbox: str) 
     coordinator_body = _declaration(
         coordinator, "func finalizeCommitted(\n", "public func "
     )
-    coordinator_tokens = swift_tokens(SwiftLexer(coordinator_body).views().structure)
-    assert swift_tokens("onNewFinalization: onNewFinalization") in coordinator_tokens
-    callback = swift_tokens("onNewFinalization()")
-    assert callback not in coordinator_tokens
+    views = SwiftLexer(coordinator_body).views()
+    writer_call = re.search(
+        r"""
+        \breturn\s+try\s+outbox\.finalizeCommittedMailboxDelivery\(\s*
+        itemID:\s*itemID,\s*expected:\s*current,\s*committed:\s*committed,\s*
+        fault:\s*(\{)
+        """,
+        views.structure,
+        re.VERBOSE,
+    )
+    assert writer_call, "Expected the durable Mailbox writer"
+    after_fault = swift_block_end(views.structure, writer_call.start(1)) + 1
+    assert swift_tokens(views.executable[after_fault:]) == swift_tokens(
+        ", onNewFinalization: onNewFinalization) }"
+    )
+    assert len(re.findall(r"\bonNewFinalization\b", views.executable)) == 3, (
+        "Coordinator may only forward the finalization callback"
+    )
     writer = _declaration(
         outbox, "func finalizeCommittedMailboxDelivery(", "public func "
     )

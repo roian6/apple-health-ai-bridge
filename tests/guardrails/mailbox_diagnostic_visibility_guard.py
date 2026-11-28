@@ -2,15 +2,14 @@
 
 import re
 
-from tests.guardrails.mailbox_publication_guard import SwiftLexer
+from tests.guardrails.mailbox_publication_guard import SwiftLexer, swift_block_end
 
 
 def assert_mailbox_summary_visibility(summary: str) -> None:
     """Tie each scope predicate to the value actually published to Activity."""
-    _, separator, body = summary.partition("{")
-    assert separator, "Expected Mailbox summary publisher body"
-    # The next declaration's access modifier is included by the caller's slice.
-    body, _, _ = body.rpartition("}")
+    structure = SwiftLexer(summary).views().structure
+    opening = structure.index("{")
+    body = structure[opening + 1 : swift_block_end(structure, opening)]
     assert re.fullmatch(
         r"""
         \s*let\s+failures\s*=\s*currentMailboxDeliveryFailures

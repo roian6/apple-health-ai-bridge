@@ -82,7 +82,8 @@ _DELIVERY_PREFIX: Final = {
     MailboxLane.SCHEDULER: (
         _ADMISSION,
         """
-        let summary = try await makeProductionMailboxDelivery().publishPendingFIFOHead()
+        let summary = try await makeProductionMailboxDelivery()
+            .publishPendingFIFOHeadWithOwnership()
         """,
     ),
     MailboxLane.FOREGROUND: (
@@ -106,7 +107,7 @@ _DELIVERY_PREFIX: Final = {
         """
         switch requestedPhase {
         case .publishFIFOHead:
-            summary = try await delivery.publishPendingFIFOHead()
+            summary = try await delivery.publishPendingFIFOHeadWithOwnership()
         case .advanceOrReconcileFIFOHead:
             let pendingPhase = try await delivery.pendingFIFOHeadBackgroundPhase()
             completedOperations.insert(.selectFIFOHeadPhase)
@@ -118,7 +119,7 @@ _DELIVERY_PREFIX: Final = {
                 ) { finalizedOwner = $0 }
             case .none, .publishFIFOHead:
                 operation = .publishFIFOHead
-                summary = try await delivery.publishPendingFIFOHead()
+                summary = try await delivery.publishPendingFIFOHeadWithOwnership()
             }
         }
         """,

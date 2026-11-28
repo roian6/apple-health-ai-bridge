@@ -83,8 +83,17 @@ def test_manual_checkpoint_completion_requires_exact_successful_write(
         ),
         pytest.param(
             _BOUNDED,
-            "finalizedOwner = nil\n                return .cancelled",
-            "return .cancelled",
+            """if settingsStore.receiverSettingsGenerationToken != expectedGeneration {
+                    finalizedOwner = nil
+                }""",
+            "finalizedOwner = nil",
+            "unconditional authority check",
+            id="bounded-drop-commit-after-cancelled-failure",
+        ),
+        pytest.param(
+            _BOUNDED,
+            "                    finalizedOwner = nil",
+            "                    return .cancelled",
             "unconditional authority check",
             id="bounded-credit-after-stale-generation",
         ),
@@ -563,6 +572,19 @@ def test_core_rejects_unrelated_coordinator_factory_declaration() -> None:
 
     with pytest.raises(AssertionError, match="must not synthesize or duplicate"):
         assert_new_mailbox_finalization_contract(mutant)
+
+
+def test_coordinator_cannot_alias_finalization_callback_before_write() -> None:
+    coordinator = (_CORE / "OutboxDeliveryCoordinatorAck.swift").read_text()
+    before = "return try outbox.finalizeCommittedMailboxDelivery("
+    assert coordinator.count(before) == 1
+    mutant = coordinator.replace(
+        before, f"let notify = onNewFinalization\n        notify()\n        {before}"
+    )
+    with pytest.raises(AssertionError, match="only forward"):
+        assert_mailbox_journal_finalization_contract(
+            mutant, (_CORE / "FileOutbox.swift").read_text()
+        )
 
 
 @pytest.mark.parametrize(

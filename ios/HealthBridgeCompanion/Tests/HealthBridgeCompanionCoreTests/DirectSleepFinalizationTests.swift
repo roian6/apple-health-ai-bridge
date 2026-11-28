@@ -567,7 +567,11 @@ final class DirectSleepFinalizationTests: XCTestCase {
     }
 
     func testLegacyMissingJournalWithoutCleanupIntentRetainsAcceptedOwnership() async throws {
-        let f = try DirectSleepFinalizationFixture()
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: "receiver-a", sourceKey: "synthetic-source",
+            cursorKind: SleepSyncBatchFactory.anchoredCursorKind, cursorValue: "next-sleep"
+        )
+        let f = try DirectSleepFinalizationFixture(checkpoint: checkpoint)
         defer { f.remove() }
         let d = f.descriptor
         let manifestURL = f.root.appendingPathComponent("sleep.json")
@@ -590,6 +594,13 @@ final class DirectSleepFinalizationTests: XCTestCase {
         let hold = try XCTUnwrap(outbox.acceptedFinalizationHold())
         XCTAssertEqual(hold.reason, .proofMissing)
         XCTAssertEqual(hold.affectedTypeCodes, ["sleep_analysis"])
+        XCTAssertNotEqual(try outbox.downgradeReadiness(), .ready)
+        XCTAssertThrowsError(try outbox.acknowledgeFinalizationRecord(record)) {
+            XCTAssertEqual($0 as? FileOutboxCursorCheckpointError, .pendingCommit)
+        }
+        XCTAssertThrowsError(try outbox.acknowledgeCursorCheckpoint(checkpoint)) {
+            XCTAssertEqual($0 as? FileOutboxCursorCheckpointError, .pendingCommit)
+        }
         XCTAssertEqual(try Data(contentsOf: journal), before)
         let finished = try await recovered.finalizeDirectAcknowledgments(
             receiverBindingID: d.receiverBindingID, receiverGeneration: d.receiverGeneration,
@@ -816,18 +827,38 @@ final class DirectSleepFinalizationTests: XCTestCase {
             XCTFail("A legacy ACK does not establish that Sleep finalization already ran.")
         } catch is DecodingError {}
 
-        do {
-            let retired = try finalizer.finalizeDirectAcknowledgments(receiverBindingID: descriptor.receiverBindingID)
-            XCTAssertFalse(retired, "General recovery cannot retire an unchecked legacy ACK.")
-        } catch {
-            // Recovery may report the unreadable journal instead of deferring.
-        }
+        let steps = StepCountSyncBatchFactory.makeAnchoredStepBatch(
+            changes: HealthKitAnchoredStepChanges(
+                stepSamples: [], deletedStepSamples: [], anchorCursorValue: "steps",
+                windowStart: Date(timeIntervalSince1970: 0), windowEnd: Date(timeIntervalSince1970: 60)
+            ), generatedAt: Date(timeIntervalSince1970: 60)
+        )
+        let next = try reopened.enqueue(HealthBridgeBatchEncoder().encode(steps), receiverIdentity: descriptor.receiverBindingID)
+        let retired = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: descriptor.receiverBindingID, receiverGeneration: descriptor.receiverGeneration,
+            sleepStore: fixture.sleep, validate: {}
+        )
+        XCTAssertFalse(retired)
+        XCTAssertEqual(try reopened.acceptedFinalizationHold()?.reason, .proofMissing)
+        XCTAssertEqual(try reopened.uploadablePendingItems(for: descriptor.receiverBindingID).map(\.id), [next.id])
         XCTAssertEqual(try Data(contentsOf: journal), damaged)
         XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initial)
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
         XCTAssertNotNil(try reopened.directFinalizationRecordReady(receiverIdentity: descriptor.receiverBindingID))
 
         try originalJournal.write(to: journal, options: .atomic)
+        let manifestURL = fixture.root.appendingPathComponent("sleep.json")
+        let originalManifest = try Data(contentsOf: manifestURL)
+        try damaged.write(to: manifestURL, options: .atomic)
+        let unreadableManifest = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: descriptor.receiverBindingID, receiverGeneration: descriptor.receiverGeneration,
+            sleepStore: fixture.sleep, validate: {}
+        )
+        XCTAssertFalse(unreadableManifest)
+        XCTAssertEqual(try Data(contentsOf: manifestURL), damaged)
+        XCTAssertEqual(try reopened.uploadablePendingItems(for: descriptor.receiverBindingID).map(\.id), [next.id])
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        try originalManifest.write(to: manifestURL, options: .atomic)
         do {
             _ = try await finalizer.recordDirectReceiverAcceptanceForSync(
                 descriptor: descriptor, sleepStore: fixture.sleep, validate: {}
@@ -847,6 +878,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertNil(try fixture.sleep.loadPendingTransition())
         XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
         XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: descriptor.receiverBindingID))
+        XCTAssertEqual(try reopened.downgradeReadiness(), .ready)
     }
 
     func testCancellationAfterManifestCommitRetainsJournalAndGenerationForReplay() async throws {

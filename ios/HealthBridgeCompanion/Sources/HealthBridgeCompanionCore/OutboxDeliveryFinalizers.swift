@@ -284,13 +284,37 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
                 sleepStore: sleepStore(), validate: validate
             )
         }
-        guard try outbox.directFinalizationRecordReady(receiverIdentity: receiverBindingID) != nil else { return false }
-        let store = try sleepStore()
-        guard let itemID = try await store.loadPendingForSync(validate: validate)?.outboxItemID else { return false }
+        guard try outbox.directFinalizationRecordReady(
+            receiverIdentity: receiverBindingID,
+            where: { record, unchecked, intent in record.isDirectSleepRecord && !unchecked.isEmpty && intent == nil }
+        ) != nil else { return false }
+        let tracked: (store: any SleepSyncManifestStoring, itemID: String)? = try await readLegacySleepEvidence(validate: validate) {
+            let store = try sleepStore()
+            guard let id = try await store.loadPendingForSync(validate: validate)?.outboxItemID else { return nil }
+            return (store, id)
+        }
+        guard let tracked else { return false }
         return try await recoverDirectSleepAcknowledgment(
-            itemID: itemID, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
-            sleepStore: store, validate: validate
+            itemID: tracked.itemID, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
+            sleepStore: tracked.store, validate: validate
         )
+    }
+
+    @MainActor
+    private func readLegacySleepEvidence<Value>(
+        validate: @MainActor () throws -> Void,
+        _ read: @MainActor () async throws -> Value?
+    ) async throws -> Value? {
+        do {
+            return try await read()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try validate()
+            try outbox.requireUploadAdmission()
+            guard try outbox.acceptedFinalizationHold()?.reason == .proofMissing else { throw error }
+            return nil
+        }
     }
 
     @MainActor
@@ -356,10 +380,11 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
                   pending.receiverBindingID == receiverBindingID,
                   pending.connectionGeneration == receiverGeneration,
                   pending.manifest.receiverSettingsGeneration == receiverGeneration,
-                  pending.rejectedMinimumResetEpoch == nil,
-                  let manifest = try await sleepStore.loadManifestForSync(validate: check) else {
-                return false
+                  pending.rejectedMinimumResetEpoch == nil else { return false }
+            let manifest = try await readLegacySleepEvidence(validate: check) {
+                try await sleepStore.loadManifestForSync(validate: check)
             }
+            guard let manifest else { return false }
             // The legacy ACK cannot prove the bytes, only the already committed transition.
             let alreadyCommitted = try await SleepSyncValueWork.run { manifest == pending.manifest }
             try check()

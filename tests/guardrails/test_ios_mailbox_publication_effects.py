@@ -11,6 +11,7 @@ _FOREGROUND = "private func reconcileForegroundMailboxDelivery("
 _BOUNDED = "private func reconcileMailboxDeliveryIfNeeded("
 _GENERATION_FENCE = "try requireCurrentConnectionGeneration(expectedGeneration)"
 _TARGET_FENCE = "try requireCurrentPayloadDeliveryTarget(target)"
+_MANUAL_GENERATION = "let expectedGeneration = target.generation"
 _SCHEDULE = guards.test_background_mailbox_failure_checks_generation_before_publication
 _FLUSH = guards.test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check
 _FOREGROUND_RECONCILE = (
@@ -93,9 +94,9 @@ _TRAILING_WRITE = 'statusMessage.append("Mailbox update")'
             _BOUNDED_RECONCILE,
             _BOUNDED,
             (
-                """summary = try await delivery.publishPendingFIFOHead()
+                """summary = try await delivery.publishPendingFIFOHeadWithOwnership()
             case""",
-                """summary = try await delivery.publishPendingFIFOHead()
+                """summary = try await delivery.publishPendingFIFOHeadWithOwnership()
                 self.objectWillChange.send()
             case""",
             ),
@@ -159,6 +160,47 @@ def test_guard_rejects_unknown_effect_after_trailing_suspension(
         AssertionError, match="Unsupported Swift after Mailbox suspension"
     ):
         _SCHEDULE()
+
+
+@pytest.mark.parametrize(
+    ("guard", "scope", "replacement", "reason"),
+    [
+        (
+            _FLUSH,
+            _MANUAL,
+            (
+                _MANUAL_GENERATION,
+                f'let expectedGeneration = "" // {_MANUAL_GENERATION}',
+            ),
+            "captured generation",
+        ),
+        (
+            _SCHEDULE,
+            _SCHEDULER,
+            ("completedOperations: [.publishFIFOHead]", "completedOperations: []"),
+            "completed operations",
+        ),
+        (
+            _SCHEDULE,
+            _SCHEDULER,
+            (
+                "completedOperations: [.publishFIFOHead]",
+                "completedOperations: [.publishFIFOHead, .manualDelivery]",
+            ),
+            "completed operations",
+        ),
+    ],
+)
+def test_publication_requires_exact_scoped_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    guard: Callable[[], None],
+    scope: str,
+    replacement: tuple[str, str],
+    reason: str,
+) -> None:
+    monkeypatch.setattr(guards, "VIEW_MODEL", mutated_view_model(scope, (replacement,)))
+    with pytest.raises(AssertionError, match=reason):
+        guard()
 
 
 def test_guard_accepts_suspension_after_actual_last_write(
