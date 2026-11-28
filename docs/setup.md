@@ -140,16 +140,21 @@ Upgrade Receiver/CLI `1.1.5` to `1.2.0` together with the matching signed iOS Co
 
 1. Record the exact database path and existing receiver launch configuration. Stop the Receiver through its current service manager and confirm no process is using the database. Using your established SQLite backup procedure, create and verify an owner-only backup of that database before upgrading, including any SQLite sidecar files that remain. Do not copy a live database.
 2. Verify the complete Receiver/CLI `1.2.0` release packet and the matching signed iOS app build. Do not install from `main`, an unverified checkout, or an older helper.
-3. Set `HEALTH_BRIDGE_DB` to the same database path used by the existing Receiver. Install the tagged release and initialize that same database:
+3. Set `HEALTH_BRIDGE_DB` to the same database path used by the existing Receiver. If you already use Mailbox, follow [Replace the installed helper](icloud-mailbox-service.md#replace-the-installed-helper) with the verified 1.2.0 wheel and matching signed helper. Use the currently installed CLI to uninstall an owned Mailbox service before replacing its CLI. Pause when the replacement helper reports `ready`, before restoring the service or restarting the foreground Receiver. For Direct without Mailbox, install the tagged release:
 
    ```bash
    uv tool install --force "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
+   ```
+
+4. Initialize the same database while the Receiver is still stopped:
+
+   ```bash
    health-bridge init --db "$HEALTH_BRIDGE_DB"
    ```
 
    Initialization applies migrations `012_catalogue_coverage_index`, `013_mailbox_enrollment`, and `014_uv_raw_aggregation`. Migration 012 builds its index synchronously and may need extra disk space or wait for database readers or writers. Migration 013 adds native Mailbox enrollment state. Migration 014 changes legacy raw UV samples from sum aggregation to min/max/average aggregation. Do not run an older Receiver/CLI against the migrated database. To downgrade, stop the Receiver and restore the verified pre-upgrade database backup before reinstalling the older version.
-4. Restart the Receiver using the existing supervisor and launch configuration, with the same database path, bind address, port, route, and credential files. Keep the existing paired devices and credentials. Do not run `health-bridge setup`, create a new pairing, reset private sync state, or change the phone's pairing.
-5. Reload or restart the existing MCP client using its documented configuration-reload procedure. Confirm the local MCP surface and database status:
+5. After initialization succeeds, resume the helper replacement procedure for Mailbox and restore the owned service with its original settings, or restart the original foreground command. For Direct without Mailbox, restart the Receiver using its existing supervisor and launch configuration. Keep the same database path, bind address, port, route, credential files, and paired devices. Do not run `health-bridge setup`, create a new pairing, reset private sync state, or change the phone's pairing.
+6. Reload or restart the existing MCP client using its documented configuration-reload procedure. Confirm the local MCP surface and database status:
 
    ```bash
    health-bridge mcp smoke --db "$HEALTH_BRIDGE_DB"

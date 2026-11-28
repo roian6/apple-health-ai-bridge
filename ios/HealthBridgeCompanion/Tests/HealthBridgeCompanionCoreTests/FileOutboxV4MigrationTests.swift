@@ -399,6 +399,74 @@ final class FileOutboxV4MigrationTests: XCTestCase {
         }
     }
 
+    func testDowngradeHoldsFilelessCheckedDirectReceiptUntilOldBindingCleanup() throws {
+        let directory = fileOutboxV4TemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let oldBinding = "synthetic-old-binding"
+        let writer = try FileOutbox(directory: directory)
+        let item = try writer.enqueue(Data("synthetic-payload".utf8), receiverIdentity: oldBinding)
+        _ = try XCTUnwrap(writer.recordDirectUploadAcceptance(
+            itemID: item.id, receiverIdentity: oldBinding, sleepChecked: true, onNewAcceptance: {}
+        ))
+        let outbox = try FileOutbox(directory: directory)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.fileURL.path))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        let journalURL = directory.appendingPathComponent(".enqueue-transaction")
+        let journal = try Data(contentsOf: journalURL)
+
+        XCTAssertNotEqual(try outbox.downgradeReadiness(), .ready)
+        XCTAssertThrowsError(try FileOutbox.assertReadableByLegacyV3Reader(directory: directory)) {
+            XCTAssertEqual($0 as? FileOutboxMailboxError, .legacyReaderCannotOpen)
+        }
+        XCTAssertFalse(try outbox.retirePlainDirectReceiptsForConnectionTransition(
+            receiverBindingID: "synthetic-other-binding"
+        ))
+        XCTAssertEqual(try Data(contentsOf: journalURL), journal)
+
+        XCTAssertTrue(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: oldBinding))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalURL.path))
+        XCTAssertEqual(try outbox.downgradeReadiness(), .ready)
+        XCTAssertNoThrow(try FileOutbox.assertReadableByLegacyV3Reader(directory: directory))
+    }
+
+    func testDowngradeAcceptsLegacyCompatibleEnqueueJournals() throws {
+        let binding = "synthetic-binding"
+        let payload = Data("synthetic-payload".utf8)
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: "synthetic-source",
+            cursorKind: "synthetic-anchor", cursorValue: "synthetic-cursor"
+        )
+        let cases: [(name: String, cursor: FileOutboxCursorCheckpoint?, retirements: [String: Int])] = [
+            ("unacknowledged", nil, [:]),
+            ("cursor-backed ACK", checkpoint, [:]),
+            ("retirement-backed ACK", nil, ["synthetic-type": 1]),
+        ]
+        for fixture in cases {
+            let directory = fileOutboxV4TemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let outbox = try FileOutbox(directory: directory)
+            if fixture.cursor == nil && fixture.retirements.isEmpty {
+                try outbox.stageEnqueueSequenceForTesting(
+                    [payload], receiverIdentity: binding, stagedPayloadCount: 1
+                )
+            } else {
+                let item = try XCTUnwrap(outbox.enqueueSequence(
+                    [payload], receiverIdentity: binding, cursorCheckpoint: fixture.cursor,
+                    pendingGenerationRetirements: fixture.retirements
+                ).first)
+                _ = try XCTUnwrap(outbox.recordDirectUploadAcceptance(
+                    itemID: item.id, receiverIdentity: binding, sleepChecked: true, onNewAcceptance: {}
+                ))
+            }
+            let journalURL = directory.appendingPathComponent(".enqueue-transaction")
+            let journal = try Data(contentsOf: journalURL)
+
+            XCTAssertEqual(try outbox.downgradeReadiness(), .ready, fixture.name)
+            XCTAssertNoThrow(try FileOutbox.assertReadableByLegacyV3Reader(directory: directory), fixture.name)
+            XCTAssertEqual(try Data(contentsOf: journalURL), journal, fixture.name)
+        }
+    }
+
     func testV3MissingReceiverIdentityDecodesSafelyWithoutRaisingVersion() throws {
         let directory = fileOutboxV4TemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

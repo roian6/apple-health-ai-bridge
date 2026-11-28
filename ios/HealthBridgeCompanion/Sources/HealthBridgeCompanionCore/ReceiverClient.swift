@@ -938,15 +938,8 @@ public final class ReceiverPairingCoordinator {
         let directory = try io.resolve(descriptor)
         try requireNativeCancellationAuthority(pending)
         let cancelURL = directory.appendingPathComponent("cancel.hbp")
-        try io.hydrate(cancelURL)
-        try requireNativeCancellationAuthority(pending)
-        let existing: Data?
-        let cancellationRead = try io.read(cancelURL)
-        try requireNativeCancellationAuthority(pending)
-        switch cancellationRead {
-        case .missing: existing = nil
-        case .downloading: throw MailboxLocatorError.storageFailure
-        case .available(let bytes): existing = bytes
+        let existing = try await readNativeFile(cancelURL, io: io, allowInitialAbsence: true) {
+            try self.requireNativeCancellationAuthority(pending)
         }
         let cancel = try NativeMailboxPairing.cancellation(pending, keys: mailboxKeyStore, existing: existing)
         try requireNativeCancellationAuthority(pending)
@@ -990,7 +983,15 @@ public final class ReceiverPairingCoordinator {
     private func nativeResponse(
         _ name: String, directory: URL, io: NativeMailboxPairingIO, requireAuthority: () throws -> Void
     ) async throws -> Data {
-        let url = directory.appendingPathComponent(name)
+        guard let response = try await readNativeFile(
+            directory.appendingPathComponent(name), io: io, allowInitialAbsence: false, requireAuthority: requireAuthority
+        ) else { throw MailboxLocatorError.storageFailure }
+        return response
+    }
+
+    private func readNativeFile(
+        _ url: URL, io: NativeMailboxPairingIO, allowInitialAbsence: Bool, requireAuthority: () throws -> Void
+    ) async throws -> Data? {
         for attempt in 0..<15 {
             try requireAuthority()
             try io.hydrate(url)
@@ -1003,6 +1004,8 @@ public final class ReceiverPairingCoordinator {
                     throw ReceiverPairingRedeemError.invalidResponse
                 }
                 return bytes
+            case .missing where attempt == 0 && allowInitialAbsence:
+                return nil
             case .missing, .downloading:
                 break
             }

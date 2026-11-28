@@ -1,5 +1,8 @@
 from pathlib import Path
 
+from tests.guardrails.mailbox_publication_effect_contract import swift_tokens
+from tests.guardrails.mailbox_publication_guard import SwiftLexer
+
 ROOT = Path(__file__).resolve().parents[2]
 VIEW_MODEL = (
     ROOT
@@ -42,7 +45,7 @@ def test_disconnect_is_async_and_uses_the_terminal_connection_barrier() -> None:
     assert "await viewModel.disconnectReceiver()" in content
 
 
-def test_legacy_v1_and_v2_replacement_call_the_same_barrier_helper() -> None:
+def test_pairing_checks_each_barrier_result_before_promotion() -> None:
     source = VIEW_MODEL.read_text()
     start = source.index("private func applyPairingMaterial(")
     end = source.index("private func applyCommittedPairingCredential(", start)
@@ -50,28 +53,40 @@ def test_legacy_v1_and_v2_replacement_call_the_same_barrier_helper() -> None:
 
     legacy = body[body.index("case .legacy") : body.index("case .invitation")]
     invitation = body[body.index("case .invitation") :]
-    assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in legacy
-    assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in invitation
-
-
-def test_pairing_ui_promotion_rechecks_the_committed_generation_after_the_barrier() -> (
-    None
-):
-    source = VIEW_MODEL.read_text()
-    start = source.index("private func applyPairingMaterial(")
-    end = source.index("private func applyCommittedPairingCredential(", start)
-    body = source[start:end]
-
-    assert body.count("committedGeneration") >= 2
-    assert (
-        body.count(
-            "requireCommittedConnectionGenerationWhileHoldingRequestGate(committedGeneration)"
+    for source_branch, promotion in (
+        (legacy, "applyCommittedPairingConnection("),
+        (invitation, "applyCommittedPairingCredential("),
+    ):
+        branch = "".join(source_branch.split())
+        barrier = branch.index(
+            "lettransition=tryawaitperformTerminalConnectionTransitionWhileHoldingRequestGate("
         )
-        >= 2
+        check = branch.index(
+            "tryrequireCommittedConnectionGenerationWhileHoldingRequestGate(", barrier
+        )
+        argument = branch[check:].partition("(")[2].partition(")")[0]
+        if argument != "transition.committedGeneration":
+            assert (
+                f"let{argument}=transition.committedGeneration" in branch[barrier:check]
+            )
+        assert check < branch.index(promotion)
+
+
+def test_history_picker_and_setter_share_terminal_user_admission() -> None:
+    source = VIEW_MODEL.read_text()
+    start = source.index("var canChangeHealthHistoryDepth: Bool")
+    end = source.index("func saveReceiverSettings() async", start)
+    admission, setter = source[start:end].split("func setHealthHistoryDepthOption(")
+    assert "terminalUserActionAdmissionIsOpen" in admission
+    assert setter.index("guard canChangeHealthHistoryDepth else { return }") < (
+        setter.index("healthHistoryDepthStore.saveHistoryDepth(")
     )
-    assert body.index(
-        "requireCommittedConnectionGenerationWhileHoldingRequestGate(committedGeneration)"
-    ) < body.index("applyCommittedPairingConnection(")
+
+    view = CONTENT_VIEW.with_name("DataScopeView.swift").read_text()
+    start = view.index("Picker(")
+    picker = view[start : view.index("VStack(", start)]
+    assert "set: { viewModel.setHealthHistoryDepthOption($0) }" in picker
+    assert ".disabled(!viewModel.canChangeHealthHistoryDepth)" in picker
 
 
 def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
@@ -116,17 +131,64 @@ def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
     pending_end = source.index(
         "private func makeProductionMailboxDelivery()", pending_start
     )
-    pending = source[pending_start:pending_end]
+    pending = SwiftLexer(source[pending_start:pending_end]).views().structure
     response = pending.index(
         "lastDirectUploadResult = try await receiverClient.upload("
     )
-    post_response_check = pending.index(
-        "try requireCurrentPayloadDeliveryTarget(target)", response
+    direct_accept_guard = source.index(
+        "private func requireCurrentAcceptedDirectTarget("
     )
-    acceptance = pending.index(
-        "cursorFinalizer.recordDirectReceiverAcceptance(", post_response_check
+    direct_accept_end = source.index(
+        "private struct PayloadDelivery", direct_accept_guard
     )
-    assert response < post_response_check < acceptance
+    direct_accept = swift_tokens(
+        SwiftLexer(source[direct_accept_guard:direct_accept_end]).views().structure
+    )
+    assert (
+        swift_tokens("""
+        guard connectionTerminalBarrier.allowsPostResponseMutation(
+            capturedGeneration: target.generation,
+            currentGeneration: settingsStore.receiverSettingsGenerationToken
+        ) else { throw CancellationError() }
+        guard !terminalRecoveryRequestIsActive, !taskUIPublicationIsSuppressed,
+              case .directHTTP(let url) = target.route,
+              settingsStore.activeTransport == .directHTTP,
+              settingsStore.receiverBindingID == target.bindingID,
+              settingsStore.receiverURLString == url.absoluteString else {
+            throw CancellationError()
+        }
+    """)
+        in direct_accept
+    )
+    assert (
+        swift_tokens("try requireCurrentPayloadDeliveryTarget(target)")
+        not in direct_accept
+    )
+    assert swift_tokens("""
+        if let (store, snapshot) = sleepInput {
+            let validateAcceptedOwner = { @MainActor in
+                try self.requireCurrentAcceptedDirectTarget(target)
+                try self.validateSleepOperationAuthority(
+                    snapshot, store: store, outbox: outbox)
+            }
+            _ = try await Task { @MainActor in
+            try validateAcceptedOwner()
+            guard try store.revisionForSync() == snapshot.storage else {
+                throw CancellationError()
+            }
+            return try await withSleepStorageOrigin {
+                try await cursorFinalizer.recordDirectReceiverAcceptanceForSync(
+    """) in swift_tokens(pending[response:])
+    assert swift_tokens("""
+        } else {
+            try requireCurrentAcceptedDirectTarget(target)
+            guard self.outbox === outbox,
+                  try outbox.pendingItem(id: item.id) == item else {
+                throw CancellationError()
+            }
+            try validateAcceptedPayload()
+            _ = try cursorFinalizer.recordDirectReceiverAcceptance(
+    """) in swift_tokens(pending[response:])
     assert "catch let cancellation as CancellationError" in pending
     assert "throw cancellation" in pending
 
@@ -165,30 +227,61 @@ def test_terminal_request_reservation_precancels_pairing() -> None:
         transition_start,
     )
     body = source[transition_start:transition_end]
+    preflight = body[: body.index("beginTerminalTaskUIPublicationSuppression()")]
     assert (
-        body.index("await cancelPairingOperationIfNeeded()")
-        < body.index(
+        preflight.index(
             "let outboxIdentityAdmissionWasReady = outboxIdentityMigrationReady"
         )
-        < body.index("connectionTerminalBarrier.perform(")
+        < preflight.index("try requireTrustedEmptyOutboxForConnectionTransition(")
+        < preflight.index("throw error")
     )
-    close = body[body.index("closeAdmission:") : body.index("invalidateGeneration:")]
+    assert "cancelPairingOperationIfNeeded()" not in preflight
+    barrier_call = "transition = try await connectionTerminalBarrier."
+    assert (
+        len(preflight)
+        < body.index("await cancelPairingOperationIfNeeded()")
+        < body.index(barrier_call)
+        < body.index("try await preparePrivateStorageForUploadAdmission()")
+    )
+    _, _, barrier_arguments = body.partition(barrier_call)
+    barrier_method = barrier_arguments.split("(", 1)[0]
+    before_commit, commit = barrier_arguments.split("commit: {", 1)
+    close = before_commit.split("closeAdmission:", 1)[1].split(
+        "cancelAndAwaitPairing:", 1
+    )[0]
     assert "privateStorageAdmissionReady = false" in close
     assert "outboxIdentityMigrationReady = false" in close
-    commit = body[body.index("commit: { expectedGeneration in") :]
-    assert commit.index(
-        "try self.requireTrustedEmptyOutboxForConnectionTransition("
-    ) < commit.index("let result = try await commit(expectedGeneration)")
-    assert body.index("connectionTerminalBarrier.perform(") < body.index(
-        "try await preparePrivateStorageForUploadAdmission()"
+    assert (
+        "invalidateReceiverSettingsGeneration(" not in body[: body.index("commit: {")]
     )
+    recheck = commit.index("try self.requireTrustedEmptyOutboxForConnectionTransition(")
+    advance = commit.index(
+        "try self.settingsStore.invalidateReceiverSettingsGeneration("
+    )
+    assert (
+        recheck
+        < advance
+        < commit.index("let result = try await commit(expectedGeneration)")
+    )
+    assert "await " not in commit[recheck:advance]
     assert "postCommitRecoveryRequired: true" in body
     assert "postCommitRecoveryRequired: false" in body
 
     barrier = RECEIVER_CLIENT.read_text()
     assert "transitionWaiters: [CheckedContinuation<Void, Never>]" in barrier
-    assert "await acquireTransition()" in barrier
-    assert "defer { releaseTransition() }" in barrier
+    implementation = barrier.split(f"public func {barrier_method}<Result>(", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    assert (
+        implementation.index("await acquireTransition()")
+        < implementation.index("defer { releaseTransition() }")
+        < implementation.index("closeAdmission()")
+        < implementation.index("await cancelAndAwaitPairing()")
+        < implementation.index("await cancelAndAwaitForegroundPayloads()")
+        < implementation.index("guard await drainBackgroundPayloads()")
+        < implementation.index("return try await commit(")
+    )
+    assert "invalidateGeneration()" not in implementation
     assert "guard admissionIsOpen else" not in barrier
 
 
@@ -373,7 +466,8 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
     begin = transition.index("beginTerminalTaskUIPublicationSuppression()")
     first_cancel = transition.index("cancelPairingOperationIfNeeded()")
     decisive_check = transition.index(
-        "requireTrustedEmptyOutboxForConnectionTransition("
+        "requireTrustedEmptyOutboxForConnectionTransition(",
+        transition.index("commit: {"),
     )
     assert begin < first_cancel < decisive_check
     coordinator_source = FILE_OUTBOX.read_text()
@@ -394,10 +488,15 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
         < coordinator.rindex("isActive = false")
     )
     assert transition.count("endTerminalTaskUIPublicationSuppression()") == 2
-    assert transition.index(
-        "endTerminalTaskUIPublicationSuppression()"
-    ) < transition.index(
-        "restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+    barrier_failure = transition.split(
+        "transition = try await connectionTerminalBarrier.", 1
+    )[1].split("\n        } catch {", 1)[1]
+    assert (
+        barrier_failure.index("endTerminalTaskUIPublicationSuppression()")
+        < barrier_failure.index(
+            "await restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+        )
+        < barrier_failure.index("\n            throw error")
     )
     assert transition.rindex(
         "endTerminalTaskUIPublicationSuppression()"
@@ -458,7 +557,6 @@ def test_terminal_transition_suppresses_transitive_task_ui_until_decision() -> N
     )
 
     for action_entry in (
-        "func setHealthHistoryDepthOption(_ optionID: String)",
         "func retryPrivateStorage() async",
         "func saveReceiverSettings() async",
         "func requestHealthPermissions() async",
@@ -641,10 +739,14 @@ def test_failed_terminal_transition_reopens_trusted_admission() -> None:
     end = source.index("private func cancelAndAwaitForegroundPayloadTasks()", start)
     body = source[start:end]
 
-    assert "restorePrivateStorageAdmissionAfterFailedConnectionTransition()" in body
-    assert body.index("connectionTerminalBarrier.perform(") < body.index(
-        "restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+    barrier_failure = (
+        body.split("transition = try await connectionTerminalBarrier.", 1)[1]
+        .split("\n        } catch {", 1)[1]
+        .split("\n        }\n", 1)[0]
     )
+    assert barrier_failure.index(
+        "await restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
+    ) < barrier_failure.index("\n            throw error")
     restore_start = source.index(
         "private func restorePrivateStorageAdmissionAfterFailedConnectionTransition()"
     )
@@ -652,8 +754,12 @@ def test_failed_terminal_transition_reopens_trusted_admission() -> None:
         "private func cancelAndAwaitForegroundPayloadTasks()", restore_start
     )
     restore = source[restore_start:restore_end]
-    assert restore.index("hasPendingCancellationRecovery()") < restore.index(
-        "preparePrivateStorageForUploadAdmission()"
+    assert (
+        restore.index("if try pairingCoordinator.hasPendingCancellationRecovery()")
+        < restore.index("privateStorageAdmissionReady = false")
+        < restore.index("outboxIdentityMigrationReady = false")
+        < restore.index("return")
+        < restore.index("try await preparePrivateStorageForUploadAdmission()")
     )
     assert "if let outboxError = error as? ReceiverOutboxIdentityError" in source
     assert "code=transition_requires_empty_outbox" in source
@@ -810,6 +916,9 @@ def test_terminal_request_prevents_post_opt_out_enqueue() -> None:
         "private static func sleepStorageMayNeedRecovery(", operation_start
     )
     context = source[context_start:operation_start]
+    authority_start = context.index("private func validateSleepOperationAuthority(")
+    assert "backgroundSyncPreferenceGeneration" not in context[authority_start:]
+    assert "backgroundSyncEnabled" not in context[authority_start:]
     for guard in (
         "try Task.checkCancellation()",
         "backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration",

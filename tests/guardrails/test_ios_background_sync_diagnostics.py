@@ -121,8 +121,20 @@ def test_settings_render_distinct_read_only_automatic_sync_evidence_lines() -> N
         assert f"viewModel.{property_name}" in content
         assert f"var {property_name}: String" in view_model
         assert f"viewModel.{property_name} =" not in content
-    assert "viewModel.syncPresentation.title" in content
-    assert "viewModel.displayStatusMessage" in content
+    current_status = content.split('Section("Current status")', 1)[1].split(
+        'Section("Recent activity")', 1
+    )[0]
+    assert "viewModel.syncPresentation.title" in current_status
+    assert "Text(viewModel.activityStatusDetail)" in current_status
+    detail = view_model.split("var activityStatusDetail: String {", 1)[1].split(
+        "\n    }", 1
+    )[0]
+    assert re.search(r"case \.needsAttention:\s*return displayStatusMessage\b", detail)
+    mailbox = detail.split("case .mailboxQueued, .mailboxConfirmationWaiting:", 1)[1]
+    assert mailbox.split("default:", 1)[0].strip() == (
+        "return activityMailboxFailureMessage ?? presentation.detail"
+    )
+    assert re.search(r"default:\s*return presentation\.detail\b", detail)
     assert "viewModel.backgroundSyncStatus" not in content
     assert "@State private var showsAdvanced = false" in content
     assert "isExpanded: $showsAdvanced" in content

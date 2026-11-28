@@ -173,21 +173,22 @@ def test_public_release_audit_supports_gitignored_local_denylist() -> None:
 
 
 def test_public_release_audit_redacts_local_denylist_hits_in_all_tracked_files(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Given
+    audit = cast(
+        "PublicReleaseAuditModule", cast("object", _load_public_release_audit())
+    )
+    # Production scans Git-relative names, not the path to a caller's checkout.
+    monkeypatch.chdir(tmp_path)
     private_literal = "PRIVATE_VALUE_FOR_LOCAL_DENYLIST_TEST"
-    denylist = tmp_path / "denylist.local"
+    denylist = Path("denylist.local")
     _ = denylist.write_text(f"{private_literal}\n")
-    public_doc = tmp_path / "README.md"
+    public_doc = Path("README.md")
     _ = public_doc.write_text(f"normal text {private_literal}\n")
-    definition_file = tmp_path / "scripts" / "public-release-audit.py"
+    definition_file = Path("scripts/public-release-audit.py")
     definition_file.parent.mkdir()
     _ = definition_file.write_text(f"guardrail text {private_literal}\n")
-    audit = cast(
-        "PublicReleaseAuditModule",
-        cast("object", _load_public_release_audit()),
-    )
     audit.LOCAL_DENYLIST_FILES = (denylist,)
     audit.STRICT_DEFINITION_FILES = {definition_file.as_posix()}
     audit.PUBLIC_SURFACE_FILES = {public_doc.as_posix()}
@@ -229,18 +230,19 @@ def test_public_release_audit_scans_definition_files_for_global_credentials(
 
 
 def test_public_release_audit_blocks_bare_account_bundle_literals(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     audit = cast(
         "PublicReleaseAuditModule",
         cast("object", _load_public_release_audit()),
     )
+    monkeypatch.chdir(tmp_path)
     bundle = ".".join(("dev", "private-owner", "bridge"))  # noqa: FLY002
-    fixture = tmp_path / "provenance.txt"
+    fixture = Path("provenance.txt")
     _ = fixture.write_text(f"source bundle: {bundle}\n")
-    canonical = tmp_path / "canonical.txt"
+    canonical = Path("canonical.txt")
     _ = canonical.write_text("dev.healthbridge.companion\n")
-    suffixed = tmp_path / "suffixed.txt"
+    suffixed = Path("suffixed.txt")
     _ = suffixed.write_text("dev.healthbridge.companion" + ".private\n")
 
     blockers = audit.scan_strict_blockers([fixture])
@@ -255,30 +257,31 @@ def test_public_release_audit_blocks_bare_account_bundle_literals(
 
 
 def test_public_release_audit_limits_cgnat_detection_to_rfc6598(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     audit = cast(
         "PublicReleaseAuditModule",
         cast("object", _load_public_release_audit()),
     )
-    outside = tmp_path / "public.txt"
+    monkeypatch.chdir(tmp_path)
+    outside = Path("public.txt")
     _ = outside.write_text(
         ".".join(("100", "63", "255", "255"))  # noqa: FLY002
         + "\n"
         + ".".join(("100", "128", "0", "1"))  # noqa: FLY002
         + "\n"
     )
-    inside = tmp_path / "private.txt"
+    inside = Path("private.txt")
     _ = inside.write_text(
         ".".join(("100", "64", "0", "1"))  # noqa: FLY002
         + "\n"
         + ".".join(("100", "127", "255", "254"))  # noqa: FLY002
         + "\n"
     )
-    definition_outside = tmp_path / "scripts" / "public-release-audit.py"
+    definition_outside = Path("scripts/public-release-audit.py")
     definition_outside.parent.mkdir()
     _ = definition_outside.write_text(outside.read_text())
-    definition_inside = tmp_path / "tests" / "guardrails" / "audit-definition.py"
+    definition_inside = Path("tests/guardrails/audit-definition.py")
     definition_inside.parent.mkdir(parents=True)
     _ = definition_inside.write_text(inside.read_text())
     audit.STRICT_DEFINITION_FILES = {
@@ -634,10 +637,14 @@ def test_public_release_audit_passes_its_real_tracked_tree() -> None:
 
 
 def test_public_release_audit_rejects_non_neutral_xcode_signing_identity(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Given
-    neutral_project = tmp_path / "neutral.pbxproj"
+    audit = cast(
+        "PublicReleaseAuditModule", cast("object", _load_public_release_audit())
+    )
+    monkeypatch.chdir(tmp_path)
+    neutral_project = Path("neutral.pbxproj")
     _ = neutral_project.write_text(
         "{}\n{}\n{}\n{}\n".format(
             'DEVELOPMENT_TEAM = "";',
@@ -646,7 +653,7 @@ def test_public_release_audit_rejects_non_neutral_xcode_signing_identity(
             'build_settings=("PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID")',
         ),
     )
-    private_project = tmp_path / "private.pbxproj"
+    private_project = Path("private.pbxproj")
     team_value = "A" * 10
     bundle_value = ".".join(("dev", "owner", "HealthBridgeCompanion"))  # noqa: FLY002
     private_lines = [
@@ -654,11 +661,6 @@ def test_public_release_audit_rejects_non_neutral_xcode_signing_identity(
         f"PRODUCT_BUNDLE_IDENTIFIER = {bundle_value};",
     ]
     _ = private_project.write_text("\n".join(private_lines) + "\n")
-    audit = cast(
-        "PublicReleaseAuditModule",
-        cast("object", _load_public_release_audit()),
-    )
-
     # When
     neutral_blockers = audit.scan_strict_blockers([neutral_project])
     private_blockers = audit.scan_strict_blockers([private_project])
@@ -1462,23 +1464,35 @@ def test_ios_pairing_bootstrap_precedes_all_automatic_sync_entrypoints() -> None
     assert "guard automaticSyncReady" in view_model
     assert "automaticSyncReady," in view_model
 
-    invitation_flow = view_model.index("case .invitation(let invitation):")
-    invitation_pause = view_model.index(
-        "pauseAutomaticSyncForPendingPairing()", invitation_flow
+    pairing_material = view_model.split("private func applyPairingMaterial(", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    invitation = pairing_material.split("case .invitation(let invitation):", 1)[1]
+    assert (
+        invitation.index("hasPendingPairing = true")
+        < invitation.index(
+            "performTerminalConnectionTransitionWhileHoldingRequestGate("
+        )
+        < invitation.index("try await self.pairingCoordinator.pair(")
     )
-    invitation_barrier = view_model.index(
-        "performTerminalConnectionTransitionWhileHoldingRequestGate(", invitation_flow
-    )
-    invitation_redeem = view_model.index("pairingCoordinator.pair(", invitation_flow)
-    assert invitation_pause < invitation_barrier < invitation_redeem
+    sync_readiness = view_model.split("private var automaticSyncReady: Bool", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    enable_prerequisites = view_model.split(
+        "private var automaticSyncEnablePrerequisitesReady: Bool", 1
+    )[1].split("\n    }", 1)[0]
+    assert "automaticSyncEnablePrerequisitesReady" in sync_readiness
+    assert "&& !hasPendingPairing" in enable_prerequisites
 
     terminal_start = view_model.index(TERMINAL_TRANSITION_HELPER)
     terminal_end = view_model.index(
         "private func cancelAndAwaitForegroundPayloadTasks()", terminal_start
     )
     terminal_body = view_model[terminal_start:terminal_end]
-    assert "await self.cancelAndAwaitForegroundPayloadTasks()" in terminal_body
-    assert "await self.drainBackgroundPayloadCancellation()" in terminal_body
+    close_admission = terminal_body.split("closeAdmission: {", 1)[1].split(
+        "cancelAndAwaitPairing:", 1
+    )[0]
+    assert "automaticSyncRuntime?.stopAdmission()" in close_admission
 
 
 def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> None:
@@ -1504,15 +1518,16 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
         "private func requireCurrentConnectionGeneration", terminal_start
     )
     terminal_body = view_model[terminal_start:terminal_end]
-    pre_cancel = terminal_body.index("await cancelPairingOperationIfNeeded()")
-    barrier_call = terminal_body.index("connectionTerminalBarrier.perform(")
-    foreground_join = terminal_body.index(
-        "await self.cancelAndAwaitForegroundPayloadTasks()"
+    assert (
+        terminal_body.index("await cancelPairingOperationIfNeeded()")
+        < terminal_body.index("transition = try await connectionTerminalBarrier.")
+        < terminal_body.index("cancelAndAwaitForegroundPayloads:")
+        < terminal_body.index("await self.cancelAndAwaitForegroundPayloadTasks()")
+        < terminal_body.index("drainBackgroundPayloads:")
+        < terminal_body.index("await self.drainBackgroundPayloadCancellation()")
+        < terminal_body.index("commit: {")
+        < terminal_body.index("try await commit(expectedGeneration)")
     )
-    background_drain = terminal_body.index(
-        "await self.drainBackgroundPayloadCancellation()"
-    )
-    assert pre_cancel < barrier_call < foreground_join < background_drain
 
     upload_start = view_model.index("private func uploadPayloadsWithOutbox(")
     upload_end = view_model.index("private func uploadPendingOutbox(", upload_start)
@@ -1630,15 +1645,24 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     )
 
     capture_start = view_model.index("private func capturePayloadDeliveryTarget()")
-    validator_start = view_model.index(
-        "private func requireCurrentPayloadDeliveryTarget(", capture_start
+    authority_start = view_model.index(
+        "private func currentPayloadDeliveryTarget()", capture_start
     )
-    capture_body = view_model[capture_start:validator_start]
+    validator_start = view_model.index(
+        "private func requireCurrentPayloadDeliveryTarget(", authority_start
+    )
+    capture_body = view_model[capture_start:authority_start]
+    assert capture_body.index("try Task.checkCancellation()") < capture_body.index(
+        "return try currentPayloadDeliveryTarget()"
+    )
+    authority_body = view_model[authority_start:validator_start]
     assert all(
-        marker in capture_body
+        marker in authority_body
         for marker in (
             "let generation = settingsStore.receiverSettingsGenerationToken",
-            "try requireCurrentConnectionGeneration(generation)",
+            "connectionTerminalBarrier.allowsPostResponseMutation(",
+            "capturedGeneration: generation",
+            "currentGeneration: settingsStore.receiverSettingsGenerationToken",
             "settingsStore.receiverBindingID",
             "identity.opaqueBinding == bindingID",
             "keys.signingKeyID == identity.deviceSigningKeyID",
@@ -1646,7 +1670,9 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
         )
     )
 
-    validator_end = view_model.index("private struct PayloadDelivery", validator_start)
+    validator_end = view_model.index(
+        "private func requireCurrentAcceptedDirectTarget(", validator_start
+    )
     validator_body = view_model[validator_start:validator_end]
     generation_check = validator_body.index(
         "try requireCurrentConnectionGeneration(target.generation)"

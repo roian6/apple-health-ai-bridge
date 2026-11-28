@@ -1,5 +1,6 @@
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 import HealthKit
 import UIKit
@@ -14,6 +15,642 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
 
     func testManualQueuedRetryWithAutomaticSyncDisabledCompletesSleep() async throws {
         try await runOnlineManualQueuedRetry(pendingSleep: true)
+    }
+
+    func testDirectAcceptedSleepACKAllowsIndependentTailAppend() async throws {
+        try await exerciseDirectAcceptedSleepACK(.append)
+    }
+
+    func testDirectAcceptedSleepACKAllowsTailAppendDuringNutritionPreparation() async throws {
+        try await exerciseDirectAcceptedSleepACK(.appendDuringNutritionPreparation)
+    }
+
+    func testDirectAcceptedSleepACKDrainsSupportedNutritionSiblingBeforeColdTail() async throws {
+        try await exerciseDirectAcceptedSleepACK(.appendWithNutritionSibling)
+    }
+
+    func testDirectAcceptedSleepACKWithoutTailAppend() async throws {
+        try await exerciseDirectAcceptedSleepACK(.unchanged)
+    }
+
+    func testDirectAcceptedSleepACKRejectsChangedAcceptedPayload() async throws {
+        try await exerciseDirectAcceptedSleepACK(.replacePayload)
+    }
+
+    private enum DirectAcceptedSleepChange {
+        case append, appendDuringNutritionPreparation, appendWithNutritionSibling, unchanged, replacePayload
+    }
+
+    private func exerciseDirectAcceptedSleepACK(_ change: DirectAcceptedSleepChange) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: fixture.nextAnchor, receivedAt: date
+            ),
+            receiverSettingsGeneration: generation, historyDepth: .allAvailable, historyStartDate: nil,
+            generatedAt: date
+        ))
+        let original = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let nutritionSibling = change == .appendWithNutritionSibling
+        let siblingBatch: HealthBridgeBatchV1
+        if nutritionSibling {
+            siblingBatch = try XCTUnwrap(GenericQuantitySyncBatchFactory.makeQuantityBatch(
+                samples: [HealthKitQuantitySampleSummary(
+                    uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000005977")),
+                    typeCode: "dietary_protein", start: date, end: date.addingTimeInterval(60), value: 12
+                )],
+                selectedTypeCodes: ["dietary_protein"], windowStart: date, windowEnd: date.addingTimeInterval(60),
+                generatedAt: date.addingTimeInterval(60)
+            ))
+            XCTAssertEqual(siblingBatch.samples.map(\.typeCode), ["dietary_protein"])
+            XCTAssertTrue(NutritionCompatibility.containsNutrition(siblingBatch))
+            XCTAssertTrue(NutritionCompatibility.permits(siblingBatch, support: .supported))
+            fixture.recorder.setCapabilitySupport(true)
+        } else {
+            siblingBatch = ConnectionTestBatchFactory.make(now: date.addingTimeInterval(60))
+        }
+        let sibling = try HealthBridgeBatchEncoder().encode(siblingBatch)
+        let independent = try HealthBridgeBatchEncoder().encode(
+            ConnectionTestBatchFactory.make(now: date.addingTimeInterval(120))
+        )
+        XCTAssertEqual(Set([original, sibling, independent]).count, 3)
+        let oldCheckpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: try XCTUnwrap(fixture.initialManifest.sourceKey),
+            cursorKind: SleepSyncBatchFactory.anchoredCursorKind, cursorValue: fixture.nextAnchor
+        )
+        let nextCheckpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: oldCheckpoint.sourceKey,
+            cursorKind: "synthetic-independent-checkpoint", cursorValue: "synthetic-independent-progress"
+        )
+        let oldItems = try fixture.outbox.enqueueSequence(
+            [original, sibling], receiverIdentity: binding, cursorCheckpoint: oldCheckpoint
+        )
+        let head = try XCTUnwrap(oldItems.first)
+        let pending = SleepSyncPendingTransition(
+            payload: original, manifest: transition.manifest, receiverBindingID: binding,
+            connectionGeneration: generation, outboxItemID: head.id
+        )
+        try fixture.sleep.savePendingTransition(pending)
+        let cursorURL = fixture.root.appendingPathComponent("cursors.json")
+        func reopenedCursor(_ checkpoint: FileOutboxCursorCheckpoint) throws -> String? {
+            try FileSyncCursorStore(fileURL: cursorURL).cursorValue(
+                receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+            )
+        }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let recorder = fixture.recorder
+        let appendDuringNutrition = change == .appendDuringNutritionPreparation
+        let sleepURL = fixture.root.appendingPathComponent("sleep.json")
+        let store = try FileSleepSyncManifestStore(fileURL: sleepURL, observeCodec: { operation in
+            if !appendDuringNutrition, operation == .encodeManifest, recorder.acceptedPayloads == [original] {
+                barrier.blockPreparation()
+            }
+        })
+        let model = try makeViewModel(
+            root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+            ),
+            outbox: fixture.outbox, receiverClient: ReceiverClient(session: fixture.session),
+            sleepManifestStore: store, scheduleDirectBackgroundUploads: { 0 },
+            terminalBackgroundPayloadDrain: { true }, platformBackgroundPayloadDrain: { true },
+            requestProjectionReadAuthorization: { _ in throw CocoaError(.featureUnsupported) }
+        )
+        await model.bootstrap()
+        XCTAssertEqual(model.pendingOutboxCount, oldItems.count)
+        XCTAssertTrue(recorder.payloads.isEmpty)
+
+        var appendedItem: FileOutboxItem?
+        let drivePreparation: @MainActor @Sendable () throws -> Void = {
+            XCTAssertEqual(recorder.payloads, [original])
+            XCTAssertEqual(recorder.acceptedPayloads, [original])
+            XCTAssertEqual(try fixture.outbox.pendingItems(), oldItems)
+            XCTAssertEqual(try fixture.sleep.loadPendingTransition(), pending)
+            XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+            XCTAssertNil(try reopenedCursor(oldCheckpoint))
+            XCTAssertNil(try reopenedCursor(nextCheckpoint))
+            switch change {
+            case .append, .appendDuringNutritionPreparation, .appendWithNutritionSibling:
+                let appended = try XCTUnwrap(try fixture.outbox.enqueueSequence(
+                    [independent], receiverIdentity: binding, cursorCheckpoint: nextCheckpoint
+                ).first)
+                appendedItem = appended
+                XCTAssertEqual(try fixture.outbox.pendingItems().dropLast().map(\.id), oldItems.map(\.id))
+                if nutritionSibling {
+                    XCTAssertGreaterThan(recorder.capabilityRequestCount, 0)
+                    XCTAssertEqual(model.nutritionNotice, NutritionSupport.supported.notice)
+                    XCTAssertNil(fixture.outbox.preparedNutritionPayloads[appended.id])
+                }
+            case .unchanged:
+                break
+            case .replacePayload:
+                try independent.write(to: head.fileURL, options: .atomic)
+                XCTAssertEqual(try fixture.outbox.pendingItems(), oldItems, "The accepted ID did not change.")
+                XCTAssertEqual(try Data(contentsOf: head.fileURL), independent)
+            }
+        }
+        if appendDuringNutrition {
+            let response = HeldFirstProtocolResponse()
+            recorder.setHeldResponseHandler { [weak recorder] resume in
+                guard recorder?.payloads == [original] else { return false }
+                return response.holdFirst(resume)
+            }
+            fixture.outbox.observeNutritionCodec = {
+                if recorder.acceptedPayloads == [original] { barrier.blockPreparation() }
+            }
+            let firstDrain = Task { @MainActor in
+                await model.performManualSyncOpportunity(processPendingTypes: { false })
+            }
+            await fulfillment(of: [response.held], timeout: 5)
+            XCTAssertTrue(recorder.acceptedPayloads.isEmpty)
+            // Make the existing sibling take the real decode path on the next
+            // preparation pass. No durable queue entry, byte, or authority changes.
+            XCTAssertNotNil(fixture.outbox.preparedNutritionPayloads.removeValue(forKey: oldItems[1].id))
+            // The codec cannot be entered until this response is released. Give it
+            // its own wait budget instead of borrowing time from the HTTP hold.
+            barrier.startDriver(action: drivePreparation)
+            XCTAssertTrue(response.release())
+            await firstDrain.value
+        } else {
+            barrier.startDriver(action: drivePreparation)
+            await model.performManualSyncOpportunity(processPendingTypes: { false })
+        }
+        try await barrier.joinDriver()
+        let observation = barrier.observation()
+        _ = try XCTUnwrap(observation.entered && observation.actionBeforeRelease ? true : nil,
+            "Fixture must change or inspect durable inputs after HTTP 200 and before local Sleep ACK.")
+
+        let reopenedOutbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let reopenedSleep = try FileSleepSyncManifestStore(fileURL: sleepURL)
+        if change == .replacePayload {
+            XCTAssertEqual(recorder.payloads, [original])
+            XCTAssertEqual(recorder.acceptedPayloads, [original])
+            XCTAssertNil(try reopenedCursor(oldCheckpoint))
+            XCTAssertNil(try reopenedCursor(nextCheckpoint))
+            XCTAssertNil(try reopenedOutbox.directFinalizationRecordReady(receiverIdentity: binding))
+            XCTAssertEqual(try reopenedOutbox.pendingItems(), oldItems)
+            XCTAssertEqual(try Data(contentsOf: head.fileURL), independent)
+            XCTAssertEqual(try reopenedSleep.loadManifest(), fixture.initialManifest)
+            XCTAssertEqual(try reopenedSleep.loadPendingTransition(), pending)
+            return
+        }
+        XCTAssertEqual(recorder.payloads, [original, sibling], "The first drain must not retry the original bytes.")
+        XCTAssertEqual(recorder.acceptedPayloads, [original, sibling])
+        let oldAfterFirstDrain = try reopenedCursor(oldCheckpoint)
+        let nextAfterFirstDrain = try reopenedCursor(nextCheckpoint)
+        XCTAssertEqual(oldAfterFirstDrain, oldCheckpoint.cursorValue)
+        XCTAssertNil(nextAfterFirstDrain)
+        XCTAssertEqual(try reopenedSleep.loadManifest(), transition.manifest)
+        XCTAssertNil(try reopenedSleep.loadPendingTransition())
+        if change == .append || appendDuringNutrition || nutritionSibling {
+            let appended = try XCTUnwrap(appendedItem)
+            let remaining = try reopenedOutbox.pendingItems()
+            XCTAssertEqual(remaining, [appended], "The first drain must leave only the independent item.")
+            XCTAssertEqual(try remaining.first.map { try Data(contentsOf: $0.fileURL) }, independent)
+            if nutritionSibling {
+                XCTAssertNil(fixture.outbox.preparedNutritionPayloads[appended.id],
+                    "The first drain must not decode the unrelated appended item.")
+            }
+
+            // A missing old checkpoint is a first-drain failure, not a reason to
+            // skip observing the real retry. Only let it consume this fixture's bytes.
+            let seededItems = oldItems + [appended]
+            let seededPayloads = [original, sibling, independent]
+            guard fixture.settings.receiverBindingID == binding,
+                  fixture.settings.receiverSettingsGenerationToken == generation,
+                  remaining.last == appended,
+                  seededItems.suffix(remaining.count).elementsEqual(remaining),
+                  try zip(remaining, seededPayloads.suffix(remaining.count)).allSatisfy({
+                      try Data(contentsOf: $0.0.fileURL) == $0.1
+                  }) else {
+                XCTFail("Retry was not safe: the remaining FIFO was not an intact suffix of the synthetic fixture.")
+                return
+            }
+            let firstPosts = recorder.payloads
+            await model.performManualSyncOpportunity(processPendingTypes: { false })
+            let posts = recorder.payloads
+            let originalPosts = posts.filter { $0 == original }.count
+            let siblingPosts = posts.filter { $0 == sibling }.count
+            let independentPosts = posts.filter { $0 == independent }.count
+            let oldAfterRetry = try reopenedCursor(oldCheckpoint)
+            let nextAfterRetry = try reopenedCursor(nextCheckpoint)
+            let marker = nutritionSibling ? "DIRECT_SLEEP_NUTRITION_CONTINUATION"
+                : (appendDuringNutrition ? "DIRECT_SLEEP_EARLY_APPEND_RETRY" : "DIRECT_SLEEP_APPEND_RETRY")
+            print("\(marker) originalPOSTs=\(originalPosts) independentPOSTs=\(independentPosts) "
+                + "siblingPOSTs=\(siblingPosts) firstSiblingPOSTs=\(firstPosts.filter { $0 == sibling }.count) "
+                + "firstOldCommitted=\(oldAfterFirstDrain == oldCheckpoint.cursorValue) "
+                + "firstNextAbsent=\(nextAfterFirstDrain == nil) "
+                + "retryOldCommitted=\(oldAfterRetry == oldCheckpoint.cursorValue) "
+                + "retryNextCommitted=\(nextAfterRetry == nextCheckpoint.cursorValue)")
+            XCTAssertEqual(originalPosts, 1, "Original POST count after foreground retry.")
+            XCTAssertEqual(siblingPosts, 1, "Sibling POST count after foreground retry.")
+            XCTAssertEqual(independentPosts, 1, "Independent POST count after foreground retry.")
+            XCTAssertEqual(Array(posts.dropFirst(firstPosts.count)), [independent],
+                "Only the independent payload should be POSTed on the second opportunity.")
+            XCTAssertEqual(posts, [original, sibling, independent])
+            XCTAssertEqual(recorder.acceptedPayloads, [original, sibling, independent])
+            XCTAssertEqual(oldAfterRetry, oldCheckpoint.cursorValue)
+            XCTAssertEqual(nextAfterRetry, nextCheckpoint.cursorValue)
+        }
+        XCTAssertTrue(try FileOutbox(directory: fixture.outbox.directoryURL).pendingItems().isEmpty)
+        #endif
+    }
+
+    func testAcceptedPlainResponseSurvivesUnsavedURLDraft() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires isolated test host.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let instant = Date(timeIntervalSince1970: 1_700_000_000)
+        // A connection-check payload declares every type (including Sleep).
+        // Use a supported, genuinely plain batch to hit the post-2xx path.
+        let bytes = try HealthBridgeBatchEncoder().encode(StepCountSyncBatchFactory.makeAnchoredStepBatch(
+            changes: HealthKitAnchoredStepChanges(
+                stepSamples: [], deletedStepSamples: [], anchorCursorValue: "draft-test-anchor",
+                windowStart: instant, windowEnd: instant.addingTimeInterval(60)
+            ),
+            generatedAt: instant.addingTimeInterval(60)
+        ))
+        _ = try fixture.outbox.enqueue(bytes, receiverIdentity: binding)
+        let model = try makeViewModel(
+            root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+            ),
+            outbox: fixture.outbox, receiverClient: ReceiverClient(session: fixture.session),
+            scheduleDirectBackgroundUploads: { 0 }, requestProjectionReadAuthorization: { _ in
+                throw CocoaError(.featureUnsupported)
+            }
+        )
+        await model.bootstrap()
+        let held = HeldFirstProtocolResponse()
+        fixture.recorder.setHeldResponseHandler(forPayload: bytes) { resume in held.holdFirst(resume) }
+        let drain = Task { await model.performManualSyncOpportunity(processPendingTypes: { false }) }
+        await fulfillment(of: [held.held], timeout: 5)
+        XCTAssertEqual(fixture.recorder.payloads, [bytes], "The held response must belong to the plain upload.")
+        XCTAssertNil(model.lastAcceptedTransferObservation)
+        let committedURL = fixture.settings.receiverURLString
+        model.receiverURLString = "https://draft.invalid/v1/batches"
+        XCTAssertTrue(held.release())
+        await drain.value
+        XCTAssertEqual(fixture.settings.receiverURLString, committedURL)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(model.lastAcceptedTransferObservation?.bindingID, binding)
+        XCTAssertEqual(model.lastAcceptedTransferObservation?.evidenceKind, .directResponse)
+        let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+        XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: binding))
+        model.receiverURLString = committedURL
+        await model.performManualSyncOpportunity(processPendingTypes: { false })
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [bytes])
+        #endif
+    }
+
+    func testReceiverReplacementRequiresOldOwnerToUnlinkRetiredPlainACKBeforeNewCheckpoint() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let oldBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let oldGeneration = fixture.settings.receiverSettingsGenerationToken
+        let oldConnection = try fixture.settings.currentConnectionRecordV2()
+        let directory = fixture.outbox.directoryURL
+        let journal = directory.appendingPathComponent(".enqueue-transaction")
+        let fault = SleepJournalUnlinkInterruption(journalURL: journal, afterUnlink: false)
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let oldPayload = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make(now: date))
+        let oldItem = try fixture.outbox.enqueue(oldPayload, receiverIdentity: oldBinding)
+        let observations = makeResetTestTransferStore(root: fixture.root, defaults: fixture.defaults)
+        let cursors = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json"))
+        let sourceKey = "synthetic-replacement-source"
+        let cursorKind = "synthetic-replacement-kind"
+        let oldCursor = "synthetic-old-cursor"
+        try cursors.saveCursorValue(oldCursor, receiverBindingID: oldBinding, sourceKey: sourceKey, cursorKind: cursorKind)
+        var replacementDrainCount = 0
+        var requestedFreshReadAuthorization: [[String]] = []
+
+        func cursor(for binding: String) throws -> String? {
+            try cursors.cursorValue(receiverBindingID: binding, sourceKey: sourceKey, cursorKind: cursorKind)
+        }
+
+        func open(_ outbox: FileOutbox) async throws -> HealthBridgeCompanionViewModel {
+            let model = try makeViewModel(
+                root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+                pairingStateStore: ReceiverPairingStateStore(
+                    pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                    cancellationStore: MemoryReceiverTokenStore(),
+                    installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+                ),
+                outbox: outbox, receiverClient: ReceiverClient(session: fixture.session),
+                automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(
+                    fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+                ),
+                readAnchoredStepChanges: { _, _, _ in
+                    XCTFail("This fixture must not execute a fresh Steps read.")
+                    throw CocoaError(.featureUnsupported)
+                },
+                scheduleDirectBackgroundUploads: { 0 },
+                terminalBackgroundPayloadDrain: {
+                    replacementDrainCount += 1
+                    XCTAssertEqual(fixture.settings.receiverBindingID, oldBinding)
+                    XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, oldGeneration)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+                    XCTAssertEqual(try? cursor(for: oldBinding), oldCursor)
+                    return true
+                },
+                platformBackgroundPayloadDrain: { true },
+                requestProjectionReadAuthorization: { types in
+                    // Sync Now offers fresh Steps only after a successful FIFO flush.
+                    requestedFreshReadAuthorization.append(types)
+                    XCTAssertEqual(fixture.recorder.acceptedPayloads.count, 2)
+                    XCTAssertTrue(try outbox.pendingItems().isEmpty)
+                    throw CocoaError(.featureUnsupported)
+                }
+            )
+            await model.bootstrap()
+            return model
+        }
+
+        let writer = try await open(FileOutbox(directory: directory, fileManager: fault))
+        await writer.performManualSyncOpportunity(processPendingTypes: { false })
+        XCTAssertEqual(fault.interruptions, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldItem.fileURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload])
+        XCTAssertTrue(requestedFreshReadAuthorization.isEmpty)
+        let networkInvocationsAfterOldUpload = fixture.recorder.invocationCount
+        let oldObservation = try XCTUnwrap(observations.load(bindingID: oldBinding, generation: oldGeneration))
+
+        let outbox = try FileOutbox(directory: directory, fileManager: fault)
+        let oldRecord = try XCTUnwrap(outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertEqual(oldRecord.itemIDs, [oldItem.id])
+        XCTAssertNil(oldRecord.cursorCheckpoint)
+        XCTAssertTrue(oldRecord.pendingGenerationRetirements.isEmpty)
+        XCTAssertNil(try outbox.directSleepCleanupIntent(for: oldRecord))
+        XCTAssertTrue(try outbox.uncheckedDirectAcknowledgmentIDs(for: oldRecord).isEmpty)
+        XCTAssertTrue(try outbox.hasDirectAcknowledgmentWithSleepChecked(
+            itemID: oldItem.id, receiverIdentity: oldBinding
+        ))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+
+        let reopened = try await open(outbox)
+        XCTAssertEqual(fault.interruptions, 2, "Bootstrap retries the journal unlink under the old binding.")
+        func replaceReceiver() async {
+            reopened.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+            reopened.bearerToken = "synthetic-plain-ack-replacement"
+            await reopened.saveReceiverSettings()
+        }
+        await replaceReceiver()
+        XCTAssertTrue(reopened.statusIsError)
+        XCTAssertEqual(fault.interruptions, 3, "The replacement attempted local cleanup while still under the old authority.")
+        XCTAssertEqual(replacementDrainCount, 0)
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), oldConnection)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, oldGeneration)
+        XCTAssertEqual(try cursor(for: oldBinding), oldCursor)
+        XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding), oldRecord)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload])
+        XCTAssertEqual(fixture.recorder.invocationCount, networkInvocationsAfterOldUpload)
+        guard fixture.settings.receiverBindingID == oldBinding else { return }
+
+        fault.stopInterrupting()
+        await replaceReceiver()
+        let newBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let newGeneration = fixture.settings.receiverSettingsGenerationToken
+        XCTAssertNotEqual(newBinding, oldBinding)
+        XCTAssertNotEqual(newGeneration, oldGeneration)
+        XCTAssertEqual(replacementDrainCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertNil(try cursor(for: newBinding))
+        XCTAssertEqual(observations.load(bindingID: oldBinding, generation: oldGeneration), oldObservation)
+        XCTAssertNil(observations.load(bindingID: newBinding, generation: newGeneration))
+        XCTAssertNil(reopened.lastAcceptedTransferObservation)
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload], "Replacement must not resend accepted bytes.")
+        XCTAssertEqual(fixture.recorder.invocationCount, networkInvocationsAfterOldUpload)
+        XCTAssertTrue(requestedFreshReadAuthorization.isEmpty)
+        guard newBinding != oldBinding else { return }
+
+        let newPayload = try HealthBridgeBatchEncoder().encode(
+            ConnectionTestBatchFactory.make(now: date.addingTimeInterval(60))
+        )
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: newBinding, sourceKey: sourceKey, cursorKind: cursorKind, cursorValue: "synthetic-new-cursor"
+        )
+        let newItems = try outbox.enqueueSequence([newPayload], receiverIdentity: newBinding, cursorCheckpoint: checkpoint)
+        let newItem = try XCTUnwrap(newItems.first)
+        await reopened.performManualSyncOpportunity(processPendingTypes: { false })
+
+        XCTAssertEqual(try cursor(for: newBinding), checkpoint.cursorValue)
+        XCTAssertNil(try cursor(for: oldBinding))
+        XCTAssertNil(try outbox.pendingCursorCheckpoint())
+        XCTAssertFalse(try outbox.hasDirectAcknowledgmentWithSleepChecked(itemID: newItem.id, receiverIdentity: newBinding))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: oldBinding))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fault.interruptions, 3)
+        XCTAssertNil(observations.load(bindingID: oldBinding, generation: oldGeneration))
+        XCTAssertEqual(observations.load(bindingID: newBinding, generation: newGeneration)?.evidenceKind, .directResponse)
+        XCTAssertEqual(requestedFreshReadAuthorization, [["steps"]])
+        XCTAssertEqual(fixture.recorder.payloads, [oldPayload, newPayload])
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [oldPayload, newPayload])
+        #endif
+    }
+
+    func testReceiverReplacementWaitsForCheckedSleepCollectionFinalization() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let oldConnection = try fixture.settings.currentConnectionRecordV2()
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: fixture.nextAnchor, receivedAt: date
+            ),
+            receiverSettingsGeneration: generation,
+            historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        ))
+        let sleepPayload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let siblingPayload = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make(now: date))
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: try XCTUnwrap(fixture.initialManifest.sourceKey),
+            cursorKind: SleepSyncBatchFactory.anchoredCursorKind, cursorValue: fixture.nextAnchor
+        )
+        let items = try fixture.outbox.enqueueSequence(
+            [sleepPayload, siblingPayload], receiverIdentity: binding, cursorCheckpoint: checkpoint,
+            pendingGenerationRetirements: fixture.generations
+        )
+        try fixture.sleep.savePendingTransition(SleepSyncPendingTransition(
+            payload: sleepPayload, manifest: transition.manifest, receiverBindingID: binding,
+            connectionGeneration: generation, outboxItemID: items[0].id
+        ))
+
+        func openViewModel(outbox: FileOutbox) async throws -> HealthBridgeCompanionViewModel {
+            let vm = try makeViewModel(
+                root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+                pairingStateStore: ReceiverPairingStateStore(
+                    pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                    cancellationStore: MemoryReceiverTokenStore(),
+                    installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+                ),
+                outbox: outbox, receiverClient: ReceiverClient(session: fixture.session),
+                automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(
+                    fileURL: fixture.root.appendingPathComponent("diagnostics.json")
+                ),
+                scheduleDirectBackgroundUploads: { 0 },
+                terminalBackgroundPayloadDrain: { true }, platformBackgroundPayloadDrain: { true },
+                requestProjectionReadAuthorization: { _ in
+                    XCTFail("Queued retry must not collect new data")
+                    throw CocoaError(.featureUnsupported)
+                }
+            )
+            await vm.bootstrap()
+            return vm
+        }
+
+        let replacementURL = "http://127.0.0.1:8766/v1/batches"
+        let replacementToken = "synthetic-checkpoint-replacement"
+        func replaceReceiver(_ vm: HealthBridgeCompanionViewModel) async {
+            vm.receiverURLString = replacementURL
+            vm.bearerToken = replacementToken
+            await vm.saveReceiverSettings()
+        }
+
+        let initial = try await openViewModel(outbox: fixture.outbox)
+        let cursorURL = fixture.root.appendingPathComponent("cursors.json")
+        let cursors = try FileSyncCursorStore(fileURL: cursorURL)
+        func cursor(for binding: String, in store: FileSyncCursorStore) throws -> String? {
+            try store.cursorValue(
+                receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+            )
+        }
+        // Keep the cursor file readable while refusing atomic replacement of that file alone.
+        guard chflags(cursorURL.path, UInt32(UF_APPEND)) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { _ = chflags(cursorURL.path, 0) }
+        XCTAssertThrowsError(try cursors.saveCursorValue(
+            checkpoint.cursorValue, receiverBindingID: binding,
+            sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        ))
+        // Arm the sibling failure after the bodyless health check and the Sleep response status are decided.
+        fixture.recorder.setBeforeResponse { [weak recorder = fixture.recorder] payload, _ in
+            if payload == sleepPayload {
+                recorder?.setFailedCursorKinds(["connection_test"])
+            }
+        }
+        await initial.performManualSyncOpportunity(processPendingTypes: { false })
+
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [sleepPayload])
+        XCTAssertTrue(try fixture.outbox.hasDirectAcknowledgmentWithSleepChecked(
+            itemID: items[0].id, receiverIdentity: binding
+        ))
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [items[1].id])
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertNil(try cursor(for: binding, in: cursors))
+        let attemptsBeforeReplacement = fixture.recorder.payloads
+        XCTAssertEqual(attemptsBeforeReplacement, [sleepPayload, siblingPayload])
+        await replaceReceiver(initial)
+        XCTAssertEqual(fixture.recorder.payloads, attemptsBeforeReplacement, "Replacement must not POST the pending sibling")
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), oldConnection)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+
+        initial.receiverURLString = fixture.settings.receiverURLString
+        initial.bearerToken = try fixture.settings.loadBearerToken()
+        fixture.recorder.setFailedCursorKinds([])
+        await initial.performManualSyncOpportunity(processPendingTypes: { false })
+        XCTAssertTrue(initial.statusIsError)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [sleepPayload, siblingPayload])
+        let posts = fixture.recorder.payloads
+        XCTAssertEqual(posts, [sleepPayload, siblingPayload, siblingPayload])
+
+        let outbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let reopenedCursors = try FileSyncCursorStore(fileURL: cursorURL)
+        let sleep = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        let background = BackgroundSyncSettingsStore(userDefaults: fixture.defaults)
+        let observations = makeResetTestTransferStore(root: fixture.root, defaults: fixture.defaults)
+        let observation = try XCTUnwrap(observations.load(bindingID: binding, generation: generation))
+        let record = try XCTUnwrap(outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertEqual(record.itemIDs, items.map(\.id))
+        XCTAssertEqual(record.cursorCheckpoint, checkpoint)
+        XCTAssertEqual(record.eligiblePendingGenerationRetirements, fixture.generations)
+        let reopened = try await openViewModel(outbox: outbox)
+        XCTAssertTrue(reopened.statusMessage.contains("Private upload storage needs recovery"))
+        await replaceReceiver(reopened)
+
+        XCTAssertTrue(reopened.statusMessage.contains("code=transition_requires_empty_outbox"))
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), oldConnection)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+        let activeBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        XCTAssertEqual(activeBinding, binding, "Replacement must not create a new binding before finalization")
+        XCTAssertNil(try cursor(for: binding, in: reopenedCursors))
+        if activeBinding != binding {
+            XCTAssertNil(try cursor(for: activeBinding, in: reopenedCursors))
+            XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: activeBinding))
+        }
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: binding), record)
+        XCTAssertNil(try outbox.directSleepCleanupIntent(for: record))
+        for item in items {
+            XCTAssertTrue(try outbox.hasDirectAcknowledgmentWithSleepChecked(
+                itemID: item.id, receiverIdentity: binding
+            ))
+        }
+        XCTAssertNil(try sleep.loadPendingTransition())
+        XCTAssertEqual(try sleep.loadManifest(), transition.manifest)
+        XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(observations.load(bindingID: binding, generation: generation), observation)
+        XCTAssertEqual(fixture.recorder.payloads, posts)
+
+        guard activeBinding == binding else { return }
+        guard chflags(cursorURL.path, 0) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        await reopened.retryPrivateStorage()
+        XCTAssertEqual(try cursor(for: binding, in: reopenedCursors), checkpoint.cursorValue)
+        XCTAssertTrue(try background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertEqual(observations.load(bindingID: binding, generation: generation), observation)
+        XCTAssertEqual(fixture.recorder.payloads, posts, "Authorized recovery must not repost accepted payloads")
+
+        await replaceReceiver(reopened)
+        let newBinding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        XCTAssertNotEqual(newBinding, binding)
+        XCTAssertNotEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+        XCTAssertEqual(fixture.settings.receiverURLString, replacementURL)
+        XCTAssertEqual(try fixture.settings.loadBearerToken(), replacementToken)
+        XCTAssertNil(try cursor(for: newBinding, in: reopenedCursors))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: newBinding))
+        XCTAssertNil(reopened.lastAcceptedTransferObservation)
+        XCTAssertEqual(fixture.recorder.payloads, posts)
     }
 
     func testManualQueuedStepsWithAutomaticSyncEnabledDoesNotReenterTransferGate() async throws {
@@ -280,6 +917,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try await runIssue96SuspensionFence(.pendingReplay, invalidation: .replace)
     }
 
+    func testCancelledDirectResponseFinishesSleepCommitBeforeRetry() async throws {
+        try await runIssue96SuspensionFence(.completion, invalidation: .cancel)
+    }
+
     func testIssue96ReplaceCompletionCodecPreservesEarnedACK() async throws {
         try await runIssue96SuspensionFence(.completion, invalidation: .replace)
     }
@@ -306,23 +947,44 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             connectionGeneration: fixture.settings.receiverSettingsGenerationToken
         )
         try fixture.sleep.savePendingTransition(pending)
-        let item = try fixture.outbox.enqueueIfAbsent(pending.payload, receiverIdentity: pending.receiverBindingID).item
-        try fixture.sleep.savePendingTransition(pending.assigningOutboxItemID(item.id))
-        try fixture.outbox.markUploaded(item)
+        let binding = pending.receiverBindingID
+        let item = try fixture.outbox.enqueue(pending.payload, receiverIdentity: binding)
+        let tracked = pending.assigningOutboxItemID(item.id)
+        try fixture.sleep.savePendingTransition(tracked)
+        let cursorStore = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json"))
+        XCTAssertFalse(try OutboxDeliveryCursorFinalizer(outbox: fixture.outbox, cursorStore: cursorStore)
+            .recordDirectReceiverAcceptance(itemID: item.id, receiverBindingID: binding))
+
+        let reopenedOutbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let reopenedStore = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        XCTAssertTrue(try reopenedOutbox.pendingItems().isEmpty)
+        XCTAssertNil(try reopenedOutbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertNil(try reopenedOutbox.directSleepCleanupRecord(receiverBindingID: binding, itemID: item.id))
+        XCTAssertFalse(try reopenedOutbox.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding))
+        XCTAssertEqual(try reopenedStore.loadPendingTransition(), tracked)
+        XCTAssertEqual(try reopenedStore.loadManifest(), fixture.initialManifest)
         let audit = Issue96CodecAudit(
             root: fixture.root, committed: fixture.initialManifest, recorder: fixture.recorder)
         fixture.recorder.setBeforeResponse { payload, _ in try audit.beforeACK(payload) }
-        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep)
+        var enqueueAttempts = 0
+        let runtime = try await makeIssue96CodecRuntime(
+            fixture, store: reopenedStore, outbox: reopenedOutbox,
+            beforeBootstrap: { model in model.observeSleepEnqueueAttemptForTesting = { enqueueAttempts += 1 } }
+        )
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertEqual(enqueueAttempts, 0)
         await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
         let foreground = runtime.automaticSyncRuntime.foregroundCatchUpCompletion()
         runtime.automaticSyncRuntime.stopAdmission()
         await runtime.automaticSyncRuntime.cancelAndWait()
         await foreground?()
         await runtime.viewModel.waitForBootstrapAndForegroundWork()
-        XCTAssertTrue(fixture.recorder.acceptedPayloads == [pending.payload])
-        XCTAssertEqual(try fixture.sleep.loadManifest(), pending.manifest)
-        XCTAssertNil(try fixture.sleep.loadPendingTransition())
-        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(fixture.recorder.invocationCount, 1)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+        XCTAssertEqual(enqueueAttempts, 1)
+        XCTAssertEqual(try reopenedStore.loadManifest(), pending.manifest)
+        XCTAssertNil(try reopenedStore.loadPendingTransition())
+        XCTAssertTrue(try reopenedOutbox.pendingItems().isEmpty)
         let observation = audit.observation()
         XCTAssertEqual(observation.failures, 0)
         XCTAssertEqual(observation.preACKChecks, 1)
@@ -3980,41 +4642,1021 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
     }
 
-    func testAutomaticSleepColdOwnerCompletesAcceptedJournalBeforeNextRead() async throws {
-        let fixture = try SleepStoreFaultFixture(point: .manifestSave)
+    func testForegroundSleepRestartResumesDurableCleanupWithoutEnqueue() async throws {
+        try await runForegroundSleepRestart(.cleanupIntent)
+    }
+
+    func testForegroundSleepRestartHoldsUncheckedACKBeforeCleanupIntent() async throws {
+        try await runForegroundSleepRestart(.uncheckedACK)
+    }
+
+    func testForegroundSleepRestartAttemptsEnqueueWhenTrackedItemHasNoACK() async throws {
+        try await runForegroundSleepRestart(.noACK)
+    }
+
+    func testForegroundSleepWriterRestartAfterDurableACKRetiresObserverGeneration() async throws {
+        try await runForegroundSleepRestart(.writerInterruption)
+    }
+
+    func testFailedReceiverSettingsSaveKeepsGenerationForPendingSleepCleanup() async throws {
+        try await runReceiverSettingsSaveWithPendingSleepCleanup(payloadStillPresent: true)
+    }
+
+    func testReceiverSettingsSaveCannotAbandonSleepCleanupWithNoPayloadFile() async throws {
+        try await runReceiverSettingsSaveWithPendingSleepCleanup(payloadStillPresent: false)
+    }
+
+    func testReceiverSettingsSaveKeepsGenerationForPayloadlessLegacySleepACK() async throws {
+        try await runReceiverSettingsSaveWithPendingSleepCleanup(payloadStillPresent: false, legacyUnchecked: true)
+    }
+
+    func testColdLegacySleepACKWithoutJournalPausesSleepUntilConfirmedResetFinishes() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires the isolated app test host.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
         defer { fixture.cleanUp() }
-        let itemID = try XCTUnwrap(fixture.pending.outboxItemID)
-        let cursorStore = try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json"))
-        _ = try OutboxDeliveryCursorFinalizer(outbox: fixture.outbox, cursorStore: cursorStore)
-            .recordDirectReceiverAcceptance(itemID: itemID, receiverBindingID: fixture.pending.receiverBindingID)
-        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
-        XCTAssertNotNil(try fixture.store.loadPendingTransition())
-        var runtime: HealthBridgeCompanionApplicationRuntime? = try await makeSleepStoreFaultRuntime(fixture)
-
-        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
-
-        XCTAssertNil(try fixture.store.loadPendingTransition())
-        XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
-        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
-        XCTAssertEqual(
-            try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations,
-            "Replaying an old journal does not prove a fresh query for the retained generation."
+        let (item, pending) = try Self.stageSleepForConnectionTransition(
+            settings: fixture.settings, outbox: fixture.outbox, store: fixture.sleep,
+            previous: fixture.initialManifest, generations: fixture.generations
         )
-        XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload])
-        runtime?.automaticSyncRuntime.stopAdmission()
-        await runtime?.automaticSyncRuntime.cancelAndWait()
-        runtime = nil
-
-        var reachedNewRead = false
-        runtime = try await makeSleepStoreFaultRuntime(fixture, readAttempted: { reachedNewRead = true })
-        await runtime?.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
-        XCTAssertTrue(reachedNewRead)
-        XCTAssertNil(try fixture.store.loadPendingTransition())
-        XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
+        XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(
+            itemID: item.id, receiverIdentity: pending.receiverBindingID
+        ))
+        try fixture.sleep.saveManifest(pending.manifest)
+        try fixture.sleep.clearPendingTransition(id: pending.id)
+        let outbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let store = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        var drains = 0
+        var enqueues = 0
+        var quantityReads: [String] = []
+        let runtime = try await makeIssue96CodecRuntime(
+            fixture, store: store, outbox: outbox, terminalDrain: {
+                drains += 1
+                return false
+            },
+            readAnchoredQuantityChanges: { type, _, start, now in
+                quantityReads.append(type)
+                return HealthKitAnchoredQuantityChanges(
+                    typeCode: type, samples: [], deletedSamples: [], anchorCursorValue: fixture.nextAnchor,
+                    windowStart: start ?? now, windowEnd: now
+                )
+            },
+            requestProjectionReadAuthorization: { _ in XCTFail("Sleep authorization reached during hold") },
+            beforeBootstrap: { $0.observeSleepEnqueueAttemptForTesting = { enqueues += 1 } }
+        )
+        let model = runtime.viewModel
+        XCTAssertTrue(model.automaticSyncRuntimeIsReady)
+        XCTAssertEqual(model.pendingOutboxCount, 0)
+        XCTAssertFalse(model.hasPendingSleepTransition)
+        XCTAssertFalse(model.hasPendingPrivateStorageRecovery)
+        XCTAssertEqual(
+            model.acceptedFinalizationRecoveryMessage,
+            "The server accepted an earlier upload, but this iPhone no longer has enough evidence to finish its local processing safely. Sleep sync is paused to avoid accidentally sending Sleep twice."
+        )
+        let automatic = await model.processAutomaticSyncType("sleep_analysis", pendingGenerations: fixture.generations)
+        XCTAssertEqual(automatic, .deferredCovering(fixture.generations))
+        try fixture.background.markPendingObserverTypeCodes(["steps", "weight", "workouts"])
+        var visitedTypes: [String] = []
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.background,
+            processType: { typeCode, generations in
+                visitedTypes.append(typeCode)
+                return await model.processAutomaticSyncType(typeCode, pendingGenerations: generations)
+            }
+        )
+        try await engine.requestRun(reason: .manualSync)
+        XCTAssertEqual(visitedTypes, ["sleep_analysis", "steps", "weight", "workouts"])
+        XCTAssertEqual(quantityReads, ["weight"])
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
-        XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload])
-        runtime?.automaticSyncRuntime.stopAdmission()
-        await runtime?.automaticSyncRuntime.cancelAndWait()
+        let manual = await model.syncRecentSleepSessions()
+        XCTAssertFalse(manual)
+        XCTAssertTrue(model.statusIsError)
+        XCTAssertTrue(fixture.readAnchors.isEmpty)
+        XCTAssertEqual(enqueues, 0)
+
+        model.requestBackgroundSyncEnabled(false)
+        await model.waitForAutomaticSyncDisableCleanup()
+        let connection = try fixture.settings.currentConnectionRecordV2()
+        model.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+        await model.saveReceiverSettings()
+        XCTAssertTrue(model.statusMessage.contains("code=transition_requires_empty_outbox"))
+        let disconnect = await model.disconnectReceiver()
+        guard case .rejected(_, 0, true) = disconnect else {
+            return XCTFail("Expected a preserved connection and zero payloads")
+        }
+        model.pairingImportText = String(decoding: try JSONEncoder().encode(syntheticInvitation()), as: UTF8.self)
+        await model.importPairingText()
+        XCTAssertTrue(model.statusIsError)
+        XCTAssertTrue(model.statusMessage.contains("code=pairing_commit_outbox_not_empty"))
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), connection)
+        XCTAssertEqual(drains, 0)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertTrue(try outbox.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: pending.receiverBindingID))
+        XCTAssertEqual(try store.loadManifest(), pending.manifest)
+        XCTAssertNil(try store.loadPendingTransition())
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+
+        await model.clearPendingOutbox()
+        XCTAssertEqual(drains, 1)
+        XCTAssertTrue(outbox.terminalResetRequestIsActive)
+        XCTAssertFalse(outbox.clearIntentIsActive)
+        XCTAssertEqual(try outbox.acceptedFinalizationHold()?.reason, .proofMissing)
+        XCTAssertNotNil(model.acceptedFinalizationRecoveryMessage)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        let reopened = try FileOutbox(directory: outbox.directoryURL)
+        let resumed = try await makeIssue96CodecRuntime(fixture, store: store, outbox: reopened)
+        XCTAssertFalse(reopened.destructiveRecoveryIsRequested)
+        XCTAssertNil(try reopened.acceptedFinalizationHold())
+        XCTAssertNil(resumed.viewModel.acceptedFinalizationRecoveryMessage)
+        XCTAssertNil(try store.loadManifest())
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        #endif
+    }
+
+    func testSaveRechecksPayloadlessSleepReceiptCreatedDuringDrain() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        let before = try fixture.settings.currentConnectionRecordV2()
+        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep, terminalDrain: {
+            do {
+                let (item, pending) = try Self.stageSleepForConnectionTransition(
+                    settings: fixture.settings, outbox: fixture.outbox, store: fixture.sleep,
+                    previous: fixture.initialManifest, generations: fixture.generations
+                )
+                _ = try fixture.outbox.recordDirectUploadAccepted(itemID: item.id, receiverIdentity: pending.receiverBindingID)
+                try fixture.sleep.clearPendingTransition(id: pending.id)
+            } catch { XCTFail("Failed to stage the interrupted acceptance: \(error)") }
+            return true
+        })
+        XCTAssertNil(runtime.viewModel.acceptedFinalizationRecoveryMessage)
+        runtime.viewModel.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+        await runtime.viewModel.saveReceiverSettings()
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), before)
+        XCTAssertTrue(runtime.viewModel.statusIsError)
+        XCTAssertNotNil(runtime.viewModel.acceptedFinalizationRecoveryMessage)
+        XCTAssertEqual(runtime.viewModel.pendingOutboxCount, 0)
+    }
+
+    func testSleepHoldCreatedDuringReadDefersOnlySleepLane() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires the isolated app test host.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        var readCount = 0
+        let runtime = try await makeIssue96CodecRuntime(
+            fixture,
+            store: fixture.sleep,
+            readAnchoredSleepChanges: { _, _, receivedAt in
+                readCount += 1
+                if readCount == 1 {
+                    let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+                    let checkpoint = FileOutboxCursorCheckpoint(
+                        receiverIdentity: binding,
+                        sourceKey: DirectSleepPreparationFixture.installationID,
+                        cursorKind: SleepSyncBatchFactory.anchoredCursorKind,
+                        cursorValue: fixture.nextAnchor
+                    )
+                    let item = try XCTUnwrap(fixture.outbox.enqueueSequence(
+                        [Data("{}".utf8)],
+                        receiverIdentity: binding,
+                        cursorCheckpoint: checkpoint,
+                        pendingGenerationRetirements: fixture.generations
+                    ).first)
+                    XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(
+                        itemID: item.id,
+                        receiverIdentity: binding
+                    ))
+                    try FileManager.default.removeItem(at: item.fileURL)
+                }
+                return HealthKitAnchoredSleepChanges(
+                    addedSamples: [],
+                    deletedSamples: [],
+                    anchorCursorValue: fixture.nextAnchor,
+                    receivedAt: receivedAt
+                )
+            }
+        )
+        let model = runtime.viewModel
+        XCTAssertNil(model.acceptedFinalizationRecoveryMessage)
+        try fixture.background.markPendingObserverTypeCodes(["steps", "workouts"])
+        var visitedTypes: [String] = []
+        var sleepResult: AutomaticSyncTypeResult?
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.background,
+            processType: { typeCode, generations in
+                visitedTypes.append(typeCode)
+                if typeCode == HealthBridgeHealthType.sleepAnalysis.typeCode {
+                    let result = await model.processAutomaticSyncType(typeCode, pendingGenerations: generations)
+                    sleepResult = result
+                    return result
+                }
+                return .noPayload
+            }
+        )
+
+        try await engine.requestRun(reason: .manualSync)
+
+        XCTAssertEqual(readCount, 1)
+        XCTAssertEqual(sleepResult, .deferredCovering(fixture.generations))
+        XCTAssertEqual(visitedTypes, ["sleep_analysis", "steps", "workouts"])
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(try fixture.outbox.acceptedFinalizationHold()?.reason, .proofMissing)
+        XCTAssertNotNil(model.acceptedFinalizationRecoveryMessage)
+        XCTAssertEqual(model.pendingOutboxCount, 0)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        #endif
+    }
+
+    func testUnreadableFinalizationEvidenceClearsPublishedSleepRecoveryMessageDuringSave() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires the isolated app test host.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        let (item, pending) = try Self.stageSleepForConnectionTransition(
+            settings: fixture.settings, outbox: fixture.outbox, store: fixture.sleep,
+            previous: fixture.initialManifest, generations: fixture.generations
+        )
+        XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(
+            itemID: item.id, receiverIdentity: pending.receiverBindingID
+        ))
+        try fixture.sleep.clearPendingTransition(id: pending.id)
+        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep)
+        let model = runtime.viewModel
+        XCTAssertNotNil(model.acceptedFinalizationRecoveryMessage)
+        let connection = try fixture.settings.currentConnectionRecordV2()
+        let journal = fixture.outbox.directoryURL.appendingPathComponent(".enqueue-transaction")
+        try FileManager.default.removeItem(at: journal)
+        try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: false)
+
+        model.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+        await model.saveReceiverSettings()
+
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), connection)
+        XCTAssertTrue(model.statusIsError)
+        XCTAssertNil(model.acceptedFinalizationRecoveryMessage)
+        #endif
+    }
+
+    func testRejectedSettingsSaveReservationDoesNotInterruptAcceptedSleepWriter() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        let driver = Issue96CodecInvalidationDriver(target: .encodeManifest)
+        defer { driver.releaseCodec() }
+        let store = try FileSleepSyncManifestStore(
+            fileURL: fixture.root.appendingPathComponent("sleep.json"),
+            observeCodec: { driver.beforeCodec($0) }
+        )
+        let runtime = try await makeIssue96CodecRuntime(
+            fixture, store: store, terminalDrain: { false }
+        )
+        let viewModel = runtime.viewModel
+        let savedURL = fixture.settings.receiverURLString
+        let (item, pending) = try Self.stageSleepForConnectionTransition(
+            settings: fixture.settings, outbox: fixture.outbox, store: store,
+            previous: fixture.initialManifest, generations: fixture.generations
+        )
+        let codecEntered = expectation(description: "the accepted response is encoding its manifest")
+        driver.start(waitForAdmissionClose: true) {
+            codecEntered.fulfill()
+        }
+        let gate = viewModel.terminalTransitionRequestGateForTesting
+        try await gate.acquire()
+        let writing = Task { @MainActor in
+            await viewModel.syncRecentSleepSessions(executionMode: .foreground)
+        }
+        await fulfillment(of: [codecEntered], timeout: 5)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+        XCTAssertEqual(try store.loadPendingTransition(), pending)
+        XCTAssertEqual(try store.loadManifest(), fixture.initialManifest)
+        XCTAssertNil(try fixture.outbox.directSleepCleanupRecord(receiverBindingID: pending.receiverBindingID))
+
+        let reserved = expectation(description: "Save reserves the request before awaiting the held gate")
+        let subscription = viewModel.$terminalTransitionRequestIsActive.filter { $0 }.prefix(1).sink { _ in
+            reserved.fulfill()
+        }
+        viewModel.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+        let saving = Task { @MainActor in await viewModel.saveReceiverSettings() }
+        await fulfillment(of: [reserved], timeout: 5)
+        XCTAssertTrue(viewModel.terminalTransitionRequestIsActive)
+        XCTAssertEqual(fixture.settings.receiverURLString, savedURL)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, pending.connectionGeneration)
+        XCTAssertEqual(fixture.settings.receiverBindingID, pending.receiverBindingID)
+        driver.invalidationApplied()
+        _ = await writing.value
+
+        XCTAssertTrue(viewModel.terminalTransitionRequestIsActive, "The writer must finish while Save is still awaiting the real gate.")
+        XCTAssertTrue(driver.didInvalidateWhileHeld)
+        XCTAssertEqual(try store.loadManifest(), pending.manifest)
+        XCTAssertNil(try store.loadPendingTransition())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.fileURL.path))
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: pending.receiverBindingID))
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+
+        await gate.release()
+        await saving.value
+        subscription.cancel()
+        driver.releaseCodec()
+        try await driver.join().get()
+        XCTAssertTrue(viewModel.statusIsError, "The incomplete drain must refuse the changed settings.")
+        XCTAssertEqual(fixture.settings.receiverURLString, savedURL)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, pending.connectionGeneration)
+        XCTAssertEqual(fixture.settings.receiverBindingID, pending.receiverBindingID)
+        XCTAssertEqual(fixture.recorder.payloads, [pending.payload], "The original writer must retire without a second POST.")
+        XCTAssertTrue(fixture.readAnchors.isEmpty)
+        #endif
+    }
+
+    func testPendingPairingCancellationDoesNotWriteMarkersOverPayloadlessSleepCleanup() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        let state = ReceiverPairingStateStore(
+            pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+            cancellationStore: MemoryReceiverTokenStore(),
+            installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+        )
+        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep, pairingStateStore: state)
+        let invitation = try state.stage(invitation: syntheticInvitation())
+        let before = try fixture.settings.currentConnectionRecordV2()
+        let (item, pending) = try Self.stageSleepForConnectionTransition(
+            settings: fixture.settings, outbox: fixture.outbox, store: fixture.sleep,
+            previous: fixture.initialManifest, generations: fixture.generations
+        )
+        let cleanup = try Self.recordPayloadlessSleepCleanup(item, pending: pending, outbox: fixture.outbox, store: fixture.sleep)
+
+        await runtime.viewModel.cancelPendingPairing()
+
+        XCTAssertTrue(runtime.viewModel.statusIsError)
+        XCTAssertTrue(runtime.viewModel.statusMessage.contains("code=transition_requires_empty_outbox"))
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), before)
+        XCTAssertEqual(try state.loadPending(), invitation)
+        XCTAssertFalse(try state.hasPendingCancellation())
+        XCTAssertNil(fixture.settings.terminalCancellationExpectedGeneration)
+        XCTAssertEqual(try fixture.sleep.loadPendingTransition(), pending)
+        XCTAssertEqual(try fixture.outbox.directSleepCleanupRecord(receiverBindingID: pending.receiverBindingID), cleanup)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+
+        await runtime.viewModel.retryPrivateStorage()
+        XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), before)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(try fixture.sleep.loadManifest(), pending.manifest)
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: pending.receiverBindingID))
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertTrue(fixture.readAnchors.isEmpty)
+        #endif
+    }
+
+    fileprivate static func stageSleepForConnectionTransition(
+        settings: ReceiverSettingsStore, outbox: FileOutbox, store: FileSleepSyncManifestStore,
+        previous: SleepSyncManifest, generations: [String: Int]
+    ) throws -> (FileOutboxItem, SleepSyncPendingTransition) {
+        let binding = try XCTUnwrap(settings.receiverBindingID)
+        let generation = settings.receiverSettingsGenerationToken
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: previous,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: "synthetic-transition-anchor", receivedAt: date
+            ),
+            receiverSettingsGeneration: generation,
+            historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        ))
+        let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let item = try XCTUnwrap(try outbox.enqueueSequence(
+            [payload], receiverIdentity: binding, pendingGenerationRetirements: generations
+        ).first)
+        let pending = SleepSyncPendingTransition(
+            payload: payload, manifest: transition.manifest, receiverBindingID: binding,
+            connectionGeneration: generation, outboxItemID: item.id
+        )
+        try store.savePendingTransition(pending)
+        return (item, pending)
+    }
+
+    fileprivate static func recordPayloadlessSleepCleanup(
+        _ item: FileOutboxItem, pending: SleepSyncPendingTransition, outbox: FileOutbox,
+        store: FileSleepSyncManifestStore
+    ) throws -> FileOutboxFinalizationRecord {
+        try store.saveManifest(pending.manifest)
+        let record = try outbox.recordDirectSleepAcceptance(DirectSleepCleanupIntent(
+            itemID: item.id, journalID: pending.id, receiverBindingID: pending.receiverBindingID,
+            receiverGeneration: pending.connectionGeneration
+        ), onNewAcceptance: {})
+        try FileManager.default.removeItem(at: item.fileURL)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        return record
+    }
+
+    private func runReceiverSettingsSaveWithPendingSleepCleanup(
+        payloadStillPresent: Bool, legacyUnchecked: Bool = false
+    ) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        try fixture.background.setEnabledDurably(false)
+        let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep)
+        let viewModel = runtime.viewModel
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let savedURL = fixture.settings.receiverURLString
+        let savedToken = try fixture.settings.loadBearerToken()
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: fixture.nextAnchor, receivedAt: date
+            ),
+            receiverSettingsGeneration: generation,
+            historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        ))
+        let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let item = try XCTUnwrap(try fixture.outbox.enqueueSequence(
+            [payload], receiverIdentity: binding, pendingGenerationRetirements: fixture.generations
+        ).first)
+        let pending = SleepSyncPendingTransition(
+            payload: payload, manifest: transition.manifest, receiverBindingID: binding,
+            connectionGeneration: generation, outboxItemID: item.id
+        )
+        try fixture.sleep.savePendingTransition(pending)
+        try fixture.sleep.saveManifest(pending.manifest)
+        let intent: DirectSleepCleanupIntent?
+        let record: FileOutboxFinalizationRecord
+        if legacyUnchecked {
+            intent = nil
+            record = try XCTUnwrap(try fixture.outbox.recordDirectUploadAccepted(
+                itemID: item.id, receiverIdentity: binding
+            ))
+        } else {
+            let scoped = DirectSleepCleanupIntent(
+                itemID: item.id, journalID: pending.id, receiverBindingID: binding, receiverGeneration: generation
+            )
+            intent = scoped
+            record = try fixture.outbox.recordDirectSleepAcceptance(scoped, onNewAcceptance: {})
+            if !payloadStillPresent {
+                try FileManager.default.removeItem(at: item.fileURL)
+            }
+        }
+        let outbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let sleep = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        let finalizer = OutboxDeliveryCursorFinalizer(
+            outbox: outbox,
+            cursorStore: try FileSyncCursorStore(fileURL: fixture.root.appendingPathComponent("cursors.json")),
+            pendingGenerationStore: fixture.background
+        )
+        func assertRetained(_ phase: String) throws {
+            XCTAssertEqual(try sleep.loadPendingTransition(), pending, phase)
+            XCTAssertEqual(try sleep.loadManifest(), pending.manifest, phase)
+            XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: binding), record, phase)
+            XCTAssertEqual(try outbox.directSleepCleanupIntent(for: record), intent, phase)
+            XCTAssertTrue(try outbox.hasUncheckedDirectAcknowledgment(
+                itemID: item.id, receiverBindingID: binding
+            ), phase)
+            XCTAssertEqual(try outbox.pendingItems().map(\.id), payloadStillPresent ? [item.id] : [], phase)
+            if payloadStillPresent {
+                XCTAssertEqual(try Data(contentsOf: item.fileURL), payload, phase)
+            }
+            XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations, phase)
+        }
+
+        let wrongBinding = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: "synthetic-wrong-binding", receiverGeneration: generation,
+            sleepStore: sleep, validate: {}
+        )
+        XCTAssertFalse(wrongBinding)
+        try assertRetained("Wrong binding with correct generation")
+        let wrongGeneration = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: binding, receiverGeneration: "g999999",
+            sleepStore: sleep, validate: {}
+        )
+        XCTAssertFalse(wrongGeneration)
+        try assertRetained("Wrong generation with correct binding")
+
+        viewModel.receiverURLString = "http://127.0.0.1:8766/v1/batches"
+        await viewModel.saveReceiverSettings()
+        runtime.automaticSyncRuntime.stopAdmission()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        await viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertTrue(viewModel.statusIsError, "A connection change cannot abandon accepted Sleep cleanup.")
+        XCTAssertTrue(viewModel.statusMessage.contains("code=transition_requires_empty_outbox"))
+        XCTAssertEqual(fixture.settings.receiverURLString, savedURL)
+        XCTAssertEqual(try fixture.settings.loadBearerToken(), savedToken)
+        XCTAssertEqual(fixture.settings.receiverBindingID, binding)
+        XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, generation)
+        XCTAssertNil(try sleep.loadPendingTransition())
+        XCTAssertEqual(try sleep.loadManifest(), pending.manifest)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertNil(try outbox.directSleepCleanupIntent(for: record))
+        XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertTrue(fixture.readAnchors.isEmpty)
+        #endif
+    }
+
+    private enum ForegroundSleepRestartState {
+        case cleanupIntent, uncheckedACK, noACK, writerInterruption
+    }
+
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    private func interruptForegroundSleepWriter(
+        _ fixture: DirectSleepPreparationFixture,
+        item: FileOutboxItem,
+        pending: SleepSyncPendingTransition
+    ) async throws {
+        let fault = SleepPayloadUnlinkInterruption(payloadURL: item.fileURL)
+        let directory = fixture.outbox.directoryURL
+        let interruptedOutbox = try FileOutbox(directory: directory, fileManager: fault)
+        var enqueueAttempts = 0
+        let installObserver: @MainActor (HealthBridgeCompanionViewModel) -> Void = { model in
+            model.observeSleepEnqueueAttemptForTesting = { enqueueAttempts += 1 }
+        }
+        let binding = pending.receiverBindingID
+        var recordedAcceptance: LastAcceptedTransferObservation?
+        do {
+            let writer = try await makeIssue96CodecRuntime(
+                fixture, store: fixture.sleep, outbox: interruptedOutbox, beforeBootstrap: installObserver
+            )
+            XCTAssertEqual(try interruptedOutbox.pendingItems().map(\.id), [item.id])
+            XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+            XCTAssertEqual(try fixture.sleep.loadPendingTransition(), pending)
+            XCTAssertEqual(fixture.recorder.invocationCount, 0)
+            XCTAssertNil(writer.viewModel.lastAcceptedTransferObservation)
+
+            _ = await writer.viewModel.syncRecentSleepSessions(executionMode: .foreground)
+            writer.automaticSyncRuntime.stopAdmission()
+            await writer.automaticSyncRuntime.cancelAndWait()
+            await writer.viewModel.waitForBootstrapAndForegroundWork()
+            recordedAcceptance = writer.viewModel.lastAcceptedTransferObservation
+            XCTAssertEqual(recordedAcceptance?.bindingID, binding)
+            XCTAssertEqual(recordedAcceptance?.evidenceKind, .directResponse)
+        }
+
+        XCTAssertEqual(fault.interruptions, 1, "Stop inside the ACK-driven payload unlink, after removal.")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.fileURL.path))
+        XCTAssertEqual(fixture.recorder.invocationCount, 1)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+        XCTAssertEqual(enqueueAttempts, 0)
+        let checked = try interruptedOutbox.hasDirectAcknowledgmentWithSleepChecked(
+            itemID: item.id, receiverIdentity: binding
+        )
+        let unchecked = try interruptedOutbox.hasUncheckedDirectAcknowledgment(
+            itemID: item.id, receiverBindingID: binding
+        )
+        XCTAssertTrue(checked || unchecked, "The real writer persisted the ACK before unlinking the payload.")
+        XCTAssertTrue(checked, "The ACK must record that the accepted Sleep journal was checked.")
+        XCTAssertEqual(try fixture.sleep.loadManifest(), pending.manifest)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+
+        let recoveredOutbox = try FileOutbox(directory: directory)
+        let recoveredStore = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        let restarted = try await makeIssue96CodecRuntime(
+            fixture, store: recoveredStore, outbox: recoveredOutbox, beforeBootstrap: installObserver
+        )
+        restarted.automaticSyncRuntime.stopAdmission()
+        await restarted.automaticSyncRuntime.cancelAndWait()
+        await restarted.viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(restarted.viewModel.lastAcceptedTransferObservation, recordedAcceptance)
+        XCTAssertEqual(try recoveredStore.loadManifest(), pending.manifest)
+        XCTAssertNil(try recoveredStore.loadPendingTransition())
+        XCTAssertTrue(try recoveredOutbox.pendingItems().isEmpty)
+        XCTAssertNil(try recoveredOutbox.directFinalizationRecordReady(receiverIdentity: binding))
+        XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        XCTAssertTrue(fixture.readAnchors.isEmpty)
+        XCTAssertEqual(enqueueAttempts, 0)
+        XCTAssertEqual(fixture.recorder.invocationCount, 1)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+    }
+    #endif
+
+    private func runForegroundSleepRestart(_ state: ForegroundSleepRestartState) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: fixture.nextAnchor, receivedAt: date
+            ),
+            receiverSettingsGeneration: generation,
+            historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        ))
+        let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        if state == .cleanupIntent {
+            // Give bootstrap a ready non-Sleep record so the foreground owner has to resume Sleep.
+            let earlier = try XCTUnwrap(try fixture.outbox.enqueueSequence(
+                [Data("{}".utf8)], receiverIdentity: binding,
+                cursorCheckpoint: FileOutboxCursorCheckpoint(
+                    receiverIdentity: binding, sourceKey: "synthetic.issue194",
+                    cursorKind: "synthetic_issue194", cursorValue: "synthetic-checkpoint"
+                )
+            ).first)
+            XCTAssertNotNil(try fixture.outbox.recordDirectUploadAccepted(itemID: earlier.id, receiverIdentity: binding))
+        }
+        let item: FileOutboxItem
+        if state == .noACK {
+            item = try fixture.outbox.enqueue(payload, receiverIdentity: binding)
+            // Model an absent tracked file with no durable acceptance to consult.
+            try FileManager.default.removeItem(at: item.fileURL)
+        } else {
+            item = try XCTUnwrap(try fixture.outbox.enqueueSequence(
+                [payload], receiverIdentity: binding, pendingGenerationRetirements: fixture.generations
+            ).first)
+        }
+        let pending = SleepSyncPendingTransition(
+            payload: payload, manifest: transition.manifest, receiverBindingID: binding,
+            connectionGeneration: generation, outboxItemID: item.id
+        )
+        try fixture.sleep.savePendingTransition(pending)
+        if state == .writerInterruption {
+            try await interruptForegroundSleepWriter(fixture, item: item, pending: pending)
+            return
+        }
+        let acceptedRecord: FileOutboxFinalizationRecord?
+        if state == .noACK {
+            acceptedRecord = nil
+        } else {
+            let record = try XCTUnwrap(try fixture.outbox.recordDirectUploadAccepted(
+                itemID: item.id, receiverIdentity: binding
+            ))
+            acceptedRecord = record
+            if state == .cleanupIntent {
+                try fixture.sleep.saveManifest(pending.manifest)
+                try fixture.outbox.beginDirectSleepCleanup(DirectSleepCleanupIntent(
+                    itemID: item.id, journalID: pending.id,
+                    receiverBindingID: binding, receiverGeneration: generation
+                ), for: record)
+            }
+        }
+
+        let outbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let store = try FileSleepSyncManifestStore(fileURL: fixture.root.appendingPathComponent("sleep.json"))
+        var enqueueAttempts = 0
+        fixture.recorder.setResponseStatusCode(500)
+        let runtime = try await makeIssue96CodecRuntime(
+            fixture, store: store, outbox: outbox,
+            beforeBootstrap: { model in model.observeSleepEnqueueAttemptForTesting = { enqueueAttempts += 1 } }
+        )
+        XCTAssertEqual(enqueueAttempts, 0)
+        XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        XCTAssertEqual(try store.loadPendingTransition(), pending)
+        XCTAssertEqual(try store.loadManifest(), state == .cleanupIntent ? pending.manifest : fixture.initialManifest)
+        XCTAssertNotEqual(fixture.initialManifest, pending.manifest)
+        XCTAssertTrue(try outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: binding), acceptedRecord)
+        XCTAssertEqual(try outbox.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding), state != .noACK)
+        XCTAssertEqual(try outbox.hasDirectSleepCleanupIntent(
+            itemID: item.id, receiverBindingID: binding, receiverGeneration: generation
+        ), state == .cleanupIntent)
+
+        _ = await runtime.viewModel.syncRecentSleepSessions(executionMode: .foreground)
+        runtime.automaticSyncRuntime.stopAdmission()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+        await runtime.viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertTrue(fixture.readAnchors.isEmpty)
+        XCTAssertTrue(fixture.recorder.acceptedPayloads.isEmpty)
+        XCTAssertEqual(enqueueAttempts, state == .noACK ? 1 : 0)
+        XCTAssertEqual(fixture.recorder.invocationCount, state == .noACK ? 1 : 0)
+        switch state {
+        case .cleanupIntent:
+            XCTAssertFalse(runtime.viewModel.statusIsError)
+            XCTAssertNil(try store.loadPendingTransition())
+            XCTAssertEqual(try store.loadManifest(), pending.manifest)
+            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: binding))
+            XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        case .uncheckedACK:
+            XCTAssertTrue(runtime.viewModel.statusIsError)
+            XCTAssertEqual(try store.loadPendingTransition(), pending)
+            XCTAssertEqual(try store.loadManifest(), fixture.initialManifest)
+            XCTAssertTrue(try outbox.pendingItems().isEmpty)
+            XCTAssertEqual(try outbox.directFinalizationRecordReady(receiverIdentity: binding), acceptedRecord)
+            XCTAssertFalse(try outbox.hasDirectSleepCleanupIntent(
+                itemID: item.id, receiverBindingID: binding, receiverGeneration: generation
+            ))
+            XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        case .noACK:
+            let replacement = try XCTUnwrap(try outbox.pendingItems().first)
+            XCTAssertEqual(try outbox.pendingItems().map(\.id), [replacement.id])
+            XCTAssertNotEqual(replacement.id, item.id)
+            XCTAssertEqual(try store.loadPendingTransition(), pending.assigningOutboxItemID(replacement.id))
+            XCTAssertEqual(try Data(contentsOf: replacement.fileURL), payload)
+            XCTAssertEqual(fixture.recorder.payloads, [payload])
+            XCTAssertEqual(try store.loadManifest(), fixture.initialManifest)
+            XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        case .writerInterruption:
+            XCTFail("The live writer case must run before seeding an ACK.")
+        }
+        #endif
+    }
+
+    func testPlainDirectItemKeepsScopedTransferWhenPayloadUnlinkThrows() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires isolated app host.")
+        #else
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let bytes = try HealthBridgeBatchEncoder().encode(
+            ConnectionTestBatchFactory.make(now: Date(timeIntervalSince1970: 1_700_000_000))
+        )
+        let item = try fixture.outbox.enqueue(bytes, receiverIdentity: binding)
+        let fault = SleepPayloadUnlinkInterruption(payloadURL: item.fileURL)
+        let directory = fixture.outbox.directoryURL
+        var accepted: LastAcceptedTransferObservation?
+        for first in [true, false] {
+            let outbox = try FileOutbox(directory: directory, fileManager: first ? fault : .default)
+            let runtime = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep, outbox: outbox)
+            let model = runtime.viewModel
+            if first { XCTAssertNil(model.lastAcceptedTransferObservation) }
+            let retry = AutomaticSyncEngine(
+                pendingStore: fixture.background, processType: { _, _ in .blocked },
+                performOpportunity: { opportunity, processPendingTypes in
+                    _ = await model.performAutomaticSyncOpportunity(
+                        opportunity: opportunity, processPendingTypes: processPendingTypes
+                    )
+                }
+            )
+            try await retry.requestRun(reason: .manualSync)
+            runtime.automaticSyncRuntime.stopAdmission()
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            await model.waitForBootstrapAndForegroundWork()
+            let reopened = try FileOutbox(directory: directory)
+            let ready = try reopened.directFinalizationRecordReady(receiverIdentity: binding)
+            if first {
+                accepted = model.lastAcceptedTransferObservation
+                XCTAssertEqual(ready?.itemIDs, [item.id])
+            } else {
+                XCTAssertNil(ready, "Retry must retire the accepted record, not just remove its payload.")
+                XCTAssertEqual(model.lastAcceptedTransferObservation, accepted)
+            }
+            XCTAssertEqual(model.lastAcceptedTransferObservation?.bindingID, binding)
+            XCTAssertEqual(model.lastAcceptedTransferObservation?.evidenceKind, .directResponse)
+            XCTAssertEqual(fixture.recorder.acceptedPayloads, [bytes])
+        }
+        XCTAssertEqual(fault.interruptions, 1)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        #endif
+    }
+
+    func testForegroundSleepRetryRetiresAcceptanceAcrossJournalUnlinkFaultsWithoutReposting() async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        for afterUnlink in [false, true] {
+            for tracksGeneration in [false, true] {
+                try await runForegroundSleepJournalUnlinkFault(
+                    afterUnlink: afterUnlink, tracksGeneration: tracksGeneration
+                )
+            }
+        }
+        #endif
+    }
+
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    private func runForegroundSleepJournalUnlinkFault(
+        afterUnlink: Bool, tracksGeneration: Bool
+    ) async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let context = "afterUnlink=\(afterUnlink), tracksGeneration=\(tracksGeneration)"
+        let binding = try XCTUnwrap(fixture.settings.receiverBindingID)
+        let generation = fixture.settings.receiverSettingsGenerationToken
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: fixture.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: fixture.nextAnchor, receivedAt: date
+            ),
+            receiverSettingsGeneration: generation,
+            historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        ))
+        let expectedManifest = transition.manifest
+        XCTAssertNotEqual(expectedManifest, fixture.initialManifest, context)
+        let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let item = try fixture.outbox.enqueueIfAbsent(
+            payload, receiverIdentity: binding,
+            pendingGenerationRetirements: tracksGeneration ? fixture.generations : [:]
+        ).item
+        let sentinelPayload = try HealthBridgeBatchEncoder().encode(ConnectionTestBatchFactory.make(now: date))
+        let sentinel = try fixture.outbox.enqueue(sentinelPayload, receiverIdentity: binding)
+        let pending = SleepSyncPendingTransition(
+            payload: payload, manifest: expectedManifest, receiverBindingID: binding,
+            connectionGeneration: generation, outboxItemID: item.id
+        )
+        try fixture.sleep.savePendingTransition(pending)
+
+        let sleepURL = fixture.root.appendingPathComponent("sleep.json")
+        let journalURL = sleepURL.appendingPathExtension("pending")
+        let fault = SleepJournalUnlinkInterruption(journalURL: journalURL, afterUnlink: afterUnlink)
+        var enqueueAttempts = 0
+        let installObserver: @MainActor (HealthBridgeCompanionViewModel) -> Void = { model in
+            model.observeSleepEnqueueAttemptForTesting = { enqueueAttempts += 1 }
+        }
+        do {
+            let store = try FileSleepSyncManifestStore(fileURL: sleepURL, fileManager: fault)
+            let writer = try await makeIssue96CodecRuntime(fixture, store: store, beforeBootstrap: installObserver)
+            XCTAssertEqual(fixture.recorder.invocationCount, 0, context)
+            XCTAssertEqual(try store.loadPendingTransition(), pending, context)
+            _ = await writer.viewModel.syncRecentSleepSessions(executionMode: .foreground)
+            writer.automaticSyncRuntime.stopAdmission()
+            await writer.automaticSyncRuntime.cancelAndWait()
+            await writer.viewModel.waitForBootstrapAndForegroundWork()
+        }
+        XCTAssertEqual(fault.interruptions, 1, context)
+        XCTAssertEqual(FileManager.default.fileExists(atPath: journalURL.path), !afterUnlink, context)
+        XCTAssertEqual(try fixture.sleep.loadPendingTransition(), afterUnlink ? nil : pending, context)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), expectedManifest, context)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations, context)
+        XCTAssertTrue(try fixture.outbox.hasDirectSleepCleanupIntent(
+            itemID: item.id, receiverBindingID: binding, receiverGeneration: generation
+        ), context)
+        XCTAssertEqual(fixture.recorder.invocationCount, 1, context)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [payload], context)
+        XCTAssertEqual(enqueueAttempts, 0, context)
+
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [item.id, sentinel.id], context)
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), payload, context)
+        XCTAssertEqual(try fixture.outbox.uploadablePendingItems(for: binding).map(\.id), [], context)
+
+        let recoveredOutbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let recoveredStore = try FileSleepSyncManifestStore(fileURL: sleepURL)
+        XCTAssertEqual(try recoveredOutbox.pendingItems().map(\.id), [item.id, sentinel.id], context)
+        XCTAssertEqual(try recoveredOutbox.uploadablePendingItems(for: binding).map(\.id), [], context)
+        try await recoveredOutbox.prepareNutritionCompatibility()
+        XCTAssertEqual(try recoveredOutbox.nutritionCompatibleItems(for: binding, support: .supported).map(\.id), [], context)
+        let restarted = try await makeIssue96CodecRuntime(
+            fixture, store: recoveredStore, outbox: recoveredOutbox, beforeBootstrap: installObserver
+        )
+        XCTAssertNil(try recoveredStore.loadPendingTransition(), context)
+        XCTAssertEqual(try recoveredOutbox.pendingItems().map(\.id), [sentinel.id], context)
+        XCTAssertEqual(try recoveredOutbox.uploadablePendingItems(for: binding).map(\.id), [sentinel.id], context)
+        XCTAssertEqual(fixture.recorder.invocationCount, 1, context)
+        // Run the real Direct queue drain without letting a fresh HealthKit read
+        // produce a new cursor-only transition after recovery.
+        let viewModel = restarted.viewModel
+        let retry = AutomaticSyncEngine(
+            pendingStore: fixture.background,
+            processType: { _, _ in .blocked },
+            performOpportunity: { opportunity, processPendingTypes in
+                _ = await viewModel.performAutomaticSyncOpportunity(
+                    opportunity: opportunity, processPendingTypes: processPendingTypes
+                )
+            }
+        )
+        try await retry.requestRun(reason: .manualSync)
+        restarted.automaticSyncRuntime.stopAdmission()
+        await restarted.automaticSyncRuntime.cancelAndWait()
+        await restarted.viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertFalse(restarted.viewModel.statusIsError, context)
+        XCTAssertEqual(fixture.background.lastRun?.outcome, tracksGeneration ? .completed : .interrupted, context)
+        XCTAssertEqual(try recoveredStore.loadManifest(), expectedManifest, context)
+        XCTAssertNil(try recoveredStore.loadPendingTransition(), context)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.fileURL.path), context)
+        XCTAssertTrue(try recoveredOutbox.pendingItems().isEmpty, context)
+        XCTAssertNil(try recoveredOutbox.directFinalizationRecordReady(receiverIdentity: binding), context)
+        XCTAssertFalse(try recoveredOutbox.hasDirectSleepCleanupIntent(
+            itemID: item.id, receiverBindingID: binding, receiverGeneration: generation
+        ), context)
+        XCTAssertEqual(
+            try fixture.background.loadPendingObserverTypeCodeGenerations(),
+            tracksGeneration ? [:] : fixture.generations,
+            context
+        )
+        XCTAssertEqual(fixture.recorder.invocationCount, 2, context)
+        XCTAssertEqual(fixture.recorder.payloads, [payload, sentinelPayload], context)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [payload, sentinelPayload], context)
+        XCTAssertEqual(enqueueAttempts, 0, context)
+        XCTAssertTrue(fixture.readAnchors.isEmpty, context)
+    }
+    #endif
+
+    func testAutomaticSleepColdOwnerCompletesAcceptedJournalBeforeNextRead() async throws {
+        let fixture = try SleepStoreFaultFixture(point: .pendingClear, withReadableBaseline: true)
+        defer { fixture.cleanUp() }
+        let pending = fixture.pending
+        // A reset-only, empty baseline deliberately ignores its stored anchor on the next read.
+        // This fixture represents an accepted populated baseline where that would be a regression.
+        XCTAssertFalse(pending.manifest.baselineResetPending == true)
+        let expectedAnchor = try XCTUnwrap(pending.manifest.anchorCursorValue)
+        let itemID = try XCTUnwrap(pending.outboxItemID)
+        let binding = pending.receiverBindingID
+        let sleepURL = fixture.root.appendingPathComponent("sleep.json")
+        let debt = BackgroundSyncSettingsStore(userDefaults: try XCTUnwrap(UserDefaults(suiteName: fixture.suiteName)))
+        XCTAssertNotEqual(fixture.reservation, pending.manifest)
+        XCTAssertEqual(try fixture.store.loadManifest(), fixture.reservation)
+
+        // Stop the real Direct writer after it commits the manifest and ACK, but before it clears the journal.
+        do {
+            let writer = try await makeSleepStoreFaultRuntime(fixture)
+            fixture.store.faultEnabled = true
+            await writer.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["sleep_analysis"]))
+            writer.automaticSyncRuntime.stopAdmission()
+            await writer.automaticSyncRuntime.cancelAndWait()
+            await writer.viewModel.waitForBootstrapAndForegroundWork()
+        }
+        XCTAssertGreaterThan(fixture.store.faultCount, 0)
+
+        let reopenedOutbox = try FileOutbox(directory: fixture.outbox.directoryURL)
+        let reopenedStore = try FileSleepSyncManifestStore(fileURL: sleepURL)
+        let record = try XCTUnwrap(try reopenedOutbox.directSleepCleanupRecord(receiverBindingID: binding, itemID: itemID))
+        XCTAssertEqual(try reopenedOutbox.directSleepCleanupIntent(for: record), DirectSleepCleanupIntent(
+            itemID: itemID, journalID: pending.id, receiverBindingID: binding,
+            receiverGeneration: pending.connectionGeneration
+        ))
+        XCTAssertTrue(try reopenedOutbox.hasUncheckedDirectAcknowledgment(itemID: itemID, receiverBindingID: binding))
+        let item = try XCTUnwrap(try reopenedOutbox.pendingItem(id: itemID))
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), pending.payload)
+        XCTAssertTrue(try reopenedOutbox.uploadablePendingItems(for: binding).isEmpty)
+        XCTAssertNil(record.cursorCheckpoint)
+        XCTAssertEqual(try reopenedStore.loadPendingTransition(), pending)
+        XCTAssertEqual(try reopenedStore.loadManifest(), pending.manifest)
+        XCTAssertEqual(try debt.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fixture.recorder.invocationCount, 1)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+        let cursorURL = fixture.root.appendingPathComponent("cursors.json")
+        let priorCursors = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: cursorURL))
+
+        #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        var enqueueAttempts = 0
+        let installObserver: @MainActor (HealthBridgeCompanionViewModel) -> Void = { model in
+            model.observeSleepEnqueueAttemptForTesting = { enqueueAttempts += 1 }
+        }
+        #else
+        let installObserver: @MainActor (HealthBridgeCompanionViewModel) -> Void = { _ in }
+        #endif
+        let stores = (outbox: reopenedOutbox, sleep: reopenedStore)
+        do {
+            let recovering = try await makeSleepStoreFaultRuntime(
+                fixture, reopened: stores, beforeBootstrap: installObserver
+            )
+            XCTAssertFalse(recovering.viewModel.statusIsError)
+            XCTAssertNil(try reopenedStore.loadPendingTransition())
+            XCTAssertEqual(try reopenedStore.loadManifest(), pending.manifest)
+            XCTAssertTrue(try reopenedOutbox.pendingItems().isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: item.fileURL.path))
+            XCTAssertNil(try reopenedOutbox.directSleepCleanupRecord(receiverBindingID: binding, itemID: itemID))
+            XCTAssertNil(try reopenedOutbox.directFinalizationRecordReady(receiverIdentity: binding))
+            XCTAssertFalse(try reopenedOutbox.hasUncheckedDirectAcknowledgment(itemID: itemID, receiverBindingID: binding))
+            XCTAssertEqual(
+                try debt.loadPendingObserverTypeCodeGenerations(), fixture.generations,
+                "Finishing an old accepted journal does not satisfy the next fresh-read obligation."
+            )
+            XCTAssertEqual(fixture.recorder.invocationCount, 1)
+            #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+            XCTAssertEqual(enqueueAttempts, 0)
+            #endif
+            recovering.automaticSyncRuntime.stopAdmission()
+            await recovering.automaticSyncRuntime.cancelAndWait()
+            await recovering.viewModel.waitForBootstrapAndForegroundWork()
+        }
+
+        var nextReadAnchors: [String?] = []
+        let next = try await makeSleepStoreFaultRuntime(
+            fixture, reopened: stores, beforeBootstrap: installObserver, readAttempted: { anchor in
+                nextReadAnchors.append(anchor)
+            }
+        )
+        await next.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        next.automaticSyncRuntime.stopAdmission()
+        await next.automaticSyncRuntime.cancelAndWait()
+        await next.viewModel.waitForBootstrapAndForegroundWork()
+
+        XCTAssertEqual(nextReadAnchors, [expectedAnchor], "The first new read must use the recovered Sleep anchor.")
+        XCTAssertNil(try reopenedStore.loadPendingTransition())
+        XCTAssertEqual(try reopenedStore.loadManifest(), pending.manifest)
+        XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: Data(contentsOf: cursorURL)), priorCursors)
+        XCTAssertEqual(try debt.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertEqual(fixture.recorder.invocationCount, 1)
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+        #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        XCTAssertEqual(enqueueAttempts, 0)
+        #endif
     }
 
     func testRejectedSleepRecoveryJournalFailureKeepsErrorPrivate() async throws {
@@ -4058,49 +5700,80 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         let fixture = try SleepStoreFaultFixture(point: point)
         defer { fixture.cleanUp() }
         let runtime = try await makeSleepStoreFaultRuntime(fixture)
+        let posts: (automaticFault: Int, foregroundFault: Int, recovery: Int)
+        switch point {
+        case .pendingSave: posts = (0, 0, 1)
+        case .manifestSave: posts = (1, 2, 3) // HTTP 200 arrives before the app can persist its ACK.
+        case .pendingClear: posts = (1, 1, 1) // The durable ACK and cleanup intent prevent another POST.
+        case .rejectionPendingSave, .rejectionReset:
+            XCTFail("Rejection faults are exercised separately.")
+            return
+        }
+        let hasCleanupIntent = point == .pendingClear
+        let faultedManifest = hasCleanupIntent ? fixture.pending.manifest : fixture.reservation
+        let binding = fixture.pending.receiverBindingID
+
+        func assertPosts(_ count: Int, phase: String) {
+            XCTAssertEqual(fixture.recorder.invocationCount, count, phase)
+            XCTAssertEqual(fixture.recorder.acceptedPayloads, Array(repeating: fixture.pending.payload, count: count), phase)
+        }
+
+        func assertFaultedStorage(_ itemID: String, phase: String) throws {
+            XCTAssertEqual(try fixture.store.loadPendingTransition(), fixture.pending, phase)
+            XCTAssertEqual(try fixture.store.loadManifest(), faultedManifest, phase)
+            XCTAssertEqual(try fixture.outbox.hasUncheckedDirectAcknowledgment(
+                itemID: itemID, receiverBindingID: binding
+            ), hasCleanupIntent, phase)
+            let record = try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding)
+            let intent = try record.flatMap { try fixture.outbox.directSleepCleanupIntent(for: $0) }
+            XCTAssertEqual(intent, hasCleanupIntent ? DirectSleepCleanupIntent(
+                itemID: itemID, journalID: fixture.pending.id,
+                receiverBindingID: binding, receiverGeneration: fixture.pending.connectionGeneration
+            ) : nil, phase)
+        }
         fixture.store.faultEnabled = true
         await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observerBatch(typeCodes: ["sleep_analysis"]))
         XCTAssertEqual(recordedSleepFailure(runtime.viewModel), AutomaticSyncDiagnosticFailure(
             stage: .store, category: .operationFailed
         ))
         XCTAssertGreaterThan(fixture.store.faultCount, 0)
-        XCTAssertEqual(try fixture.store.loadPendingTransition(), fixture.pending)
-        XCTAssertEqual(try fixture.store.loadManifest(), point == .pendingClear
-            ? fixture.pending.manifest : fixture.reservation)
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
         XCTAssertTrue(runtime.viewModel.canSyncSleep)
-        XCTAssertEqual(fixture.recorder.invocationCount, point == .pendingSave ? 0 : 1)
-        XCTAssertEqual(fixture.recorder.acceptedPayloads, point == .pendingSave ? [] : [fixture.pending.payload])
+        assertPosts(posts.automaticFault, phase: "automatic while faulted")
         XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
         XCTAssertFalse(fixture.diagnostics.latestRecord?.latestLaneSummary.contains(SleepStoreFaultFixture.privateMarker) ?? true)
         let item = try XCTUnwrap(try fixture.outbox.pendingItems().first)
         XCTAssertEqual(try Data(contentsOf: item.fileURL), fixture.pending.payload)
+        try assertFaultedStorage(item.id, phase: "automatic while faulted")
+        let automaticFaultCount = fixture.store.faultCount
         _ = await runtime.viewModel.syncRecentSleepSessions()
+        assertPosts(posts.foregroundFault, phase: "foreground retry while faulted")
+        try assertFaultedStorage(item.id, phase: "foreground retry while faulted")
+        XCTAssertGreaterThan(fixture.store.faultCount, automaticFaultCount)
         XCTAssertFalse(runtime.viewModel.statusMessage.contains(SleepStoreFaultFixture.privateMarker))
         fixture.store.faultEnabled = false
-        let expectedManifest = try fixture.store.loadManifest()
         fixture.recorder.setBeforeResponse { payload, _ in
             XCTAssertEqual(payload, fixture.pending.payload)
-            XCTAssertEqual(try fixture.store.base.loadManifest(), expectedManifest)
+            XCTAssertEqual(try fixture.store.base.loadManifest(), faultedManifest)
             XCTAssertNotNil(try fixture.store.base.loadPendingTransition())
         }
         _ = await runtime.viewModel.syncRecentSleepSessions()
         XCTAssertNil(try fixture.store.loadPendingTransition())
         XCTAssertEqual(try fixture.store.loadManifest(), fixture.pending.manifest)
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
-        XCTAssertEqual(fixture.recorder.invocationCount, point == .pendingSave ? 1 : 2)
-        XCTAssertEqual(fixture.recorder.acceptedPayloads, point == .pendingSave
-            ? [fixture.pending.payload] : [fixture.pending.payload, fixture.pending.payload])
+        XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: binding))
+        assertPosts(posts.recovery, phase: "foreground recovery")
+        XCTAssertEqual(fixture.recorder.responseInspectionCount, posts.recovery - posts.foregroundFault)
         XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
         if point == .pendingSave {
             await runtime.automaticSyncRuntime.cancelAndWait()
             var freshReadAttempted = false
-            let next = try await makeSleepStoreFaultRuntime(fixture, readAttempted: { freshReadAttempted = true })
+            let next = try await makeSleepStoreFaultRuntime(fixture, readAttempted: { _ in freshReadAttempted = true })
             await next.automaticSyncRuntime.runAutomaticSync(reason: .observer(typeCode: "sleep_analysis"))
             await next.automaticSyncRuntime.cancelAndWait()
             XCTAssertTrue(freshReadAttempted, "Old-journal replay must retain the next fresh-read obligation.")
             XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
-            XCTAssertEqual(fixture.recorder.acceptedPayloads, [fixture.pending.payload])
+            assertPosts(posts.recovery, phase: "next fresh read")
         }
     }
 
@@ -4112,7 +5785,9 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
 
     private func makeSleepStoreFaultRuntime(
         _ fixture: SleepStoreFaultFixture,
-        readAttempted: (@MainActor () -> Void)? = nil
+        reopened: (outbox: FileOutbox, sleep: FileSleepSyncManifestStore)? = nil,
+        beforeBootstrap: @MainActor (HealthBridgeCompanionViewModel) -> Void = { _ in },
+        readAttempted: (@MainActor (String?) -> Void)? = nil
     ) async throws -> HealthBridgeCompanionApplicationRuntime {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PayloadFenceURLProtocol.self]
@@ -4126,12 +5801,12 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 cancellationStore: MemoryReceiverTokenStore(),
                 installationIDGenerator: { "synthetic-issue64-installation" }
             ),
-            outbox: fixture.outbox, receiverClient: ReceiverClient(session: session),
+            outbox: reopened?.outbox ?? fixture.outbox, receiverClient: ReceiverClient(session: session),
             automaticSyncDiagnosticStore: fixture.diagnostics,
-            sleepManifestStore: fixture.store,
-            readAnchoredSleepChanges: { _, _, receivedAt in
+            sleepManifestStore: reopened.map { $0.sleep as any SleepSyncManifestStoring } ?? fixture.store,
+            readAnchoredSleepChanges: { anchor, _, receivedAt in
                 if let readAttempted {
-                    readAttempted()
+                    readAttempted(anchor)
                 } else {
                     XCTFail("Pending delivery failure must not reach a HealthKit query.")
                 }
@@ -4140,6 +5815,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             automaticSyncEligibleTypeCodesForTesting: ["sleep_analysis"],
             scheduleDirectBackgroundUploads: { 0 }
         )
+        beforeBootstrap(viewModel)
         await viewModel.bootstrap()
         XCTAssertTrue(viewModel.canSyncSleep)
         let coordinator = HealthKitBackgroundDeliveryCoordinator(
@@ -4250,6 +5926,18 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             XCTAssertNil(committed)
             XCTAssertNil(pending)
             XCTAssertTrue(items.isEmpty)
+        } else if scenario == .completion, invalidation == .cancel {
+            let accepted = try XCTUnwrap(seeded)
+            let reopened = try FileOutbox(directory: fixture.outbox.directoryURL)
+            XCTAssertEqual(committed, accepted.manifest)
+            XCTAssertNil(pending)
+            XCTAssertTrue(try reopened.uploadablePendingItems(for: accepted.receiverBindingID).isEmpty)
+            XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: accepted.receiverBindingID))
+            let retry = try await makeIssue96CodecRuntime(fixture, store: fixture.sleep, outbox: reopened,
+                requestProjectionReadAuthorization: { _ in throw CocoaError(.featureUnsupported) })
+            await retry.viewModel.performManualSyncOpportunity { false }
+            XCTAssertEqual(fixture.recorder.acceptedPayloads, [accepted.payload])
+            XCTAssertEqual(fixture.recorder.payloads, [accepted.payload])
         } else {
             XCTAssertTrue(committed == fixture.initialManifest)
             switch scenario {
@@ -4503,35 +6191,45 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
     private func makeIssue96CodecRuntime(
         _ fixture: DirectSleepPreparationFixture,
         store: FileSleepSyncManifestStore,
+        pairingStateStore: ReceiverPairingStateStore? = nil,
+        outbox: FileOutbox? = nil,
         admissionClosed: @escaping @MainActor () -> Void = {},
         terminalDrain: @escaping @MainActor () async -> Bool = { true },
+        readAnchoredSleepChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
+        readAnchoredQuantityChanges: (@MainActor (String, String?, Date?, Date) async throws -> HealthKitAnchoredQuantityChanges)? = nil,
+        requestProjectionReadAuthorization: (@MainActor ([String]) async throws -> Void)? = nil,
         beforeBootstrap: @MainActor (HealthBridgeCompanionViewModel) -> Void = { _ in }
     ) async throws -> HealthBridgeCompanionApplicationRuntime {
         PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let sleepReader = readAnchoredSleepChanges ?? { anchor, start, receivedAt in
+            fixture.readAnchors.append(anchor)
+            XCTAssertNil(start)
+            return HealthKitAnchoredSleepChanges(
+                addedSamples: anchor == nil ? fixture.children : [], deletedSamples: [],
+                anchorCursorValue: fixture.nextAnchor, receivedAt: receivedAt
+            )
+        }
         let viewModel = try makeViewModel(
             root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
-            pairingStateStore: ReceiverPairingStateStore(
+            pairingStateStore: pairingStateStore ?? ReceiverPairingStateStore(
                 pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
                 cancellationStore: MemoryReceiverTokenStore(),
                 installationIDGenerator: { DirectSleepPreparationFixture.installationID }
             ),
-            outbox: fixture.outbox, receiverClient: ReceiverClient(session: fixture.session),
+            outbox: outbox ?? fixture.outbox, receiverClient: ReceiverClient(session: fixture.session),
             automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: fixture.root.appendingPathComponent("diagnostics.json")),
             sleepManifestStore: store,
-            readAnchoredSleepChanges: { anchor, start, receivedAt in
-                fixture.readAnchors.append(anchor)
-                XCTAssertNil(start)
-                return HealthKitAnchoredSleepChanges(
-                    addedSamples: anchor == nil ? fixture.children : [], deletedSamples: [],
-                    anchorCursorValue: fixture.nextAnchor, receivedAt: receivedAt
-                )
-            },
-            automaticSyncEligibleTypeCodesForTesting: ["sleep_analysis"],
+            readAnchoredSleepChanges: sleepReader,
+            automaticSyncEligibleTypeCodesForTesting: readAnchoredQuantityChanges == nil ? ["sleep_analysis"] : ["sleep_analysis", "weight"],
             scheduleDirectBackgroundUploads: {
                 fixture.directScheduleCount += 1
                 return 0
             },
-            terminalBackgroundPayloadDrain: terminalDrain, platformBackgroundPayloadDrain: { true }
+            terminalBackgroundPayloadDrain: terminalDrain, platformBackgroundPayloadDrain: { true },
+            readAnchoredQuantityChanges: readAnchoredQuantityChanges,
+            requestProjectionReadAuthorization: requestProjectionReadAuthorization
         )
         beforeBootstrap(viewModel)
         await viewModel.bootstrap()
@@ -4693,6 +6391,228 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             requestProjectionReadAuthorization: requestProjectionReadAuthorization
         )
     }
+}
+
+// Historical settings-generation evidence. The current app is only the reader.
+extension HealthBridgeCompanionResetAdmissionTests {
+    func testReopenedHistoricalSleepMismatchWithPayloadDeniesWithoutMutation() async throws {
+        try await assertHistoricalSleepMismatchDenial(payloadPresent: true)
+    }
+
+    func testReopenedHistoricalSleepMismatchWithoutPayloadDeniesWithoutMutation() async throws {
+        try await assertHistoricalSleepMismatchDenial(payloadPresent: false)
+    }
+
+    private func assertHistoricalSleepMismatchDenial(payloadPresent: Bool) async throws {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        let seed = try DirectSleepPreparationFixture()
+        defer { seed.cleanUp() }
+        let seedSettingsSuite = "\(seed.suiteName).historicalSettings"
+        let seedSettingsDefaults = try XCTUnwrap(UserDefaults(suiteName: seedSettingsSuite))
+        defer { seedSettingsDefaults.removePersistentDomain(forName: seedSettingsSuite) }
+        let tokens = MemoryReceiverTokenStore()
+        let seedSettings = ReceiverSettingsStore(
+            userDefaults: seedSettingsDefaults, tokenStore: tokens,
+            preCutoverBackupStore: MemoryReceiverTokenStore(), synchronize: { true }
+        )
+        try seedSettings.save(
+            receiverURLString: seed.settings.receiverURLString,
+            bearerToken: try seed.settings.loadBearerToken()
+        )
+        let g1Token = try tokens.loadToken()
+        let g1 = seedSettings.receiverSettingsGenerationToken
+        let binding = try XCTUnwrap(seedSettings.receiverBindingID)
+        XCTAssertEqual(g1, "g1")
+
+        let date = Date(timeIntervalSince1970: 1_700_259_200)
+        let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: seed.initialManifest,
+            changes: HealthKitAnchoredSleepChanges(
+                addedSamples: [], deletedSamples: [], anchorCursorValue: seed.nextAnchor, receivedAt: date
+            ),
+            receiverSettingsGeneration: g1, historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        ))
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: DirectSleepPreparationFixture.installationID,
+            cursorKind: SleepSyncBatchFactory.anchoredCursorKind, cursorValue: seed.nextAnchor
+        )
+        let payload = try HealthBridgeBatchEncoder().encode(transition.batch)
+        let item = try XCTUnwrap(try seed.outbox.enqueueSequence(
+            [payload], receiverIdentity: binding, cursorCheckpoint: checkpoint,
+            pendingGenerationRetirements: seed.generations
+        ).first)
+        let journal = SleepSyncPendingTransition(
+            payload: payload, manifest: transition.manifest, receiverBindingID: binding,
+            connectionGeneration: g1, outboxItemID: item.id
+        )
+        let intent = DirectSleepCleanupIntent(
+            itemID: item.id, journalID: journal.id, receiverBindingID: binding, receiverGeneration: g1
+        )
+        try seed.sleep.savePendingTransition(journal)
+        try seed.sleep.saveManifest(journal.manifest)
+        let record = try seed.outbox.recordDirectSleepAcceptance(intent, onNewAcceptance: {})
+        try FileSyncCursorStore(fileURL: seed.root.appendingPathComponent("cursors.json")).saveCursorValue(
+            seed.previousAnchor, receiverBindingID: binding,
+            sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        )
+
+        var failedSaveProjection: HistoricalSleepProjection?
+        for history in HistoricalSleepHistory.allCases {
+            let label = "\(history), payloadPresent=\(payloadPresent)"
+            let root = seed.root.appendingPathComponent(history.rawValue, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            for name in ["outbox", "sleep.json", "sleep.json.pending", "cursors.json"] {
+                try FileManager.default.copyItem(
+                    at: seed.root.appendingPathComponent(name), to: root.appendingPathComponent(name)
+                )
+            }
+            let suite = "\(seed.suiteName).\(history.rawValue)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let background = BackgroundSyncSettingsStore(userDefaults: defaults)
+            try background.setEnabledDurably(false)
+            try background.markPendingObserverTypeCodes(["sleep_analysis"])
+            let primary = MemoryReceiverTokenStore()
+            try primary.saveToken(g1Token)
+            let backup = MemoryReceiverTokenStore()
+            let writer = ReceiverSettingsStore(
+                userDefaults: defaults, tokenStore: primary, preCutoverBackupStore: backup, synchronize: { true }
+            )
+            let outboxURL = root.appendingPathComponent("outbox")
+            let writerOutbox = try FileOutbox(directory: outboxURL)
+            switch history {
+            case .parentShapedFailedSave:
+                // Model the parent's invalidate-before-empty-check ordering using the real barrier.
+                // Do not call the current app's Save and attribute the old fault to it.
+                do {
+                    try await ReceiverConnectionTerminalBarrier().perform(
+                        closeAdmission: {},
+                        invalidateGeneration: { try writer.invalidateReceiverSettingsGeneration() },
+                        cancelAndAwaitPairing: {}, cancelAndAwaitForegroundPayloads: {},
+                        drainBackgroundPayloads: { true },
+                        commit: { generation in
+                            guard ReceiverConnectionTransitionPolicy.canBegin(
+                                outboxIdentityAdmissionReady: true,
+                                pendingItemCount: try writerOutbox.pendingItems().count,
+                                clearIntentIsActive: writerOutbox.destructiveRecoveryIsRequested
+                            ) else {
+                                throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
+                            }
+                            try writer.save(
+                                receiverURLString: "http://127.0.0.1:8766/v1/batches",
+                                bearerToken: try seed.settings.loadBearerToken(),
+                                expectedGeneration: generation
+                            )
+                        }
+                    )
+                    XCTFail("The parent-shaped Save must encounter a nonempty FIFO.")
+                } catch ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox {}
+            case .deliberateInvalidation:
+                XCTAssertEqual(try writer.invalidateReceiverSettingsGeneration(), "g2")
+            }
+
+            let payloadURL = outboxURL.appendingPathComponent(item.fileURL.lastPathComponent)
+            // Model loss of the payload *after* the fence, not a failed empty-FIFO Save.
+            if !payloadPresent { try FileManager.default.removeItem(at: payloadURL) }
+            let settings = ReceiverSettingsStore(
+                userDefaults: try XCTUnwrap(UserDefaults(suiteName: suite)),
+                tokenStore: primary, preCutoverBackupStore: backup, synchronize: { true }
+            )
+            let outbox = try FileOutbox(directory: outboxURL)
+            let sleep = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
+            XCTAssertEqual(settings.receiverSettingsGenerationToken, "g2", label)
+            XCTAssertEqual(settings.receiverBindingID, binding, label)
+            XCTAssertEqual(settings.receiverURLString, seed.settings.receiverURLString, label)
+            XCTAssertEqual(try settings.loadBearerToken(), try seed.settings.loadBearerToken(), label)
+            XCTAssertEqual(try sleep.loadPendingTransition(), journal, label)
+            XCTAssertEqual(try sleep.loadManifest(), journal.manifest, label)
+            XCTAssertEqual(try outbox.pendingItems().map(\.id), payloadPresent ? [item.id] : [], label)
+            XCTAssertEqual(try outbox.directSleepCleanupRecord(receiverBindingID: binding), record, label)
+            XCTAssertEqual(try outbox.directSleepCleanupIntent(for: record), intent, label)
+            XCTAssertTrue(try outbox.hasUncheckedDirectAcknowledgment(itemID: item.id, receiverBindingID: binding), label)
+            XCTAssertEqual(try background.loadPendingObserverTypeCodeGenerations(), seed.generations, label)
+
+            func projection() throws -> HistoricalSleepProjection {
+                let paths = ["sleep.json", "sleep.json.pending", "cursors.json",
+                             "outbox/.enqueue-transaction", "outbox/.fifo-sequence", "outbox/\(payloadURL.lastPathComponent)"]
+                var files: [String: Data] = [:]
+                for path in paths {
+                    let url = root.appendingPathComponent(path)
+                    if FileManager.default.fileExists(atPath: url.path) { files[path] = try Data(contentsOf: url) }
+                }
+                return try HistoricalSleepProjection(
+                    settings: settings.currentConnectionRecordV2(), primary: primary.loadToken(),
+                    backup: backup.loadToken(), observers: background.loadPendingObserverTypeCodeGenerations(),
+                    files: files
+                )
+            }
+            let before = try projection()
+            switch history {
+            case .parentShapedFailedSave:
+                failedSaveProjection = before
+            case .deliberateInvalidation:
+                XCTAssertEqual(before, try XCTUnwrap(failedSaveProjection), "Reopened projections must be identical.")
+            }
+
+            let recorder = PayloadFenceNetworkRecorder()
+            PayloadFenceURLProtocol.networkRecorder = recorder
+            var authorizationRequests: [[String]] = []
+            var healthReads = 0
+            let viewModel = try makeViewModel(
+                root: root, defaults: defaults, settingsStore: settings,
+                pairingStateStore: ReceiverPairingStateStore(
+                    pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                    cancellationStore: MemoryReceiverTokenStore(),
+                    installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+                ),
+                outbox: outbox, receiverClient: ReceiverClient(session: seed.session),
+                automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: root.appendingPathComponent("diagnostics.json")),
+                sleepManifestStore: sleep,
+                readAnchoredSleepChanges: { _, _, _ in
+                    healthReads += 1
+                    throw HistoricalSleepProbeStop.unexpectedHealthWork
+                },
+                terminalBackgroundPayloadDrain: { true }, platformBackgroundPayloadDrain: { true },
+                requestProjectionReadAuthorization: { types in
+                    authorizationRequests.append(types)
+                    // Stop after the stale-journal decision, before a new baseline can hide it.
+                    throw HistoricalSleepProbeStop.unexpectedHealthWork
+                }
+            )
+            await viewModel.bootstrap()
+            await viewModel.waitForBootstrapAndForegroundWork()
+            XCTAssertEqual(try projection(), before, "Bootstrap admission changed evidence: \(label)")
+            let delivered = await viewModel.syncRecentSleepSessions()
+            await viewModel.waitForBootstrapAndForegroundWork()
+            XCTAssertFalse(delivered, label)
+            XCTAssertEqual(try projection(), before, "Sleep opportunity changed evidence: \(label)")
+            XCTAssertEqual(authorizationRequests, [], label)
+            XCTAssertEqual(healthReads, 0, label)
+            XCTAssertEqual(recorder.invocationCount, 0, label)
+        }
+        #endif
+    }
+
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    private enum HistoricalSleepHistory: String, CaseIterable {
+        case parentShapedFailedSave
+        case deliberateInvalidation
+    }
+
+    private enum HistoricalSleepProbeStop: Error {
+        case unexpectedHealthWork
+    }
+
+    private struct HistoricalSleepProjection: Equatable {
+        let settings: ReceiverConnectionRecordV2?
+        let primary: String
+        let backup: String
+        let observers: [String: Int]
+        let files: [String: Data]
+    }
+    #endif
 }
 
 private func makeResetTestTransferStore(root: URL, defaults: UserDefaults) -> LastAcceptedTransferObservationStore {
@@ -4978,6 +6898,64 @@ private final class Issue96CodecAudit: @unchecked Sendable {
     }
 }
 
+#if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+private final class SleepPayloadUnlinkInterruption: FileManager, @unchecked Sendable {
+    enum Fault: Error { case afterUnlink }
+    private let payloadURL: URL
+    private let lock = NSLock()
+    private var faultCount = 0
+
+    init(payloadURL: URL) {
+        self.payloadURL = payloadURL
+        super.init()
+    }
+
+    var interruptions: Int { lock.withLock { faultCount } }
+
+    override func removeItem(at url: URL) throws {
+        try super.removeItem(at: url)
+        guard url == payloadURL else { return }
+        lock.withLock { faultCount += 1 }
+        throw Fault.afterUnlink
+    }
+}
+#endif
+
+#if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+private final class SleepJournalUnlinkInterruption: FileManager, @unchecked Sendable {
+    private enum Fault: Error { case interrupted }
+    private let journalURL: URL
+    private let afterUnlink: Bool
+    private let lock = NSLock()
+    private var faultCount = 0
+    private var faultEnabled = true
+
+    init(journalURL: URL, afterUnlink: Bool) {
+        self.journalURL = journalURL
+        self.afterUnlink = afterUnlink
+        super.init()
+    }
+
+    var interruptions: Int { lock.withLock { faultCount } }
+
+    func stopInterrupting() {
+        lock.withLock { faultEnabled = false }
+    }
+
+    override func removeItem(at url: URL) throws {
+        guard url == journalURL else { return try super.removeItem(at: url) }
+        let shouldInterrupt = lock.withLock {
+            guard faultEnabled else { return false }
+            faultCount += 1
+            return true
+        }
+        guard shouldInterrupt else { return try super.removeItem(at: url) }
+        if afterUnlink { try super.removeItem(at: url) }
+        throw Fault.interrupted
+    }
+}
+#endif
+
 @MainActor
 private final class DirectSleepPreparationFixture {
     static let installationID = "synthetic-issue96-installation"
@@ -5233,7 +7211,7 @@ private final class SleepStoreFaultFixture: @unchecked Sendable {
     let recorder = PayloadFenceNetworkRecorder()
     var session: URLSession?
 
-    init(point: Point) throws {
+    init(point: Point, withReadableBaseline: Bool = false) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("Synthetic-Issue64-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         suiteName = "Synthetic.Issue64.SleepStore.\(UUID())"
@@ -5261,9 +7239,13 @@ private final class SleepStoreFaultFixture: @unchecked Sendable {
             historyDepth: HealthHistoryDepthSelectionStore(userDefaults: defaults).historyDepth, historyStartDate: nil,
             sourceKey: "apple_health.phone.synthetic-issue64-installation", baselineResetEpoch: 1)
         let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let addedSamples = withReadableBaseline ? [HealthKitSleepChildSample(
+            uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000064")),
+            stage: "core", start: date.addingTimeInterval(-3600), end: date
+        )] : []
         let transition = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
             previousManifest: reservation,
-            changes: HealthKitAnchoredSleepChanges(addedSamples: [], deletedSamples: [],
+            changes: HealthKitAnchoredSleepChanges(addedSamples: addedSamples, deletedSamples: [],
                 anchorCursorValue: "synthetic-issue64-anchor", receivedAt: date),
             receiverSettingsGeneration: settings.receiverSettingsGenerationToken,
             historyDepth: reservation.historyDepth, historyStartDate: nil, generatedAt: date))
@@ -5611,21 +7593,24 @@ private final class PayloadFenceNetworkRecorder: @unchecked Sendable {
     private var capabilitySupport: Bool?
     private var capabilityRequests = 0
     private var heldCapabilityHandler: (@Sendable () -> Void)?
-    private var heldResponseHandler: (@Sendable (@escaping @Sendable () -> Void) -> Bool)?
+    private var heldResponseHandler: (@Sendable (Data?, @escaping @Sendable () -> Void) -> Bool)?
 
     func setHeldResponseHandler(
+        forPayload expectedPayload: Data? = nil,
         _ handler: @escaping @Sendable (@escaping @Sendable () -> Void) -> Bool
     ) {
         lock.lock()
-        heldResponseHandler = handler
+        heldResponseHandler = { payload, resume in
+            (expectedPayload == nil || payload == expectedPayload) && handler(resume)
+        }
         lock.unlock()
     }
 
-    func holdResponseIfRequested(resume: @escaping @Sendable () -> Void) -> Bool {
+    func holdResponseIfRequested(payload: Data?, resume: @escaping @Sendable () -> Void) -> Bool {
         lock.lock()
         let handler = heldResponseHandler
         lock.unlock()
-        return handler?(resume) ?? false
+        return handler?(payload, resume) ?? false
     }
 
     func setFailedCursorKinds(_ kinds: Set<String>) {
@@ -5810,6 +7795,7 @@ private final class PayloadFenceURLProtocol: URLProtocol, @unchecked Sendable {
         if request.url?.path == "/v1/capabilities",
            Self.networkRecorder?.holdCapabilityResponseIfRequested() == true { return }
         if Self.networkRecorder?.holdResponseIfRequested(
+            payload: responsePayload,
             resume: { self.completeLoading(with: responsePayload) }
         ) == true { return }
         completeLoading(with: payload)
@@ -5951,7 +7937,10 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             try requirePrivateURL(url)
         }, wait: { throw ExchangeFailure.responseUnavailable })
         let keysBefore = try fixture.keys.loadOrCreate()
+        let freshAnchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 43))
+        let freshSampleID = UUID()
         var rawBindings: [String] = []
+        var rawAnchors: [String?] = []
         let runtime = try fixture.makeRuntime(
             cleanup: nil, nativeMailboxIO: io, pairingStateStore: state,
             firstReaderOverride: { anchor, _, now in
@@ -5961,14 +7950,27 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
                 }
                 XCTAssertEqual(identity.opaqueBinding, peer.expectedBinding)
                 XCTAssertEqual(record.localScope.bindingID, identity.opaqueBinding)
-                XCTAssertNil(anchor, "The first raw read must use the new binding's absent cursor")
                 XCTAssertNil(try fixture.cursors.cursorValue(
                     receiverBindingID: identity.opaqueBinding,
                     sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
                     cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
                 ))
                 rawBindings.append(identity.opaqueBinding)
+                rawAnchors.append(anchor)
                 fixture.reads.append("raw")
+                if anchor == fixture.nextAnchor {
+                    // New data is ready before the second opportunity, even though its
+                    // first turn belongs to the previously acknowledged raw checkpoint.
+                    let start = Calendar.current.startOfDay(for: now)
+                    return HealthKitAnchoredStepChanges(
+                        stepSamples: [HealthKitStepSampleSummary(
+                            uuid: freshSampleID, start: start, end: now, count: 29
+                        )],
+                        deletedStepSamples: [], anchorCursorValue: freshAnchor,
+                        windowStart: start, windowEnd: now
+                    )
+                }
+                XCTAssertNil(anchor, "The initial raw payload must not be replayed from a different anchor.")
                 return fixture.rawChanges(now: now, hasRecords: true)
             },
             deliveryOverride: { try fixture.nativeFlowDelivery(peer: peer) },
@@ -6079,6 +8081,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         _ = try XCTUnwrap(fixture.background.isEnabled ? true : nil,
             "NOT_REACHED: encrypted first payload and ACK until enable succeeds")
         XCTAssertEqual(rawBindings, [identity.opaqueBinding], "One first read on the authenticated new binding")
+        XCTAssertEqual(rawAnchors, [nil], "The first raw read starts without a shared or automatic anchor")
         XCTAssertGreaterThan(fixture.deliveryConstructions, 0)
         let beforeACK = try fixture.outbox.pendingItems()
         let item = try XCTUnwrap(beforeACK.first, "The real automatic owner must enqueue its first payload")
@@ -6120,21 +8123,32 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
             cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
         ))
+        let pendingSteps = try fixture.pending()
+        XCTAssertNotNil(pendingSteps["steps"])
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw"], "An unacknowledged raw head must block further collection")
+        XCTAssertEqual(try fixture.outbox.pendingItems(), beforeACK)
+        XCTAssertEqual(try fixture.pending(), pendingSteps)
+
         let unrelatedBytes = try beforeACK.dropFirst().map { try Data(contentsOf: $0.fileURL) }
-        let ack = try DeliveryProtocolV1.sealAck(
-            DeliveryReceiptV1(
-                result: .committed, payloadSHA256: opened.payloadSHA256,
-                receiptID: 1, datasetGeneration: 1,
-                committedAtMS: Int64(Date().timeIntervalSince1970 * 1_000), errorCode: nil
-            ),
-            context: DeliveryAckSealContext(
-                envelopeID: envelopeID, receiverID: components.ackContext.receiverID,
-                deviceID: components.ackContext.deviceID,
-                connectionGeneration: Int64(identity.connectionGeneration),
-                deviceAgreementPublicKey: try fixture.keys.agreementPrivateKey().publicKey,
-                receiverSigningPrivateKey: peer.signing, receiverAgreementPrivateKey: peer.agreement
+        func sealACK(envelopeID: Data, payloadSHA256: String, receiptID: Int64) throws -> Data {
+            try DeliveryProtocolV1.sealAck(
+                DeliveryReceiptV1(
+                    result: .committed, payloadSHA256: payloadSHA256,
+                    receiptID: receiptID, datasetGeneration: 1,
+                    committedAtMS: Int64(Date().timeIntervalSince1970 * 1_000), errorCode: nil
+                ),
+                context: DeliveryAckSealContext(
+                    envelopeID: envelopeID, receiverID: components.ackContext.receiverID,
+                    deviceID: components.ackContext.deviceID,
+                    connectionGeneration: Int64(identity.connectionGeneration),
+                    deviceAgreementPublicKey: try fixture.keys.agreementPrivateKey().publicKey,
+                    receiverSigningPrivateKey: peer.signing, receiverAgreementPrivateKey: peer.agreement
+                )
             )
-        )
+        }
+        let ack = try sealACK(envelopeID: envelopeID, payloadSHA256: opened.payloadSHA256, receiptID: 1)
         let ackName = try MailboxLayoutV1.finalFileName(identifier: envelopeID.hexV1, kind: .acknowledgment)
         let ackURL = try XCTUnwrap(locator.lanes[.acks]).appendingPathComponent(ackName)
         try ack.write(to: ackURL, options: [.withoutOverwriting])
@@ -6158,6 +8172,71 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         XCTAssertTrue(runtime.viewModel.receiverURLString.isEmpty)
         XCTAssertTrue(runtime.viewModel.bearerToken.isEmpty)
         XCTAssertTrue(fixture.background.isEnabled)
+        XCTAssertEqual(try fixture.pending(), pendingSteps, "Raw ACK must leave daily Steps work pending")
+        let automaticAnchorKind = GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps")
+        func automaticAnchor() throws -> String? {
+            try fixture.cursors.cursorValue(
+                receiverBindingID: identity.opaqueBinding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: automaticAnchorKind
+            )
+        }
+        XCTAssertEqual(try automaticAnchor(), fixture.nextAnchor)
+
+        fixture.offerData = true
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw", "daily"],
+            "Acknowledged raw coverage must get a daily turn even when fresh raw is available")
+        let nextItems = try fixture.outbox.pendingItems()
+        XCTAssertEqual(nextItems.count, 1)
+        let nextItem = try XCTUnwrap(nextItems.first)
+        XCTAssertEqual(nextItem.deliveryState?.phase, .providerObserved)
+        let nextPayload = try Data(contentsOf: nextItem.fileURL)
+        let nextBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: nextPayload)
+        XCTAssertFalse(nextBatch.samples.isEmpty)
+        XCTAssertTrue(nextBatch.samples.allSatisfy {
+            $0.metadata["sample_kind"] == "daily_aggregate" && $0.metadata["aggregation_completeness"] == "complete"
+        })
+        XCTAssertEqual(try fixture.pending(), pendingSteps, "Publication must not retire the pending Steps generation")
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw", "daily"], "A held daily head must also block fresh raw collection")
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [nextItem.id])
+        XCTAssertEqual(try Data(contentsOf: nextItem.fileURL), nextPayload)
+        XCTAssertEqual(try automaticAnchor(), fixture.nextAnchor)
+
+        let dailyEnvelopeID = try components.transport.finalizedEnvelopeID(itemID: nextItem.id)
+        let dailyACK = try sealACK(
+            envelopeID: dailyEnvelopeID, payloadSHA256: ExchangePeer.hex(ExchangePeer.hash(nextPayload)), receiptID: 2
+        )
+        let dailyACKName = try MailboxLayoutV1.finalFileName(identifier: dailyEnvelopeID.hexV1, kind: .acknowledgment)
+        try dailyACK.write(to: ackURL.deletingLastPathComponent().appendingPathComponent(dailyACKName),
+            options: [.withoutOverwriting])
+        let dailyAccepted = try await fixture.nativeFlowDelivery(peer: peer)
+            .reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
+        XCTAssertEqual(dailyAccepted.finalizedCount, 1)
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try fixture.pending(), pendingSteps, "This daily turn cannot retire unread raw work")
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw", "daily", "raw"])
+        XCTAssertEqual(rawAnchors, [nil, fixture.nextAnchor], "Fresh raw resumes from the exact ACK's checkpoint")
+        let freshItems = try fixture.outbox.pendingItems()
+        XCTAssertEqual(freshItems.count, 1)
+        let freshItem = try XCTUnwrap(freshItems.first)
+        XCTAssertEqual(freshItem.deliveryState?.phase, .providerObserved)
+        let freshBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: freshItem.fileURL))
+        XCTAssertEqual(freshBatch.samples.map(\.value), [29])
+        XCTAssertEqual(freshBatch.samples.map { $0.metadata["sample_kind"] }, ["raw_quantity"])
+        XCTAssertEqual(try automaticAnchor(), fixture.nextAnchor, "Publishing new raw cannot advance its checkpoint")
+        XCTAssertNil(try fixture.cursors.cursorValue(
+            receiverBindingID: identity.opaqueBinding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+        ))
+        XCTAssertFalse(fixture.proofs.hasUploadedRecords(lane: .steps, receiverBindingID: identity.opaqueBinding))
+
         #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
         // Only this isolated synthetic fixture's already-observed wire and keys.
         let witness: [String: Any] = [
@@ -6295,6 +8374,12 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
 
     func testInterruptedNativePairingRetryReusesPublishedRequest() async throws {
         try await assertInterruptedNativePairingRecovery(coldBootstrap: false, superseded: false)
+    }
+
+    func testNativePairingRetryWaitsForPayloadlessDirectSleepCleanup() async throws {
+        try await assertInterruptedNativePairingRecovery(
+            coldBootstrap: false, superseded: false, protectDirectSleep: true
+        )
     }
 
     func testInterruptedNativePairingColdBootstrapReusesPublishedRequest() async throws {
@@ -6636,13 +8721,19 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
 
     private func assertInterruptedNativePairingRecovery(
         coldBootstrap: Bool, superseded: Bool, reimport: Bool = false, conflictingReimports: Bool = false,
-        textReimport: Bool = false
+        textReimport: Bool = false, protectDirectSleep: Bool = false
     ) async throws {
         let fixture = try MailboxLaunchFixture(representation: .raw, enabled: false, unpaired: true)
         let state = ReceiverPairingStateStore(
             pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
             cancellationStore: MemoryReceiverTokenStore()
         )
+        if protectDirectSleep {
+            try fixture.settings.save(
+                receiverURLString: "http://127.0.0.1:8765/v1/batches",
+                bearerToken: "synthetic-pairing-retry-direct-token", rotateBindingID: true
+            )
+        }
         let peer = try ExchangePeer()
         let privateRoot = fixture.root.appendingPathComponent("native-resume")
         var requests: [Data] = []
@@ -6694,7 +8785,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         let pending = try XCTUnwrap(state.loadPending())
         XCTAssertTrue(initial.viewModel.hasPendingPairing)
         XCTAssertTrue(initial.viewModel.statusIsError)
-        XCTAssertFalse(initial.viewModel.receiverSettingsSaved)
+        XCTAssertEqual(initial.viewModel.receiverSettingsSaved, protectDirectSleep)
         let requestGeneration = try XCTUnwrap(pending.nativeExpectedGeneration)
         XCTAssertEqual(fixture.settings.receiverSettingsGenerationToken, requestGeneration)
 
@@ -6741,6 +8832,36 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }
         let beforeRetry = try fixture.settings.currentConnectionRecordV2()
         completionAvailable = true
+        if protectDirectSleep {
+            let installationID = try state.loadOrCreateInstallationID()
+            let previous = SleepSyncBatchFactory.makeManifestReservation(
+                receiverSettingsGeneration: requestGeneration, historyDepth: .allAvailable, historyStartDate: nil,
+                sourceKey: "apple_health.phone.\(installationID.lowercased())", baselineResetEpoch: 1
+            )
+            try fixture.background.markPendingObserverTypeCodes(["sleep_analysis"])
+            let generations = try fixture.background.loadPendingObserverTypeCodeGenerations()
+            let (item, sleepPending) = try HealthBridgeCompanionResetAdmissionTests.stageSleepForConnectionTransition(
+                settings: fixture.settings, outbox: fixture.outbox, store: fixture.sleep,
+                previous: previous, generations: generations
+            )
+            let cleanup = try HealthBridgeCompanionResetAdmissionTests.recordPayloadlessSleepCleanup(
+                item, pending: sleepPending, outbox: fixture.outbox, store: fixture.sleep
+            )
+
+            await initial.viewModel.retryPendingPairing()
+            await fixture.join(initial)
+
+            XCTAssertTrue(initial.viewModel.statusIsError)
+            XCTAssertEqual(try fixture.settings.currentConnectionRecordV2(), beforeRetry)
+            XCTAssertEqual(try state.loadPending(), pending, "The published native request keeps its original authority.")
+            XCTAssertEqual(requests, [publishedRequest])
+            XCTAssertEqual(responseReads, 0)
+            XCTAssertNil(try fixture.sleep.loadPendingTransition())
+            XCTAssertEqual(try fixture.sleep.loadManifest(), sleepPending.manifest)
+            XCTAssertNil(try fixture.outbox.directSleepCleanupIntent(for: cleanup))
+            XCTAssertNil(try fixture.outbox.directFinalizationRecordReady(receiverIdentity: sleepPending.receiverBindingID))
+            XCTAssertTrue(try fixture.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        }
         let resumed: HealthBridgeCompanionApplicationRuntime
         if coldBootstrap {
             initial.automaticSyncRuntime.stopAdmission()
@@ -6784,11 +8905,25 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
             XCTAssertEqual(record.localScope.bindingID, peer.expectedBinding)
             let requestGenerationNumber = try XCTUnwrap(UInt64(requestGeneration.dropFirst()))
             XCTAssertEqual(record.localScope.generation, requestGenerationNumber + 1)
-            XCTAssertTrue(fixture.settings.receiverURLString.isEmpty)
+            if protectDirectSleep {
+                let direct = DirectHTTPConnectionConfigurationV1(
+                    receiverURLString: "http://127.0.0.1:8765/v1/batches",
+                    bearerToken: "synthetic-pairing-retry-direct-token"
+                )
+                XCTAssertEqual(record.transportConfigurations, [
+                    .directHTTP(activation: .inactive, configuration: direct),
+                    .mailbox(activation: .active, configuration: MailboxConnectionConfigurationV1()),
+                ])
+                XCTAssertEqual(fixture.settings.receiverURLString, direct.receiverURLString)
+            } else {
+                XCTAssertTrue(fixture.settings.receiverURLString.isEmpty)
+            }
         }
         XCTAssertTrue(requests.allSatisfy { $0 == publishedRequest })
         XCTAssertEqual(try fixture.keys.loadOrCreate(), originalKeys)
-        XCTAssertTrue(try fixture.settings.loadBearerToken().isEmpty)
+        if !protectDirectSleep {
+            XCTAssertTrue(try fixture.settings.loadBearerToken().isEmpty)
+        }
         XCTAssertFalse(fixture.background.isEnabled)
         XCTAssertTrue(fixture.reads.isEmpty)
         XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
@@ -7056,6 +9191,149 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         }
     }
 
+    func testMailboxFirstRawStepsACKWithNoPriorAnchorOpensDailyCollection() async throws {
+        let (fixture, runtime) = try makeFixture(representation: .raw, hasPriorRawAnchor: false)
+        let binding = fixture.identity.opaqueBinding
+        let source = HealthBridgeAppleHealthSource.phone.sourceKey
+        let rawKind = StepCountSyncBatchFactory.anchoredCursorKind
+        let fallbackKind = GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps")
+        func cursor(_ kind: String) throws -> String? {
+            try fixture.cursors.cursorValue(receiverBindingID: binding, sourceKey: source, cursorKind: kind)
+        }
+
+        await runtime.bootstrap()
+        await fixture.join(runtime)
+        try await fixture.arm(runtime)
+        let pending = try fixture.pending()
+        let generation = try XCTUnwrap(pending["steps"])
+        XCTAssertNil(try cursor(rawKind))
+        XCTAssertNil(try cursor(fallbackKind))
+
+        await runtime.handleBackgroundRefresh()
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw"])
+        let raw = try XCTUnwrap(fixture.outbox.pendingItems().first)
+        XCTAssertEqual(raw.deliveryState?.phase, .providerObserved)
+        XCTAssertNil(try cursor(fallbackKind), "Publishing raw bytes is not an ACK.")
+
+        await runtime.handleBackgroundRefresh()
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw"], "A published but unacknowledged item must still block collection.")
+        XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [raw.id])
+        XCTAssertEqual(try fixture.pending(), pending)
+
+        try await fixture.acknowledge(raw)
+        XCTAssertEqual(try cursor(fallbackKind), fixture.nextAnchor)
+        XCTAssertNil(try cursor(rawKind), "An automatic bounded read must not establish the shared anchor.")
+        XCTAssertEqual(try fixture.pending(), pending, "A raw ACK does not satisfy the observer's daily coverage.")
+
+        await runtime.handleBackgroundRefresh()
+        await fixture.join(runtime)
+        XCTAssertEqual(fixture.reads, ["raw", "daily"], "The first post-ACK read must be daily even with raw data still available.")
+        let daily = try XCTUnwrap(fixture.outbox.pendingItems().first)
+        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: daily.fileURL))
+        XCTAssertFalse(batch.samples.isEmpty)
+        XCTAssertTrue(batch.samples.allSatisfy { $0.metadata["sample_kind"] == "daily_aggregate" })
+        XCTAssertFalse(try fixture.outbox.hasPendingGenerationRetirement(typeCode: "steps", generation: generation))
+        try await fixture.acknowledge(daily)
+        XCTAssertEqual(try fixture.pending(), pending, "The priority turn may not retire later unread raw work.")
+    }
+
+    func testMailboxAcknowledgedStepsProjectionRetriesAfterDailyReadFailure() async throws {
+        enum RawOutcome: CaseIterable { case readFailure, admissionFailure, queued }
+        for raw in RawOutcome.allCases {
+            let (fixture, runtime) = try makeFixture(representation: .raw)
+            await runtime.bootstrap()
+            await fixture.join(runtime)
+            try await fixture.arm(runtime)
+
+            await runtime.handleBackgroundRefresh()
+            await fixture.join(runtime)
+            try await fixture.assertCollectedAndAcknowledge()
+            let admitted = try fixture.pending()
+            let generation = try XCTUnwrap(admitted["steps"])
+            let freshAnchor = try HealthKitAnchorCursorCodec.encode(HKQueryAnchor(fromValue: 43))
+            fixture.followUpRawAnchor = freshAnchor
+            fixture.failDailyStepsRead = true
+
+            await runtime.handleBackgroundRefresh()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.reads, ["raw", "daily"], "The raw ACK must open one actual daily query.")
+            XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty, "The daily query threw before enqueue.")
+            XCTAssertEqual(try fixture.pending(), admitted)
+
+            fixture.failRawStepsRead = raw == .readFailure
+            let sequenceURL = fixture.outbox.directoryURL.appendingPathComponent(".fifo-sequence")
+            let sequenceBytes = try Data(contentsOf: sequenceURL)
+            if raw == .admissionFailure {
+                var sequence = try XCTUnwrap(JSONSerialization.jsonObject(with: sequenceBytes) as? [String: Any])
+                sequence["nextSequence"] = NSNumber(value: UInt64.max - 1)
+                try JSONSerialization.data(withJSONObject: sequence).write(to: sequenceURL, options: .atomic)
+            }
+            // Keep statistics unavailable until raw has had its opportunity.
+            await runtime.handleBackgroundRefresh()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.reads, ["raw", "daily", "raw"])
+            if raw == .admissionFailure {
+                try sequenceBytes.write(to: sequenceURL, options: .atomic)
+            }
+            if raw != .queued {
+                XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+            } else {
+                let freshRaw = try XCTUnwrap(fixture.outbox.pendingItems().first)
+                let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: freshRaw.fileURL))
+                XCTAssertEqual(batch.samples.map { $0.metadata["sample_kind"] }, ["raw_quantity"])
+                XCTAssertEqual(batch.sync.cursors.first {
+                    $0.cursorKind == StepCountSyncBatchFactory.anchoredCursorKind
+                }?.cursorValue, freshAnchor)
+                await runtime.handleBackgroundRefresh()
+                await fixture.join(runtime)
+                XCTAssertEqual(fixture.reads, ["raw", "daily", "raw"], "Daily must wait for the fresh raw FIFO head.")
+                XCTAssertEqual(try fixture.outbox.pendingItems().map(\.id), [freshRaw.id])
+                try await fixture.acknowledge(freshRaw)
+            }
+            XCTAssertEqual(try fixture.pending(), admitted)
+
+            fixture.failDailyStepsRead = false
+            await runtime.handleBackgroundRefresh()
+            await fixture.join(runtime)
+            XCTAssertEqual(fixture.reads, ["raw", "daily", "raw", "daily"],
+                "Recovered daily statistics must be queried even when the intervening raw read still fails.")
+            let items = try fixture.outbox.pendingItems()
+            XCTAssertEqual(items.count, 1)
+            let daily = try XCTUnwrap(items.first)
+            let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: daily.fileURL))
+            XCTAssertFalse(batch.samples.isEmpty)
+            XCTAssertTrue(batch.samples.allSatisfy { $0.metadata["sample_kind"] == "daily_aggregate" })
+            XCTAssertFalse(try fixture.outbox.hasPendingGenerationRetirement(typeCode: "steps", generation: generation))
+            try await fixture.acknowledge(daily)
+            XCTAssertEqual(try fixture.pending(), admitted, "A projection turn cannot retire unread raw work.")
+        }
+    }
+
+    func testMailboxPreACKCursorComparisonRejectsOtherReceiverProjectionTurnMutation() throws {
+        let (fixture, _) = try makeFixture(representation: .raw)
+        let kind = "mailbox_steps_projection_turn"
+        let source = HealthBridgeAppleHealthSource.phone.sourceKey
+        let unrelatedBinding = Data(repeating: 0x55, count: 32).base64URLEncodedString()
+        try fixture.cursors.saveCursorValue("old", receiverBindingID: unrelatedBinding, sourceKey: source, cursorKind: kind)
+        let decoder = JSONDecoder()
+        let before = try decoder.decode([String: String].self, from: Data(contentsOf: fixture.cursors.fileURL))
+        try fixture.cursors.saveCursorValue("turn", receiverBindingID: fixture.identity.opaqueBinding, sourceKey: source, cursorKind: kind)
+        let scopedTurnOnly = try decoder.decode([String: String].self, from: Data(contentsOf: fixture.cursors.fileURL))
+        XCTAssertEqual(fixture.preACKCursorMap(before, allowRawProjectionTurn: true),
+                       fixture.preACKCursorMap(scopedTurnOnly, allowRawProjectionTurn: true))
+        XCTAssertNotEqual(fixture.preACKCursorMap(before, allowRawProjectionTurn: false),
+                          fixture.preACKCursorMap(scopedTurnOnly, allowRawProjectionTurn: false))
+
+        try fixture.cursors.saveCursorValue("changed", receiverBindingID: unrelatedBinding, sourceKey: source, cursorKind: kind)
+        let unrelatedTurnChanged = try decoder.decode([String: String].self, from: Data(contentsOf: fixture.cursors.fileURL))
+        for allowRawProjectionTurn in [true, false] {
+            XCTAssertNotEqual(fixture.preACKCursorMap(scopedTurnOnly, allowRawProjectionTurn: allowRawProjectionTurn),
+                              fixture.preACKCursorMap(unrelatedTurnChanged, allowRawProjectionTurn: allowRawProjectionTurn))
+        }
+    }
+
     func testForegroundMailboxWaitingHeadDoesNotCollectNewData() async throws {
         let (fixture, runtime) = try makeFixture(representation: .raw)
         await runtime.bootstrap()
@@ -7253,13 +9531,15 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
         representation: MailboxLaunchFixture.Representation,
         enabled: Bool = true,
         mailboxOnly: Bool = false,
+        hasPriorRawAnchor: Bool = true,
         cleanup: BlockingBootstrapCleanup? = nil
     ) throws -> (MailboxLaunchFixture, HealthBridgeCompanionApplicationRuntime) {
         #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
         throw XCTSkip("Build the App host and test target with HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST.")
         #else
         let fixture = try MailboxLaunchFixture(
-            representation: representation, enabled: enabled, mailboxOnly: mailboxOnly
+            representation: representation, enabled: enabled, mailboxOnly: mailboxOnly,
+            hasPriorRawAnchor: hasPriorRawAnchor
         )
         let runtime = try fixture.makeRuntime(cleanup: cleanup)
         addTeardownBlock { @MainActor in
@@ -7281,6 +9561,7 @@ final class MailboxForegroundLaunchCatchUpTests: XCTestCase {
 @MainActor
 private final class MailboxLaunchFixture {
     enum Representation: CaseIterable { case raw, daily }
+    private enum StepsReadFailure: Error { case raw, daily }
 
     let root: URL
     let suiteName = "MailboxForegroundLaunchCatchUpTests.\(UUID().uuidString)"
@@ -7306,7 +9587,11 @@ private final class MailboxLaunchFixture {
     let initialCursorBytes: Data
     let session: URLSession
     let representation: Representation
+    let hasPriorRawAnchor: Bool
     var offerData = false
+    var failRawStepsRead = false
+    var failDailyStepsRead = false
+    var followUpRawAnchor: String?
     var offeredDailyAggregates: [HealthKitDailyActivityAggregate] = []
     var readSuspension: MailboxLaunchReadSuspension?
     var reads: [String] = []
@@ -7319,8 +9604,12 @@ private final class MailboxLaunchFixture {
     private var envelopeNumber: UInt8 = 0
     private var registeredQueries: [HKQuery] = []
 
-    init(representation: Representation, enabled: Bool, mailboxOnly: Bool = false, unpaired: Bool = false) throws {
+    init(
+        representation: Representation, enabled: Bool, mailboxOnly: Bool = false, unpaired: Bool = false,
+        hasPriorRawAnchor: Bool = true
+    ) throws {
         self.representation = representation
+        self.hasPriorRawAnchor = hasPriorRawAnchor
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MailboxLaunchNoNetworkURLProtocol.self]
         session = URLSession(configuration: configuration)
@@ -7406,18 +9695,20 @@ private final class MailboxLaunchFixture {
         previousDailyCursor = HealthBridgeUTCFormatter.string(from: Date().addingTimeInterval(-172_800))
         // This models an existing installation with previously acknowledged raw Steps.
         // New reads must not replace this cursor or retire pending work without an ACK.
-        try cursors.saveCursorValue(
-            previousAnchor, receiverBindingID: identity.opaqueBinding,
-            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
-            cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
-        )
+        if hasPriorRawAnchor {
+            try cursors.saveCursorValue(
+                previousAnchor, receiverBindingID: identity.opaqueBinding,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+            )
+            proofs.markUploadedRecords(lane: .steps, receiverBindingID: identity.opaqueBinding)
+        }
         try cursors.saveCursorValue(
             previousDailyCursor, receiverBindingID: identity.opaqueBinding,
             sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
             cursorKind: DailyActivityAggregateSyncPolicy.cursorKind
         )
         initialCursorBytes = try Data(contentsOf: cursors.fileURL)
-        proofs.markUploadedRecords(lane: .steps, receiverBindingID: identity.opaqueBinding)
         try background.setEnabledDurably(enabled)
         CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
             runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
@@ -7455,9 +9746,17 @@ private final class MailboxLaunchFixture {
             mailboxKeyStore: keys, nativeMailboxIO: nativeMailboxIO,
             readAnchoredStepChanges: firstReaderOverride ?? { [self] anchor, start, now in
                 reads.append("raw")
-                XCTAssertEqual(anchor, previousAnchor)
-                XCTAssertNil(start)
-                let changes = rawChanges(now: now, hasRecords: offerData && representation == .raw)
+                if hasPriorRawAnchor {
+                    XCTAssertEqual(anchor, followUpRawAnchor == nil ? previousAnchor : nextAnchor)
+                    XCTAssertNil(start)
+                } else if reads == ["raw"] {
+                    XCTAssertNil(anchor)
+                    XCTAssertNotNil(start, "A cursorless automatic read must be bounded.")
+                }
+                if failRawStepsRead { throw StepsReadFailure.raw }
+                let changes = rawChanges(
+                    now: now, hasRecords: offerData && representation == .raw, resultAnchor: followUpRawAnchor
+                )
                 if representation == .raw, let readSuspension {
                     await readSuspension.wait()
                 }
@@ -7467,6 +9766,7 @@ private final class MailboxLaunchFixture {
             readDailyActivityAggregates: { [self] types, start, end, calendar in
                 reads.append("daily")
                 XCTAssertEqual(types, ["steps"])
+                if failDailyStepsRead { throw StepsReadFailure.daily }
                 guard offerData else { return [] }
                 let today = calendar.startOfDay(for: end)
                 let yesterday = try XCTUnwrap(calendar.date(byAdding: .day, value: -1, to: today))
@@ -7562,13 +9862,13 @@ private final class MailboxLaunchFixture {
         admittedGenerations = try pending()
     }
 
-    func rawChanges(now: Date, hasRecords: Bool) -> HealthKitAnchoredStepChanges {
+    func rawChanges(now: Date, hasRecords: Bool, resultAnchor: String? = nil) -> HealthKitAnchoredStepChanges {
         let start = now.addingTimeInterval(-120)
         return HealthKitAnchoredStepChanges(
             stepSamples: hasRecords ? [HealthKitStepSampleSummary(
                 uuid: UUID(), start: start, end: start.addingTimeInterval(60), count: 17
             )] : [],
-            deletedStepSamples: [], anchorCursorValue: hasRecords ? nextAnchor : previousAnchor,
+            deletedStepSamples: [], anchorCursorValue: hasRecords ? (resultAnchor ?? nextAnchor) : previousAnchor,
             windowStart: start, windowEnd: now
         )
     }
@@ -7600,13 +9900,32 @@ private final class MailboxLaunchFixture {
         return replacement.opaqueBinding
     }
 
-    func assertOldProgress() throws {
-        XCTAssertEqual(try Data(contentsOf: cursors.fileURL), initialCursorBytes)
+    func preACKCursorMap(_ entries: [String: String], allowRawProjectionTurn: Bool) -> [String: String] {
+        guard allowRawProjectionTurn else { return entries }
+        let source = HealthBridgeAppleHealthSource.phone.sourceKey
+        let turnKey = "receiver_binding_v1#\(identity.opaqueBinding)#\(source)#mailbox_steps_projection_turn"
+        return entries.filter { $0.key != turnKey }
+    }
+
+    func assertOldProgress(allowRawProjectionTurn: Bool = false) throws {
+        let decoder = JSONDecoder()
+        let initial = try decoder.decode([String: String].self, from: initialCursorBytes)
+        let current = try decoder.decode([String: String].self, from: Data(contentsOf: cursors.fileURL))
+        XCTAssertEqual(preACKCursorMap(current, allowRawProjectionTurn: allowRawProjectionTurn),
+                       preACKCursorMap(initial, allowRawProjectionTurn: allowRawProjectionTurn))
         XCTAssertEqual(try cursors.cursorValue(
             receiverBindingID: identity.opaqueBinding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
             cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
-        ), previousAnchor)
-        XCTAssertTrue(proofs.hasUploadedRecords(lane: .steps, receiverBindingID: identity.opaqueBinding))
+        ), hasPriorRawAnchor ? previousAnchor : nil)
+        XCTAssertEqual(try cursors.cursorValue(
+            receiverBindingID: identity.opaqueBinding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: DailyActivityAggregateSyncPolicy.cursorKind
+        ), previousDailyCursor)
+        XCTAssertNil(try cursors.cursorValue(
+            receiverBindingID: identity.opaqueBinding, sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+            cursorKind: GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps")
+        ))
+        XCTAssertEqual(proofs.hasUploadedRecords(lane: .steps, receiverBindingID: identity.opaqueBinding), hasPriorRawAnchor)
         XCTAssertFalse(proofs.hasUploadedRecords(lane: .workouts, receiverBindingID: identity.opaqueBinding))
     }
 
@@ -7769,13 +10088,13 @@ private final class MailboxLaunchFixture {
         XCTAssertEqual(admitted, admittedGenerations)
         let generation = try XCTUnwrap(admitted["steps"])
         XCTAssertEqual(try outbox.hasPendingGenerationRetirement(typeCode: "steps", generation: generation), representation == .daily)
-        try assertOldProgress()
+        try assertOldProgress(allowRawProjectionTurn: representation == .raw)
         XCTAssertEqual(item.deliveryState?.phase, .providerObserved)
         let summaryWithoutACK = try await delivery().reconcilePendingFIFOHeadAcknowledgment(afterAcknowledgmentCheckpoint: nil)
         XCTAssertEqual(summaryWithoutACK.finalizedCount, 0)
         XCTAssertEqual(try outbox.pendingItems().map(\.id), [item.id])
         XCTAssertEqual(try pending(), admitted)
-        try assertOldProgress()
+        try assertOldProgress(allowRawProjectionTurn: representation == .raw)
 
         try await acknowledge(item)
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
@@ -7799,7 +10118,7 @@ private final class MailboxLaunchFixture {
         }
     }
 
-    private func acknowledge(_ item: FileOutboxItem) async throws {
+    func acknowledge(_ item: FileOutboxItem) async throws {
         let payload = try Data(contentsOf: item.fileURL)
         let envelopeID = try components().transport.finalizedEnvelopeID(itemID: item.id)
         let ack = try DeliveryProtocolV1.sealAck(
