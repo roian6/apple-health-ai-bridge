@@ -1,5 +1,8 @@
 from pathlib import Path
 
+from tests.guardrails.mailbox_publication_effect_contract import swift_tokens
+from tests.guardrails.mailbox_publication_guard import SwiftLexer
+
 VIEW_MODEL = Path("ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift")
 UPLOADER = Path(
     "ios/HealthBridgeCompanion/App/BackgroundURLSessionOutboxUploader.swift"
@@ -121,7 +124,19 @@ def test_background_completion_requires_exact_atomic_receiver_binding() -> None:
         "public func directFinalizationRecordReady(", accepted_start
     )
     accepted = outbox[accepted_start:accepted_end]
-    assert "transaction.cursorCheckpoint?.receiverIdentity" in accepted
+    transaction_owner = swift_tokens("""
+        guard transaction.entries.allSatisfy({
+            $0.receiverIdentity == receiverIdentity
+        }), transaction.cursorCheckpoint?.receiverIdentity == receiverIdentity
+            || transaction.cursorCheckpoint == nil else {
+            throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
+        }
+        let isNewAcceptance = !transaction.directAcknowledgedIDs.contains(itemID)
+    """)
+    accepted_code = swift_tokens(SwiftLexer(accepted).views().structure)
+    assert transaction_owner in accepted_code, (
+        "Direct ACK must require matching transaction entries and checkpoint owner"
+    )
     assert "item.receiverIdentity == receiverIdentity" in accepted
 
 

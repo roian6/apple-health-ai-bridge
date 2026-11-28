@@ -49,6 +49,7 @@ final class NutritionMailboxFixture {
     var envelopeNumber: UInt8 = 0
     var capabilityReadIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in })
     var beforeTransportLocate: (() throws -> Void)?
+    var beforeDeliveryComponents: (() throws -> Void)?
     var ackScanFault: MailboxAckScanner.Fault = { _ in }
     var prepareAckCandidate = MailboxAckScanner.prepareCandidateForBoundedRead
 
@@ -173,7 +174,10 @@ final class NutritionMailboxFixture {
             settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
             pendingGenerationStore: pendingGenerationStore ?? BackgroundSyncSettingsStore(userDefaults: base.defaults),
             sleepStore: sleepStore,
-            keyStore: keys, componentsFactory: { components }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
+            keyStore: keys, componentsFactory: { [self] in
+                try beforeDeliveryComponents?()
+                return components
+            }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
         )
     }
 

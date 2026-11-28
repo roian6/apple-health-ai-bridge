@@ -139,7 +139,7 @@ def assert_live_mailbox_finalization_attribution(view_model: str) -> None:
               let deliveryOutbox, outbox === deliveryOutbox,
               ownership.receiverBindingID == target.bindingID,
               ownership.receiverGeneration == target.generation,
-              (try? requireCurrentPayloadDeliveryTarget(target)) != nil,
+              (try? currentPayloadDeliveryTarget()) == target,
               (try? deliveryOutbox.requireUploadAdmission()) != nil else { return }
         recordAcceptedTransfer(
             bindingID: target.bindingID, generation: target.generation,
@@ -179,12 +179,12 @@ def assert_new_mailbox_finalization_contract(delivery: str) -> None:
             onNewFinalization(coordinator.ownership)
         }
     """)
-    callback = swift_tokens("onNewFinalization(")
+    callback = re.compile(r"\bonNewFinalization(?: \))* \(")
     for tokens, invocations in ((bounded_tokens, 2), (manual_tokens, 1)):
         assert tokens.count(commit) == invocations, (
             "Core must forward evidence from the commit callback with the actual owner"
         )
-        assert tokens.count(callback) == invocations, (
+        assert len(callback.findall(tokens)) == invocations, (
             "Core must not synthesize or duplicate durable finalization evidence"
         )
 

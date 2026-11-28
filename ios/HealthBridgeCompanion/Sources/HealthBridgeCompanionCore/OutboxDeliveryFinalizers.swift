@@ -112,7 +112,7 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
                itemID: descriptor.itemID, receiverIdentity: descriptor.receiverBindingID
            ),
            let finalized = try await commitDirectSleepIfPending(
-                descriptor: descriptor, item: item, sleepStore: sleepStore(),
+                descriptor: descriptor, item: item, sleepStore: sleepStore(), acceptedRevision: acceptedSleepRevision,
                 onNewAcceptance: onNewAcceptance,
                 validateOwner: validate,
                 validate: {
@@ -141,11 +141,12 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
         descriptor: DirectUploadCompletionDescriptor,
         item: FileOutboxItem?,
         sleepStore: any SleepSyncManifestStoring,
+        acceptedRevision: SleepSyncStorageRevision?,
         onNewAcceptance: @MainActor () -> Void,
         validateOwner: @MainActor () throws -> Void,
         validate: @escaping @MainActor () throws -> Void
     ) async throws -> Bool? {
-        var revision = try sleepStore.revisionForSync()
+        var revision = try acceptedRevision ?? sleepStore.revisionForSync()
         let check = { @MainActor in
             try Task.checkCancellation()
             try validate()
@@ -277,13 +278,18 @@ public final class OutboxDeliveryCursorFinalizer: OutboxDeliveryCommitFinalizing
     ) async throws -> Bool {
         try validate()
         if try finalizeDirectAcknowledgments(receiverBindingID: receiverBindingID) { return true }
-        guard let record = try outbox.directSleepCleanupRecord(receiverBindingID: receiverBindingID)
-            ?? outbox.directFinalizationRecordReady(receiverIdentity: receiverBindingID) else {
-            return false
+        if let record = try outbox.directSleepCleanupRecord(receiverBindingID: receiverBindingID) {
+            return try await recoverDirectSleepAcknowledgment(
+                record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
+                sleepStore: sleepStore(), validate: validate
+            )
         }
+        guard try outbox.directFinalizationRecordReady(receiverIdentity: receiverBindingID) != nil else { return false }
+        let store = try sleepStore()
+        guard let itemID = try await store.loadPendingForSync(validate: validate)?.outboxItemID else { return false }
         return try await recoverDirectSleepAcknowledgment(
-            record, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
-            sleepStore: sleepStore(), validate: validate
+            itemID: itemID, receiverBindingID: receiverBindingID, receiverGeneration: receiverGeneration,
+            sleepStore: store, validate: validate
         )
     }
 

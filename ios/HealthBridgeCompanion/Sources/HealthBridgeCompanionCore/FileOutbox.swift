@@ -326,6 +326,16 @@ public enum FileOutboxDowngradeReadiness: Equatable, Sendable {
     case hold(FileOutboxDowngradeHoldReason)
 }
 
+public enum AcceptedFinalizationHoldReason: Equatable, Sendable {
+    case cleanupPending
+    case proofMissing
+}
+
+public struct AcceptedFinalizationHold: Error, Equatable, Sendable {
+    public let reason: AcceptedFinalizationHoldReason
+    public let affectedTypeCodes: Set<String>
+}
+
 enum FileOutboxEnvelopeFinalizationBoundary: CaseIterable, Equatable {
     case intentPersisted
     case stagedEnvelopePersisted
@@ -1455,10 +1465,27 @@ public final class FileOutbox {
     }
 
     func hasPendingDirectSleepCleanup() throws -> Bool {
-        try loadEnqueueTransactions().contains {
-            $0.directSleepCleanupIntent != nil
-                || ($0.finalizationRecord?.isDirectSleepRecord == true && !$0.uncheckedDirectAcknowledgmentIDs.isEmpty)
+        try acceptedFinalizationHold()?.affectedTypeCodes.contains(HealthBridgeHealthType.sleepAnalysis.typeCode) == true
+    }
+
+    public func acceptedFinalizationHold() throws -> AcceptedFinalizationHold? {
+        let sleepTypes: Set<String> = [HealthBridgeHealthType.sleepAnalysis.typeCode]
+        var cleanupPending = false
+        for transaction in try loadEnqueueTransactions() {
+            let intent = transaction.directSleepCleanupIntent
+            guard intent != nil || transaction.finalizationRecord?.isDirectSleepRecord == true else { continue }
+            for id in transaction.uncheckedDirectAcknowledgmentIDs {
+                // An intent proves only its own item. A missing sibling payload may
+                // still need independent proof from the domain finalizer.
+                if id != intent?.itemID,
+                   !fileManager.fileExists(atPath: finalPayloadURL(for: id).path),
+                   !fileManager.fileExists(atPath: stagedPayloadURL(for: id).path) {
+                    return AcceptedFinalizationHold(reason: .proofMissing, affectedTypeCodes: sleepTypes)
+                }
+                cleanupPending = true
+            }
         }
+        return cleanupPending ? AcceptedFinalizationHold(reason: .cleanupPending, affectedTypeCodes: sleepTypes) : nil
     }
 
     func hasUncheckedDirectSleepAcknowledgment(for transition: SleepSyncPendingTransition) throws -> Bool {
@@ -2962,13 +2989,24 @@ public final class FileOutbox {
     }
 
     private func recoverEnqueueTransactionsIfNeeded() throws {
-        let transactions = try loadEnqueueTransactions()
+        var transactions = try loadEnqueueTransactions()
         guard !transactions.isEmpty else { return }
         let loadedManifest = try loadManifest()
         var manifest = loadedManifest ?? .empty
         var manifestEntries = Dictionary(
             uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
         )
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        if !destructiveRecoveryIsRequested {
+            let checked = transactions.map { recoverLegacyDirectStepsChecks($0, manifestEntries: manifestEntries) }
+            if checked != transactions {
+                // Keep the classification durable before unlinking the only
+                // surviving evidence, including across a second restart.
+                try persistEnqueueTransactions(checked)
+                transactions = checked
+            }
+        }
+        #endif
         var sequenceOwners = Dictionary(
             uniqueKeysWithValues: manifest.entries.map { ($0.sequence, $0.id) }
         )
@@ -3096,6 +3134,47 @@ public final class FileOutbox {
             try persistEnqueueTransactions(retainedTransactions)
         }
     }
+
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    private func recoverLegacyDirectStepsChecks(
+        _ transaction: EnqueueTransaction, manifestEntries: [String: SequenceEntry]
+    ) -> EnqueueTransaction {
+        let unchecked = transaction.uncheckedDirectAcknowledgmentIDs
+        guard !unchecked.isEmpty, transaction.finalizationRecord?.isDirectSleepRecord == true else {
+            return transaction
+        }
+        var checked = transaction
+        for entry in transaction.entries where unchecked.contains(entry.id) {
+            guard transaction.directSleepCleanupIntent?.itemID != entry.id,
+                  let binding = entry.receiverIdentity, !binding.isEmpty,
+                  transaction.entries.allSatisfy({ $0.receiverIdentity == binding }),
+                  transaction.cursorCheckpoint.map({ $0.receiverIdentity == binding }) != false,
+                  let current = manifestEntries[entry.id], Self.hasSameCollectionIdentity(current, entry),
+                  current.mailboxBinding == nil, entry.mailboxBinding == nil,
+                  current.deliveryState == nil, entry.deliveryState == nil,
+                  !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path),
+                  legacyPayloadIsStepsOnly(finalPayloadURL(for: entry.id)) else { continue }
+            checked = checked.recordingDirectAcknowledgment(for: entry.id, sleepChecked: true)
+        }
+        return checked
+    }
+
+    private func legacyPayloadIsStepsOnly(_ url: URL) -> Bool {
+        guard let file = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              file.isRegularFile == true, file.isSymbolicLink == false,
+              let bytes = try? Data(contentsOf: url),
+              let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes),
+              batch.schemaID == "health_bridge.batch.v1", batch.schemaVersion == "1.0.0",
+              batch.healthTypes == [.steps], batch.workouts.isEmpty, batch.sleepSessions.isEmpty,
+              batch.samples.allSatisfy({ $0.typeCode == HealthBridgeHealthType.steps.typeCode }),
+              batch.deletedRecords.allSatisfy({ $0.recordFamily == "sample" }),
+              !batch.sync.cursors.isEmpty else { return false }
+        return batch.sync.cursors.allSatisfy {
+            $0.cursorKind == StepCountSyncBatchFactory.anchoredCursorKind
+                || $0.cursorKind == StepCountSyncBatchFactory.foregroundDailyCursorKind
+        }
+    }
+    #endif
 
     private func removeIfExists(_ fileURL: URL) throws {
         guard fileManager.fileExists(atPath: fileURL.path) else { return }

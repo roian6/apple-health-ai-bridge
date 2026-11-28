@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+from tests.guardrails.mailbox_publication_guard import SwiftLexer
+
 ROOT = Path(__file__).resolve().parents[2]
 VIEW_MODEL = ROOT / "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
 CORE = (
@@ -98,10 +100,9 @@ def test_sleep_delivery_cannot_report_completion_while_tracked_item_is_queued() 
     assert "if enqueueResult.wasInserted" in helper[track:held]
     # From the upload through the final queue check, even a recovery/error
     # branch may report only noncompletion.
-    assert all(
-        outcome.group(1).strip() == "false"
-        for outcome in re.finditer(r"\breturn\b([^\n]*)", helper[flush:held])
-    )
+    pre_fifo = SwiftLexer(helper[flush:held]).views().structure
+    exits = re.finditer(r"\breturn\b(?:\s+(false)\s*\})?", pre_fifo)
+    assert all(exit_.group(1) == "false" for exit_ in exits)
     assert queued_body.splitlines()[0].endswith("outboxItemID }) {")
     assert queued_body.splitlines()[-1] == "            return false"
     assert re.findall(r"\breturn\b", queued_body) == ["return"]

@@ -19,6 +19,10 @@ _PERSIST: Final = """try backgroundSyncStore.persistMailboxAckScanCheckpoint(
                             write.checkpoint, receiverGeneration: expectedGeneration
                         )"""
 _BOUNDED: Final = "private func reconcileMailboxDeliveryIfNeeded("
+_MANUAL_CANCEL: Final = """} catch let cancellation as CancellationError {
+                throw cancellation
+            } catch {
+                try requireCurrentPayloadDeliveryTarget(target)"""
 _CORE: Final = Path("ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore")
 _MANUAL_GUARD = (
     guards.test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check
@@ -69,10 +73,13 @@ def test_manual_checkpoint_completion_requires_exact_successful_write(
     [
         pytest.param(
             _MANUAL,
-            "finalizedOwner = nil\n                throw cancellation",
-            "throw cancellation",
-            "cancellation must discard",
-            id="manual-credit-after-cancellation",
+            _MANUAL_CANCEL,
+            _MANUAL_CANCEL.replace(
+                "throw cancellation",
+                "finalizedOwner = nil\n                throw cancellation",
+            ),
+            "cancellation must preserve",
+            id="manual-drop-commit-after-cancellation",
         ),
         pytest.param(
             _BOUNDED,
@@ -83,10 +90,12 @@ def test_manual_checkpoint_completion_requires_exact_successful_write(
         ),
         pytest.param(
             _BOUNDED,
-            "finalizedOwner = nil\n            return .cancelled",
-            "return .cancelled",
-            "cancellation must discard",
-            id="bounded-credit-after-cancellation",
+            "} catch is CancellationError {\n            return .cancelled",
+            """} catch is CancellationError {
+            finalizedOwner = nil
+            return .cancelled""",
+            "cancellation must preserve",
+            id="bounded-drop-commit-after-cancellation",
         ),
         pytest.param(
             _MANUAL,
@@ -165,7 +174,7 @@ def test_manual_checkpoint_guard_accepts_renamed_write(
         "outbox === deliveryOutbox",
         "ownership.receiverGeneration == target.generation",
         "ownership.receiverBindingID == target.bindingID",
-        "(try? requireCurrentPayloadDeliveryTarget(target)) != nil",
+        "(try? currentPayloadDeliveryTarget()) == target",
         "(try? deliveryOutbox.requireUploadAdmission()) != nil",
     ],
     ids=["outbox", "generation", "binding", "target", "admission"],

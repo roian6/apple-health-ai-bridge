@@ -377,6 +377,7 @@ def test_foreground_mailbox_phase_is_admitted_once_per_active_scene() -> None:
 
 
 def _assert_scoped_mailbox_summary(success: str, message: str) -> None:
+    success = SwiftLexer(success).views().structure
     calls = list(re.finditer(r"\bpublishMailboxDeliverySummary\s*\(", success))
     unchanged_ids = "".join(
         (
@@ -402,7 +403,25 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
         target_helpers.index("private func requireCurrentPayloadDeliveryTarget(") :
     ]
     assert "let generation = settingsStore.receiverSettingsGenerationToken" in capture
-    assert "try requireCurrentConnectionGeneration(generation)" in capture
+    capture_tokens = swift_tokens(SwiftLexer(capture).views().structure)
+    assert (
+        swift_tokens(
+            "try Task.checkCancellation()\nreturn try currentPayloadDeliveryTarget()"
+        )
+        in capture_tokens
+    )
+    guard_and_result = swift_tokens("""
+        guard connectionTerminalBarrier.allowsPostResponseMutation(
+            capturedGeneration: generation,
+            currentGeneration: settingsStore.receiverSettingsGenerationToken
+        ), settingsStore.receiverBindingID == bindingID else {
+            throw CancellationError()
+        }
+        return PayloadDeliveryTarget(
+            route: route, generation: generation, bindingID: bindingID
+        )
+    """)
+    assert guard_and_result in capture_tokens
     assert (
         "record.localScope.generation == settingsStore.receiverSettingsGeneration"
         in capture
@@ -439,8 +458,8 @@ def test_manual_mailbox_ack_diagnostic_publishes_only_after_generation_check() -
     assert_manual_mailbox_checkpoint_completion(success)
     assert swift_tokens(
         mailbox[cancellation_catch:failure_catch].split("{", 1)[1]
-    ) == swift_tokens("finalizedOwner = nil\nthrow cancellation"), (
-        "Manual Mailbox cancellation must discard the finalization evidence"
+    ) == swift_tokens("throw cancellation"), (
+        "Manual Mailbox cancellation must preserve the durable commit evidence"
     )
     failure = mailbox[failure_catch:]
     assert_failed_mailbox_publication(failure, TARGET_FENCE)
@@ -513,8 +532,9 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
         r"\blet diagnostic\s*=\s*" + failure_factory + scope_inputs, publisher
     )
     scope_filter = r"\.filter\s*\{\s*\$0\.scope\s*!=\s*diagnostic\.scope\s*\}"
+    earlier_assignment = r"\blet earlier\s*=\s*currentMailboxDeliveryFailures\s*"
     assert re.search(
-        rf"\blet earlier\s*=\s*currentMailboxDeliveryFailures\s*{scope_filter}",
+        earlier_assignment + scope_filter + r"\s+let recovered\s*=",
         publisher,
     ), "Replace the same scope without dropping unrelated current failures"
     writes = list(
@@ -531,13 +551,16 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
             \s*if\s+case\s+\.item\(let\s+itemID\)\s*=\s*\$0\.scope\s*\{
                 \s*return\s+!recovered\.contains\(itemID\)\s*
             \}
+            \s*if\s+case\s+\.operation\(let\s+op\)\s*=\s*\$0\.scope\s*\{
+                \s*return\s+!completedOperations\.contains\(op\)\s*
+            \}
             \s*return\s+true\s*
         \}\s*\+\s*\[diagnostic\]
         \s+return\s+diagnostic\.message\s*\}\s*
         """,
         publisher[writes[0].end() :],
         re.VERBOSE,
-    ), "Drop only proven item failures and append the new diagnostic last"
+    ), "Drop only resolved items or operations; append the new diagnostic last"
     proof = _region(
         source, "func recoveredMailboxFailureIDs(", "func mailboxCheckpointWrite("
     )
@@ -558,10 +581,16 @@ def test_mailbox_failure_diagnostic_never_uses_arbitrary_error_text() -> None:
     assert "let generation = settingsStore.receiverSettingsGenerationToken" in (
         current_failures
     )
-    generation_filter = r"\.filter\s*\{\s*\$0\.failureGeneration\s*==\s*generation\s*\}"
-    assert re.search(
-        r"\breturn\s+mailboxDeliveryDiagnosticLines\s*" + generation_filter,
-        current_failures,
+    tokenized = swift_tokens(SwiftLexer(current_failures).views().structure)
+    expected = swift_tokens("""
+        let generation = settingsStore.receiverSettingsGenerationToken
+        return mailboxDeliveryDiagnosticLines.filter {
+            $0.failureGeneration == generation
+        }
+    }
+    """)
+    assert tokenized.partition("{")[2].strip() == expected, (
+        "Return only the current generation's diagnostics"
     )
     formatter = _region(
         source,
@@ -634,8 +663,8 @@ def test_background_delivery_uses_separate_bounded_publish_and_ack_phases() -> N
     failure_catch = helper.index("} catch {", cancellation_catch)
     assert swift_tokens(
         helper[cancellation_catch:failure_catch].split("{", 1)[1]
-    ) == swift_tokens("finalizedOwner = nil\nreturn .cancelled"), (
-        "Bounded Mailbox cancellation must discard the finalization evidence"
+    ) == swift_tokens("return .cancelled"), (
+        "Bounded Mailbox cancellation must preserve the durable commit evidence"
     )
     stale_fence = "".join(
         (

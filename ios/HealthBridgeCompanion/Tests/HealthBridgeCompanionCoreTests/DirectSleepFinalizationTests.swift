@@ -42,6 +42,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertTrue(receipt.pendingGenerationRetirements.isEmpty)
         XCTAssertNil(try outbox.directSleepCleanupIntent(for: receipt))
         XCTAssertTrue(try outbox.hasDirectAcknowledgmentWithSleepChecked(itemID: item.id, receiverIdentity: oldBinding))
+        XCTAssertNil(try outbox.acceptedFinalizationHold())
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
         let journalBefore = try Data(contentsOf: journal)
         XCTAssertFalse(try recovered.finalizeDirectAcknowledgments(receiverBindingID: newBinding))
@@ -215,6 +216,218 @@ final class DirectSleepFinalizationTests: XCTestCase {
         try await assertScopedSleepRecovery(legacyAcknowledgedSleep: true)
     }
 
+    func testAcceptedSleepRevisionCannotAdoptReplacementJournalAtCommit() async throws {
+        let f = try DirectSleepFinalizationFixture()
+        defer { f.remove() }
+        let accepted = try f.sleep.revisionForSync()
+        let replacement = SleepSyncPendingTransition(
+            payload: f.pending.payload, manifest: f.pending.manifest,
+            receiverBindingID: f.pending.receiverBindingID, connectionGeneration: f.pending.connectionGeneration,
+            outboxItemID: f.descriptor.itemID
+        )
+        var reads = 0
+        func store() throws -> FileSleepSyncManifestStore {
+            reads += 1
+            if reads == 2 { try f.sleep.savePendingTransition(replacement) }
+            return f.sleep
+        }
+        do {
+            _ = try await f.finalizer.recordDirectReceiverAcceptanceForSync(
+                descriptor: f.descriptor, sleepStore: store(), acceptedSleepRevision: accepted,
+                validate: {}, validatePending: {}, onNewAcceptance: { XCTFail("Wrong journal credited") }
+            )
+            XCTFail("Expected stale revision to cancel")
+        } catch is CancellationError {}
+        XCTAssertEqual(try f.sleep.loadPendingTransition(), replacement)
+        XCTAssertEqual(try f.sleep.loadManifest(), f.initial)
+        XCTAssertNotNil(try f.outbox.pendingItem(id: f.descriptor.itemID))
+    }
+
+    func testReceiverWideRecoveryFindsPendingSleepBehindIndependentReadyReceipts() async throws {
+        let binding = "receiver-a"
+        let steps = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: "steps-source", cursorKind: "steps-anchor", cursorValue: "steps"
+        )
+        let unknown = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: "older-sleep-source",
+            cursorKind: SleepSyncBatchFactory.anchoredCursorKind, cursorValue: "unknown"
+        )
+        let target = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: "target-sleep-source",
+            cursorKind: SleepSyncBatchFactory.anchoredCursorKind, cursorValue: "target"
+        )
+        let older = try DirectSleepFinalizationFixture()
+        defer { older.remove() }
+        let f = try DirectSleepFinalizationFixture(
+            checkpoint: target, leadingTransactions: [(try stepsPayload(), steps), (older.pending.payload, unknown)]
+        )
+        defer { f.remove() }
+        let ids = try f.outbox.pendingItems().map(\.id)
+        XCTAssertEqual(ids.count, 3)
+        let olderSleepID = try XCTUnwrap(ids.dropFirst().first)
+        let descriptor = f.descriptor
+        for id in ids {
+            XCTAssertNotNil(try f.outbox.recordDirectUploadAccepted(itemID: id, receiverIdentity: binding))
+        }
+        try f.sleep.saveManifest(f.pending.manifest)
+        let outbox = try FileOutbox(directory: f.outbox.directoryURL)
+        let cursor = try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("cursors.json"))
+        let sleep = try FileSleepSyncManifestStore(fileURL: f.root.appendingPathComponent("sleep.json"))
+        let finalizer = OutboxDeliveryCursorFinalizer(
+            outbox: outbox, cursorStore: cursor, pendingGenerationStore: f.background
+        )
+        func value(_ checkpoint: FileOutboxCursorCheckpoint) throws -> String? {
+            try cursor.cursorValue(
+                receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+            )
+        }
+        let journal = outbox.directoryURL.appendingPathComponent(".enqueue-transaction")
+        let original = try Data(contentsOf: journal)
+        let foreign = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: "receiver-b", receiverGeneration: descriptor.receiverGeneration,
+            sleepStore: sleep, validate: {}
+        )
+        XCTAssertFalse(foreign)
+        XCTAssertEqual(try Data(contentsOf: journal), original)
+
+        // A corrupt head is an error, not a failed match that recovery may bypass.
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        var transactions = try XCTUnwrap(object["transactions"] as? [[String: Any]])
+        transactions[0]["directSleepCheckedItemIDs"] = [descriptor.itemID]
+        object["transactions"] = transactions
+        let corrupt = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try corrupt.write(to: journal, options: .atomic)
+        do {
+            _ = try await finalizer.finalizeDirectAcknowledgments(
+                receiverBindingID: binding, receiverGeneration: descriptor.receiverGeneration,
+                sleepStore: sleep, validate: {}
+            )
+            XCTFail("Expected the corrupt journal to stop recovery.")
+        } catch {}
+        XCTAssertEqual(try Data(contentsOf: journal), corrupt)
+        XCTAssertEqual(try sleep.loadPendingTransition(), f.pending)
+        XCTAssertNil(try value(steps))
+        XCTAssertNil(try value(target))
+        try original.write(to: journal, options: .atomic)
+
+        let retiredSteps = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: binding, receiverGeneration: descriptor.receiverGeneration,
+            sleepStore: sleep, validate: {}
+        )
+        XCTAssertTrue(retiredSteps)
+        let recovered = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: binding, receiverGeneration: descriptor.receiverGeneration,
+            sleepStore: sleep, validate: {}
+        )
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(try value(steps), steps.cursorValue)
+        XCTAssertEqual(try value(target), target.cursorValue)
+        XCTAssertNil(try value(unknown))
+        XCTAssertNil(try sleep.loadPendingTransition())
+        XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
+        XCTAssertTrue(try f.background.loadPendingObserverTypeCodeGenerations().isEmpty)
+        let reopened = try FileOutbox(directory: outbox.directoryURL)
+        XCTAssertEqual(try reopened.directFinalizationRecordReady(receiverIdentity: binding)?.itemIDs, [olderSleepID])
+        XCTAssertTrue(try reopened.hasUncheckedDirectAcknowledgment(itemID: olderSleepID, receiverBindingID: binding))
+        XCTAssertTrue(try reopened.uploadablePendingItems(for: binding).isEmpty)
+    }
+
+    func testMixedLegacyRecoveryUsesSurvivingStepsPayloadBeforeRetiringIt() async throws {
+        try await assertMixedLegacyRecovery(stepsPayloadSurvives: true)
+    }
+
+    func testMixedLegacyRecoveryCannotInferStepsProvenanceAfterPayloadIsGone() async throws {
+        try await assertMixedLegacyRecovery(stepsPayloadSurvives: false)
+    }
+
+    func testMixedLegacyRecoveryDoesNotTrustCorruptedSurvivingStepsPayload() async throws {
+        try await assertMixedLegacyRecovery(stepsPayloadSurvives: true, corruptStepsPayload: true)
+    }
+
+    private func assertMixedLegacyRecovery(
+        stepsPayloadSurvives: Bool, corruptStepsPayload: Bool = false
+    ) async throws {
+        let binding = "receiver-a"
+        let checkpoint = FileOutboxCursorCheckpoint(
+            receiverIdentity: binding, sourceKey: "mixed-source", cursorKind: "mixed-anchor", cursorValue: "accepted"
+        )
+        let bytes = try stepsPayload()
+        let f = try DirectSleepFinalizationFixture(checkpoint: checkpoint, leadingPayload: bytes)
+        defer { f.remove() }
+        let steps = try XCTUnwrap(f.previousItem)
+        let target = f.descriptor
+        let directory = f.outbox.directoryURL
+        let sleepItem = try XCTUnwrap(f.outbox.pendingItem(id: target.itemID))
+        try f.sleep.saveManifest(f.pending.manifest)
+        // Publish the same receipt shape as the old writer, without invoking
+        // the current writer's retirement path before the cold owner opens it.
+        let journal = directory.appendingPathComponent(".enqueue-transaction")
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [String: Any])
+        var transactions = try XCTUnwrap(object["transactions"] as? [[String: Any]])
+        XCTAssertEqual(transactions.count, 1)
+        XCTAssertNil(transactions[0]["directSleepCheckedItemIDs"])
+        XCTAssertNil(transactions[0]["directSleepCleanupIntent"])
+        transactions[0]["directAcknowledgedItemIDs"] = [steps.id, target.itemID].sorted()
+        object["transactions"] = transactions
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: journal, options: .atomic)
+        try FileManager.default.removeItem(at: sleepItem.fileURL)
+        if !stepsPayloadSurvives {
+            try FileManager.default.removeItem(at: steps.fileURL)
+        } else if corruptStepsPayload {
+            try Data("{}".utf8).write(to: steps.fileURL)
+        }
+        let stepsProven = stepsPayloadSurvives && !corruptStepsPayload
+        let outbox = try FileOutbox(directory: directory)
+        let cursor = try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("cursors.json"))
+        let sleep = try FileSleepSyncManifestStore(fileURL: f.root.appendingPathComponent("sleep.json"))
+        let finalizer = OutboxDeliveryCursorFinalizer(
+            outbox: outbox, cursorStore: cursor, pendingGenerationStore: f.background
+        )
+        let stale = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: binding, receiverGeneration: "generation-other", sleepStore: sleep, validate: {}
+        )
+        XCTAssertFalse(stale)
+        XCTAssertEqual(try sleep.loadPendingTransition(), f.pending)
+        let finished = try await finalizer.finalizeDirectAcknowledgments(
+            receiverBindingID: binding, receiverGeneration: target.receiverGeneration, sleepStore: sleep, validate: {}
+        )
+        XCTAssertTrue(finished, "Sleep's own scoped cleanup must progress in both cases.")
+        XCTAssertNil(try sleep.loadPendingTransition())
+        XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
+        let reopened = try FileOutbox(directory: directory)
+        XCTAssertTrue(try reopened.uploadablePendingItems(for: binding).isEmpty)
+        let value = try cursor.cursorValue(
+            receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: checkpoint.cursorKind
+        )
+        XCTAssertEqual(value, stepsProven ? checkpoint.cursorValue : nil)
+        XCTAssertEqual(
+            try f.background.loadPendingObserverTypeCodeGenerations(), stepsProven ? [:] : f.generations
+        )
+        if stepsProven {
+            XCTAssertNil(try reopened.directFinalizationRecordReady(receiverIdentity: binding))
+        } else {
+            XCTAssertTrue(try reopened.hasUncheckedDirectAcknowledgment(itemID: steps.id, receiverBindingID: binding))
+            XCTAssertTrue(try reopened.hasDirectAcknowledgmentWithSleepChecked(
+                itemID: target.itemID, receiverIdentity: binding
+            ))
+        }
+    }
+
+    private func stepsPayload() throws -> Data {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        return try HealthBridgeBatchEncoder().encode(StepCountSyncBatchFactory.makeAnchoredStepBatch(
+            changes: HealthKitAnchoredStepChanges(
+                stepSamples: [HealthKitStepSampleSummary(
+                    uuid: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000186")),
+                    start: start, end: start.addingTimeInterval(60), count: 18
+                )],
+                deletedStepSamples: [], anchorCursorValue: "steps-anchor",
+                windowStart: start, windowEnd: start.addingTimeInterval(3600)
+            ),
+            generatedAt: start.addingTimeInterval(3600)
+        ))
+    }
+
     private func assertScopedSleepRecovery(legacyAcknowledgedSleep: Bool) async throws {
         let earlier = try DirectSleepFinalizationFixture()
         defer { earlier.remove() }
@@ -251,6 +464,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
             outbox: writer, cursorStore: cursorStore, pendingGenerationStore: f.background
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: a.fileURL.path))
+        XCTAssertEqual(try writer.acceptedFinalizationHold()?.reason, .proofMissing)
         XCTAssertTrue(try writer.hasUncheckedDirectAcknowledgment(itemID: a.id, receiverBindingID: binding))
 
         // Even the old ACK cannot prove a not-yet-committed Sleep transition.
@@ -311,6 +525,8 @@ final class DirectSleepFinalizationTests: XCTestCase {
             sleepStore: sleep, validate: {}
         )
         XCTAssertFalse(wrongItemAfterRestart)
+        XCTAssertEqual(try reopened.acceptedFinalizationHold()?.reason, .proofMissing,
+                       "B's scoped intent cannot cover A's missing proof.")
         XCTAssertEqual(try sleep.loadPendingTransition(), f.pending)
         let cleaned = try await recovered.finalizeDirectAcknowledgments(
             receiverBindingID: binding, receiverGeneration: generation, sleepStore: sleep, validate: {}
@@ -321,6 +537,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertTrue(try reopened.pendingItems().isEmpty)
         XCTAssertTrue(try reopened.hasDirectAcknowledgmentWithSleepChecked(itemID: b.itemID, receiverIdentity: binding))
         XCTAssertTrue(try reopened.hasUncheckedDirectAcknowledgment(itemID: a.id, receiverBindingID: binding))
+        XCTAssertEqual(try reopened.acceptedFinalizationHold()?.reason, .proofMissing)
         XCTAssertEqual(try cursorValue(), "old-checkpoint")
         XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
         let withoutAuthority = try await recovered.finalizeDirectAcknowledgments(
@@ -338,6 +555,11 @@ final class DirectSleepFinalizationTests: XCTestCase {
             itemID: a.id, receiverBindingID: binding, receiverGeneration: generation, sleepStore: sleep, validate: {}
         )
         XCTAssertTrue(aChecked)
+        XCTAssertNil(try reopened.acceptedFinalizationHold())
+        let replay = try await recovered.finalizeDirectAcknowledgments(
+            receiverBindingID: binding, receiverGeneration: generation, sleepStore: sleep, validate: {}
+        )
+        XCTAssertFalse(replay)
         XCTAssertNil(try sleep.loadPendingTransition())
         XCTAssertEqual(try cursorValue(), checkpoint.cursorValue)
         XCTAssertTrue(try f.background.loadPendingObserverTypeCodeGenerations().isEmpty)
@@ -363,6 +585,12 @@ final class DirectSleepFinalizationTests: XCTestCase {
         )
         XCTAssertNil(try sleep.loadPendingTransition())
         XCTAssertFalse(try outbox.retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: d.receiverBindingID))
+        let journal = outbox.directoryURL.appendingPathComponent(".enqueue-transaction")
+        let before = try Data(contentsOf: journal)
+        let hold = try XCTUnwrap(outbox.acceptedFinalizationHold())
+        XCTAssertEqual(hold.reason, .proofMissing)
+        XCTAssertEqual(hold.affectedTypeCodes, ["sleep_analysis"])
+        XCTAssertEqual(try Data(contentsOf: journal), before)
         let finished = try await recovered.finalizeDirectAcknowledgments(
             receiverBindingID: d.receiverBindingID, receiverGeneration: d.receiverGeneration,
             sleepStore: sleep, validate: {}
@@ -372,6 +600,33 @@ final class DirectSleepFinalizationTests: XCTestCase {
         XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
         XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
         XCTAssertTrue(try outbox.pendingItems().isEmpty)
+    }
+
+    func testIndependentStepsAndWorkoutReceiptsFinalizeWhileSleepProofIsMissing() throws {
+        let f = try DirectSleepFinalizationFixture()
+        defer { f.remove() }
+        let binding = f.descriptor.receiverBindingID
+        let outbox = f.outbox
+        XCTAssertNotNil(try outbox.recordDirectUploadAccepted(itemID: f.descriptor.itemID, receiverIdentity: binding))
+        try f.sleep.clearPendingTransition(id: f.pending.id)
+        let cursors = try FileSyncCursorStore(fileURL: f.root.appendingPathComponent("metric-cursors.json"))
+        let finalizer = OutboxDeliveryCursorFinalizer(outbox: outbox, cursorStore: cursors)
+        for kind in [StepCountSyncBatchFactory.anchoredCursorKind, WorkoutSyncBatchFactory.anchoredCursorKind] {
+            let checkpoint = FileOutboxCursorCheckpoint(
+                receiverIdentity: binding, sourceKey: "synthetic-source", cursorKind: kind, cursorValue: "next"
+            )
+            let item = try XCTUnwrap(outbox.enqueueSequence(
+                [Data("{}".utf8)], receiverIdentity: binding, cursorCheckpoint: checkpoint
+            ).first)
+            XCTAssertNotNil(try outbox.recordDirectUploadAccepted(itemID: item.id, receiverIdentity: binding))
+            XCTAssertEqual(try outbox.acceptedFinalizationHold()?.affectedTypeCodes, ["sleep_analysis"])
+            XCTAssertTrue(try finalizer.finalizeDirectAcknowledgments(receiverBindingID: binding))
+            XCTAssertEqual(try cursors.cursorValue(
+                receiverBindingID: binding, sourceKey: checkpoint.sourceKey, cursorKind: kind
+            ), "next")
+        }
+        XCTAssertEqual(try outbox.acceptedFinalizationHold()?.reason, .proofMissing)
+        XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
     }
 
     func testLegacySleepCleanupInterruptionRetainsAcceptanceAcrossRestart() async throws {
@@ -397,6 +652,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
             let outbox = try FileOutbox(directory: f.outbox.directoryURL)
             let sleep = try FileSleepSyncManifestStore(fileURL: manifest)
             XCTAssertEqual(try sleep.loadPendingTransition() != nil, !afterUnlink)
+            XCTAssertEqual(try outbox.acceptedFinalizationHold()?.reason, .cleanupPending)
             XCTAssertNotNil(try outbox.directFinalizationRecordReady(receiverIdentity: d.receiverBindingID))
             XCTAssertEqual(try f.background.loadPendingObserverTypeCodeGenerations(), f.generations)
             let recovered = OutboxDeliveryCursorFinalizer(
@@ -408,6 +664,7 @@ final class DirectSleepFinalizationTests: XCTestCase {
                 sleepStore: sleep, validate: {}
             )
             XCTAssertTrue(finished)
+            XCTAssertNil(try outbox.acceptedFinalizationHold())
             XCTAssertNil(try sleep.loadPendingTransition())
             XCTAssertEqual(try sleep.loadManifest(), f.pending.manifest)
             XCTAssertNil(try outbox.directFinalizationRecordReady(receiverIdentity: d.receiverBindingID))
@@ -733,13 +990,19 @@ private final class DirectSleepFinalizationFixture {
     let previousItem: FileOutboxItem?
 
     init(
-        checkpoint: FileOutboxCursorCheckpoint? = nil, nextPayload: Data? = nil, leadingPayload: Data? = nil
+        checkpoint: FileOutboxCursorCheckpoint? = nil, nextPayload: Data? = nil, leadingPayload: Data? = nil,
+        leadingTransactions: [(Data, FileOutboxCursorCheckpoint)] = []
     ) throws {
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         background = BackgroundSyncSettingsStore(userDefaults: defaults)
         try background.markPendingObserverTypeCodes(["sleep_analysis"])
         generations = try background.loadPendingObserverTypeCodeGenerations()
         outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        for (payload, checkpoint) in leadingTransactions {
+            _ = try outbox.enqueueSequence(
+                [payload], receiverIdentity: checkpoint.receiverIdentity, cursorCheckpoint: checkpoint
+            )
+        }
         sleep = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
         initial = SleepSyncBatchFactory.makeManifestReservation(
             receiverSettingsGeneration: "generation-a", historyDepth: .allAvailable,

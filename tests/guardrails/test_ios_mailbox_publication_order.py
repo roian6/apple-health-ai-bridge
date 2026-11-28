@@ -95,9 +95,12 @@ class _InMemoryViewModel:
             guards.test_background_delivery_uses_separate_bounded_publish_and_ack_phases,
             _BOUNDED,
             (
-                "completedOperations: completedOperations\n            )",
+                """completedOperations: completedOperations
+            )
+            if summary.terminalCount > 0""",
                 """completedOperations: await MainActor.run { completedOperations }
-            )""",
+            )
+            if summary.terminalCount > 0""",
             ),
             _SUSPENSION,
             id="bounded-normal-final-argument",

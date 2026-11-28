@@ -1,5 +1,8 @@
 from pathlib import Path
 
+from tests.guardrails.mailbox_publication_effect_contract import swift_tokens
+from tests.guardrails.mailbox_publication_guard import SwiftLexer
+
 ROOT = Path(__file__).resolve().parents[2]
 VIEW_MODEL = (
     ROOT
@@ -128,17 +131,60 @@ def test_foreground_uploads_capture_and_recheck_connection_generation() -> None:
     pending_end = source.index(
         "private func makeProductionMailboxDelivery()", pending_start
     )
-    pending = source[pending_start:pending_end]
+    pending = SwiftLexer(source[pending_start:pending_end]).views().structure
     response = pending.index(
         "lastDirectUploadResult = try await receiverClient.upload("
     )
-    post_response_check = pending.index(
-        "try requireCurrentPayloadDeliveryTarget(target)", response
+    direct_accept_guard = source.index(
+        "private func requireCurrentAcceptedDirectTarget("
     )
-    acceptance = pending.index(
-        "cursorFinalizer.recordDirectReceiverAcceptance(", post_response_check
+    direct_accept_end = source.index(
+        "private struct PayloadDelivery", direct_accept_guard
     )
-    assert response < post_response_check < acceptance
+    direct_accept = swift_tokens(
+        SwiftLexer(source[direct_accept_guard:direct_accept_end]).views().structure
+    )
+    assert (
+        swift_tokens("""
+        try requireCurrentConnectionGeneration(target.generation)
+        guard !terminalRecoveryRequestIsActive, !taskUIPublicationIsSuppressed,
+              case .directHTTP(let url) = target.route,
+              settingsStore.activeTransport == .directHTTP,
+              settingsStore.receiverBindingID == target.bindingID,
+              settingsStore.receiverURLString == url.absoluteString else {
+            throw CancellationError()
+        }
+    """)
+        in direct_accept
+    )
+    assert (
+        swift_tokens("try requireCurrentPayloadDeliveryTarget(target)")
+        not in direct_accept
+    )
+    assert swift_tokens("""
+        if let (store, snapshot) = sleepInput {
+            let validateAcceptedOwner = { @MainActor in
+                try self.requireCurrentAcceptedDirectTarget(target)
+                try self.validateSleepOperationAuthority(
+                    snapshot, store: store, outbox: outbox)
+            }
+            try validateAcceptedOwner()
+            guard try store.revisionForSync() == snapshot.storage else {
+                throw CancellationError()
+            }
+            _ = try await withSleepStorageOrigin {
+                try await cursorFinalizer.recordDirectReceiverAcceptanceForSync(
+    """) in swift_tokens(pending[response:])
+    assert swift_tokens("""
+        } else {
+            try requireCurrentAcceptedDirectTarget(target)
+            guard self.outbox === outbox,
+                  try outbox.pendingItem(id: item.id) == item else {
+                throw CancellationError()
+            }
+            try validateAcceptedPayload()
+            _ = try cursorFinalizer.recordDirectReceiverAcceptance(
+    """) in swift_tokens(pending[response:])
     assert "catch let cancellation as CancellationError" in pending
     assert "throw cancellation" in pending
 

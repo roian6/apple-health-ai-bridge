@@ -511,6 +511,71 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(tailAcceptance.generation, headAcceptance.generation)
     }
 
+    func testFailedMailboxReconciliationClearsOnlyResolvedPhaseSelection() async throws {
+        let fixture = try NutritionMailboxFixture(nativePairing: true)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        try BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults).setEnabledDurably(true)
+        CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        let outbox = fixture.base.outbox
+        // Exercise delivery and diagnostics without introducing two copies of
+        // the same nutrition cursor transaction ahead of the intended fault.
+        let binding = fixture.identity.opaqueBinding
+        let head = try outbox.enqueue(JSONEncoder().encode(fixture.base.mixedBatch()), receiverIdentity: binding)
+        let tail = try outbox.enqueue(
+            JSONEncoder().encode(fixture.base.mixedBatch(workoutEnergy: 20)), receiverIdentity: binding
+        )
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let waitingHead = try XCTUnwrap(outbox.pendingItem(id: head.id))
+        XCTAssertEqual(waitingHead.deliveryState?.phase, .providerObserved)
+        let vm = try await fixture.base.makeViewModel(mailbox: fixture, eligibleTypeCodes: [])
+        XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+
+        fixture.beforeTransportLocate = {
+            if try outbox.pendingItem(id: tail.id)?.deliveryState?.phase == .published {
+                throw MailboxLocatorError.symbolicLink
+            }
+        }
+        await vm.performManualSyncOpportunity(processPendingTypes: { false })
+        await vm.waitForBootstrapAndForegroundWork()
+        let tailFailure = try XCTUnwrap(vm.activityMailboxFailureMessage)
+        XCTAssertTrue(tailFailure.contains("phase=initial_advance"))
+        XCTAssertEqual(try outbox.pendingItem(id: tail.id)?.deliveryState?.phase, .published)
+        fixture.beforeTransportLocate = nil
+
+        fixture.beforeDeliveryComponents = { throw MailboxLocatorError.symbolicLink }
+        vm.noteSceneLeftActive()
+        vm.runForegroundMailboxReconciliationIfNeeded()
+        await vm.waitForBootstrapAndForegroundWork()
+        let selectionFailure = try XCTUnwrap(vm.activityMailboxFailureMessage)
+        XCTAssertTrue(selectionFailure.contains("error=mailbox_delivery_failed"))
+        XCTAssertNotEqual(selectionFailure, tailFailure)
+
+        _ = try fixture.receiveAndAcknowledge(waitingHead)
+        fixture.beforeDeliveryComponents = nil
+        fixture.ackScanFault = { boundary in
+            if boundary == .beforeCandidateOpen { throw MailboxAckScannerError.unsafeMailbox }
+        }
+        vm.noteSceneLeftActive()
+        vm.runForegroundMailboxReconciliationIfNeeded()
+        await vm.waitForBootstrapAndForegroundWork()
+        XCTAssertTrue(vm.activityMailboxFailureMessage?.contains("phase=scan_ack") == true)
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [head.id, tail.id])
+        XCTAssertNil(vm.lastAcceptedTransferObservation)
+
+        // Manual delivery can resolve the head's item failure but does not select
+        // the background phase. The preceding failed reconcile must retire that diagnostic.
+        fixture.ackScanFault = { _ in }
+        await vm.performManualSyncOpportunity(processPendingTypes: { false })
+        XCTAssertEqual(try outbox.deliveryState(for: head.id)?.phase, .committedFinalized)
+        XCTAssertEqual(try outbox.pendingItems().map(\.id), [tail.id])
+        XCTAssertEqual(vm.activityMailboxFailureMessage, tailFailure)
+    }
+
     func testAuthenticatedMailboxCommitRecordsAcceptedTransfer() async throws {
         let fixture = try NutritionMailboxFixture(nativePairing: true)
         defer { fixture.base.cleanup() }
@@ -803,6 +868,126 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: deliveries.path).sorted(), sent)
         XCTAssertEqual(fixture.base.receiver.batches.count, receiverCount)
         XCTAssertEqual(fixture.base.receiver.credentials, credentials)
+    }
+
+    func testManualMailboxCancellationBeforeAtomicCommitDoesNotRecordAcceptance() async throws {
+        try await checkMailboxCancellationAtCommit(.beforeCommit)
+    }
+
+    func testManualMailboxCancellationAfterAtomicCommitPreservesAcceptance() async throws {
+        try await checkMailboxCancellationAtCommit(.committedManual)
+    }
+
+    func testBoundedMailboxCancellationAfterAtomicCommitPreservesAcceptance() async throws {
+        try await checkMailboxCancellationAtCommit(.committedBounded)
+    }
+
+    func testCancelledMailboxCommitDoesNotCreditAuthoritativeReplacement() async throws {
+        try await checkMailboxCancellationAtCommit(.replacedAfterCommit)
+    }
+
+    private func checkMailboxCancellationAtCommit(_ scenario: MailboxCommitCancellation) async throws {
+        let files = MailboxEnvelopeRemovalFailure()
+        let fixture = try NutritionMailboxFixture(nativePairing: true, outboxFileManager: files)
+        defer { fixture.base.cleanup() }
+        try fixture.writeCapabilities()
+        let bounded = scenario == .committedBounded
+        try BackgroundSyncSettingsStore(userDefaults: fixture.base.defaults).setEnabledDurably(bounded)
+        if bounded {
+            CompanionHealthPermissionRequestStore(userDefaults: fixture.base.defaults).recordCompletedRequest(
+                runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                    forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+                )
+            )
+        }
+        let suite = fixture.base.suite + ".commit-cancellation"
+        let defaults = try XCTUnwrap(ForegroundSleepCommitDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let observations = LastAcceptedTransferObservationStore(
+            userDefaults: defaults, resetEpochURL: fixture.base.acceptedTransferResetEpochURL
+        )
+        fixture.base.acceptedTransferStore = observations
+        let outbox = fixture.base.outbox
+        let settings = fixture.base.settings
+        let generation = settings.receiverSettingsGenerationToken
+        let bindingID = fixture.identity.opaqueBinding
+        let item = try fixture.base.enqueueMixed()
+        _ = try await fixture.delivery().publishPendingFIFOHead()
+        let head = try XCTUnwrap(outbox.pendingItem(id: item.id))
+        XCTAssertEqual(head.deliveryState?.phase, .providerObserved)
+        let owner = try XCTUnwrap(head.deliveryState?.ownership)
+        _ = try fixture.receiveAndAcknowledge(head)
+        let event = try XCTUnwrap(fixture.components().scanner.scan().events.first)
+        let receipt = try XCTUnwrap(OutboxDeliveryCommittedReceiptV1(event: event))
+        let vm = try await fixture.base.makeViewModel(
+            mailbox: fixture, eligibleTypeCodes: [],
+            requestReadAuthorization: { _ in throw CocoaError(.featureUnsupported) }
+        )
+        XCTAssertNil(vm.lastAcceptedTransferObservation)
+        let phase: OutboxDeliveryPhase = scenario == .beforeCommit ? .ackVerified : .committedFinalized
+        var cancelledAt: FileOutboxDeliveryStateV1?
+        files.rejectManifestHardening = { path in
+            guard cancelledAt == nil,
+                  path == outbox.directoryURL.appendingPathComponent(".fifo-sequence").path,
+                  let state = try outbox.mailboxBoundItemsForAckScanning().first(where: { $0.id == item.id })?.deliveryState,
+                  state.phase == phase else { return false }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: item.fileURL.path))
+            cancelledAt = state
+            if scenario == .replacedAfterCommit {
+                _ = try settings.invalidateReceiverSettingsGeneration(expectedGeneration: generation)
+            }
+            withUnsafeCurrentTask { $0?.cancel() }
+            XCTAssertTrue(Task.isCancelled)
+            if scenario == .beforeCommit { try Task.checkCancellation() }
+            return false
+        }
+        defer { files.rejectManifestHardening = nil }
+
+        if bounded {
+            XCTAssertTrue(vm.automaticSyncRuntimeIsReady)
+            vm.noteSceneLeftActive()
+            vm.runForegroundMailboxReconciliationIfNeeded()
+            await vm.waitForBootstrapAndForegroundWork()
+        } else {
+            let sync = Task { @MainActor in
+                await vm.performManualSyncOpportunity(processPendingTypes: { false })
+            }
+            await sync.value
+            XCTAssertTrue(sync.isCancelled)
+        }
+
+        let boundary = try XCTUnwrap(cancelledAt)
+        XCTAssertEqual(boundary.committedReceipt, receipt)
+        XCTAssertEqual(boundary.ownership, owner)
+        let reopened = try FileOutbox(directory: outbox.directoryURL)
+        XCTAssertEqual(try reopened.deliveryState(for: item.id), boundary)
+        let observation = vm.lastAcceptedTransferObservation
+        switch scenario {
+        case .beforeCommit:
+            XCTAssertEqual(try reopened.pendingItems().map(\.id), [item.id])
+            XCTAssertNil(try fixture.base.cursor("dietary_protein"))
+            XCTAssertNil(observation)
+            XCTAssertEqual(defaults.commitWrites, 0)
+        case .replacedAfterCommit:
+            let replacementBinding = try XCTUnwrap(settings.receiverBindingID)
+            let replacementGeneration = settings.receiverSettingsGenerationToken
+            XCTAssertEqual(replacementBinding, bindingID)
+            XCTAssertNotEqual(replacementGeneration, generation)
+            XCTAssertNil(observations.load(bindingID: bindingID, generation: generation))
+            XCTAssertNil(observations.load(bindingID: replacementBinding, generation: replacementGeneration))
+            XCTAssertNil(observation)
+            XCTAssertEqual(defaults.commitWrites, 0)
+        case .committedManual, .committedBounded:
+            XCTAssertTrue(try reopened.pendingItems().isEmpty)
+            XCTAssertEqual(try fixture.base.cursor("dietary_protein"), fixture.base.anchor)
+            XCTAssertEqual(observation?.evidenceKind, .mailboxCommit)
+            XCTAssertEqual(observation?.bindingID, bindingID)
+            XCTAssertEqual(observation?.generation, generation)
+            XCTAssertEqual(defaults.commitWrites, 1)
+            await vm.performManualSyncOpportunity(processPendingTypes: { false })
+            XCTAssertEqual(vm.lastAcceptedTransferObservation, observation)
+            XCTAssertEqual(defaults.commitWrites, 1, "Ordinary replay cannot earn new acceptance credit")
+        }
     }
 
     func testManualMailboxTwoNewCommitsRecordOneLatestTransferObservation() async throws {
@@ -1641,6 +1826,10 @@ final class CompanionSyncPresentationAppTests: XCTestCase {
         ))
         XCTAssertEqual(viewModel.lastAcceptedTransferObservation, current)
     }
+}
+
+private enum MailboxCommitCancellation: Equatable {
+    case beforeCommit, committedManual, committedBounded, replacedAfterCommit
 }
 
 private enum ForegroundDirectSleepCompletionInput: Equatable {
