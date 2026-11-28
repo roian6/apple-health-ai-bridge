@@ -526,9 +526,12 @@ def test_background_mailbox_failure_checks_generation_before_publication() -> No
     )
     failure = mailbox[failure_catch:]
     assert_failed_mailbox_publication(failure, CONNECTION_FENCE, stale_return="")
+    diagnostic_prefix = r"\bpublishMailboxDeliveryFailure\s*\(\s*error\s*,\s*"
+    diagnostic_suffix = (
+        r"generation:\s*expectedGeneration\s*,\s*operation:\s*\.publishFIFOHead\s*\)"
+    )
     assert re.search(
-        r"\bpublishMailboxDeliveryFailure\s*\(\s*error\s*,\s*"
-        r"generation:\s*expectedGeneration\s*,\s*operation:\s*\.publishFIFOHead\s*\)",
+        f"{diagnostic_prefix}{diagnostic_suffix}",
         SwiftLexer(failure).views().structure,
     ), "Expected a scoped scheduler failure diagnostic"
     assert (

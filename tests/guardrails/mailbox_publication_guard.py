@@ -16,10 +16,11 @@ from tests.guardrails.mailbox_publication_effect_contract import (
 
 _LEXEME: Final = re.compile(r'//[^\n]*|/\*|\#*"{3}|\#*"|[/()]')
 _COMMENT_EDGE: Final = re.compile(r"/\*|\*/")
-_OPERAND_END: Final = re.compile(
+_OPERAND_PREFIX: Final = (
     r"(?:[)\]]|\b(?!(?:return|throw|try|await|yield|in|case|where|if|guard|"
-    r"while|switch|for|repeat|each|consume|copy|borrow)\b)\w+)\Z"
 )
+_OPERAND_SUFFIX: Final = r"while|switch|for|repeat|each|consume|copy|borrow)\b)\w+)\Z"
+_OPERAND_END: Final = re.compile(f"{_OPERAND_PREFIX}{_OPERAND_SUFFIX}")
 _DELIMITER: Final = re.compile(r"[][(){};\n]")
 _OPEN: Final = {"(": ")", "[": "]", "{": "}"}
 _CLOSE: Final = frozenset(_OPEN.values())
