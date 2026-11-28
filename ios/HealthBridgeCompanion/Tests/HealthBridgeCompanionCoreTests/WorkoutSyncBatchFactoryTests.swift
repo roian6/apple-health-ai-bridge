@@ -453,6 +453,50 @@ final class WorkoutSyncBatchFactoryTests: XCTestCase {
         ])
         XCTAssertEqual(batch.workouts.map(\.workoutType), ["walking", "running"])
     }
+
+    func testHistoryBackfillBatchUsesDedicatedCursorKindAndStableRecordIDs() throws {
+        let workoutID = try XCTUnwrap(UUID(uuidString: "A3E4C5B6-1111-2222-3333-444455556666"))
+        let workouts = [
+            HealthKitWorkoutSummary(
+                uuid: workoutID,
+                workoutType: "running",
+                start: try date("2025-06-09T10:00:00Z"),
+                end: try date("2025-06-09T10:45:00Z"),
+                durationSeconds: 2700,
+                activeEnergyKcal: 240.5,
+                distanceMeters: nil
+            )
+        ]
+
+        let batch = WorkoutSyncBatchFactory.makeWorkoutBatch(
+            workouts: workouts,
+            windowStart: try date("2025-01-01T00:00:00Z"),
+            windowEnd: try date("2026-06-10T08:00:00Z"),
+            generatedAt: try date("2026-06-10T08:00:00Z"),
+            cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+        )
+
+        XCTAssertEqual(batch.workouts.count, 1)
+        XCTAssertEqual(
+            batch.workouts.first?.clientRecordID,
+            "hk-workout-a3e4c5b6-1111-2222-3333-444455556666"
+        )
+        XCTAssertEqual(batch.sync.cursors, [
+            HealthBridgeSyncCursor(
+                sourceKey: "apple_health.phone",
+                cursorKind: "workout_history_backfill_start",
+                cursorValue: "2026-06-10T08:00:00Z"
+            )
+        ])
+
+        let legacyBatch = WorkoutSyncBatchFactory.makeWorkoutBatch(
+            workouts: workouts,
+            windowStart: try date("2025-01-01T00:00:00Z"),
+            windowEnd: try date("2026-06-10T08:00:00Z"),
+            generatedAt: try date("2026-06-10T08:00:00Z")
+        )
+        XCTAssertEqual(legacyBatch.sync.cursors.first?.cursorKind, "foreground_workout_sync")
+    }
 }
 
 #if canImport(HealthKit)

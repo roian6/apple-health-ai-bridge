@@ -1,11 +1,12 @@
 import json
 import math
 import subprocess
-import sys
 from pathlib import Path
 from typing import cast
 
 import pytest
+
+from tests.script_runner import run_script
 
 VALIDATOR = Path("scripts/validate-fresh-device-evidence.py")
 EXPECTED_SOURCE_TREE = "a" * 40
@@ -154,21 +155,15 @@ def _run_validator(
 ) -> subprocess.CompletedProcess[str]:
     path = tmp_path / "private-evidence.json"
     _ = path.write_text(json.dumps(evidence), encoding="utf-8")
-    return subprocess.run(
-        [
-            sys.executable,
-            str(VALIDATOR),
-            str(path),
-            "--expected-source-tree",
-            expected_source_tree,
-            "--expected-app-sha256",
-            expected_app_sha256,
-            "--expected-receiver-sha256",
-            expected_receiver_sha256,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    return run_script(
+        VALIDATOR,
+        str(path),
+        "--expected-source-tree",
+        expected_source_tree,
+        "--expected-app-sha256",
+        expected_app_sha256,
+        "--expected-receiver-sha256",
+        expected_receiver_sha256,
     )
 
 
@@ -178,28 +173,23 @@ def _run_raw_validator(
 ) -> subprocess.CompletedProcess[str]:
     path = tmp_path / "private-evidence.json"
     _ = path.write_text(raw_evidence, encoding="utf-8")
-    return subprocess.run(
-        [
-            sys.executable,
-            str(VALIDATOR),
-            str(path),
-            "--expected-source-tree",
-            EXPECTED_SOURCE_TREE,
-            "--expected-app-sha256",
-            EXPECTED_APP_SHA256,
-            "--expected-receiver-sha256",
-            EXPECTED_RECEIVER_SHA256,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    return run_script(
+        VALIDATOR,
+        str(path),
+        "--expected-source-tree",
+        EXPECTED_SOURCE_TREE,
+        "--expected-app-sha256",
+        EXPECTED_APP_SHA256,
+        "--expected-receiver-sha256",
+        EXPECTED_RECEIVER_SHA256,
+        process=True,
     )
 
 
 def test_fresh_device_evidence_validator_accepts_complete_aggregate_evidence(
     tmp_path: Path,
 ) -> None:
-    completed = _run_validator(tmp_path, _valid_evidence())
+    completed = _run_raw_validator(tmp_path, json.dumps(_valid_evidence()))
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "fresh-device evidence: PASS"
@@ -288,7 +278,15 @@ def test_fresh_device_evidence_validator_binds_independent_hashes(
 ) -> None:
     kwargs = {expected_name: expected_value}
 
-    completed = _run_validator(tmp_path, _valid_evidence(), **kwargs)  # type: ignore[arg-type]
+    completed = _run_validator(
+        tmp_path,
+        _valid_evidence(),
+        expected_source_tree=kwargs.get("expected_source_tree", EXPECTED_SOURCE_TREE),
+        expected_app_sha256=kwargs.get("expected_app_sha256", EXPECTED_APP_SHA256),
+        expected_receiver_sha256=kwargs.get(
+            "expected_receiver_sha256", EXPECTED_RECEIVER_SHA256
+        ),
+    )
 
     assert completed.returncode == 1
     assert "binding mismatch" in completed.stderr

@@ -48,9 +48,13 @@ final class NutritionMailboxFixture {
     let agreement = Curve25519.KeyAgreement.PrivateKey()
     var envelopeNumber: UInt8 = 0
     var capabilityReadIO = MailboxReceiverCapabilities.IO(requestDownload: { _ in })
+    var beforeTransportLocate: (() throws -> Void)?
+    var beforeDeliveryComponents: (() throws -> Void)?
+    var ackScanFault: MailboxAckScanner.Fault = { _ in }
+    var prepareAckCandidate = MailboxAckScanner.prepareCandidateForBoundedRead
 
-    init(nativePairing: Bool = false) throws {
-        base = try NutritionFixture(directPairing: !nativePairing)
+    init(nativePairing: Bool = false, outboxFileManager: FileManager = .default) throws {
+        base = try NutritionFixture(directPairing: !nativePairing, outboxFileManager: outboxFileManager)
         keys = MailboxKeyStore(service: base.suite, keychain: NutritionKeychain())
         let device = try keys.loadOrCreate()
         let receiverID = Data(repeating: 0x71, count: 16)
@@ -127,18 +131,22 @@ final class NutritionMailboxFixture {
         )
     }
 
-    func components() -> ProductionMailboxComponents {
+    func components(outbox selectedOutbox: FileOutbox? = nil) -> ProductionMailboxComponents {
+        let outbox = selectedOutbox ?? base.outbox
         let location = locator
-        let lookup = FileOutboxMailboxAckLookup(outbox: base.outbox, deviceSigningPublicKey: context.deviceSigningPublicKey)
+        let lookup = FileOutboxMailboxAckLookup(outbox: outbox, deviceSigningPublicKey: context.deviceSigningPublicKey)
         let transport = MailboxTransport(
-            outbox: base.outbox,
+            outbox: outbox,
             context: MailboxTransportContext(
                 receiverID: context.receiverID, deviceID: context.deviceID,
                 receiverBindingID: identity.opaqueBinding, connectionGeneration: 1,
                 receiverAgreementPublicKey: agreement.publicKey, receiverAgreementKeyID: identity.receiverAgreementKeyID,
                 deviceSigningPublicKey: context.deviceSigningPublicKey, deviceSigningKeyID: identity.deviceSigningKeyID
             ),
-            sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keys), locate: { location },
+            sealer: DeliveryProtocolMailboxEnvelopeSealer(keyStore: keys), locate: { [self] in
+                try beforeTransportLocate?()
+                return location
+            },
             publisher: POSIXMailboxEnvelopePublisher(),
             envelopeID: { [self] in envelopeNumber += 1; return Data(repeating: envelopeNumber, count: 16) },
             nowMilliseconds: { 1_790_000_000_000 },
@@ -150,16 +158,30 @@ final class NutritionMailboxFixture {
         return ProductionMailboxComponents(
             identity: identity, deviceSigningPublicKey: context.deviceSigningPublicKey, ackContext: context,
             transport: transport, ackLookup: lookup,
-            scanner: MailboxAckScanner(context: context, lookup: lookup, locate: { location }), locate: { location }
+            scanner: MailboxAckScanner(
+                context: context, lookup: lookup, locate: { location }, fault: ackScanFault,
+                prepareCandidate: prepareAckCandidate
+            ),
+            locate: { location }
         )
     }
 
-    func delivery() -> ProductionMailboxDelivery {
-        let components = components()
+    func delivery(
+        outbox selectedOutbox: FileOutbox? = nil,
+        cursorStore: FileSyncCursorStore? = nil,
+        pendingGenerationStore: BackgroundSyncSettingsStore? = nil,
+        sleepStore: FileSleepSyncManifestStore? = nil
+    ) -> ProductionMailboxDelivery {
+        let outbox = selectedOutbox ?? base.outbox
+        let components = components(outbox: outbox)
         return ProductionMailboxDelivery(
-            settingsStore: base.settings, outbox: base.outbox, cursorStore: base.cursors,
-            pendingGenerationStore: BackgroundSyncSettingsStore(userDefaults: base.defaults),
-            keyStore: keys, componentsFactory: { components }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
+            settingsStore: base.settings, outbox: outbox, cursorStore: cursorStore ?? base.cursors,
+            pendingGenerationStore: pendingGenerationStore ?? BackgroundSyncSettingsStore(userDefaults: base.defaults),
+            sleepStore: sleepStore,
+            keyStore: keys, componentsFactory: { [self] in
+                try beforeDeliveryComponents?()
+                return components
+            }, receiverClient: base.client, capabilityReadIO: capabilityReadIO
         )
     }
 

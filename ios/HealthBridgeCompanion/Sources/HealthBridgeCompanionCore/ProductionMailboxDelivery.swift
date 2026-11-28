@@ -31,11 +31,24 @@ public enum ProductionMailboxDeliveryPhaseError: Error, Equatable, Sendable {
         case .remainingCount: "remaining_count"
         }
     }
+
+    fileprivate func forItem(
+        _ itemID: String, ownership: OutboxDeliveryOwnershipV1?
+    ) -> ProductionMailboxItemDeliveryError {
+        ProductionMailboxItemDeliveryError(phase: self, itemID: itemID, ownership: ownership)
+    }
+}
+
+struct ProductionMailboxItemDeliveryError: Error, Sendable {
+    let phase: ProductionMailboxDeliveryPhaseError
+    let itemID: String
+    let ownership: OutboxDeliveryOwnershipV1?
 }
 
 public struct ProductionMailboxDeliverySummary: Equatable, Sendable {
     public let attemptedCount: Int
-    public let finalizedCount: Int
+    let finalizedItemIDs: Set<String>
+    public var finalizedCount: Int { finalizedItemIDs.count }
     public let waitingCount: Int
     public let terminalCount: Int
     public let ackCleanupFailureCount: Int
@@ -83,7 +96,8 @@ public enum ProductionMailboxBackgroundPhase: String, Equatable, Sendable {
 public struct ProductionMailboxBackgroundDeliverySummary: Equatable, Sendable {
     public let phase: ProductionMailboxBackgroundPhase
     public let attemptedCount: Int
-    public let finalizedCount: Int
+    let finalizedItemIDs: Set<String>
+    public var finalizedCount: Int { finalizedItemIDs.count }
     public let waitingCount: Int
     public let terminalCount: Int
     public let ackCleanupFailureCount: Int
@@ -199,9 +213,16 @@ public final class ProductionMailboxDelivery {
     }
 
     @MainActor
-    public func publishPendingFIFOHead() async throws
-        -> ProductionMailboxBackgroundDeliverySummary
-    {
+    public func publishPendingFIFOHead() async throws -> ProductionMailboxBackgroundDeliverySummary {
+        do {
+            return try await publishPendingFIFOHeadWithOwnership()
+        } catch let error as ProductionMailboxItemDeliveryError {
+            throw error.phase
+        }
+    }
+
+    @MainActor
+    func publishPendingFIFOHeadWithOwnership() async throws -> ProductionMailboxBackgroundDeliverySummary {
         try Task.checkCancellation()
         try await refreshNutritionSupport()
         let receiverGeneration = settingsStore.receiverSettingsGenerationToken
@@ -215,8 +236,10 @@ public final class ProductionMailboxDelivery {
             )
         }
         let deliveryCoordinator: OutboxDeliveryCoordinator
+        var ownership = item.deliveryState?.ownership
         do {
             deliveryCoordinator = try await coordinator(components: components, itemID: item.id)
+            ownership = deliveryCoordinator.ownership
             var terminalCount = 0
             for _ in 0 ..< 4 {
                 try Task.checkCancellation()
@@ -246,7 +269,7 @@ public final class ProductionMailboxDelivery {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw ProductionMailboxDeliveryPhaseError.initialAdvance
+            throw ProductionMailboxDeliveryPhaseError.initialAdvance.forItem(item.id, ownership: ownership)
         }
     }
 
@@ -255,6 +278,23 @@ public final class ProductionMailboxDelivery {
         afterAcknowledgmentCheckpoint: String?,
         maximumAcknowledgmentFiles: Int = ProductionMailboxDelivery
             .backgroundAcknowledgmentFileLimit
+    ) async throws -> ProductionMailboxBackgroundDeliverySummary {
+        do {
+            return try await reconcilePendingFIFOHeadAcknowledgment(
+                afterAcknowledgmentCheckpoint: afterAcknowledgmentCheckpoint,
+                maximumAcknowledgmentFiles: maximumAcknowledgmentFiles,
+                onNewFinalization: { _ in }
+            )
+        } catch let error as ProductionMailboxItemDeliveryError {
+            throw error.phase
+        }
+    }
+
+    @MainActor
+    func reconcilePendingFIFOHeadAcknowledgment(
+        afterAcknowledgmentCheckpoint: String?,
+        maximumAcknowledgmentFiles: Int = ProductionMailboxDelivery.backgroundAcknowledgmentFileLimit,
+        onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void
     ) async throws -> ProductionMailboxBackgroundDeliverySummary {
         try Task.checkCancellation()
         try await refreshNutritionSupport()
@@ -267,34 +307,45 @@ public final class ProductionMailboxDelivery {
                 waitingCount: 0
             )
         }
-        let coordinator = try await coordinator(components: components, itemID: item.id)
-        if try coordinator.state(itemID: item.id)?.phase == .published {
+        let coordinator: OutboxDeliveryCoordinator
+        var phase: OutboxDeliveryPhase?
+        do {
+            coordinator = try await self.coordinator(components: components, itemID: item.id)
+            phase = try coordinator.state(itemID: item.id)?.phase
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ProductionMailboxDeliveryPhaseError.loadPending.forItem(item.id, ownership: item.deliveryState?.ownership)
+        }
+        if phase == .published {
             do {
                 try Task.checkCancellation()
-                _ = try coordinator.advance(itemID: item.id)
+                phase = try coordinator.advance(itemID: item.id).phase
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw ProductionMailboxDeliveryPhaseError.initialAdvance
+                throw ProductionMailboxDeliveryPhaseError.initialAdvance.forItem(item.id, ownership: coordinator.ownership)
             }
         }
-        if try coordinator.state(itemID: item.id)?.phase == .ackVerified {
+        if phase == .ackVerified {
             do {
                 try Task.checkCancellation()
-                _ = try await coordinator.finalizeCommitted(itemID: item.id)
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }
                 return backgroundSummary(
                     phase: .reconcileFIFOHeadAcknowledgment,
                     attemptedCount: 1,
-                    finalizedCount: 1,
+                    finalizedItemIDs: [item.id],
                     waitingCount: max(0, items.count - 1)
                 )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw ProductionMailboxDeliveryPhaseError.consumeAck
+                throw ProductionMailboxDeliveryPhaseError.consumeAck.forItem(item.id, ownership: coordinator.ownership)
             }
         }
-        guard try coordinator.state(itemID: item.id)?.phase == .providerObserved else {
+        guard phase == .providerObserved else {
             return backgroundSummary(
                 phase: .reconcileFIFOHeadAcknowledgment,
                 attemptedCount: 1,
@@ -311,7 +362,7 @@ public final class ProductionMailboxDelivery {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw ProductionMailboxDeliveryPhaseError.locateAckLane
+            throw ProductionMailboxDeliveryPhaseError.locateAckLane.forItem(item.id, ownership: coordinator.ownership)
         }
         let pendingFIFOHeadRecord: MailboxAckOutboxRecord?
         do {
@@ -319,7 +370,7 @@ public final class ProductionMailboxDelivery {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw ProductionMailboxDeliveryPhaseError.mapAckItem
+            throw ProductionMailboxDeliveryPhaseError.mapAckItem.forItem(item.id, ownership: coordinator.ownership)
         }
         let acknowledgment: (
             hydration: MailboxAckHydrationReport,
@@ -341,7 +392,7 @@ public final class ProductionMailboxDelivery {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    throw ProductionMailboxDeliveryPhaseError.hydrateAck
+                    throw ProductionMailboxDeliveryPhaseError.hydrateAck.forItem(item.id, ownership: coordinator.ownership)
                 }
                 try Task.checkCancellation()
                 let report: MailboxAckScanReport
@@ -350,7 +401,7 @@ public final class ProductionMailboxDelivery {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    throw ProductionMailboxDeliveryPhaseError.scanAck
+                    throw ProductionMailboxDeliveryPhaseError.scanAck.forItem(item.id, ownership: coordinator.ownership)
                 }
                 guard Self.acknowledgmentIndexForPendingFIFOHead(
                     eventEnvelopeIDs: report.events.map(\.envelopeID),
@@ -376,7 +427,7 @@ public final class ProductionMailboxDelivery {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    throw ProductionMailboxDeliveryPhaseError.scanAck
+                    throw ProductionMailboxDeliveryPhaseError.scanAck.forItem(item.id, ownership: coordinator.ownership)
                 }
                 let hydration: MailboxAckHydrationReport
                 do {
@@ -388,7 +439,7 @@ public final class ProductionMailboxDelivery {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    throw ProductionMailboxDeliveryPhaseError.hydrateAck
+                    throw ProductionMailboxDeliveryPhaseError.hydrateAck.forItem(item.id, ownership: coordinator.ownership)
                 }
                 try Task.checkCancellation()
                 let report: MailboxAckScanReport
@@ -397,7 +448,7 @@ public final class ProductionMailboxDelivery {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    throw ProductionMailboxDeliveryPhaseError.scanAck
+                    throw ProductionMailboxDeliveryPhaseError.scanAck.forItem(item.id, ownership: coordinator.ownership)
                 }
                 return (
                     hydration: hydration,
@@ -410,7 +461,7 @@ public final class ProductionMailboxDelivery {
         )
         let hydration = acknowledgment.hydration
         let report = acknowledgment.report
-        var finalizedCount = 0
+        var finalizedItemIDs: Set<String> = []
         var terminalCount = 0
         var ackCleanupFailureCount = 0
         if let pendingFIFOHeadEnvelopeID = pendingFIFOHeadRecord?.envelopeID,
@@ -421,13 +472,18 @@ public final class ProductionMailboxDelivery {
             let event = report.events[index]
             do {
                 try Task.checkCancellation()
+                guard settingsStore.receiverSettingsGenerationToken == coordinator.ownership.receiverGeneration else {
+                    throw CancellationError()
+                }
                 switch event.classification {
                 case .committed, .duplicateIdentical:
                     let disposition = try coordinator.consume(event, itemID: item.id)
                     if disposition == .ackVerified {
                         try Task.checkCancellation()
-                        _ = try await coordinator.finalizeCommitted(itemID: item.id)
-                        finalizedCount = 1
+                        _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                            onNewFinalization(coordinator.ownership)
+                        }
+                        finalizedItemIDs.insert(item.id)
                     }
                     if try coordinator.state(itemID: item.id)?.phase == .committedFinalized,
                        !acknowledgment.usedExactCandidate,
@@ -448,14 +504,14 @@ public final class ProductionMailboxDelivery {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw ProductionMailboxDeliveryPhaseError.consumeAck
+                throw ProductionMailboxDeliveryPhaseError.consumeAck.forItem(item.id, ownership: coordinator.ownership)
             }
         }
         return backgroundSummary(
             phase: .reconcileFIFOHeadAcknowledgment,
             attemptedCount: 1,
-            finalizedCount: finalizedCount,
-            waitingCount: max(0, items.count - finalizedCount),
+            finalizedItemIDs: finalizedItemIDs,
+            waitingCount: max(0, items.count - finalizedItemIDs.count),
             terminalCount: terminalCount,
             ackCleanupFailureCount: ackCleanupFailureCount,
             hydration: hydration,
@@ -467,6 +523,17 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     public func deliverPending() async throws -> ProductionMailboxDeliverySummary {
+        do {
+            return try await deliverPending(onNewFinalization: { _ in })
+        } catch let error as ProductionMailboxItemDeliveryError {
+            throw error.phase
+        }
+    }
+
+    @MainActor
+    func deliverPending(
+        onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void
+    ) async throws -> ProductionMailboxDeliverySummary {
         try await refreshNutritionSupport()
         let receiverGeneration = settingsStore.receiverSettingsGenerationToken
         let components: ProductionMailboxComponents
@@ -486,12 +553,14 @@ public final class ProductionMailboxDelivery {
             throw ProductionMailboxDeliveryPhaseError.loadPending
         }
         var terminalCount = 0
-        do {
-            for item in items {
+        for item in items {
+            var ownership = item.deliveryState?.ownership
+            do {
                 let coordinator = try await coordinator(
                     components: components,
                     itemID: item.id
                 )
+                ownership = coordinator.ownership
                 for _ in 0 ..< 4 {
                     let state = try await advanceForPublication(
                         coordinator,
@@ -511,20 +580,15 @@ public final class ProductionMailboxDelivery {
                     }
                     break
                 }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ProductionMailboxDeliveryPhaseError.initialAdvance.forItem(item.id, ownership: ownership)
             }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw ProductionMailboxDeliveryPhaseError.initialAdvance
         }
-        var finalizedCount: Int
-        do {
-            finalizedCount = try await finalizeVerifiedForegroundHeads(components: components)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw ProductionMailboxDeliveryPhaseError.consumeAck
-        }
+        var finalizedItemIDs = try await finalizeVerifiedForegroundHeads(
+            components: components, onNewFinalization: onNewFinalization
+        )
         let ackLane: URL
         do {
             let locator = try components.locate()
@@ -545,12 +609,12 @@ public final class ProductionMailboxDelivery {
         } catch {
             throw ProductionMailboxDeliveryPhaseError.hydrateAck
         }
+        try Task.checkCancellation()
+        guard settingsStore.receiverSettingsGenerationToken == receiverGeneration else {
+            throw ProductionMailboxDeliveryPhaseError.scanAck
+        }
         var report: MailboxAckScanReport
         do {
-            try Task.checkCancellation()
-            guard settingsStore.receiverSettingsGenerationToken == receiverGeneration else {
-                throw ProductionMailboxDeliveryError.inactive
-            }
             report = try components.scanner.scan()
         } catch is CancellationError {
             throw CancellationError()
@@ -558,25 +622,33 @@ public final class ProductionMailboxDelivery {
             throw ProductionMailboxDeliveryPhaseError.scanAck
         }
         let pendingFIFOHead: FileOutboxItem?
-        let pendingFIFOHeadEnvelopeID: Data?
         do {
             pendingFIFOHead = try backgroundPendingItems(components: components).first
-            if let pendingFIFOHead,
-               pendingFIFOHead.receiverIdentity == components.identity.opaqueBinding,
-               pendingFIFOHead.deliveryState?.phase == .providerObserved {
-                pendingFIFOHeadEnvelopeID = try envelopeID(
-                    for: pendingFIFOHead,
-                    signingPublicKey: components.deviceSigningPublicKey
-                )
-            } else {
-                pendingFIFOHeadEnvelopeID = nil
-            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             throw ProductionMailboxDeliveryPhaseError.mapAckItem
         }
-        if let pendingFIFOHeadEnvelopeID,
+        let pendingFIFOHeadEnvelopeID: Data?
+        if let pendingFIFOHead,
+           pendingFIFOHead.receiverIdentity == components.identity.opaqueBinding,
+           pendingFIFOHead.deliveryState?.phase == .providerObserved {
+            do {
+                pendingFIFOHeadEnvelopeID = try envelopeID(
+                    for: pendingFIFOHead,
+                    signingPublicKey: components.deviceSigningPublicKey
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ProductionMailboxDeliveryPhaseError.mapAckItem.forItem(
+                    pendingFIFOHead.id, ownership: pendingFIFOHead.deliveryState?.ownership
+                )
+            }
+        } else {
+            pendingFIFOHeadEnvelopeID = nil
+        }
+        if let pendingFIFOHead, let pendingFIFOHeadEnvelopeID,
            !report.events.contains(where: { $0.envelopeID == pendingFIFOHeadEnvelopeID }) {
             let exactHydration: MailboxAckHydrationReport
             do {
@@ -588,7 +660,9 @@ public final class ProductionMailboxDelivery {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw ProductionMailboxDeliveryPhaseError.hydrateAck
+                throw ProductionMailboxDeliveryPhaseError.hydrateAck.forItem(
+                    pendingFIFOHead.id, ownership: pendingFIFOHead.deliveryState?.ownership
+                )
             }
             let exactReport: MailboxAckScanReport
             do {
@@ -601,7 +675,9 @@ public final class ProductionMailboxDelivery {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw ProductionMailboxDeliveryPhaseError.scanAck
+                throw ProductionMailboxDeliveryPhaseError.scanAck.forItem(
+                    pendingFIFOHead.id, ownership: pendingFIFOHead.deliveryState?.ownership
+                )
             }
             hydration = MailboxAckHydrationReport(
                 eligibleCandidateCount: hydration.eligibleCandidateCount + exactHydration.eligibleCandidateCount,
@@ -647,11 +723,13 @@ public final class ProductionMailboxDelivery {
         )
         for index in orderedIndices {
             let (event, itemID) = mappedEvents[index]
+            var ownership: OutboxDeliveryOwnershipV1?
             do {
                 let coordinator = try await coordinator(
                     components: components,
                     itemID: itemID
                 )
+                ownership = coordinator.ownership
                 guard pendingItemIDSet.contains(itemID) else {
                     if try coordinator.state(itemID: itemID)?.phase == .committedFinalized {
                         let deleted = Self.deleteAcknowledgmentAfterDurableCommit {
@@ -666,7 +744,9 @@ public final class ProductionMailboxDelivery {
                 switch event.classification {
                 case .committed, .duplicateIdentical:
                     _ = try coordinator.consume(event, itemID: itemID)
-                    finalizedCount += try await finalizeVerifiedForegroundHeads(components: components)
+                    finalizedItemIDs.formUnion(try await finalizeVerifiedForegroundHeads(
+                        components: components, onNewFinalization: onNewFinalization
+                    ))
                     if try coordinator.state(itemID: itemID)?.phase == .committedFinalized {
                         let deleted = Self.deleteAcknowledgmentAfterDurableCommit {
                             try coordinator.deleteAcknowledgment(for: event, itemID: itemID)
@@ -686,8 +766,16 @@ public final class ProductionMailboxDelivery {
                 }
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let failure as ProductionMailboxItemDeliveryError {
+                throw failure
+            } catch let failure as ProductionMailboxDeliveryPhaseError {
+                throw failure
             } catch {
-                throw ProductionMailboxDeliveryPhaseError.consumeAck
+                let phase = ProductionMailboxDeliveryPhaseError.consumeAck
+                if pendingItemIDSet.contains(itemID) {
+                    throw phase.forItem(itemID, ownership: ownership)
+                }
+                throw phase
             }
         }
         let remaining: Int
@@ -702,7 +790,7 @@ public final class ProductionMailboxDelivery {
         }
         return ProductionMailboxDeliverySummary(
             attemptedCount: items.count,
-            finalizedCount: finalizedCount,
+            finalizedItemIDs: finalizedItemIDs,
             waitingCount: remaining,
             terminalCount: terminalCount,
             ackCleanupFailureCount: ackCleanupFailureCount,
@@ -716,19 +804,36 @@ public final class ProductionMailboxDelivery {
 
     @MainActor
     private func finalizeVerifiedForegroundHeads(
-        components: ProductionMailboxComponents
-    ) async throws -> Int {
-        var finalizedCount = 0
+        components: ProductionMailboxComponents,
+        onNewFinalization: @MainActor (OutboxDeliveryOwnershipV1) -> Void
+    ) async throws -> Set<String> {
+        var finalizedItemIDs: Set<String> = []
         while true {
             try Task.checkCancellation()
-            guard let item = try backgroundPendingItems(components: components).first,
+            let head: FileOutboxItem?
+            do {
+                head = try backgroundPendingItems(components: components).first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ProductionMailboxDeliveryPhaseError.consumeAck
+            }
+            guard let item = head,
                   item.receiverIdentity == components.identity.opaqueBinding,
                   item.deliveryState?.phase == .ackVerified else {
-                return finalizedCount
+                return finalizedItemIDs
             }
-            let coordinator = try await coordinator(components: components, itemID: item.id)
-            _ = try await coordinator.finalizeCommitted(itemID: item.id)
-            finalizedCount += 1
+            do {
+                let coordinator = try await coordinator(components: components, itemID: item.id)
+                _ = try await coordinator.finalizeCommitted(itemID: item.id) {
+                    onNewFinalization(coordinator.ownership)
+                }
+                finalizedItemIDs.insert(item.id)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ProductionMailboxDeliveryPhaseError.consumeAck.forItem(item.id, ownership: item.deliveryState?.ownership)
+            }
         }
     }
 
@@ -786,29 +891,31 @@ public final class ProductionMailboxDelivery {
         receiverGeneration: String
     ) async throws -> FileOutboxDeliveryStateV1 {
         try Task.checkCancellation()
-        guard let publication = try coordinator.preparePublication(itemID: itemID) else {
-            return try coordinator.advance(itemID: itemID)
-        }
-        let result: DeliveryTransportResult
-        if let work = publication.work {
-            let pending = try outbox.pendingItems()
-            let outcome = await Task.detached { try work.publish() }.result
-            try await validatePublicationCompletion(
-                coordinator,
+        switch try coordinator.preparePublicationAdvance(itemID: itemID) {
+        case .advanced(let state):
+            return state
+        case .publication(let state, let work):
+            let result: DeliveryTransportResult
+            if let work {
+                let pending = try outbox.pendingItems()
+                let outcome = await Task.detached { try work.publish() }.result
+                try await validatePublicationCompletion(
+                    coordinator,
+                    itemID: itemID,
+                    components: components,
+                    receiverGeneration: receiverGeneration,
+                    pending: pending
+                )
+                result = try components.transport.publicationResult(outcome)
+            } else {
+                result = .retryable
+            }
+            return try coordinator.completePublication(
                 itemID: itemID,
-                components: components,
-                receiverGeneration: receiverGeneration,
-                pending: pending
+                current: state,
+                result: result
             )
-            result = try components.transport.publicationResult(outcome)
-        } else {
-            result = .retryable
         }
-        return try coordinator.completePublication(
-            itemID: itemID,
-            current: publication.state,
-            result: result
-        )
     }
 
     @MainActor
@@ -989,7 +1096,7 @@ public final class ProductionMailboxDelivery {
     private func backgroundSummary(
         phase: ProductionMailboxBackgroundPhase,
         attemptedCount: Int,
-        finalizedCount: Int = 0,
+        finalizedItemIDs: Set<String> = [],
         waitingCount: Int,
         terminalCount: Int = 0,
         ackCleanupFailureCount: Int = 0,
@@ -1012,7 +1119,7 @@ public final class ProductionMailboxDelivery {
         ProductionMailboxBackgroundDeliverySummary(
             phase: phase,
             attemptedCount: attemptedCount,
-            finalizedCount: finalizedCount,
+            finalizedItemIDs: finalizedItemIDs,
             waitingCount: waitingCount,
             terminalCount: terminalCount,
             ackCleanupFailureCount: ackCleanupFailureCount,

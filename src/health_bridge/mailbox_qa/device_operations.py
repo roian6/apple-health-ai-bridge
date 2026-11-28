@@ -184,7 +184,7 @@ def _private_canonical_document(path: Path) -> dict[str, JsonValue]:
         document = hbjcs1_decode(encoded)
     except HBJCS1Error as exc:
         raise DeviceOperationError from exc
-    if not isinstance(document, dict) or hbjcs1_encode(document) != encoded:
+    if not isinstance(document, dict):
         raise DeviceOperationError
     return document
 

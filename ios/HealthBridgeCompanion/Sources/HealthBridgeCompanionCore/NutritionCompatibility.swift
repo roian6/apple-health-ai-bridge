@@ -150,6 +150,7 @@ struct NutritionPayloadRevision: Equatable, Sendable {
 struct PreparedNutritionPayload: Sendable {
     let revision: NutritionPayloadRevision
     let containsNutrition: Bool
+    let mayContainSleep: Bool
     let permitsSupported: Bool
     let projection: Data?
     let remainder: Data?
@@ -173,16 +174,32 @@ extension FileOutbox {
     public func prepareNutritionCompatibility(
         validate: @MainActor () throws -> Void = {}
     ) async throws {
+        try await prepareNutritionCompatibility(allowingTailAppend: false, validate: validate)
+    }
+
+    @MainActor
+    func prepareNutritionCompatibility(
+        allowingTailAppend: Bool,
+        validate: @MainActor () throws -> Void
+    ) async throws {
         try Task.checkCancellation()
         try validate()
         try requireUploadAdmission()
         let pending = try pendingItems()
-        let revision = try nutritionStorageRevision()
+        let revision = allowingTailAppend ? nil : try nutritionStorageRevision()
         let payloads = try pending.map { item in
             (item.id, try NutritionPayloadRevision(item.fileURL), try Data(contentsOf: item.fileURL))
         }
         let previous = preparedNutritionPayloads
         let observe = observeNutritionCodec
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        let sleepCursorKinds = Set([
+            SleepSyncBatchFactory.foregroundCursorKind, SleepSyncBatchFactory.anchoredCursorKind,
+            SleepSyncBatchFactory.baselineResetCursorKind,
+        ])
+        #else
+        let sleepCursorKinds: Set<String> = []
+        #endif
         let prepared = try await SleepSyncValueWork.run {
             try Dictionary(uniqueKeysWithValues: payloads.map { id, revision, bytes in
                 if let retained = previous[id], retained.revision == revision {
@@ -196,6 +213,10 @@ extension FileOutbox {
                     : nil
                 return (id, PreparedNutritionPayload(
                     revision: revision, containsNutrition: contains,
+                    mayContainSleep: !batch.sleepSessions.isEmpty
+                        || batch.healthTypes.contains { $0.typeCode == HealthBridgeHealthType.sleepAnalysis.typeCode }
+                        || batch.deletedRecords.contains { $0.recordFamily == "sleep_session" }
+                        || batch.sync.cursors.contains { sleepCursorKinds.contains($0.cursorKind) },
                     permitsSupported: NutritionCompatibility.permits(batch, support: .supported),
                     projection: projection,
                     remainder: projection == nil ? nil : try JSONEncoder().encode(
@@ -210,7 +231,15 @@ extension FileOutbox {
         try Task.checkCancellation()
         try validate()
         try requireUploadAdmission()
-        guard try nutritionStorageRevision() == revision else { throw CancellationError() }
+        if let revision {
+            guard try nutritionStorageRevision() == revision else { throw CancellationError() }
+        } else {
+            // The scoped ACK owns the prepared prefix, not files enqueued after it.
+            guard try pendingItemsForNutritionValidation().starts(with: pending),
+                  try zip(pending, payloads).allSatisfy({
+                      try NutritionPayloadRevision($0.0.fileURL) == $0.1.1
+                  }) else { throw CancellationError() }
+        }
         preparedNutritionPayloads = prepared
     }
 
@@ -234,11 +263,17 @@ extension FileOutbox {
     public func preparedNutritionItems(
         for receiverIdentity: String, support: NutritionSupport
     ) throws -> [FileOutboxItem] {
+        try preparedNutritionItems(for: receiverIdentity, support: support, admittedItemIDs: nil)
+    }
+
+    func preparedNutritionItems(
+        for receiverIdentity: String, support: NutritionSupport, admittedItemIDs: Set<String>?
+    ) throws -> [FileOutboxItem] {
         try requireUploadAdmission()
         var blockedCursors: Set<NutritionCursorKey> = []
         var legacyHold = false
         var selected: [FileOutboxItem] = []
-        for group in try nutritionPendingGroups(for: receiverIdentity) {
+        for group in try nutritionPendingGroups(for: receiverIdentity, admittedItemIDs: admittedItemIDs) {
             switch group {
             case .original(let item, let permitsSplit):
                 guard let value = try preparedNutritionPayload(for: item) else { throw CancellationError() }
@@ -285,7 +320,7 @@ extension FileOutbox {
         guard first.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        let owned = pending.prefix { $0.receiverIdentity == receiverIdentity }
+        let owned = try pendingItemsBeforeDirectSleepCleanup(pending).prefix { $0.receiverIdentity == receiverIdentity }
         for item in owned {
             guard let value = try preparedNutritionPayload(for: item) else { throw CancellationError() }
             if !value.permits(support), let projection = value.projection,

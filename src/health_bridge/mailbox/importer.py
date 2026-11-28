@@ -124,6 +124,9 @@ class MailboxImporter:
                     fault_hook,
                 )
                 directory.validate_attached()
+                if accepted is None:
+                    aggregate = _combine(aggregate, MailboxImportResult(retryable=1))
+                    continue
                 publication = self._publish_ack(
                     directory,
                     accepted,
@@ -239,14 +242,17 @@ class MailboxImporter:
         directory: MailboxDirectoryHandle,
         delivery_name: str,
         fault_hook: MailboxImportFaultHook | None,
-    ) -> _AcceptedDelivery:
+    ) -> _AcceptedDelivery | None:
         remaining = self._config.path_replacement_retry_limit
         while True:
             try:
                 return self._accept(directory, delivery_name, fault_hook)
             except MailboxFileError as exc:
-                if exc.code is not MailboxFileErrorCode.PATH_REPLACED or remaining == 0:
+                if exc.code is not MailboxFileErrorCode.PATH_REPLACED:
                     raise
+                if remaining == 0:
+                    # The final name remains a candidate for a later stable read.
+                    return None
                 remaining -= 1
 
     def _accept(

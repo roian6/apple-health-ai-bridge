@@ -43,12 +43,61 @@ private enum CompanionPrivateStorageError: LocalizedError {
     }
 }
 
-private enum MailboxDeliveryDiagnosticLine {
-    static func failure(for error: Error) -> String {
-        if let phaseError = error as? ProductionMailboxDeliveryPhaseError {
-            return "Mailbox ACK diagnostics failed: phase=\(phaseError.diagnosticCode)."
+private enum MailboxDeliveryOperation: Hashable {
+    case manualDelivery
+    case selectFIFOHeadPhase
+    case publishFIFOHead
+    case reconcileFIFOHeadAcknowledgment
+    case persistScanCheckpoint
+}
+
+private struct MailboxAckCheckpointWrite: Error {
+    let startingCheckpoint: String?
+    let checkpoint: String
+
+    func canRetry(from current: String?) -> Bool {
+        // A failed synchronization may already have changed the in-memory defaults.
+        current == startingCheckpoint || current == checkpoint
+    }
+}
+
+private struct MailboxDeliveryDiagnosticLine {
+    enum FailureScope: Equatable {
+        case item(String)
+        case operation(MailboxDeliveryOperation)
+        case unattributed
+    }
+
+    let message: String
+    let failureGeneration: String?
+    let scope: FailureScope?
+    let checkpointWrite: MailboxAckCheckpointWrite?
+    let itemOwnership: OutboxDeliveryOwnershipV1?
+
+    static func summary(_ message: String) -> Self {
+        Self(message: message, failureGeneration: nil, scope: nil, checkpointWrite: nil, itemOwnership: nil)
+    }
+
+    static func failure(
+        for error: Error, generation: String, operation: MailboxDeliveryOperation?
+    ) -> Self {
+        let itemError = error as? ProductionMailboxItemDeliveryError
+        let checkpointWrite = error as? MailboxAckCheckpointWrite
+        let phase = itemError?.phase ?? (error as? ProductionMailboxDeliveryPhaseError)
+        let reason = phase.map { "phase=\($0.diagnosticCode)" } ?? "error=mailbox_delivery_failed"
+        let scope: FailureScope
+        if let itemError {
+            scope = .item(itemError.itemID)
+        } else if checkpointWrite != nil {
+            scope = .operation(.persistScanCheckpoint)
+        } else if let operation {
+            scope = .operation(operation)
+        } else {
+            scope = .unattributed
         }
-        return "Mailbox ACK diagnostics failed: error=mailbox_delivery_failed."
+        return Self(message: "Mailbox ACK diagnostics failed: \(reason).",
+                    failureGeneration: generation, scope: scope, checkpointWrite: checkpointWrite,
+                    itemOwnership: itemError?.ownership)
     }
 }
 
@@ -64,6 +113,7 @@ private final class TerminalBackgroundPayloadDrainResult {
 
 enum DisconnectReceiverOutcome: Equatable {
     case disconnected(pendingOutboxCount: Int?)
+    case disconnectedWithRecoveryRequired
     case rejected(
         message: String,
         pendingOutboxCount: Int?,
@@ -79,6 +129,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         case workouts
         case sleep
         case supportedQuantities
+    }
+
+    private enum ConnectionIssue {
+        case invalidAddress
+        case offline
+        case unreachable
+        case secureConnection
+        case mailboxUnavailable
+
+        var message: String {
+            switch self {
+            case .invalidAddress:
+                return "Review the receiver address in Connection settings."
+            case .offline:
+                return "This iPhone is offline. Reconnect to your network, then try again."
+            case .unreachable:
+                return "The receiver could not be reached. Keep it running and check the network or VPN."
+            case .secureConnection:
+                return "The secure connection could not be verified. Check the receiver's HTTPS certificate."
+            case .mailboxUnavailable:
+                return "The encrypted iCloud mailbox is unavailable on this iPhone. Check iCloud Drive, then retry."
+            }
+        }
+    }
+
+    private enum ConnectionProbeResult {
+        case reachable(String)
+        case failed(String, issue: ConnectionIssue? = nil)
     }
 
     @MainActor
@@ -132,19 +210,21 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             viewModel.isSyncing = true
             viewModel.statusIsError = false
             viewModel.statusMessage = "Starting sync for allowed Apple Health data."
-            await viewModel.checkReceiverHealth()
-            guard !viewModel.statusIsError else {
-                viewModel.statusMessage = "Sync stopped: \(viewModel.statusMessage)"
-                if !viewModel.taskUIPublicationIsSuppressed {
-                    viewModel.isSyncing = false
-                }
+            let result = await viewModel.checkReceiverHealth()
+            guard !Task.isCancelled, !viewModel.taskUIPublicationIsSuppressed else { return false }
+            switch result {
+            case .reachable:
+                return true
+            case .failed(let message, let issue):
+                viewModel.statusIsError = true
+                viewModel.statusMessage = "Sync stopped: \(message)"
+                viewModel.connectionIssue = issue
                 return false
             }
-            return true
         }
 
         private func performManualSync() async {
-            if viewModel.pendingOutboxCount > 0 {
+            if viewModel.pendingOutboxCount > 0 || viewModel.hasPendingManualMailboxRetry {
                 guard await viewModel.flushPendingOutbox(executionMode: .foreground) else {
                     viewModel.statusMessage = "Sync stopped: \(viewModel.statusMessage)"
                     return
@@ -166,6 +246,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 guard await runManualLane(lane) else { return }
             }
 
+            if viewModel.acceptedFinalizationHold?.reason == .proofMissing,
+               let message = viewModel.acceptedFinalizationRecoveryMessage {
+                viewModel.statusIsError = true
+                viewModel.statusMessage = message
+                return
+            }
             let completion = CompanionSyncNowCompletion.summary(
                 pendingOutboxCount: viewModel.pendingOutboxCount
             )
@@ -204,7 +290,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             case .workouts:
                 _ = await viewModel.syncAnchoredWorkoutChanges()
             case .sleep:
-                _ = await viewModel.syncRecentSleepSessions()
+                _ = await viewModel.syncRecentSleepSessions(deferMissingProof: true)
             case .supportedQuantities:
                 await viewModel.syncSupportedQuantityMetrics()
             }
@@ -215,7 +301,21 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var receiverURLString: String
     @Published var bearerToken: String
     @Published private(set) var receiverSettingsSaved: Bool
+    struct ConnectionCheckNotice {
+        let message: String
+        let isError: Bool
+        fileprivate let generation: String
+    }
+    @Published private var lastConnectionCheck: ConnectionCheckNotice?
+    var connectionCheckNotice: ConnectionCheckNotice? {
+        guard let lastConnectionCheck,
+              lastConnectionCheck.generation == settingsStore.receiverSettingsGenerationToken else {
+            return nil
+        }
+        return lastConnectionCheck
+    }
     @Published private var publishedStatusIsError = false
+    @Published private var connectionIssue: ConnectionIssue?
     var statusIsError: Bool {
         get { publishedStatusIsError }
         set {
@@ -230,16 +330,22 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         get { publishedStatusMessage }
         set {
             guard !taskUIPublicationIsSuppressed else { return }
+            pairingInputError = nil
+            connectionIssue = nil
             publishedStatusMessage = newValue
         }
     }
     var displayStatusMessage: String {
+        if let connectionIssue {
+            return connectionIssue.message
+        }
         let message = CompanionPrimaryStatusMessage.sanitized(
             from: statusMessage, isError: statusIsError
         )
         return message + (nutritionNotice.isEmpty ? "" : " " + nutritionNotice)
     }
     @Published private var publishedPendingOutboxCount = 0
+    @Published private var hasPublishedMailboxItem = false
     var pendingOutboxCount: Int {
         get { publishedPendingOutboxCount }
         set {
@@ -250,11 +356,46 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     var usesMailboxTransport: Bool {
         settingsStore.activeTransport == .mailbox
     }
+    var savedReceiverDestination: String {
+        if usesMailboxTransport { return "Your Mac" }
+        guard let components = URLComponents(string: settingsStore.receiverURLString),
+              let host = components.host else { return "Saved receiver" }
+        let displayHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        return components.port.map { "\(displayHost):\($0)" } ?? displayHost
+    }
     @Published private(set) var hasPendingSleepTransition = false
+    @Published private var acceptedFinalizationHold: AcceptedFinalizationHold?
+    var acceptedFinalizationRecoveryMessage: String? {
+        guard let hold = acceptedFinalizationHold,
+              hold.affectedTypeCodes.contains(HealthBridgeHealthType.sleepAnalysis.typeCode) else { return nil }
+        switch hold.reason {
+        case .proofMissing:
+            return "The server accepted an earlier upload, but this iPhone no longer has enough evidence to finish its local processing safely. Sleep sync is paused to avoid accidentally sending Sleep twice."
+        case .cleanupPending:
+            return "The server accepted an earlier Sleep upload. This iPhone still needs to finish processing it."
+        }
+    }
     @Published private(set) var hasPendingOutboxDeletion = false
     @Published private(set) var hasPendingPrivateStorageRecovery = false
     @Published private(set) var hasTransientPrivateStorageFailure = false
     @Published var pairingImportText = ""
+    @Published var pairingInputError: ReceiverPairingBundleError?
+    @Published private(set) var setupLinkReplacementFailure: String?
+    var pairingInputCorrection: String? {
+        guard let pairingInputError else { return nil }
+        switch pairingInputError {
+        case .invalidJSON, .invalidDeepLink, .missingPayload:
+            return "Paste the complete private setup link from your receiver."
+        case .invalidReceiverURL:
+            return "Enter a complete server address beginning with http:// or https://."
+        case .invalidInvitationCode:
+            return "Enter all 15 letters and numbers from the invitation code."
+        case .unsupportedSchema, .unsupportedTransport:
+            return "Create a new setup link with the current receiver."
+        case .emptyBearerToken, .emptyInvitationSecret, .crossOriginRedeemURL:
+            return "This invitation is incomplete. Create a new link on your receiver."
+        }
+    }
     @Published var manualPairingServer = ""
     @Published var manualPairingCode = ""
     @Published var isPairing = false
@@ -330,25 +471,32 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published var historicalBackfillState: HealthHistoricalBackfillState
     @Published private(set) var activityLogMessages: [String]
     @Published private(set) var mailboxKeyDiagnosticState: MailboxKeyDiagnosticState
-    @Published private(set) var mailboxDeliveryDiagnosticLine = ""
+    @Published private var mailboxDeliveryDiagnosticLines: [MailboxDeliveryDiagnosticLine] = []
     @Published private(set) var automaticSyncLaneDiagnosticLine: String
 
     private var foregroundCatchUpTask: Task<Void, Never>?
     private var foregroundMailboxOpportunityConsumed = false
     private var foregroundMailboxSceneIsActive = false
-    private var bootstrapTask: Task<Void, Never>?
+    @Published private var bootstrapTask: Task<Void, Never>?
     private var bootstrapAttemptID: UUID?
     private var bootstrapWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var bootstrapRetryGeneration: UInt64 = 0
-    private var terminalRecoveryRequestIsActive = false
+    @Published private var terminalRecoveryRequestIsActive = false
     private var pairingTask: Task<Void, Never>?
     private var pairingAttemptID: UUID?
     private var pairingOperationKind: PairingOperationCategory?
     private let pairingRequestEpoch = PairingRequestEpoch()
     private var backgroundOutboxSchedulingTask: Task<Void, Never>?
     private var backgroundOutboxSchedulingID: UUID?
+    private var backgroundOutboxSchedulingWaiters: [
+        UUID: (schedulingID: UUID, completion: AsyncStream<Void>.Continuation)
+    ] = [:]
     private var trackedSyncTasks: [UUID: Task<Void, Never>] = [:]
     private var directOutboxTransferRequestCount = 0
+    private var automaticDirectPendingTypes: Set<String>?
+    private var automaticDirectReentryTypes: Set<String>?
+    private var automaticDirectDeferredTypes: Set<String> = []
+    private var automaticDirectRawStepsGeneration: Int?
     private var bootstrapCompleted = false
     private var backgroundSyncPreferenceGeneration: UInt64 = 0
     private var automaticSyncPreferenceTask: Task<Void, Never>?
@@ -375,9 +523,13 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @Published private(set) var backgroundSyncRequestedEnabled: Bool
     private var outboxIdentityMigrationReady: Bool
     private var privateStorageAdmissionReady = false
-    private var lastDirectAcceptance: (itemID: String, binding: String, generation: String, reset: UInt64)?
     private let directOutboxTransferGate = AsyncExclusiveAccessGate()
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    let terminalTransitionRequestGateForTesting = AsyncExclusiveAccessGate()
+    private lazy var terminalTransitionRequestCoordinator = TerminalRequestCoordinator(gate: terminalTransitionRequestGateForTesting)
+    #else
     private let terminalTransitionRequestCoordinator = TerminalRequestCoordinator()
+    #endif
     @Published private(set) var terminalTransitionRequestIsActive = false
     private let connectionTerminalBarrier = ReceiverConnectionTerminalBarrier()
     private let encoder = HealthBridgeBatchEncoder()
@@ -393,6 +545,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let historicalBackfillStateStore: HealthHistoricalBackfillStateStore
     private let quantityObservationStore: QuantityObservationStore
     private let coreLaneUploadProofStore: CoreLaneUploadProofStore
+    private let acceptedTransferStore: LastAcceptedTransferObservationStore
     private var outbox: FileOutbox?
     private let outboxDirectoryURL: URL?
     private var cursorStore: FileSyncCursorStore?
@@ -404,12 +557,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private let sleepResetEpochStore: SleepResetEpochStore
     private let sleepSyncPreparer: AnchoredSleepSyncPreparer
     var observeSleepOutboxPayloadReadForTesting: @Sendable () -> Void = {}
+    #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+    var observeSleepEnqueueAttemptForTesting: @MainActor () -> Void = {}
+    #endif
     private let readAnchoredSleepChanges: (@MainActor (
         String?, Date?, Date
     ) async throws -> HealthKitAnchoredSleepChanges)?
     private let readAnchoredStepChanges: (@MainActor (
         String?, Date?, Date
     ) async throws -> HealthKitAnchoredStepChanges)?
+    private let readAnchoredWorkoutChanges: (@MainActor (
+        String?, Date?, Date
+    ) async throws -> HealthKitAnchoredWorkoutChanges)?
+    private let readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])?
     private let automaticSyncEligibleTypeCodesForTesting: [String]?
     private let readDailyActivityAggregates: (@MainActor (
         [String], Date, Date, Calendar
@@ -419,6 +579,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     ) async throws -> HealthKitAnchoredQuantityChanges)?
     private let requestProjectionReadAuthorization: (@MainActor ([String]) async throws -> Void)?
     private let scheduleDirectBackgroundUploads: (@MainActor () async throws -> Int)?
+    private let retainedBackgroundUploadOwnership: (@MainActor (
+        String, String, String
+    ) async -> Bool)?
     private let cancelInheritedLegacyUploads: @MainActor () async -> BackgroundUploadCancellationResult
     private let terminalBackgroundPayloadDrain: (@MainActor () async -> Bool)?
     private let platformBackgroundPayloadDrain: (@MainActor () async -> Bool)?
@@ -448,6 +611,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         historicalBackfillStateStore: HealthHistoricalBackfillStateStore = HealthHistoricalBackfillStateStore(),
         quantityObservationStore: QuantityObservationStore = QuantityObservationStore(),
         coreLaneUploadProofStore: CoreLaneUploadProofStore = CoreLaneUploadProofStore(),
+        acceptedTransferStore: LastAcceptedTransferObservationStore = LastAcceptedTransferObservationStore(),
         outbox: FileOutbox? = HealthBridgeCompanionViewModel.makeDefaultOutbox(),
         outboxDirectoryURL: URL? = HealthBridgeCompanionViewModel.defaultOutboxDirectoryURL(),
         cursorStore: FileSyncCursorStore? = HealthBridgeCompanionViewModel.makeDefaultCursorStore(),
@@ -466,11 +630,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         readAnchoredStepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredStepChanges)? = nil,
+        readAnchoredWorkoutChanges: (@MainActor (
+            String?, Date?, Date
+        ) async throws -> HealthKitAnchoredWorkoutChanges)? = nil,
+        readWorkoutHistory: (@MainActor (Date, Date) async throws -> [HealthKitWorkoutSummary])? = nil,
         automaticSyncEligibleTypeCodesForTesting: [String]? = nil,
         readDailyActivityAggregates: (@MainActor (
             [String], Date, Date, Calendar
         ) async throws -> [HealthKitDailyActivityAggregate])? = nil,
         scheduleDirectBackgroundUploads: (@MainActor () async throws -> Int)? = nil,
+        retainedBackgroundUploadOwnership: (@MainActor (
+            String, String, String
+        ) async -> Bool)? = nil,
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             await BackgroundURLSessionOutboxUploader.shared.cancelInheritedLegacyUploads()
         },
@@ -515,6 +686,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.historicalBackfillStateStore = historicalBackfillStateStore
         self.quantityObservationStore = quantityObservationStore
         self.coreLaneUploadProofStore = coreLaneUploadProofStore
+        self.acceptedTransferStore = acceptedTransferStore
         self.outbox = outbox
         #if !HEALTH_BRIDGE_MAILBOX_QA
         outbox?.automaticSyncDiagnosticStore = automaticSyncDiagnosticStore
@@ -547,11 +719,25 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.sleepSyncPreparer = sleepSyncPreparer
         self.readAnchoredSleepChanges = readAnchoredSleepChanges
         self.readAnchoredStepChanges = readAnchoredStepChanges
+        self.readAnchoredWorkoutChanges = readAnchoredWorkoutChanges
+        self.readWorkoutHistory = readWorkoutHistory
         self.automaticSyncEligibleTypeCodesForTesting = automaticSyncEligibleTypeCodesForTesting
         self.readDailyActivityAggregates = readDailyActivityAggregates
         self.readAnchoredQuantityChanges = readAnchoredQuantityChanges
         self.requestProjectionReadAuthorization = requestProjectionReadAuthorization
         self.scheduleDirectBackgroundUploads = scheduleDirectBackgroundUploads
+        #if os(iOS)
+        self.retainedBackgroundUploadOwnership = retainedBackgroundUploadOwnership ?? {
+            itemID, receiverGeneration, receiverBindingID in
+            BackgroundURLSessionOutboxUploader.shared.hasRetainedTaskOwnership(
+                itemID: itemID,
+                receiverGeneration: receiverGeneration,
+                receiverBindingID: receiverBindingID
+            )
+        }
+        #else
+        self.retainedBackgroundUploadOwnership = retainedBackgroundUploadOwnership
+        #endif
         self.cancelInheritedLegacyUploads = cancelInheritedLegacyUploads
         self.terminalBackgroundPayloadDrain = terminalBackgroundPayloadDrain
         self.platformBackgroundPayloadDrain = platformBackgroundPayloadDrain
@@ -653,6 +839,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 .latestLaneSummary ?? "No automatic-sync lane diagnostic recorded."
         }
         self.publishedPendingOutboxCount = (try? outbox?.pendingItems().count) ?? 0
+        self.acceptedFinalizationHold = try? outbox?.acceptedFinalizationHold()
         self.hasPendingSleepTransition = Self.sleepStorageMayNeedRecovery(in: sleepManifestStore)
         self.hasPendingOutboxDeletion = outbox?.destructiveRecoveryIsRequested ?? true
         if outbox == nil {
@@ -821,6 +1008,60 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         isSyncing || automaticSyncOwnerIsActive
     }
 
+    var syncPresentation: CompanionSyncPresentation {
+        CompanionSyncPresentation(
+            snapshot: setupSnapshot,
+            canSendConnectionTest: canSendConnectionTest,
+            isPairing: isPairing,
+            hasPendingPairing: hasPendingPairing,
+            hasPendingPrivateStorageRecovery: hasPendingPrivateStorageRecovery,
+            usesMailboxTransport: usesMailboxTransport,
+            backgroundSyncEnabled: backgroundSyncEnabled,
+            hasPublishedMailboxItem: hasPublishedMailboxItem
+        )
+    }
+
+    var activityMailboxFailureMessage: String? {
+        guard usesMailboxTransport, let diagnostic = mailboxDeliveryDiagnosticLines.last,
+              diagnostic.failureGeneration == settingsStore.receiverSettingsGenerationToken else { return nil }
+        return diagnostic.message
+    }
+
+    var activityStatusDetail: String {
+        let presentation = syncPresentation
+        switch presentation.phase {
+        case .needsAttention:
+            return displayStatusMessage
+        case .mailboxQueued, .mailboxConfirmationWaiting:
+            return activityMailboxFailureMessage ?? presentation.detail
+        default:
+            return presentation.detail
+        }
+    }
+
+    var lastAcceptedTransferObservation: LastAcceptedTransferObservation? {
+        guard receiverSettingsSaved, let bindingID = settingsStore.receiverBindingID else { return nil }
+        return acceptedTransferStore.load(
+            bindingID: bindingID,
+            generation: settingsStore.receiverSettingsGenerationToken
+        )
+    }
+
+    private func recordAcceptedTransfer(
+        bindingID: String,
+        generation: String,
+        evidenceKind: LastAcceptedTransferObservation.EvidenceKind
+    ) {
+        guard settingsStore.receiverBindingID == bindingID,
+              settingsStore.receiverSettingsGenerationToken == generation else { return }
+        acceptedTransferStore.record(LastAcceptedTransferObservation(
+            bindingID: bindingID,
+            generation: generation,
+            observedAt: Date(),
+            evidenceKind: evidenceKind
+        ))
+    }
+
     var setupStateDetail: String {
         switch setupState {
         case .unpaired:
@@ -906,8 +1147,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         HealthHistoricalBackfillPresentation.summary(state: historicalBackfillState)
     }
 
+    var canChangeHealthHistoryDepth: Bool {
+        terminalUserActionAdmissionIsOpen
+    }
+
     func setHealthHistoryDepthOption(_ optionID: String) {
-        guard terminalUserActionAdmissionIsOpen else { return }
+        guard canChangeHealthHistoryDepth else { return }
         let selected = HealthHistoryDepthPresentation.historyDepth(forOptionID: optionID)
         healthHistoryDepthStore.saveHistoryDepth(selected)
         healthHistoryDepth = healthHistoryDepthStore.historyDepth
@@ -923,6 +1168,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 pairingRequestEpoch.invalidate()
                 let previousGeneration = settingsStore.receiverSettingsGenerationToken
                 let newReceiverURLString = receiverURLString
+                let previousBindingID = settingsStore.receiverBindingID
                 let newBearerToken = bearerToken
                 let transition: (
                     result: Void,
@@ -960,6 +1206,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         statusIsError = true
                         statusMessage = "Connection saved, but private sync storage must recover before uploads can resume."
                     } else {
+                        if receiverSettingsSaved, settingsStore.receiverBindingID != previousBindingID {
+                            setupLinkReplacementFailure = nil
+                        }
                         statusIsError = false
                         statusMessage = "Saved connection on this iPhone."
                     }
@@ -1062,19 +1311,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             receiverSettingsSaved = false
             hasPendingPairing = ((try? pairingCoordinator.hasPendingPairing()) ?? false)
                 || cancellationCleanupRecoveryRequired
-            mailboxDeliveryDiagnosticLine = ""
+            mailboxDeliveryDiagnosticLines = []
+            setupLinkReplacementFailure = nil
             backgroundSyncStatus = "Automatic sync is off. Sync Now still works."
             refreshPendingOutboxCount()
             if cancellationCleanupRecoveryRequired || transition.postCommitRecoveryRequired {
                 statusIsError = true
                 statusMessage = "Disconnected and turned automatic sync off. Private sync storage must recover before uploads can resume."
+                return .disconnectedWithRecoveryRequired
+            }
+            statusIsError = false
+            if let trustedPendingOutboxCount {
+                statusMessage = "Disconnected and turned automatic sync off. Queued uploads: \(trustedPendingOutboxCount)."
             } else {
-                statusIsError = false
-                if let trustedPendingOutboxCount {
-                    statusMessage = "Disconnected and turned automatic sync off. Queued uploads: \(trustedPendingOutboxCount)."
-                } else {
-                    statusMessage = "Disconnected and turned automatic sync off. Queued-upload status is unavailable."
-                }
+                statusMessage = "Disconnected and turned automatic sync off. Queued-upload status is unavailable."
             }
             return .disconnected(pendingOutboxCount: trustedPendingOutboxCount)
         } catch {
@@ -1086,42 +1336,60 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let failureMessage = "Disconnect failed: \(describe(error))"
             statusIsError = true
             statusMessage = failureMessage
+            let notice = if error as? ReceiverConnectionTerminalBarrierError
+                == .backgroundPayloadCancellationNotFinalized {
+                "Background uploads haven’t finished stopping. Wait for cleanup, then try disconnecting again."
+            } else if connectionPreserved,
+                      let message = acceptedFinalizationRecoveryMessage {
+                "\(message) Review Recovery in Settings before disconnecting."
+            } else if connectionPreserved,
+                      error as? ReceiverOutboxIdentityError == .receiverTransitionRequiresEmptyOutbox,
+                      outboxIdentityMigrationReady, outbox?.destructiveRecoveryIsRequested == false,
+                      let trustedPendingOutboxCount, trustedPendingOutboxCount > 0 {
+                "Queued uploads are waiting on this iPhone. Bring the server back and tap Sync Now to send them, or use Reset Private Sync State in Settings to discard them and rebuild local sync history before disconnecting."
+            } else if connectionPreserved {
+                "Your saved server connection was not removed. Review Recovery in Settings, then try disconnecting again."
+            } else {
+                "Health Bridge couldn’t finish disconnecting. Review the saved connection and Recovery in Settings."
+            }
             return .rejected(
-                message: failureMessage,
+                message: notice,
                 pendingOutboxCount: trustedPendingOutboxCount,
                 connectionPreserved: connectionPreserved
             )
         }
     }
 
-    private func checkReceiverHealth() async {
+    private func checkReceiverHealth() async -> ConnectionProbeResult {
         if settingsStore.activeTransport == .mailbox {
             do {
-                statusIsError = false
-                statusMessage = "Checking encrypted iCloud mailbox..."
                 try makeProductionMailboxDelivery().validateAvailability()
-                statusMessage = "Mailbox folder is ready on this iPhone. Receiver delivery has not been verified."
+                return .reachable("Mailbox folder is ready on this iPhone. Receiver delivery has not been verified.")
             } catch {
-                statusIsError = true
-                statusMessage = "Encrypted iCloud mailbox check failed: \(describe(error))"
+                return .failed(
+                    "Encrypted iCloud mailbox check failed: \(describe(error))", issue: .mailboxUnavailable
+                )
             }
-            return
         }
         guard let url = URL(string: receiverURLString) else {
-            statusIsError = true
-            statusMessage = "Bridge URL is invalid."
-            return
+            return .failed("Bridge URL is invalid.", issue: .invalidAddress)
         }
 
         do {
-            statusIsError = false
-            statusMessage = "Checking connection..."
-            let result = try await receiverClient.healthCheck(forBatchURL: url)
-            statusIsError = false
-            statusMessage = "Connection check passed with HTTP \(result.statusCode)."
+            _ = try await receiverClient.healthCheck(forBatchURL: url)
+            return .reachable("Health Bridge connected")
         } catch {
-            statusIsError = true
-            statusMessage = "Local bridge check failed: \(describe(error))"
+            let issue: ConnectionIssue? = switch (error as? URLError)?.code {
+            case .notConnectedToInternet: .offline
+            case .cannotFindHost, .cannotConnectToHost, .timedOut, .networkConnectionLost:
+                .unreachable
+            case .secureConnectionFailed, .serverCertificateUntrusted,
+                 .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+                 .serverCertificateNotYetValid:
+                .secureConnection
+            default: nil
+            }
+            return .failed("Local bridge check failed: \(describe(error))", issue: issue)
         }
     }
 
@@ -1169,21 +1437,30 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func performCheckConnection() async {
         guard !isCheckingConnection else { return }
-        guard canSendConnectionTest, !Task.isCancelled else {
-            statusIsError = true
-            statusMessage = "Connection test is paused while pairing recovery is in progress."
-            return
-        }
+        guard canSendConnectionTest, !Task.isCancelled else { return }
+        let generation = settingsStore.receiverSettingsGenerationToken
         isCheckingConnection = true
-        statusIsError = false
-        statusMessage = "Checking connection..."
+        pairingInputError = nil
         defer {
             if !taskUIPublicationIsSuppressed {
                 isCheckingConnection = false
             }
         }
 
-        await checkReceiverHealth()
+        let result = await checkReceiverHealth()
+        guard !Task.isCancelled, !taskUIPublicationIsSuppressed,
+              generation == settingsStore.receiverSettingsGenerationToken else { return }
+        switch result {
+        case .reachable(let message):
+            lastConnectionCheck = ConnectionCheckNotice(
+                message: message, isError: false, generation: generation
+            )
+        case .failed(let message, let issue):
+            lastConnectionCheck = ConnectionCheckNotice(
+                message: issue?.message ?? CompanionPrimaryStatusMessage.sanitized(from: message, isError: true),
+                isError: true, generation: generation
+            )
+        }
     }
 
     func performPrimaryAction() async {
@@ -1228,14 +1505,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func runWithExclusiveDirectOutboxTransfer<Result>(
-        _ operation: @escaping @MainActor () async -> Result
+        reschedulePendingUploads: Bool = true,
+        _ operation: @escaping @MainActor () async throws -> Result
     ) async throws -> Result {
         directOutboxTransferRequestCount += 1
         do {
             try await directOutboxTransferGate.acquire()
         } catch {
             directOutboxTransferRequestCount -= 1
-            if directOutboxTransferRequestCount == 0 {
+            if reschedulePendingUploads, directOutboxTransferRequestCount == 0 {
                 schedulePendingBackgroundOutboxUploadsIfAllowed()
             }
             throw error
@@ -1263,30 +1541,103 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 }
             }
             #endif
-            let result = await operation()
-            await finishExclusiveDirectOutboxTransfer()
+            let result = try await operation()
+            await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             return result
         } catch {
-            await finishExclusiveDirectOutboxTransfer()
+            await finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads)
             throw error
         }
     }
 
-    private func finishExclusiveDirectOutboxTransfer() async {
+    private func finishExclusiveDirectOutboxTransfer(reschedulePendingUploads: Bool) async {
         await directOutboxTransferGate.release()
         directOutboxTransferRequestCount -= 1
-        if directOutboxTransferRequestCount == 0 {
+        if reschedulePendingUploads, directOutboxTransferRequestCount == 0 {
             schedulePendingBackgroundOutboxUploadsIfAllowed()
         }
     }
 
-    private func flushAutomaticPendingOutbox() async throws -> Bool {
+    private func flushAutomaticPendingOutbox(reschedulePendingUploads: Bool = true) async throws -> Bool {
         guard settingsStore.activeTransport == .directHTTP else {
             return await flushPendingOutbox(executionMode: .automatic)
         }
-        return try await runWithExclusiveDirectOutboxTransfer {
+        return try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: reschedulePendingUploads) {
             await self.flushPendingOutbox(executionMode: .automatic)
         }
+    }
+
+    private func collectAutomaticDirectTypes(
+        _ processPendingTypes: @escaping AutomaticSyncEngine.ProcessPendingTypes,
+        reentryTypes: Set<String>?,
+        acknowledgedRawStepsGeneration: Int?
+    ) async throws -> (
+        processing: Result<Bool, Error>,
+        deferredTypes: Set<String>,
+        enqueuedPayloads: Bool,
+        rawStepsGeneration: Int?
+    ) {
+        try await runWithExclusiveDirectOutboxTransfer(reschedulePendingUploads: false) {
+            try await self.preparePrivateStorageForUploadAdmission()
+            let target = try self.capturePayloadDeliveryTarget()
+            guard let outbox = self.outbox else {
+                throw CompanionPrivateStorageError.outboxUnavailable
+            }
+            let items = try outbox.pendingItems()
+            // Unknown payload types cannot establish that a HealthKit lane is independent.
+            // Fail before collection rather than reading against an unknown retained cursor.
+            let pendingTypes = try await SleepSyncValueWork.run {
+                Set(try items.flatMap { item -> [String] in
+                    let batch = try JSONDecoder().decode(
+                        HealthBridgeBatchV1.self, from: Data(contentsOf: item.fileURL)
+                    )
+                    // Catalogue-only probes do not own any HealthKit read progress.
+                    guard !batch.samples.isEmpty || !batch.workouts.isEmpty
+                            || !batch.sleepSessions.isEmpty || !batch.deletedRecords.isEmpty
+                            || batch.sync.cursors.contains(where: { $0.cursorKind != "connection_test" })
+                    else { return [] }
+                    return GenericQuantityCoveragePolicy.canonicalTypeCodes(
+                        for: batch.healthTypes.map(\.typeCode)
+                    )
+                })
+            }
+            try self.requireCurrentPayloadDeliveryTarget(target)
+            guard self.outbox === outbox, try outbox.pendingItems() == items else {
+                throw CancellationError()
+            }
+            self.automaticDirectPendingTypes = pendingTypes
+            self.automaticDirectReentryTypes = reentryTypes
+            self.automaticDirectDeferredTypes = []
+            self.automaticDirectRawStepsGeneration = acknowledgedRawStepsGeneration
+            defer {
+                self.automaticDirectPendingTypes = nil
+                self.automaticDirectReentryTypes = nil
+                self.automaticDirectDeferredTypes = []
+                self.automaticDirectRawStepsGeneration = nil
+            }
+            let processing: Result<Bool, Error>
+            do {
+                processing = .success(try await processPendingTypes())
+            } catch {
+                processing = .failure(error)
+            }
+            // Account for durable work inside the gate even if a later lane throws.
+            let previousIDs = Set(items.map(\.id))
+            let enqueuedPayloads = Result {
+                try outbox.pendingItems().contains { !previousIDs.contains($0.id) }
+            }
+            return (
+                processing.flatMap { processed in enqueuedPayloads.map { _ in processed } },
+                self.automaticDirectDeferredTypes,
+                (try? enqueuedPayloads.get()) == true,
+                self.automaticDirectRawStepsGeneration
+            )
+        }
+    }
+
+    private func deferAutomaticDirectTypes(_ generations: [String: Int]) -> AutomaticSyncTypeResult {
+        automaticDirectDeferredTypes.formUnion(generations.keys)
+        return .deferredCovering(generations)
     }
 
     private func flushPendingOutbox(executionMode: HealthBridgeSyncExecutionMode) async -> Bool {
@@ -1322,7 +1673,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             let upload = try await uploadPendingOutbox(
                 outbox,
                 to: target,
-                finalizePendingSleep: true,
                 executionMode: executionMode
             )
             let summary = upload.summary
@@ -1335,9 +1685,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } else if summary.failedCount > 0 {
                 statusIsError = true
                 statusMessage = "Some queued uploads did not finish: attempted \(summary.attemptedCount), uploaded \(summary.uploadedCount), failed \(summary.failedCount). \(Self.firstFailureSentence(summary)) Queued uploads: \(pendingOutboxCount)."
+                if executionMode == .foreground, target.route != .mailbox { return false }
             } else {
                 statusIsError = false
-                statusMessage = "Queued uploads sent: \(summary.uploadedCount). Remaining: \(pendingOutboxCount)."
+                if summary.uploadedCount > 0 {
+                    statusMessage = "Queued uploads sent: \(summary.uploadedCount). Remaining: \(pendingOutboxCount)."
+                } else if pendingOutboxCount > 0 {
+                    statusMessage = "Nothing was sent. Queued uploads remaining: \(pendingOutboxCount)."
+                }
             }
             return true
         } catch let conflict as RejectedSleepBaselineOutboxItem {
@@ -1479,11 +1834,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return true
     }
 
-    private func resetPrivateSyncProgressForClear() throws {
+    private func resetPrivateSyncStateAndOutbox() throws -> FileOutboxDestructiveRecoveryResult {
         if connectionStateNeedsRecovery {
             try settingsStore.resetInvalidConnectionRecord()
             connectionStateNeedsRecovery = false
         } else {
+            if settingsStore.activeTransport == .mailbox,
+               mailboxKeyStore.diagnosticState() == .lost {
+                try settingsStore.beginTerminalCancellationIntent(
+                    expectedGeneration: settingsStore.receiverSettingsGenerationToken
+                )
+            }
             try settingsStore.resolveTerminalCancellationForPrivateReset()
         }
         try pairingStateStore.resetPrivatePairingState()
@@ -1520,18 +1881,20 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         historicalBackfillStateStore.reset()
         refreshHistoricalBackfillPublishedStateIfAllowed()
         cursorStateNeedsRecovery = false
+        guard let outboxDirectoryURL else {
+            throw CompanionPrivateStorageError.outboxUnavailable
+        }
+        try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
+        try acceptedTransferStore.clear()
+        let recovery = try FileOutbox.completeConfirmedTerminalReset(directory: outboxDirectoryURL)
+        setupLinkReplacementFailure = nil
+        mailboxDeliveryDiagnosticLines = []
+        return recovery
     }
 
     private func performClearPendingOutbox() async -> Bool {
         do {
-            try resetPrivateSyncProgressForClear()
-            guard let outboxDirectoryURL else {
-                throw CompanionPrivateStorageError.outboxUnavailable
-            }
-            try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
-            let recovery = try FileOutbox.completeConfirmedTerminalReset(
-                directory: outboxDirectoryURL
-            )
+            let recovery = try resetPrivateSyncStateAndOutbox()
             self.outbox = recovery.outbox
             let removedCount = recovery.removedPayloadCount
             outboxIdentityMigrationReady = true
@@ -1782,14 +2145,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return false
         }
         do {
-            try resetPrivateSyncProgressForClear()
-            guard let outboxDirectoryURL else {
-                throw CompanionPrivateStorageError.outboxUnavailable
-            }
-            try FileOutbox.beginDestructiveRecovery(directory: outboxDirectoryURL)
-            let recovery = try FileOutbox.completeConfirmedTerminalReset(
-                directory: outboxDirectoryURL
-            )
+            let recovery = try resetPrivateSyncStateAndOutbox()
             self.outbox = recovery.outbox
             let removedCount = recovery.removedPayloadCount
             outboxIdentityMigrationReady = true
@@ -2131,9 +2487,28 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             throw CompanionPrivateStorageError.outboxUnavailable
         }
         let pendingItemCount: Int
+        let receiptsBlockTransition: Bool
         do {
             pendingItemCount = try outbox.pendingItems().count
+            let hold = try outbox.acceptedFinalizationHold()
+            if !taskUIPublicationIsSuppressed { acceptedFinalizationHold = hold }
+            if hold != nil {
+                receiptsBlockTransition = true
+            } else if pendingItemCount == 0 {
+                let mayRetirePlainDirectReceipts = outboxIdentityAdmissionWasReady
+                    && !outbox.destructiveRecoveryIsRequested
+                    && !recoverCommittedReceiverRemoval
+                    && settingsStore.activeTransport == .directHTTP
+                    && (expectedGeneration == nil || expectedGeneration == settingsStore.receiverSettingsGenerationToken)
+                // This runs before invalidating the old generation, and is checked again after drain.
+                receiptsBlockTransition = try !outbox.retirePlainDirectReceiptsForConnectionTransition(
+                    receiverBindingID: mayRetirePlainDirectReceipts ? settingsStore.receiverBindingID : nil
+                )
+            } else {
+                receiptsBlockTransition = false
+            }
         } catch {
+            if !taskUIPublicationIsSuppressed { acceptedFinalizationHold = nil }
             if diagnosePairingCommitBarriers {
                 throw ReceiverPairingCommitBarrierError.outboxUnreadable
             }
@@ -2148,9 +2523,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             guard pendingItemCount == 0, !outbox.destructiveRecoveryIsRequested else {
                 throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
             }
-            return
-        }
-        if diagnosePairingCommitBarriers {
+        } else if diagnosePairingCommitBarriers {
             if let failure = ReceiverConnectionTransitionPolicy.pairingCommitBarrierFailure(
                 outboxIdentityAdmissionReady: outboxIdentityAdmissionWasReady,
                 pendingItemCount: pendingItemCount,
@@ -2158,13 +2531,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             ) {
                 throw failure
             }
-            return
-        }
-        guard ReceiverConnectionTransitionPolicy.canBegin(
+        } else if !ReceiverConnectionTransitionPolicy.canBegin(
             outboxIdentityAdmissionReady: outboxIdentityAdmissionWasReady,
             pendingItemCount: pendingItemCount,
             clearIntentIsActive: outbox.destructiveRecoveryIsRequested
-        ) else {
+        ) {
+            throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
+        }
+        if receiptsBlockTransition {
+            if diagnosePairingCommitBarriers { throw ReceiverPairingCommitBarrierError.outboxNotEmpty }
             throw ReceiverOutboxIdentityError.receiverTransitionRequiresEmptyOutbox
         }
     }
@@ -2228,33 +2603,36 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         committedGeneration: String,
         postCommitRecoveryRequired: Bool
     ) {
+        let outboxIdentityAdmissionWasReady = outboxIdentityMigrationReady
+        let originalGeneration = settingsStore.receiverSettingsGenerationToken
+        // Reject known queued work before stopping a writer that can still finish
+        // a receiver-accepted response under the current generation.
+        do {
+            try requireTrustedEmptyOutboxForConnectionTransition(
+                outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady,
+                expectedGeneration: originalGeneration,
+                recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval,
+                diagnosePairingCommitBarriers: diagnosePairingCommitBarriers
+            )
+        } catch {
+            if (try? outbox?.hasPendingDirectSleepCleanup()) == true {
+                await restorePrivateStorageAdmissionAfterFailedConnectionTransition()
+            }
+            throw error
+        }
         beginTerminalTaskUIPublicationSuppression()
         if cancelPairingOperation {
             await cancelPairingOperationIfNeeded()
         }
-        let outboxIdentityAdmissionWasReady = outboxIdentityMigrationReady
         var previousBindingID: String?
         let transition: (result: Result, committedGeneration: String)
         do {
-            transition = try await connectionTerminalBarrier.perform(
+            transition = try await connectionTerminalBarrier.performRecovery(
             closeAdmission: {
                 previousBindingID = self.settingsStore.receiverBindingID
                 self.privateStorageAdmissionReady = false
                 self.outboxIdentityMigrationReady = false
                 self.automaticSyncRuntime?.stopAdmission()
-            },
-            invalidateGeneration: {
-                do {
-                    if advanceGeneration {
-                        return try self.settingsStore.invalidateReceiverSettingsGeneration()
-                    }
-                    return self.settingsStore.receiverSettingsGenerationToken
-                } catch {
-                    if diagnosePairingCommitBarriers {
-                        throw ReceiverPairingCommitBarrierError.generationInvalidationFailed
-                    }
-                    throw error
-                }
             },
             cancelAndAwaitPairing: {
                 if cancelPairingOperation {
@@ -2270,13 +2648,34 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 }
                 return await self.drainBackgroundPayloadCancellation()
             },
-            commit: { expectedGeneration in
+            commit: {
+                guard self.settingsStore.receiverSettingsGenerationToken == originalGeneration,
+                      self.settingsStore.receiverBindingID == previousBindingID else {
+                    throw ReceiverSettingsGenerationError.staleGeneration
+                }
                 try self.requireTrustedEmptyOutboxForConnectionTransition(
                     outboxIdentityAdmissionWasReady: outboxIdentityAdmissionWasReady,
-                    expectedGeneration: expectedGeneration,
+                    expectedGeneration: originalGeneration,
                     recoverCommittedReceiverRemoval: recoverCommittedReceiverRemoval,
                     diagnosePairingCommitBarriers: diagnosePairingCommitBarriers
                 )
+                // With admission closed and drained, keep this check and any
+                // preliminary generation write in the same MainActor turn.
+                let expectedGeneration: String
+                if advanceGeneration {
+                    do {
+                        expectedGeneration = try self.settingsStore.invalidateReceiverSettingsGeneration(
+                            expectedGeneration: originalGeneration
+                        )
+                    } catch {
+                        if diagnosePairingCommitBarriers {
+                            throw ReceiverPairingCommitBarrierError.generationInvalidationFailed
+                        }
+                        throw error
+                    }
+                } else {
+                    expectedGeneration = originalGeneration
+                }
                 let result = try await commit(expectedGeneration)
                 let committedBindingID = self.settingsStore.receiverBindingID
                 if committedBindingID != previousBindingID {
@@ -2455,13 +2854,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
-    private func pauseAutomaticSyncForPendingPairing() {
-        hasPendingPairing = true
-        automaticSyncRuntime?.stopAdmission()
-    }
-
     private func activateAutomaticSyncIfReady(scheduleOutbox: Bool = true) {
         automaticSyncRuntime?.activateIfReady(scheduleOutbox: scheduleOutbox)
+    }
+
+    func dismissPairingInputError() {
+        guard pairingInputError != nil else { return }
+        statusIsError = false
+        statusMessage = "Enter a private setup link or an invitation code."
     }
 
     func importPairingText() async {
@@ -2475,6 +2875,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               connectionTerminalBarrier.admissionIsOpen else {
             return
         }
+        setupLinkReplacementFailure = nil
         guard privateStorageAdmissionReady, !hasPendingPrivateStorageRecovery else {
             statusIsError = true
             statusMessage = "Reset unreadable private sync state before importing a new setup link."
@@ -2482,6 +2883,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard !isPairing else { return }
         pairingFailurePresentation = nil
+        pairingInputError = nil
         let trimmed = pairingImportText.trimmingCharacters(in: .whitespacesAndNewlines)
         isPairing = true
         defer {
@@ -2502,6 +2904,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     func importPairingURL(_ url: URL) async {
         guard !taskUIPublicationIsSuppressed else { return }
         pairingFailurePresentation = nil
+        pairingInputError = nil
         let pendingPairingExists: Bool
         do {
             pendingPairingExists = try pairingCoordinator.hasPendingPairing()
@@ -2553,6 +2956,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               connectionTerminalBarrier.admissionIsOpen else {
             return
         }
+        setupLinkReplacementFailure = nil
         guard privateStorageAdmissionReady, !hasPendingPrivateStorageRecovery else {
             statusIsError = true
             statusMessage = "Reset unreadable private sync state before opening a new setup link."
@@ -2592,6 +2996,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard !isPairing else { return }
         pairingFailurePresentation = nil
+        pairingInputError = nil
         isPairing = true
         defer {
             if !taskUIPublicationIsSuppressed {
@@ -2606,7 +3011,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             statusIsError = false
             statusMessage = "Redeeming temporary pairing invitation..."
-            pauseAutomaticSyncForPendingPairing()
+            hasPendingPairing = true
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                 cancelPairingOperation: false,
@@ -2636,26 +3041,35 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             if hasPendingPairing {
                 throw ReceiverPairingStateError.pendingPairingConflict
             }
+            let isReplacingConnection = receiverSettingsSaved
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
-            let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
-                cancelPairingOperation: false,
-                diagnosePairingCommitBarriers: true
-            ) { expectedGeneration in
-                try self.settingsStore.save(
-                    receiverURLString: bundle.receiverURLString,
-                    bearerToken: bundle.bearerToken,
-                    expectedGeneration: expectedGeneration,
-                    rotateBindingID: true
+            do {
+                let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
+                    cancelPairingOperation: false,
+                    diagnosePairingCommitBarriers: true
+                ) { expectedGeneration in
+                    try self.settingsStore.save(
+                        receiverURLString: bundle.receiverURLString,
+                        bearerToken: bundle.bearerToken,
+                        expectedGeneration: expectedGeneration,
+                        rotateBindingID: true
+                    )
+                }
+                try requireCommittedConnectionGenerationWhileHoldingRequestGate(
+                    transition.committedGeneration
                 )
+                applyCommittedPairingConnection(
+                    receiverURL: bundle.receiverURLString,
+                    token: bundle.bearerToken,
+                    label: bundle.label,
+                    previousGeneration: previousGeneration
+                )
+            } catch let error as ReceiverPairingCommitBarrierError
+                where isReplacingConnection && error == .backgroundPayloadCancellationNotFinalized {
+                setupLinkReplacementFailure =
+                    "Background upload cleanup is still in progress. Your saved connection was not replaced. Try again after cleanup finishes."
+                throw error
             }
-            let committedGeneration = transition.committedGeneration
-            try requireCommittedConnectionGenerationWhileHoldingRequestGate(committedGeneration)
-            applyCommittedPairingConnection(
-                receiverURL: bundle.receiverURLString,
-                token: bundle.bearerToken,
-                label: bundle.label,
-                previousGeneration: previousGeneration
-            )
         case .invitation(let invitation):
             let pendingPairingExists = try pairingCoordinator.hasPendingPairing()
             let matchesPendingInvitation: Bool
@@ -2677,7 +3091,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 && invitation.mailboxBootstrap != nil
             statusIsError = false
             statusMessage = "Redeeming temporary pairing invitation..."
-            pauseAutomaticSyncForPendingPairing()
+            hasPendingPairing = true
             let previousGeneration = settingsStore.receiverSettingsGenerationToken
             let transition = try await performTerminalConnectionTransitionWhileHoldingRequestGate(
                 cancelPairingOperation: false,
@@ -2721,6 +3135,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         usesMailbox: Bool = false
     ) {
         pairingFailurePresentation = nil
+        pairingInputError = nil
+        setupLinkReplacementFailure = nil
         receiverURLString = receiverURL
         bearerToken = token
         reloadCommittedReceiverSettings()
@@ -3165,7 +3581,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               directOutboxTransferRequestCount == 0 else { return }
         #if os(iOS)
         startBackgroundOutboxScheduling(cancelExistingUploads: false)
-        await backgroundOutboxSchedulingTask?.value
+        guard !Task.isCancelled, let schedulingID = backgroundOutboxSchedulingID else { return }
+        // Cancelling the stream wait releases the owner without cancelling the scheduler.
+        let (finished, completion) = AsyncStream<Void>.makeStream()
+        let waiterID = UUID()
+        backgroundOutboxSchedulingWaiters[waiterID] = (schedulingID, completion)
+        defer { backgroundOutboxSchedulingWaiters.removeValue(forKey: waiterID) }
+        var iterator = finished.makeAsyncIterator()
+        _ = await iterator.next()
         #endif
     }
 
@@ -3193,7 +3616,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func reschedulePendingBackgroundOutboxUploadsAfterReceiverChange() {
-        mailboxDeliveryDiagnosticLine = ""
+        mailboxDeliveryDiagnosticLines = []
         guard terminalPayloadActionAdmissionIsOpen,
               automaticSyncReady,
               directOutboxTransferRequestCount == 0 else { return }
@@ -3254,6 +3677,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func finishBackgroundOutboxScheduling(id: UUID) {
+        // A replaced or terminally cancelled scheduler still finishes its own waiters.
+        for waiter in backgroundOutboxSchedulingWaiters.values where waiter.schedulingID == id {
+            waiter.completion.finish()
+        }
         guard backgroundOutboxSchedulingID == id else { return }
         backgroundOutboxSchedulingTask = nil
         backgroundOutboxSchedulingID = nil
@@ -3281,14 +3708,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             do {
                 try requireCurrentConnectionGeneration(expectedGeneration)
                 let summary = try await makeProductionMailboxDelivery()
-                    .publishPendingFIFOHead()
+                    .publishPendingFIFOHeadWithOwnership()
                 try requireCurrentConnectionGeneration(expectedGeneration)
                 refreshPendingOutboxCount()
                 backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage(
                     summary,
                     pendingCount: pendingOutboxCount
                 )
-                mailboxDeliveryDiagnosticLine = summary.diagnosticLine
+                publishMailboxDeliverySummary(
+                    summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                    completedOperations: [.publishFIFOHead]
+                )
                 if summary.terminalCount > 0 {
                     statusIsError = true
                     statusMessage = "Receiver rejected a secure mailbox item. Review the connection before retrying."
@@ -3301,8 +3731,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 } catch {
                     return
                 }
+                refreshPendingOutboxCount()
                 let description = describe(error)
-                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                publishMailboxDeliveryFailure(error, generation: expectedGeneration, operation: .publishFIFOHead)
                 backgroundSyncStatus = "Encrypted iCloud mailbox delivery failed: \(description)"
             }
             return
@@ -3486,8 +3917,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             } catch {
                 return
             }
-            mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
-            backgroundSyncStatus = mailboxDeliveryDiagnosticLine
+            backgroundSyncStatus = publishMailboxDeliveryFailure(error, generation: expectedGeneration)
         }
     }
 
@@ -3501,40 +3931,69 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             return .completed(pendingCount: pendingOutboxCount)
         }
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
+        let acceptanceTarget = try? capturePayloadDeliveryTarget()
+        let deliveryOutbox = outbox
+        var finalizedOwner: OutboxDeliveryOwnershipV1?
+        defer {
+            recordNewMailboxFinalization(finalizedOwner, for: acceptanceTarget, outbox: deliveryOutbox)
+        }
+        var operation: MailboxDeliveryOperation = requestedPhase == .publishFIFOHead
+            ? .publishFIFOHead : .selectFIFOHeadPhase
+        var completedOperations: Set<MailboxDeliveryOperation> = []
         do {
             try Task.checkCancellation()
             try requireCurrentConnectionGeneration(expectedGeneration)
             let delivery = try makeProductionMailboxDelivery()
+            let startingCheckpoint = backgroundSyncStore.mailboxAckScanCheckpoint(receiverGeneration: expectedGeneration)
             let summary: ProductionMailboxBackgroundDeliverySummary
             switch requestedPhase {
             case .publishFIFOHead:
-                summary = try await delivery.publishPendingFIFOHead()
+                summary = try await delivery.publishPendingFIFOHeadWithOwnership()
             case .advanceOrReconcileFIFOHead:
-                switch try await delivery.pendingFIFOHeadBackgroundPhase() {
+                let pendingPhase = try await delivery.pendingFIFOHeadBackgroundPhase()
+                completedOperations.insert(.selectFIFOHeadPhase)
+                switch pendingPhase {
                 case .reconcileFIFOHeadAcknowledgment:
+                    operation = .reconcileFIFOHeadAcknowledgment
                     summary = try await delivery.reconcilePendingFIFOHeadAcknowledgment(
-                        afterAcknowledgmentCheckpoint: backgroundSyncStore
-                            .mailboxAckScanCheckpoint(
-                                receiverGeneration: expectedGeneration
-                            )
-                    )
+                        afterAcknowledgmentCheckpoint: startingCheckpoint
+                    ) { finalizedOwner = $0 }
                 case .none, .publishFIFOHead:
-                    summary = try await delivery.publishPendingFIFOHead()
+                    operation = .publishFIFOHead
+                    summary = try await delivery.publishPendingFIFOHeadWithOwnership()
                 }
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
-            if let checkpoint = summary.nextAcknowledgmentCheckpoint {
-                try backgroundSyncStore.persistMailboxAckScanCheckpoint(
-                    checkpoint,
-                    receiverGeneration: expectedGeneration
-                )
+            completedOperations.insert(operation)
+            if requestedPhase == .advanceOrReconcileFIFOHead,
+               let write = mailboxCheckpointWrite(
+                   startingCheckpoint: startingCheckpoint,
+                   nextCheckpoint: summary.nextAcknowledgmentCheckpoint,
+                   generation: expectedGeneration
+               ) {
+                do {
+                    try backgroundSyncStore.persistMailboxAckScanCheckpoint(
+                        write.checkpoint, receiverGeneration: expectedGeneration
+                    )
+                    completedOperations.insert(.persistScanCheckpoint)
+                } catch {
+                    // Item finalization and scan completion still happened even though this write failed.
+                    publishMailboxDeliverySummary(
+                        summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                        completedOperations: completedOperations
+                    )
+                    throw write
+                }
             }
             refreshPendingOutboxCount()
             backgroundSyncStatus = Self.mailboxBackgroundDeliveryMessage(
                 summary,
                 pendingCount: pendingOutboxCount
             )
-            mailboxDeliveryDiagnosticLine = summary.diagnosticLine
+            publishMailboxDeliverySummary(
+                summary.diagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                completedOperations: completedOperations
+            )
             if summary.terminalCount > 0 {
                 statusIsError = true
                 statusMessage = "Receiver rejected a secure mailbox item. Review the connection before retrying."
@@ -3548,9 +4007,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             do {
                 try requireCurrentConnectionGeneration(expectedGeneration)
             } catch {
+                if settingsStore.receiverSettingsGenerationToken != expectedGeneration {
+                    finalizedOwner = nil
+                }
                 return .cancelled
             }
-            mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+            refreshPendingOutboxCount()
+            publishMailboxDeliveryFailure(
+                error, generation: expectedGeneration, operation: operation, completedOperations: completedOperations
+            )
             backgroundSyncStatus = "Encrypted iCloud mailbox reconciliation failed: \(describe(error))"
             return .failed
         }
@@ -3741,11 +4206,24 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             retirementGenerations = exactGeneration
         }
         guard let outbox else { return .blocked }
-        #if !HEALTH_BRIDGE_MAILBOX_QA
-        outbox.automaticSyncDiagnosticDraft?.noteAttempt(typeCode: typeCode)
-        #endif
-        let isRuntimeEligible = automaticSyncSelectedEligibleTypeCodes().contains(typeCode)
+        let isRuntimeEligible: Bool
         do {
+            if typeCode == HealthBridgeHealthType.sleepAnalysis.typeCode,
+               try sleepFinalizationHold(in: outbox)?.reason == .proofMissing {
+                return .deferredCovering(exactGeneration)
+            }
+            if let reentryTypes = automaticDirectReentryTypes, !reentryTypes.contains(typeCode) {
+                return .deferredCovering(exactGeneration)
+            }
+            #if !HEALTH_BRIDGE_MAILBOX_QA
+            outbox.automaticSyncDiagnosticDraft?.noteAttempt(typeCode: typeCode)
+            #endif
+            isRuntimeEligible = automaticSyncSelectedEligibleTypeCodes().contains(typeCode)
+            if let pendingTypes = automaticDirectPendingTypes,
+               pendingTypes.contains(typeCode),
+               typeCode == "steps" || !HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode) {
+                return deferAutomaticDirectTypes(exactGeneration)
+            }
             if try outbox.hasPendingGenerationRetirements(retirementGenerations) {
                 return .payloadEnqueued
             }
@@ -3767,6 +4245,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         guard isRuntimeEligible else {
             return .noPayloadCovering(exactGeneration)
         }
+        if automaticDirectPendingTypes != nil, automaticDirectReentryTypes == nil,
+           NutritionCompatibility.isNutrition(typeCode) {
+            // Receiver admission is a dependency, not part of independent collection.
+            return deferAutomaticDirectTypes(exactGeneration)
+        }
         statusIsError = false
         backgroundAutomaticSyncFailure = nil
         backgroundAutomaticSyncQuerySucceeded = false
@@ -3774,9 +4257,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         let pendingBefore = trustedPendingOutboxCount()
         switch typeCode {
         case HealthBridgeHealthType.steps.typeCode:
-            return await processAutomaticStepRepresentations(
-                pendingGenerationRetirements: retirementGenerations
-            )
+            return await processAutomaticStepRepresentations(pendingGeneration: generation)
         case HealthBridgeHealthType.workouts.typeCode:
             _ = await syncAnchoredWorkoutChanges(
                 executionMode: .automatic,
@@ -3814,6 +4295,19 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             if admission == .heldForReceiverSupport { return .unknownAvailabilityCovering(retirementGenerations) }
         }
+        do {
+            if typeCode == HealthBridgeHealthType.sleepAnalysis.typeCode,
+               try sleepFinalizationHold(in: outbox)?.reason == .proofMissing {
+                return .deferredCovering(exactGeneration)
+            }
+        } catch {
+            noteBackgroundAutomaticSyncFailure(
+                stage: .store,
+                error: error,
+                executionMode: .automatic
+            )
+            return .blocked
+        }
         if let failure = backgroundAutomaticSyncFailure {
             if !backgroundAutomaticSyncQuerySucceeded,
                failure.stage == .read,
@@ -3825,6 +4319,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         guard !statusIsError else { return .blocked }
         let pendingAfter = trustedPendingOutboxCount()
+        if let pendingTypes = automaticDirectPendingTypes,
+           HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode),
+           !pendingTypes.isDisjoint(with: retirementGenerations.keys)
+                || (pendingAfter ?? 0) > (pendingBefore ?? 0) {
+            return deferAutomaticDirectTypes(retirementGenerations)
+        }
         do {
             if try outbox.hasPendingGenerationRetirements(retirementGenerations) {
                 return .payloadEnqueued
@@ -3851,24 +4351,48 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private enum QuantitySyncOutcome {
         case noPayload
         case accepted(hasRecords: Bool)
-        case queued(hasRecords: Bool)
+        case queued(hasRecords: Bool, canProjectBehindRaw: Bool = false)
         case failed
 
         var hasRecords: Bool {
             switch self {
             case .noPayload, .failed: return false
-            case .accepted(let hasRecords), .queued(let hasRecords): return hasRecords
+            case .accepted(let hasRecords), .queued(let hasRecords, _): return hasRecords
             }
         }
     }
 
+    private struct MailboxStepsProjectionTurn {
+        static let cursorKind = "mailbox_steps_projection_turn"
+        static let rawYieldSuffix = "\nraw"
+
+        let store: FileSyncCursorStore
+        let scope: ReceiverSyncProgressScope
+        let acknowledgedValue: String
+        let yieldsToRaw: Bool
+
+        func save(_ value: String) throws {
+            try store.saveCursorValue(
+                value, receiverBindingID: scope.receiverBindingID,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey, cursorKind: Self.cursorKind
+            )
+        }
+    }
+
     private func processAutomaticStepRepresentations(
-        pendingGenerationRetirements: [String: Int]
+        pendingGeneration: Int
     ) async -> AutomaticSyncTypeResult {
         let expectedGeneration = settingsStore.receiverSettingsGenerationToken
+        let pendingGenerationRetirements = [HealthBridgeHealthType.steps.typeCode: pendingGeneration]
         do {
             guard let pendingBeforeRead = trustedPendingOutboxCount() else { return .blocked }
-            if pendingBeforeRead > 0 {
+            let mailbox = settingsStore.activeTransport == .mailbox
+            if mailbox {
+                // The opportunity reconciles the FIFO head before collection. A
+                // publication, failed ACK, or unrelated head cannot open this lane.
+                guard pendingBeforeRead == 0 else { return .blocked }
+            } else if pendingBeforeRead > 0, automaticDirectPendingTypes == nil {
+                // Direct collection normally classifies dependencies under its held gate.
                 guard let outbox else { return .blocked }
                 // Accept queued Steps before selecting its next anchor; leave other lanes alone
                 // until this lane has a successful read to deliver.
@@ -3891,22 +4415,37 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
 
-            // Raw acceptance checkpoints its own cursor, but cannot retire the daily obligation.
-            let raw = await performRecentStepCounts(executionMode: .automatic)
-            try requireCurrentConnectionGeneration(expectedGeneration)
-            switch raw {
-            case .noPayload, .accepted:
-                break
-            case .queued:
-                return .blocked
-            case .failed:
-                return automaticStepReadFailureResult(pendingGenerationRetirements)
+            let mailboxTurn = mailbox ? try mailboxStepsProjectionTurn() : nil
+            let acknowledgedMailboxTurn = mailboxTurn?.yieldsToRaw == false
+            if let mailboxTurn, mailboxTurn.yieldsToRaw {
+                // Offer raw one attempt. A failed raw read must leave daily eligible;
+                // a newly enqueued raw payload still has to clear FIFO before daily can run.
+                try mailboxTurn.save(mailboxTurn.acknowledgedValue)
+            }
+            // A raw ACK from this opportunity covers only the generation that produced it.
+            if !acknowledgedMailboxTurn, automaticDirectRawStepsGeneration != pendingGeneration {
+                let raw = await performRecentStepCounts(executionMode: .automatic)
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                switch raw {
+                case .noPayload, .accepted:
+                    break
+                case .queued(_, let canProjectBehindRaw):
+                    guard automaticDirectPendingTypes != nil else { return .blocked }
+                    if !canProjectBehindRaw {
+                        automaticDirectRawStepsGeneration = pendingGeneration
+                        return deferAutomaticDirectTypes(pendingGenerationRetirements)
+                    }
+                case .failed:
+                    return automaticStepReadFailureResult(pendingGenerationRetirements)
+                }
             }
 
             // Reconcile older deliveries only after this lane reached a successful read.
             // A read failure must not consume another selected lane's pending transition.
             guard let pendingCount = trustedPendingOutboxCount() else { return .blocked }
-            if pendingCount > 0 {
+            if mailbox {
+                guard pendingCount == 0 else { return .blocked }
+            } else if pendingCount > 0, automaticDirectPendingTypes == nil {
                 let flushed = try await flushAutomaticPendingOutbox()
                 try requireCurrentConnectionGeneration(expectedGeneration)
                 guard flushed, !statusIsError, trustedPendingOutboxCount() == 0 else {
@@ -3915,15 +4454,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
 
-            // A durable daily retirement marker is created only after raw work is complete.
-            // If interrupted before this enqueue, the generation remains pending for fresh reads.
+            // The daily retirement follows the raw read. In the bounded Direct
+            // fallback, FIFO ensures the queued raw payload is accepted first.
+            // A priority Mailbox turn repairs acknowledged work but has not read any
+            // newly available raw changes, so it cannot retire the pending generation.
             let daily = await performDailyActivityAggregates(
                 typeCodes: [HealthBridgeHealthType.steps.typeCode],
                 executionMode: .automatic,
-                pendingGenerationRetirements: pendingGenerationRetirements,
-                stepsRawAndDailyCoverage: true
+                pendingGenerationRetirements: acknowledgedMailboxTurn ? [:] : pendingGenerationRetirements,
+                stepsRawAndDailyCoverage: !acknowledgedMailboxTurn
             )
             try requireCurrentConnectionGeneration(expectedGeneration)
+            if let mailboxTurn {
+                try requireCurrentReceiverSyncProgressScope(mailboxTurn.scope)
+                switch daily {
+                case .noPayload, .accepted, .queued:
+                    // Even empty statistics enqueue a durable observation.
+                    try mailboxTurn.save("")
+                case .failed:
+                    try mailboxTurn.save(mailboxTurn.acknowledgedValue + MailboxStepsProjectionTurn.rawYieldSuffix)
+                }
+            }
             switch daily {
             case .noPayload:
                 return .unknownAvailabilityCovering(pendingGenerationRetirements)
@@ -3938,6 +4489,30 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             return .blocked
         }
+    }
+
+    private func mailboxStepsProjectionTurn() throws -> MailboxStepsProjectionTurn? {
+        let (store, scope) = try captureReceiverSyncProgressScope()
+        let binding = scope.receiverBindingID
+        let source = HealthBridgeAppleHealthSource.phone.sourceKey
+        guard let turn = try store.cursorValue(
+            receiverBindingID: binding, sourceKey: source, cursorKind: MailboxStepsProjectionTurn.cursorKind
+        ), !turn.isEmpty else { return nil }
+        for kind in [
+            StepCountSyncBatchFactory.anchoredCursorKind,
+            GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps"),
+        ] {
+            guard let acknowledged = try store.cursorValue(
+                receiverBindingID: binding, sourceKey: source, cursorKind: kind
+            ) else { continue }
+            let acknowledgedValue = "\(scope.connectionGeneration)\n\(kind)\n\(acknowledged)"
+            let yieldsToRaw = turn == acknowledgedValue + MailboxStepsProjectionTurn.rawYieldSuffix
+            guard turn == acknowledgedValue || yieldsToRaw else { continue }
+            return MailboxStepsProjectionTurn(
+                store: store, scope: scope, acknowledgedValue: acknowledgedValue, yieldsToRaw: yieldsToRaw
+            )
+        }
+        return nil
     }
 
     private func automaticStepReadFailureResult(
@@ -4160,31 +4735,54 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             diagnostic.noteCompletion(.failed)
             return
         }
-        if pendingOutbox > 0 {
-            if settingsStore.activeTransport == .mailbox {
-                _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
-            } else {
-                schedulePendingBackgroundOutboxUploadsIfAllowed()
-            }
+        if settingsStore.activeTransport == .mailbox,
+           pendingOutbox > 0 || pendingMailboxCheckpointWrite != nil
+               || currentMailboxDeliveryFailures.contains(where: { $0.itemOwnership != nil }) {
+            _ = await reconcileMailboxDeliveryIfNeeded(at: .beforePayloadGeneration)
         }
         var processedAllPending: Bool?
+        var collectedNewPayloads = false
+        var finishedDirectCollection = false
         do {
             try requireCurrentConnectionGeneration(expectedGeneration)
-            try await preparePrivateStorageForUploadAdmission()
-            processedAllPending = try await processPendingTypes()
-            try Task.checkCancellation()
-            try requireCurrentConnectionGeneration(expectedGeneration)
-            guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
-                throw CancellationError()
-            }
-            if (trustedPendingOutboxCount() ?? 0) > 0 {
-                if settingsStore.activeTransport == .mailbox {
-                    _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
-                } else {
-                    _ = try await flushAutomaticPendingOutbox()
-                    if (trustedPendingOutboxCount() ?? 0) > 0 {
-                        await schedulePendingBackgroundOutboxUploadsAndWaitIfAllowed()
+            if settingsStore.activeTransport == .directHTTP {
+                var reentryTypes: Set<String>?
+                var acknowledgedRawStepsGeneration: Int?
+                // One collection pass is independent of receiver availability.
+                // One bounded reentry resolves raw-before-projection dependencies after ACK.
+                for _ in 0..<2 {
+                    let collection = try await collectAutomaticDirectTypes(
+                        processPendingTypes, reentryTypes: reentryTypes,
+                        acknowledgedRawStepsGeneration: acknowledgedRawStepsGeneration
+                    )
+                    collectedNewPayloads = collectedNewPayloads || collection.enqueuedPayloads
+                    processedAllPending = try collection.processing.get()
+                    reentryTypes = collection.deferredTypes
+                    try Task.checkCancellation()
+                    try requireCurrentConnectionGeneration(expectedGeneration)
+                    guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
+                        throw CancellationError()
                     }
+                    if (trustedPendingOutboxCount() ?? 0) > 0 {
+                        let flushed = try await flushAutomaticPendingOutbox(reschedulePendingUploads: false)
+                        try Task.checkCancellation()
+                        try requireCurrentConnectionGeneration(expectedGeneration)
+                        guard flushed, !statusIsError, trustedPendingOutboxCount() == 0 else { break }
+                        acknowledgedRawStepsGeneration = collection.rawStepsGeneration
+                    }
+                    if collection.deferredTypes.isEmpty || trustedPendingOutboxCount() != 0 { break }
+                }
+                finishedDirectCollection = true
+            } else {
+                try await preparePrivateStorageForUploadAdmission()
+                processedAllPending = try await processPendingTypes()
+                try Task.checkCancellation()
+                try requireCurrentConnectionGeneration(expectedGeneration)
+                guard terminalPayloadActionAdmissionIsOpen, backgroundSyncEnabled else {
+                    throw CancellationError()
+                }
+                if (trustedPendingOutboxCount() ?? 0) > 0 {
+                    _ = await reconcileMailboxDeliveryIfNeeded(at: .afterDurableEnqueue)
                 }
             }
         } catch {
@@ -4194,9 +4792,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 isCancellation: cancelled
             ))
         }
+        if collectedNewPayloads || (finishedDirectCollection && !statusIsError),
+           settingsStore.receiverSettingsGenerationToken == expectedGeneration,
+           (trustedPendingOutboxCount() ?? 0) > 0 {
+            await schedulePendingBackgroundOutboxUploadsAndWaitIfAllowed()
+        }
         let pendingTypeCodes = (try? backgroundSyncStore
             .loadPendingObserverTypeCodeGenerations().keys.sorted()) ?? []
-        if processedAllPending == true, !statusIsError,
+        if !statusIsError,
            diagnostic.record.failure == nil,
            let readFailure = diagnostic.firstReadFailure {
             diagnostic.noteFailure(readFailure)
@@ -4444,15 +5047,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 sourceKey: sourceKey,
                 cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
             )
-            let anchorCursorValue = CoreLaneSyncCursorPolicy.effectiveCursorValue(
+            let sharedAnchor = CoreLaneSyncCursorPolicy.effectiveCursorValue(
                 storedCursorValue: storedAnchorCursorValue,
                 hasUploadedRecords: hasUploadedStepRecords
             )
             let shouldPersistSharedProgress = executionMode.shouldPersistSharedProgress(
                 hadUsableCursor: HealthKitAnchoredCursorPolicy.hasUsableCursorValue(
-                    anchorCursorValue
+                    sharedAnchor
                 )
             )
+            // Both routes finalize this bounded checkpoint only after receiver acceptance.
+            // It must not establish the wider foreground checkpoint.
+            let usesAutomaticFallback = !shouldPersistSharedProgress
+            let checkpointKind = usesAutomaticFallback
+                ? GenericQuantitySyncBatchFactory.automaticAnchoredCursorKind(for: "steps")
+                : StepCountSyncBatchFactory.anchoredCursorKind
+            let anchorCursorValue = usesAutomaticFallback ? try cursorStore.cursorValue(
+                receiverBindingID: receiverBindingID, sourceKey: sourceKey, cursorKind: checkpointKind
+            ) : sharedAnchor
+            let hasAnchorProgress = usesAutomaticFallback
+                ? HealthKitAnchoredCursorPolicy.hasUsableCursorValue(anchorCursorValue)
+                : hasUploadedStepRecords
             let storedBootstrapStartValue = try cursorStore.cursorValue(
                 receiverBindingID: receiverBindingID,
                 sourceKey: sourceKey,
@@ -4498,6 +5113,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             try requireCurrentReceiverSyncProgressScope(progressScope)
             try requireCurrentPayloadDeliveryTarget(target)
+            let schedulesMailboxProjection = executionMode == .automatic && target.route == .mailbox
+            failureStage = .store
+            if schedulesMailboxProjection {
+                guard try outbox.pendingItems().isEmpty else { return .failed }
+            }
             guard !changes.stepSamples.isEmpty
                 || !changes.deletedStepSamples.isEmpty
                 || HealthKitAnchoredCursorPolicy.hasAdvanced(
@@ -4526,7 +5146,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 statusMessage = "HealthKit returned no anchored step-count payload. Nothing sent."
                 return .noPayload
             }
-            guard uploadedRecords || hasUploadedStepRecords || !changes.deletedStepSamples.isEmpty else {
+            guard uploadedRecords || hasAnchorProgress || !changes.deletedStepSamples.isEmpty else {
                 statusIsError = false
                 statusMessage = "HealthKit returned no readable Step Count records. Step cursor was not advanced so future Health permission changes can backfill history."
                 return .noPayload
@@ -4538,30 +5158,38 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusMessage = target.uploadStatus(uploadDescription)
             failureStage = .encoding
             let data = try encoder.encode(batch)
-            let shouldPersistAnchorCursor = shouldPersistSharedProgress
-                && CoreLaneSyncCursorPolicy.shouldPersistCursor(
-                    uploadedRecords: uploadedRecords,
-                    hasUploadedRecords: hasUploadedStepRecords
-                )
+            let shouldPersistAnchorCursor = CoreLaneSyncCursorPolicy.shouldPersistCursor(
+                uploadedRecords: uploadedRecords,
+                hasUploadedRecords: hasAnchorProgress
+            )
             let cursorCheckpoint = shouldPersistAnchorCursor
                 ? FileOutboxCursorCheckpoint(
                     receiverIdentity: receiverBindingID,
                     sourceKey: sourceKey,
-                    cursorKind: StepCountSyncBatchFactory.anchoredCursorKind,
+                    cursorKind: checkpointKind,
                     cursorValue: changes.anchorCursorValue,
-                    coreLaneUploadProof: uploadedRecords ? .steps : nil
+                    coreLaneUploadProof: shouldPersistSharedProgress && uploadedRecords ? .steps : nil
                 )
                 : nil
-            failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
             try requireCurrentPayloadDeliveryTarget(target)
+            failureStage = .transport
             let deliveryResult = try await uploadPayloadsWithOutbox(
                 [data],
                 to: target,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
                 pendingGenerationRetirements: pendingGenerationRetirements
-            )
+            ) {
+                guard schedulesMailboxProjection, let cursorCheckpoint,
+                      cursorCheckpoint.cursorValue != anchorCursorValue else { return }
+                failureStage = .store
+                try cursorStore.saveCursorValue(
+                    "\(target.generation)\n\(cursorCheckpoint.cursorKind)\n\(cursorCheckpoint.cursorValue)",
+                    receiverBindingID: receiverBindingID, sourceKey: sourceKey,
+                    cursorKind: MailboxStepsProjectionTurn.cursorKind
+                )
+            }
             try requireCurrentReceiverSyncProgressScope(
                 progressScope,
                 deliveryGeneration: deliveryResult.connectionGeneration
@@ -4579,7 +5207,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 outboxNotice: outboxNotice
             )
             return deliveryResult.directUpload == nil
-                ? .queued(hasRecords: uploadedRecords)
+                ? .queued(
+                    hasRecords: uploadedRecords,
+                    canProjectBehindRaw: usesAutomaticFallback && target.route != .mailbox
+                )
                 : .accepted(hasRecords: uploadedRecords)
         } catch {
             noteBackgroundAutomaticSyncFailure(
@@ -4701,6 +5332,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
             try requireCurrentReceiverSyncProgressScope(progressScope)
             try requireCurrentPayloadDeliveryTarget(target)
+            if target.route == .mailbox, stepsRawAndDailyCoverage != nil {
+                failureStage = .store
+                guard try outbox.pendingItems().isEmpty else { return .failed }
+            }
             guard let aggregateBatch = DailyActivityAggregateSyncBatchFactory.makeDailyActivityAggregateBatch(
                 aggregates: aggregates,
                 typeCodes: typeCodes,
@@ -4923,7 +5558,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             statusIsError = false
             statusMessage = "Reading anchored workout changes from HealthKit..."
             if executionMode.shouldRequestReadAuthorization {
-                try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.workouts])
+                if let requestProjectionReadAuthorization {
+                    try await requestProjectionReadAuthorization([HealthBridgeHealthType.workouts.typeCode])
+                } else {
+                    try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.workouts])
+                }
             }
             let now = Date()
             let calendar = utcCalendar()
@@ -4955,11 +5594,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 sourceKey: sourceKey,
                 cursorKind: AnchoredWorkoutSyncPolicy.bootstrapStartCursorKind
             )
+            let requestedHistoryStart: Date?
+            if executionMode == .foreground {
+                let depth = healthHistoryDepth.sanitized
+                requestedHistoryStart = depth == .allAvailable
+                    ? Date(timeIntervalSince1970: 0)
+                    : depth.lowerBoundDate(now: now, calendar: calendar)
+            } else {
+                requestedHistoryStart = nil
+            }
+            let storedHistoryBackfillStartValue = try cursorStore.cursorValue(
+                receiverBindingID: receiverBindingID,
+                sourceKey: sourceKey,
+                cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+            )
             let queryPlan = AnchoredWorkoutSyncPolicy.queryPlan(
                 anchorCursorValue: anchorCursorValue,
                 storedBootstrapStartValue: storedBootstrapStartValue,
                 bootstrapLookbackDays: executionMode.cursorlessFallbackDays ?? AnchoredWorkoutSyncPolicy.bootstrapLookbackDays,
                 clampStoredBootstrapToLookback: executionMode == .automatic,
+                requestedHistoryStart: requestedHistoryStart,
+                storedHistoryBackfillStartValue: storedHistoryBackfillStartValue,
                 now: now,
                 calendar: calendar
             )
@@ -4973,19 +5628,53 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             failureStage = .read
             noteAutomaticSyncQueryStarted(executionMode: executionMode)
-            let changes = try await HealthKitWorkoutReader().readAnchoredWorkoutChanges(
-                anchorCursorValue: anchorCursorValue,
-                predicateStart: queryPlan.queryStart,
-                receivedAt: now
-            )
+            let workoutReader = HealthKitWorkoutReader()
+            let changes: HealthKitAnchoredWorkoutChanges
+            if let readAnchoredWorkoutChanges {
+                changes = try await readAnchoredWorkoutChanges(anchorCursorValue, queryPlan.queryStart, now)
+            } else {
+                changes = try await workoutReader.readAnchoredWorkoutChanges(
+                    anchorCursorValue: anchorCursorValue,
+                    predicateStart: queryPlan.queryStart,
+                    receivedAt: now
+                )
+            }
             noteAutomaticSyncQueryResult(
                 hasRecords: !changes.workouts.isEmpty || !changes.deletedWorkouts.isEmpty,
                 newestSampleEnd: changes.workouts.map(\.end).max(),
                 executionMode: executionMode
             )
             try requireCurrentPayloadDeliveryTarget(target)
+            var payloads: [Data] = []
+            var historicalWorkoutCount = 0
+            var acknowledgedCoverageCandidate: Date?
+            if let backfillStart = queryPlan.historicalBackfillStart,
+               HealthKitAnchoredCursorPolicy.hasUsableCursorValue(anchorCursorValue) {
+                failureStage = .read
+                let historicalWorkouts: [HealthKitWorkoutSummary]
+                if let readWorkoutHistory {
+                    historicalWorkouts = try await readWorkoutHistory(backfillStart, now)
+                } else {
+                    historicalWorkouts = try await workoutReader.readWorkouts(start: backfillStart, end: now)
+                }
+                let backfillBatch = WorkoutSyncBatchFactory.makeWorkoutBatch(
+                    workouts: historicalWorkouts,
+                    windowStart: backfillStart,
+                    windowEnd: now,
+                    generatedAt: now,
+                    cursorKind: AnchoredWorkoutSyncPolicy.historicalBackfillCursorKind
+                )
+                if !backfillBatch.workouts.isEmpty {
+                    failureStage = .encoding
+                    payloads += try WorkoutSyncBatchFactory.encodePayloads(backfillBatch, using: encoder)
+                    historicalWorkoutCount = backfillBatch.workouts.count
+                    acknowledgedCoverageCandidate = backfillStart
+                }
+            }
+            let uploadedHistoricalWorkouts = historicalWorkoutCount > 0
             guard !changes.workouts.isEmpty
                 || !changes.deletedWorkouts.isEmpty
+                || uploadedHistoricalWorkouts
                 || HealthKitAnchoredCursorPolicy.hasAdvanced(
                     from: anchorCursorValue,
                     to: changes.anchorCursorValue
@@ -4999,27 +5688,38 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 generatedAt: now
             )
             let uploadedRecords = !batch.workouts.isEmpty
-
-            guard ForegroundSyncUploadPolicy.shouldUpload(batch) else {
-                statusIsError = false
-                statusMessage = "HealthKit returned no anchored workout payload. Nothing sent."
-                return false
-            }
-            guard uploadedRecords || hasUploadedWorkoutRecords || !batch.deletedRecords.isEmpty else {
-                statusIsError = false
-                statusMessage = "HealthKit returned no readable Workout records. Workout cursor was not advanced so future Health permission changes can backfill history."
-                return false
+            if uploadedRecords, executionMode == .foreground, let bootstrapStart = queryPlan.queryStart {
+                acknowledgedCoverageCandidate = bootstrapStart
             }
 
-            let uploadDescription = batch.workouts.isEmpty && batch.deletedRecords.isEmpty
-                ? "workout anchor cursor-only sync"
-                : "\(batch.workouts.count) workout add/update(s), \(batch.deletedRecords.count) workout deletion(s)"
+            if uploadedRecords || !batch.deletedRecords.isEmpty {
+                failureStage = .encoding
+                payloads += try WorkoutSyncBatchFactory.encodePayloads(batch, using: encoder)
+            } else if !uploadedHistoricalWorkouts {
+                guard ForegroundSyncUploadPolicy.shouldUpload(batch) else {
+                    statusIsError = false
+                    statusMessage = "HealthKit returned no anchored workout payload. Nothing sent."
+                    return false
+                }
+                guard hasUploadedWorkoutRecords else {
+                    statusIsError = false
+                    statusMessage = "HealthKit returned no readable Workout records. Workout cursor was not advanced so future Health permission changes can backfill history."
+                    return false
+                }
+                failureStage = .encoding
+                payloads += try WorkoutSyncBatchFactory.encodePayloads(batch, using: encoder)
+            }
+
+            let uploadDescription = uploadedHistoricalWorkouts
+                ? "workout history backfill and anchor sync"
+                : batch.workouts.isEmpty && batch.deletedRecords.isEmpty
+                    ? "workout anchor cursor-only sync"
+                    : "\(batch.workouts.count) workout add/update(s), \(batch.deletedRecords.count) workout deletion(s)"
             statusMessage = target.uploadStatus(uploadDescription)
-            failureStage = .encoding
-            let data = try encoder.encode(batch)
+            let anchorCountsAsUploaded = uploadedRecords || uploadedHistoricalWorkouts
             let shouldPersistAnchorCursor = shouldPersistSharedProgress
                 && CoreLaneSyncCursorPolicy.shouldPersistCursor(
-                    uploadedRecords: uploadedRecords,
+                    uploadedRecords: anchorCountsAsUploaded,
                     hasUploadedRecords: hasUploadedWorkoutRecords
                 )
             let cursorCheckpoint = shouldPersistAnchorCursor
@@ -5028,14 +5728,15 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     sourceKey: sourceKey,
                     cursorKind: WorkoutSyncBatchFactory.anchoredCursorKind,
                     cursorValue: changes.anchorCursorValue,
-                    coreLaneUploadProof: uploadedRecords ? .workouts : nil
+                    coreLaneUploadProof: anchorCountsAsUploaded ? .workouts : nil,
+                    workoutHistoryStart: acknowledgedCoverageCandidate
                 )
                 : nil
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
             try requireCurrentPayloadDeliveryTarget(target)
             let deliveryResult = try await uploadPayloadsWithOutbox(
-                [data],
+                payloads,
                 to: target,
                 cursorCheckpoint: cursorCheckpoint,
                 executionMode: executionMode,
@@ -5048,16 +5749,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try requireCurrentPayloadDeliveryTarget(target)
             let outboxNotice = lastOutboxNotice
             statusIsError = false
-            let resultDescription = batch.workouts.isEmpty && batch.deletedRecords.isEmpty
-                ? "Recorded workout anchor cursor"
-                : "Synced workout changes: added/updated \(batch.workouts.count), deleted \(batch.deletedRecords.count)"
+            let resultDescription = uploadedHistoricalWorkouts
+                ? "Synced workout history backfill (\(historicalWorkoutCount) record(s)) and anchor changes"
+                : batch.workouts.isEmpty && batch.deletedRecords.isEmpty
+                    ? "Recorded workout anchor cursor"
+                    : "Synced workout changes: added/updated \(batch.workouts.count), deleted \(batch.deletedRecords.count)"
             statusMessage = deliveryStatusMessage(
                 deliveryResult,
                 uploadedDescription: resultDescription,
                 queuedDescription: "Queued \(uploadDescription) behind earlier pending upload(s)",
                 outboxNotice: outboxNotice
             )
-            return uploadedRecords
+            return uploadedRecords || uploadedHistoricalWorkouts
         } catch {
             noteBackgroundAutomaticSyncFailure(
                 stage: failureStage,
@@ -5085,7 +5788,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     @discardableResult
     func syncRecentSleepSessions(
         executionMode: HealthBridgeSyncExecutionMode = .foreground,
-        pendingGenerationRetirements: [String: Int] = [:]
+        pendingGenerationRetirements: [String: Int] = [:],
+        deferMissingProof: Bool = false
     ) async -> Bool {
         guard let target = try? capturePayloadDeliveryTarget() else {
             noteBackgroundAutomaticSyncFailure(.unknown, executionMode: executionMode)
@@ -5119,18 +5823,53 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             var snapshot = try sleepOperationSnapshot(
                 store: sleepManifestStore, outbox: outbox, automatic: executionMode == .automatic
             )
-            let validate = { @MainActor in
+            let validateSnapshot = { @MainActor in
                 try self.validateSleepOperation(snapshot, store: sleepManifestStore, outbox: outbox)
             }
-            if let pendingTransition = try await sleepManifestStore.loadPendingForSync(validate: validate) {
-                try validate()
-                let needsMigration = try await SleepSyncValueWork.run {
-                    let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pendingTransition.payload)
-                    return SleepSyncBatchFactory.requiresInstallationSourceMigration(
-                        manifest: pendingTransition.manifest, pendingBatch: batch, expectedSourceKey: sleepSourceKey
-                    )
+            let pending: SleepSyncPendingTransition?
+            do {
+                pending = try await sleepManifestStore.loadPendingForSync(validate: validateSnapshot)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try validateSnapshot()
+                if let hold = try sleepFinalizationHold(in: outbox), hold.reason == .proofMissing { throw hold }
+                throw error
+            }
+            if let pendingTransition = pending {
+                try validateSnapshot()
+                let needsMigration: Bool
+                do {
+                    needsMigration = try await SleepSyncValueWork.run {
+                        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pendingTransition.payload)
+                        return SleepSyncBatchFactory.requiresInstallationSourceMigration(
+                            manifest: pendingTransition.manifest, pendingBatch: batch, expectedSourceKey: sleepSourceKey
+                        )
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try validateSnapshot()
+                    if let hold = try sleepFinalizationHold(in: outbox), hold.reason == .proofMissing { throw hold }
+                    throw error
                 }
-                try validate()
+                try validateSnapshot()
+                let matchesCurrentConnection =
+                    settingsStore.receiverSettingsGenerationToken == pendingTransition.connectionGeneration
+                    && settingsStore.receiverBindingID == pendingTransition.receiverBindingID
+                    && target.generation == pendingTransition.connectionGeneration
+                    && target.bindingID == pendingTransition.receiverBindingID
+                if (needsMigration || !matchesCurrentConnection),
+                   let hold = try sleepFinalizationHold(in: outbox) { throw hold }
+                if (needsMigration || !matchesCurrentConnection),
+                   try outbox.hasUncheckedDirectSleepAcknowledgment(for: pendingTransition) {
+                    // The absent payload does not make an accepted journal obsolete.
+                    // Only its original live scope can authorize cleanup.
+                    refreshPendingOutboxCount()
+                    statusIsError = true
+                    statusMessage = "An accepted Sleep upload could not be finalized for this connection. Its recovery state was retained."
+                    return false
+                }
                 if needsMigration {
                     if let itemID = pendingTransition.outboxItemID,
                        let obsoleteItem = try outbox.pendingItem(id: itemID) {
@@ -5145,12 +5884,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     snapshot.fifo = try outbox.pendingItems()
                     refreshPendingOutboxCount()
                 } else {
-                    let matchesCurrentConnection =
-                        settingsStore.receiverSettingsGenerationToken
-                            == pendingTransition.connectionGeneration
-                        && settingsStore.receiverBindingID == pendingTransition.receiverBindingID
-                        && target.generation == pendingTransition.connectionGeneration
-                        && target.bindingID == pendingTransition.receiverBindingID
                     if matchesCurrentConnection {
                         failureStage = .transport
                         let delivered = try await deliverPendingSleepTransition(
@@ -5158,7 +5891,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             store: sleepManifestStore,
                             to: target,
                             executionMode: executionMode,
-                            pendingGenerationRetirements: pendingGenerationRetirements
+                            // This journal predates the current opportunity's read.
+                            // Existing FIFO tokens remain valid; a recreated item
+                            // cannot retire a newer generation it has not queried.
+                            pendingGenerationRetirements: [:]
                         )
                         try requireCurrentPayloadDeliveryTarget(target)
                         if executionMode != .automatic {
@@ -5167,8 +5903,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         failureStage = .store
                         snapshot.storage = try sleepManifestStore.revisionForSync()
                         snapshot.fifo = try outbox.pendingItems()
-                        let remaining = try await sleepManifestStore.loadPendingForSync(validate: validate)
-                        try validate()
+                        let remaining = try await sleepManifestStore.loadPendingForSync(validate: validateSnapshot)
+                        try validateSnapshot()
                         if remaining != nil {
                             return delivered
                         }
@@ -5182,17 +5918,26 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                             statusMessage = "A pending Sleep upload belongs to an earlier connection. It is quarantined and must be deleted before Sleep sync can continue."
                             return false
                         }
-                        try validate()
+                        try validateSnapshot()
                         try sleepManifestStore.resetSynchronizationState()
                         snapshot.storage = try sleepManifestStore.revisionForSync()
                         refreshPendingOutboxCount()
                     }
                 }
             }
+            let validate = { @MainActor in
+                try validateSnapshot()
+                if let hold = try self.sleepFinalizationHold(in: outbox) { throw hold }
+            }
+            try validate()
             statusIsError = false
             statusMessage = "Reading anchored Sleep Analysis changes from HealthKit..."
             if executionMode.shouldRequestReadAuthorization {
-                try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.sleepAnalysis])
+                if let requestProjectionReadAuthorization {
+                    try await requestProjectionReadAuthorization([HealthBridgeHealthType.sleepAnalysis.typeCode])
+                } else {
+                    try await HealthStoreAuthorizer().requestReadAuthorization(healthTypes: [.sleepAnalysis])
+                }
             }
             try requireCurrentPayloadDeliveryTarget(target)
             let now = Date()
@@ -5344,6 +6089,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     settingsStore.receiverSettingsGenerationToken, settingsStore.receiverBindingID,
                     settingsStore.receiverURLString, bootstrapRetryGeneration, backgroundSyncPreferenceGeneration
                   ) else { return false }
+            if let hold = error as? AcceptedFinalizationHold, let message = acceptedFinalizationRecoveryMessage {
+                statusIsError = !(deferMissingProof && hold.reason == .proofMissing)
+                statusMessage = message
+                return false
+            }
             noteBackgroundAutomaticSyncFailure(
                 stage: failureStage,
                 error: error,
@@ -5392,6 +6142,32 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try self.requireCurrentPayloadDeliveryTarget(target)
             try self.validateSleepOperation(snapshot, store: store, outbox: outbox)
         }
+        @MainActor func finishAcceptedSleep(itemID: String) async throws {
+            guard let cursorStore else { throw CompanionPrivateStorageError.cursorStoreUnavailable }
+            let finalizer = OutboxDeliveryCursorFinalizer(
+                outbox: outbox, cursorStore: cursorStore, proofStore: coreLaneUploadProofStore,
+                pendingGenerationStore: backgroundSyncStore
+            )
+            let finalized = try await withSleepStorageOrigin {
+                try await finalizer.recoverDirectSleepAcknowledgment(
+                    itemID: itemID, receiverBindingID: target.bindingID,
+                    receiverGeneration: target.generation, sleepStore: store,
+                    validate: {
+                        try self.requireCurrentPayloadDeliveryTarget(target)
+                        try self.validateSleepOperationContext(snapshot, store: store, outbox: outbox)
+                    }
+                )
+            }
+            guard finalized else {
+                try validate()
+                if try outbox.acceptedFinalizationHold(matching: (itemID, target.bindingID))?.reason == .proofMissing,
+                   let hold = try sleepFinalizationHold(in: outbox), hold.reason == .proofMissing { throw hold }
+                throw FileOutboxCursorCheckpointError.pendingCommit
+            }
+            snapshot.storage = try store.revisionForSync()
+            snapshot.fifo = try outbox.pendingItems()
+            try validate()
+        }
         let (uploadedRecords, hasRecordChanges) = try await SleepSyncValueWork.run {
             let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: pendingTransition.payload)
             let uploaded = !(batch?.sleepSessions.isEmpty ?? true)
@@ -5399,14 +6175,41 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         try validate()
         var trackedTransition = pendingTransition
-        let acceptedBeforeEntry = lastDirectAcceptance.map {
-            $0.itemID == pendingTransition.outboxItemID
-                && $0.binding == pendingTransition.receiverBindingID
-                && $0.generation == pendingTransition.connectionGeneration
-                && $0.reset == snapshot.retryGeneration
-        } ?? false
         let trackedItemExists = snapshot.fifo.contains { $0.id == pendingTransition.outboxItemID }
-        if trackedTransition.outboxItemID == nil || (!trackedItemExists && !acceptedBeforeEntry) {
+        // A scoped cleanup intent still owns its place in the FIFO. An older,
+        // unchecked ACK can also need recovery after its payload was removed.
+        if case .directHTTP = target.route,
+           let itemID = pendingTransition.outboxItemID,
+           try (outbox.hasDirectSleepCleanupIntent(
+               itemID: itemID, receiverBindingID: target.bindingID, receiverGeneration: target.generation
+           ) || (!trackedItemExists && outbox.hasUncheckedDirectAcknowledgment(
+               itemID: itemID, receiverBindingID: target.bindingID
+           ))) {
+            try await finishAcceptedSleep(itemID: itemID)
+            refreshPendingOutboxCount()
+            if let hold = acceptedFinalizationHold, hold.reason == .proofMissing,
+               hold.affectedTypeCodes.contains(HealthBridgeHealthType.sleepAnalysis.typeCode) { throw hold }
+            statusIsError = false
+            statusMessage = "Recovered the accepted Sleep transition. Pending outbox: \(pendingOutboxCount)."
+            return uploadedRecords
+        }
+        if let hold = try sleepFinalizationHold(in: outbox) { throw hold }
+        if !trackedItemExists,
+           let trackedItemID = trackedTransition.outboxItemID,
+           let retainedBackgroundUploadOwnership,
+           await retainedBackgroundUploadOwnership(
+               trackedItemID,
+               trackedTransition.connectionGeneration,
+               trackedTransition.receiverBindingID
+           ) {
+            statusMessage = "The Sleep upload is still owned by background delivery. Waiting for durable finalization before retrying."
+            statusIsError = true
+            return false
+        }
+        if !trackedItemExists {
+            #if HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+            observeSleepEnqueueAttemptForTesting()
+            #endif
             let enqueueResult = try outbox.enqueueIfAbsent(
                 trackedTransition.payload,
                 receiverIdentity: trackedTransition.receiverBindingID,
@@ -5423,80 +6226,60 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
         try validate()
         guard let outboxItemID = trackedTransition.outboxItemID else { throw CocoaError(.fileWriteUnknown) }
-        var itemRemains = snapshot.fifo.contains { $0.id == outboxItemID }
-        if executionMode == .automatic, case .directHTTP = target.route, itemRemains {
+        if executionMode == .automatic, case .directHTTP = target.route {
             schedulePendingBackgroundOutboxUploadsIfAllowed()
             statusIsError = false
             statusMessage = "Sleep transition is durably journaled and queued for background delivery. Pending outbox: \(pendingOutboxCount)."
             return false
         }
-        if itemRemains, snapshot.fifo.first?.id != outboxItemID {
+        if snapshot.fifo.first?.id != outboxItemID {
             schedulePendingBackgroundOutboxUploadsIfAllowed()
             statusIsError = false
             statusMessage = "Sleep transition is durably journaled behind an earlier queued upload. Pending outbox: \(pendingOutboxCount)."
             return false
         }
-        var summary: FileOutboxFlushSummary?
-        if itemRemains {
-            do {
-                summary = try await uploadPendingOutbox(
-                    outbox, to: target
-                ).summary
-            } catch let conflict as RejectedSleepBaselineOutboxItem {
-                try await recoverRejectedSleepBaseline(conflict)
-                statusIsError = true
-                statusMessage = "Receiver required a newer Sleep reset epoch. The rejected transition was retired crash-safely and a receiver-safe epoch was reserved."
-                return false
-            }
-            try requireCurrentPayloadDeliveryTarget(target)
-            try validateSleepOperationContext(snapshot, store: store, outbox: outbox)
-            if target.route == .mailbox,
-               let state = try outbox.deliveryState(for: outboxItemID),
-               state.phase == .committedFinalized,
-               state.ownership?.receiverGeneration == pendingTransition.connectionGeneration,
-               state.ownership?.receiverBindingID == pendingTransition.receiverBindingID,
-               state.ownership?.resetEpoch == pendingTransition.manifest.baselineResetEpoch {
-                snapshot.storage = try store.revisionForSync()
-                snapshot.fifo = try outbox.pendingItems()
-                let manifest = try await store.loadManifestForSync(validate: validate)
-                let pending = try await store.loadPendingForSync(validate: validate)
-                let complete = try await SleepSyncValueWork.run {
-                    pending == nil && manifest == pendingTransition.manifest
-                }
-                try validate()
-                guard complete else { throw CancellationError() }
-                refreshPendingOutboxCount()
-                statusIsError = false
-                statusMessage = "Synced the durable authoritative sleep transition. Pending outbox: \(pendingOutboxCount)."
-                return uploadedRecords
-            }
-            guard try store.revisionForSync() == snapshot.storage else { throw CancellationError() }
-            snapshot.fifo = try outbox.pendingItems()
-            itemRemains = snapshot.fifo.contains { $0.id == outboxItemID }
-            refreshPendingOutboxCount()
-        }
-        if itemRemains {
-            statusIsError = false
-            let failure = summary.map { Self.firstFailureSentence($0) } ?? ""
-            statusMessage = "Sleep transition is durably journaled and queued for FIFO retry. Pending outbox: \(pendingOutboxCount). \(failure)"
+        let upload: (
+            summary: FileOutboxFlushSummary,
+            lastDirectUploadResult: ReceiverUploadResult?,
+            acceptedDirectItemIDs: Set<String>
+        )
+        do {
+            upload = try await uploadPendingOutbox(outbox, to: target, executionMode: executionMode)
+        } catch let conflict as RejectedSleepBaselineOutboxItem {
+            try await recoverRejectedSleepBaseline(conflict)
+            statusIsError = true
+            statusMessage = "Receiver required a newer Sleep reset epoch. The rejected transition was retired crash-safely and a receiver-safe epoch was reserved."
             return false
         }
-        guard lastDirectAcceptance.map({
-            $0.itemID == outboxItemID && $0.binding == trackedTransition.receiverBindingID
-                && $0.generation == trackedTransition.connectionGeneration
-                && $0.reset == snapshot.retryGeneration
-        }) == true else { throw CancellationError() }
-        snapshot.storage = try await withSleepStorageOrigin {
-            try await store.saveManifestForSync(pendingTransition.manifest, validate: validate)
+        try requireCurrentPayloadDeliveryTarget(target)
+        try validateSleepOperationContext(snapshot, store: store, outbox: outbox)
+        snapshot.fifo = try outbox.pendingItems()
+        refreshPendingOutboxCount()
+        if snapshot.fifo.contains(where: { $0.id == outboxItemID }) {
+            guard try store.revisionForSync() == snapshot.storage else { throw CancellationError() }
+            statusIsError = false
+            statusMessage = "Sleep transition is durably journaled and queued for FIFO retry. Pending outbox: \(pendingOutboxCount). \(Self.firstFailureSentence(upload.summary))"
+            return false
         }
-        snapshot.storage = try await withSleepStorageOrigin {
-            try await store.clearPendingForSync(id: pendingTransition.id, validate: validate)
+        if target.route == .mailbox {
+            guard pendingTransition.hasFinalizedMailboxProof(
+                try outbox.deliveryState(for: outboxItemID)
+            ) else {
+                throw CancellationError()
+            }
+        } else {
+            guard upload.acceptedDirectItemIDs.contains(outboxItemID) else { throw CancellationError() }
+        }
+        snapshot.storage = try store.revisionForSync()
+        let manifest = try await store.loadManifestForSync(validate: validate)
+        let pending = try await store.loadPendingForSync(validate: validate)
+        let complete = try await SleepSyncValueWork.run {
+            pending == nil && manifest == pendingTransition.manifest
         }
         try validate()
-        lastDirectAcceptance = nil
-        refreshPendingOutboxCount()
+        guard complete else { throw CancellationError() }
         statusIsError = false
-        statusMessage = hasRecordChanges
+        statusMessage = target.route == .mailbox || hasRecordChanges
             ? "Synced the durable authoritative sleep transition. Pending outbox: \(pendingOutboxCount)."
             : "Recorded the durable sleep anchor transition. Pending outbox: \(pendingOutboxCount)."
         return uploadedRecords
@@ -5707,6 +6490,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             var queuedAnyPayload = false
 
             for typeCode in selectedTypeCodes {
+                if automaticDirectPendingTypes?.contains(typeCode) == true { continue }
                 do {
                     failureStage = .store
                     try requireCurrentReceiverSyncProgressScope(progressScope)
@@ -5847,6 +6631,11 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         to: target,
                         cursorCheckpoint: cursorCheckpoint,
                         executionMode: mode.executionMode,
+                        // Independent quantities must not spend the collection owner's
+                        // lifetime on HTTP before later selected lanes can journal.
+                        // Daily activity retains its raw-before-projection acceptance.
+                        deferDirectDelivery: mode == .background
+                            && !HealthBridgeBackgroundSync.dailyActivityTypeCodes.contains(typeCode),
                         // Nutrition has no separate daily-activity owner; its receipt retires this generation.
                         pendingGenerationRetirements: selectedEntries.first(where: { $0.typeCode == typeCode })?.aggregation == .sum
                             && !NutritionCompatibility.typeCodes.contains(typeCode)
@@ -5857,10 +6646,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         deliveryGeneration: deliveryResult.connectionGeneration
                     )
                     try requireCurrentPayloadDeliveryTarget(target)
-                    await reaggregateActivityIfNeeded(
-                        typeCode: typeCode, executionMode: mode.executionMode,
-                        retirements: pendingGenerationRetirements
-                    )
+                    if automaticDirectPendingTypes == nil || deliveryResult.directUpload != nil {
+                        await reaggregateActivityIfNeeded(
+                            typeCode: typeCode, executionMode: mode.executionMode,
+                            retirements: pendingGenerationRetirements
+                        )
+                    }
                     try requireCurrentReceiverSyncProgressScope(progressScope)
                     try requireCurrentPayloadDeliveryTarget(target)
                     if deliveryResult.directUpload == nil {
@@ -5983,8 +6774,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func capturePayloadDeliveryTarget() throws -> PayloadDeliveryTarget {
+        try Task.checkCancellation()
+        return try currentPayloadDeliveryTarget()
+    }
+
+    // A durable Mailbox commit can predate task cancellation. Recheck its
+    // authority independently of whether the task may start more work.
+    private func currentPayloadDeliveryTarget() throws -> PayloadDeliveryTarget {
         let generation = settingsStore.receiverSettingsGenerationToken
-        try requireCurrentConnectionGeneration(generation)
         guard let bindingID = settingsStore.receiverBindingID else {
             throw CancellationError()
         }
@@ -6017,14 +6814,30 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         case nil:
             throw CancellationError()
         }
-        try requireCurrentConnectionGeneration(generation)
-        guard settingsStore.receiverBindingID == bindingID else { throw CancellationError() }
+        guard connectionTerminalBarrier.allowsPostResponseMutation(
+            capturedGeneration: generation, currentGeneration: settingsStore.receiverSettingsGenerationToken
+        ), settingsStore.receiverBindingID == bindingID else { throw CancellationError() }
         return PayloadDeliveryTarget(route: route, generation: generation, bindingID: bindingID)
     }
 
     private func requireCurrentPayloadDeliveryTarget(_ target: PayloadDeliveryTarget) throws {
         try requireCurrentConnectionGeneration(target.generation)
         guard try capturePayloadDeliveryTarget() == target else { throw CancellationError() }
+    }
+
+    private func requireCurrentAcceptedDirectTarget(_ target: PayloadDeliveryTarget) throws {
+        guard connectionTerminalBarrier.allowsPostResponseMutation(
+            capturedGeneration: target.generation, currentGeneration: settingsStore.receiverSettingsGenerationToken
+        ) else { throw CancellationError() }
+        // A response already accepted by the receiver belongs to the committed
+        // connection, not to the URL draft used to request a settings change.
+        guard !terminalRecoveryRequestIsActive, !taskUIPublicationIsSuppressed,
+              case .directHTTP(let url) = target.route,
+              settingsStore.activeTransport == .directHTTP,
+              settingsStore.receiverBindingID == target.bindingID,
+              settingsStore.receiverURLString == url.absoluteString else {
+            throw CancellationError()
+        }
     }
 
     private struct PayloadDelivery {
@@ -6063,8 +6876,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         to target: PayloadDeliveryTarget,
         cursorCheckpoint: FileOutboxCursorCheckpoint? = nil,
         executionMode: HealthBridgeSyncExecutionMode = .foreground,
+        deferDirectDelivery: Bool = false,
         pendingGenerationRetirements: [String: Int] = [:],
-        stepsRawAndDailyCoverage: Bool? = nil
+        stepsRawAndDailyCoverage: Bool? = nil,
+        onDurableEnqueue: () throws -> Void = {}
     ) async throws -> PayloadDelivery {
         guard !hasPendingPairing, !Task.isCancelled else {
             throw CancellationError()
@@ -6091,6 +6906,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             pendingGenerationRetirements: pendingGenerationRetirements,
             stepsRawAndDailyCoverage: stepsRawAndDailyCoverage
         )
+        try onDurableEnqueue()
         let enqueuedItemIDs = Set(try outbox.pendingItems().map(\.id))
             .subtracting(initialItemIDs)
         refreshPendingOutboxCount()
@@ -6104,7 +6920,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             )
         }
 
-        if !executionMode.shouldAttemptInlineDirectDelivery {
+        if automaticDirectPendingTypes != nil || deferDirectDelivery || !executionMode.shouldAttemptInlineDirectDelivery {
             lastOutboxNotice = " Exact payload sequence is durably queued for background Direct delivery."
             schedulePendingBackgroundOutboxUploadsIfAllowed()
             return PayloadDelivery(
@@ -6115,7 +6931,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
         let upload = try await uploadPendingOutbox(
             outbox,
-            to: target
+            to: target,
+            executionMode: executionMode
         )
         try requireCurrentPayloadDeliveryTarget(target)
         let remainingItemIDs = Set(try outbox.pendingItems().map(\.id))
@@ -6361,25 +7178,46 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         try outbox.requireUploadAdmission()
         if settingsStore.activeTransport == .directHTTP,
            let receiverBindingID = settingsStore.receiverBindingID {
+            let recovery = try sleepOperationSnapshot(store: sleepManifestStore, outbox: outbox)
             let finalizer = OutboxDeliveryCursorFinalizer(
                 outbox: outbox,
                 cursorStore: cursorStore,
                 proofStore: coreLaneUploadProofStore,
                 pendingGenerationStore: backgroundSyncStore
             )
-            _ = try finalizer.finalizeDirectAcknowledgments(
-                receiverBindingID: receiverBindingID
-            )
+            _ = try await withSleepStorageOrigin {
+                try await finalizer.finalizeDirectAcknowledgments(
+                    receiverBindingID: receiverBindingID,
+                    receiverGeneration: recovery.generation,
+                    sleepStore: sleepManifestStore,
+                    validate: { try self.validateSleepOperationContext(recovery, store: sleepManifestStore, outbox: outbox) }
+                )
+            }
         }
 
         var snapshot = try sleepOperationSnapshot(store: sleepManifestStore, outbox: outbox)
         let validate = { @MainActor in
             try self.validateSleepOperation(snapshot, store: sleepManifestStore, outbox: outbox)
         }
-        _ = try await sleepManifestStore.loadManifestForSync(validate: validate)
-        try validate()
-        if let loadedTransition = try await sleepManifestStore.loadPendingForSync(validate: validate) {
+        let loadedTransition: SleepSyncPendingTransition?
+        do {
+            _ = try await sleepManifestStore.loadManifestForSync(validate: validate)
             try validate()
+            loadedTransition = try await sleepManifestStore.loadPendingForSync(validate: validate)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try validate()
+            guard try sleepFinalizationHold(in: outbox)?.reason == .proofMissing else { throw error }
+            loadedTransition = nil
+        }
+        try validate()
+        if try sleepFinalizationHold(in: outbox)?.reason == .proofMissing {
+            privateStorageAdmissionReady = true
+            refreshPendingOutboxCount()
+            return
+        }
+        if let loadedTransition {
             var pendingTransition = loadedTransition
             if loadedTransition.outboxItemID == nil,
                let item = try await matchingPendingSleepOutboxItems(loadedTransition, in: outbox).first {
@@ -6391,6 +7229,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 try validate()
             }
             if let rejectedFloor = pendingTransition.rejectedMinimumResetEpoch {
+                guard try !outbox.hasUncheckedDirectSleepAcknowledgment(for: pendingTransition) else {
+                    throw FileOutboxCursorCheckpointError.pendingCommit
+                }
                 try await recoverRejectedSleepBaseline(
                     RejectedSleepBaselineOutboxItem(
                         itemID: pendingTransition.outboxItemID ?? "",
@@ -6410,14 +7251,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try validate()
             if needsMigration {
-                _ = try sleepResetEpochStore.reserveEpoch(
-                    after: pendingTransition.manifest.baselineResetEpoch ?? 0
-                )
                 let matchingItems = try await matchingPendingSleepOutboxItems(
                     pendingTransition,
                     in: outbox
                 )
                 try validate()
+                guard try !outbox.hasUncheckedDirectSleepAcknowledgment(for: pendingTransition) else {
+                    throw FileOutboxCursorCheckpointError.pendingCommit
+                }
+                _ = try sleepResetEpochStore.reserveEpoch(
+                    after: pendingTransition.manifest.baselineResetEpoch ?? 0
+                )
                 for item in matchingItems {
                     try outbox.markUploaded(item)
                     outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .retired)
@@ -6436,6 +7280,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try validate()
             if needsMigration {
+                if let loadedTransition,
+                   try outbox.hasUncheckedDirectSleepAcknowledgment(for: loadedTransition) {
+                    throw FileOutboxCursorCheckpointError.pendingCommit
+                }
                 _ = try sleepResetEpochStore.reserveEpoch(after: manifest.baselineResetEpoch ?? 0)
                 try sleepManifestStore.resetSynchronizationState()
                 snapshot.storage = try sleepManifestStore.revisionForSync()
@@ -6480,17 +7328,23 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private func uploadPendingOutbox(
         _ outbox: FileOutbox,
         to target: PayloadDeliveryTarget,
-        finalizePendingSleep: Bool = false,
         executionMode: HealthBridgeSyncExecutionMode = .foreground
     ) async throws -> (
         summary: FileOutboxFlushSummary,
-        lastDirectUploadResult: ReceiverUploadResult?
+        lastDirectUploadResult: ReceiverUploadResult?,
+        acceptedDirectItemIDs: Set<String>
     ) {
         let expectedGeneration = target.generation
         try requireCurrentPayloadDeliveryTarget(target)
         if target.route == .mailbox {
+            var finalizedOwner: OutboxDeliveryOwnershipV1?
+            defer {
+                recordNewMailboxFinalization(finalizedOwner, for: target, outbox: outbox)
+            }
             do {
-                let summary = try await makeProductionMailboxDelivery().deliverPending()
+                let summary = try await makeProductionMailboxDelivery().deliverPending {
+                    finalizedOwner = $0
+                }
                 try requireCurrentPayloadDeliveryTarget(target)
                 let flushSummary = FileOutboxFlushSummary(
                     attemptedCount: summary.attemptedCount,
@@ -6503,16 +7357,38 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         : [],
                     mailboxDeliveryDiagnosticLine: summary.ackDiagnosticLine
                 )
-                mailboxDeliveryDiagnosticLine = flushSummary.mailboxDeliveryDiagnosticLine
+                var completedOperations: Set<MailboxDeliveryOperation> = [.manualDelivery]
+                if let write = pendingMailboxCheckpointWrite,
+                   write.canRetry(from: backgroundSyncStore.mailboxAckScanCheckpoint(
+                       receiverGeneration: expectedGeneration
+                   )) {
+                    do {
+                        try backgroundSyncStore.persistMailboxAckScanCheckpoint(
+                            write.checkpoint, receiverGeneration: expectedGeneration
+                        )
+                        completedOperations.insert(.persistScanCheckpoint)
+                    } catch {
+                        publishMailboxDeliverySummary(
+                            flushSummary.mailboxDeliveryDiagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                            completedOperations: completedOperations
+                        )
+                        throw write
+                    }
+                }
+                publishMailboxDeliverySummary(
+                    flushSummary.mailboxDeliveryDiagnosticLine, finalizedItemIDs: summary.finalizedItemIDs,
+                    completedOperations: completedOperations
+                )
                 return (
                     summary: flushSummary,
-                    lastDirectUploadResult: nil
+                    lastDirectUploadResult: nil,
+                    acceptedDirectItemIDs: []
                 )
             } catch let cancellation as CancellationError {
                 throw cancellation
             } catch {
                 try requireCurrentPayloadDeliveryTarget(target)
-                mailboxDeliveryDiagnosticLine = MailboxDeliveryDiagnosticLine.failure(for: error)
+                publishMailboxDeliveryFailure(error, generation: expectedGeneration, operation: .manualDelivery)
                 throw error
             }
         }
@@ -6531,9 +7407,17 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             proofStore: coreLaneUploadProofStore,
             pendingGenerationStore: backgroundSyncStore
         )
-        _ = try cursorFinalizer.finalizeDirectAcknowledgments(
-            receiverBindingID: receiverIdentity
-        )
+        if let sleepManifestStore {
+            _ = try await withSleepStorageOrigin {
+                try await cursorFinalizer.finalizeDirectAcknowledgments(
+                    receiverBindingID: receiverIdentity, receiverGeneration: expectedGeneration,
+                    sleepStore: sleepManifestStore,
+                    validate: { try self.requireCurrentPayloadDeliveryTarget(target) }
+                )
+            }
+        } else {
+            _ = try cursorFinalizer.finalizeDirectAcknowledgments(receiverBindingID: receiverIdentity)
+        }
         let allPending = try outbox.uploadablePendingItems(for: receiverIdentity)
         let hasNutrition = try outbox.containsPreparedNutrition(in: allPending)
         let support = hasNutrition ? try await refreshNutritionSupport() : NutritionSupport.unknown
@@ -6542,11 +7426,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
               try outbox.uploadablePendingItems(for: receiverIdentity) == allPending else {
             throw CancellationError()
         }
-        var pendingItems = hasNutrition
+        var pendingItems = (hasNutrition
             ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
-            : allPending
+            : allPending)[...]
+        let admittedNutritionItemIDs = hasNutrition ? Set(allPending.map(\.id)) : nil
         var attemptedCount = 0
-        var uploadedCount = 0
+        var acceptedDirectItemIDs: Set<String> = []
         var failedItemIDs: [String] = []
         var failedDescriptions: [String] = []
         var lastDirectUploadResult: ReceiverUploadResult?
@@ -6555,51 +7440,84 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             try outbox.requireUploadAdmission()
             attemptedCount += 1
             do {
+                let prepared = try outbox.preparedNutritionPayload(for: item)
                 let payload = try Data(contentsOf: item.fileURL)
+                let sleepInput: (store: any SleepSyncManifestStoring, snapshot: SleepOperationSnapshot)?
+                if prepared?.mayContainSleep != false {
+                    guard let store = sleepManifestStore else {
+                        throw CompanionPrivateStorageError.sleepManifestUnavailable
+                    }
+                    let snapshot = try sleepOperationSnapshot(
+                        store: store, outbox: outbox, automatic: executionMode == .automatic
+                    )
+                    guard snapshot.fifo.contains(item) else { throw CancellationError() }
+                    sleepInput = (store, snapshot)
+                } else {
+                    sleepInput = nil
+                }
                 lastDirectUploadResult = try await receiverClient.upload(
                     payload,
                     to: url,
                     bearerToken: uploadBearerToken
                 )
-                try requireCurrentPayloadDeliveryTarget(target)
-                if finalizePendingSleep, let store = sleepManifestStore {
-                    var snapshot = try sleepOperationSnapshot(
-                        store: store, outbox: outbox, automatic: executionMode == .automatic
-                    )
-                    let validate = { @MainActor in
-                        try self.requireCurrentPayloadDeliveryTarget(target)
-                        try self.validateSleepOperation(snapshot, store: store, outbox: outbox)
-                    }
-                    if let pending = try await withSleepStorageOrigin({
-                        try await store.loadPendingForSync(validate: validate)
-                    }), pending.outboxItemID == item.id {
-                        guard pending.receiverBindingID == receiverIdentity,
-                              pending.connectionGeneration == expectedGeneration,
-                              pending.payload == payload else {
-                            throw CancellationError()
-                        }
-                        snapshot.storage = try await withSleepStorageOrigin {
-                            try await store.saveManifestForSync(pending.manifest, validate: validate)
-                        }
-                        snapshot.storage = try await withSleepStorageOrigin {
-                            try await store.clearPendingForSync(id: pending.id, validate: validate)
-                        }
-                        try validate()
+                let validateAcceptedPayload = { @MainActor in
+                    guard try outbox.preparedNutritionPayload(for: item)?.revision == prepared?.revision,
+                          try Data(contentsOf: item.fileURL) == payload else {
+                        throw CancellationError()
                     }
                 }
-                _ = try cursorFinalizer.recordDirectReceiverAcceptance(
-                    itemID: item.id,
-                    receiverBindingID: receiverIdentity
-                )
-                lastDirectAcceptance = (item.id, receiverIdentity, expectedGeneration, bootstrapRetryGeneration)
+                let recordAcceptance = { @MainActor in
+                    self.recordAcceptedTransfer(
+                        bindingID: receiverIdentity, generation: expectedGeneration, evidenceKind: .directResponse
+                    )
+                }
+                if let (store, snapshot) = sleepInput {
+                    let validateAcceptedOwner = { @MainActor in
+                        try self.requireCurrentAcceptedDirectTarget(target)
+                        // A reservation excludes new work without revoking a response
+                        // whose committed authority is still current.
+                        try self.validateSleepOperationAuthority(snapshot, store: store, outbox: outbox)
+                    }
+                    // Join the response commit under the transfer gate even if Cancel Sync stops the caller.
+                    _ = try await Task { @MainActor in
+                        try validateAcceptedOwner()
+                        guard try store.revisionForSync() == snapshot.storage else { throw CancellationError() }
+                        return try await withSleepStorageOrigin {
+                            try await cursorFinalizer.recordDirectReceiverAcceptanceForSync(
+                                descriptor: DirectUploadCompletionDescriptor(
+                                    itemID: item.id, receiverGeneration: expectedGeneration,
+                                    receiverBindingID: receiverIdentity
+                                ),
+                                sleepStore: store,
+                                acceptedSleepRevision: snapshot.storage,
+                                validate: validateAcceptedOwner,
+                                validatePending: {
+                                    // A new tail is outside this accepted FIFO snapshot.
+                                    // No existing entry may move, disappear, or change owner.
+                                    guard try outbox.pendingItems().starts(with: snapshot.fifo) else {
+                                        throw CancellationError()
+                                    }
+                                    try validateAcceptedPayload()
+                                }, onNewAcceptance: recordAcceptance
+                            )
+                        }
+                    }.value
+                } else {
+                    try requireCurrentAcceptedDirectTarget(target)
+                    guard self.outbox === outbox, try outbox.pendingItem(id: item.id) == item else {
+                        throw CancellationError()
+                    }
+                    try validateAcceptedPayload()
+                    _ = try cursorFinalizer.recordDirectReceiverAcceptance(
+                        itemID: item.id, receiverBindingID: receiverIdentity, sleepChecked: true,
+                        onNewAcceptance: recordAcceptance
+                    )
+                }
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .accepted)
-                uploadedCount += 1
-                pendingItems = hasNutrition
-                    ? try outbox.nutritionCompatibleItems(for: receiverIdentity, support: support)
-                    : Array(pendingItems.dropFirst())
+                acceptedDirectItemIDs.insert(item.id)
             } catch let cancellation as CancellationError {
                 outbox.noteDiagnosticDelivery(itemID: item.id, outcome: .cancelled)
-                if finalizePendingSleep {
+                if executionMode == .automatic {
                     noteBackgroundAutomaticSyncFailure(
                         stage: .transport, error: cancellation, executionMode: executionMode
                     )
@@ -6623,16 +7541,44 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 failedDescriptions.append(describe(error))
                 break
             }
+            if let admittedNutritionItemIDs {
+                // The first selection prepared these owners. Re-evaluate their
+                // ordering after ACK without admitting or decoding a cold tail.
+                pendingItems = try outbox.preparedNutritionItems(
+                    for: receiverIdentity, support: support, admittedItemIDs: admittedNutritionItemIDs
+                )[...]
+            } else {
+                pendingItems = pendingItems.dropFirst()
+            }
         }
         try requireCurrentPayloadDeliveryTarget(target)
         return (
             summary: FileOutboxFlushSummary(
                 attemptedCount: attemptedCount,
-                uploadedCount: uploadedCount,
+                uploadedCount: acceptedDirectItemIDs.count,
                 failedItemIDs: failedItemIDs,
                 failedDescriptions: failedDescriptions
             ),
-            lastDirectUploadResult: lastDirectUploadResult
+            lastDirectUploadResult: lastDirectUploadResult,
+            acceptedDirectItemIDs: acceptedDirectItemIDs
+        )
+    }
+
+    private func recordNewMailboxFinalization(
+        _ ownership: OutboxDeliveryOwnershipV1?,
+        for target: PayloadDeliveryTarget?,
+        outbox deliveryOutbox: FileOutbox?
+    ) {
+        // A completed transition survives unrelated delivery failures, but only
+        // this still-live opportunity may attribute it to the captured receiver.
+        guard let ownership, let target, target.route == .mailbox,
+              let deliveryOutbox, outbox === deliveryOutbox,
+              ownership.receiverBindingID == target.bindingID,
+              ownership.receiverGeneration == target.generation,
+              (try? currentPayloadDeliveryTarget()) == target,
+              (try? deliveryOutbox.requireUploadAdmission()) != nil else { return }
+        recordAcceptedTransfer(
+            bindingID: target.bindingID, generation: target.generation, evidenceKind: .mailboxCommit
         )
     }
 
@@ -6655,6 +7601,93 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             sleepStore: sleepManifestStore,
             receiverClient: receiverClient
         )
+    }
+
+    private var currentMailboxDeliveryFailures: [MailboxDeliveryDiagnosticLine] {
+        let generation = settingsStore.receiverSettingsGenerationToken
+        return mailboxDeliveryDiagnosticLines.filter { $0.failureGeneration == generation }
+    }
+
+    private var hasPendingManualMailboxRetry: Bool {
+        usesMailboxTransport && currentMailboxDeliveryFailures.contains { failure in
+            switch failure.scope {
+            case .operation(.manualDelivery), .operation(.persistScanCheckpoint), .item:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    private var pendingMailboxCheckpointWrite: MailboxAckCheckpointWrite? {
+        currentMailboxDeliveryFailures.last { $0.checkpointWrite != nil }?.checkpointWrite
+    }
+
+    private func recoveredMailboxFailureIDs(
+        _ failures: [MailboxDeliveryDiagnosticLine]
+    ) -> Set<String> {
+        guard usesMailboxTransport, let outbox, let bindingID = settingsStore.receiverBindingID else { return [] }
+        let generation = settingsStore.receiverSettingsGenerationToken
+        var expected: [String: OutboxDeliveryOwnershipV1] = [:]
+        for failure in failures {
+            guard case .item(let itemID) = failure.scope, let ownership = failure.itemOwnership,
+                  ownership.receiverBindingID == bindingID, ownership.receiverGeneration == generation else { continue }
+            expected[itemID] = ownership
+        }
+        guard !expected.isEmpty else { return [] }
+        return (try? outbox.recoveredMailboxFinalizationIDs(matching: expected)) ?? []
+    }
+
+    private func mailboxCheckpointWrite(
+        startingCheckpoint: String?, nextCheckpoint: String?, generation: String
+    ) -> MailboxAckCheckpointWrite? {
+        let current = backgroundSyncStore.mailboxAckScanCheckpoint(receiverGeneration: generation)
+        if let nextCheckpoint {
+            guard current == startingCheckpoint else { return nil }
+            return MailboxAckCheckpointWrite(startingCheckpoint: startingCheckpoint, checkpoint: nextCheckpoint)
+        }
+        if let retry = pendingMailboxCheckpointWrite, retry.canRetry(from: current) {
+            return retry
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func publishMailboxDeliveryFailure(
+        _ error: Error, generation: String, operation: MailboxDeliveryOperation? = nil,
+        completedOperations: Set<MailboxDeliveryOperation> = []
+    ) -> String {
+        let diagnostic = MailboxDeliveryDiagnosticLine.failure(
+            for: error, generation: generation, operation: operation
+        )
+        let earlier = currentMailboxDeliveryFailures.filter { $0.scope != diagnostic.scope }
+        // A delivery pass can commit an earlier item and then throw before returning a summary.
+        let recovered = recoveredMailboxFailureIDs(earlier)
+        mailboxDeliveryDiagnosticLines = earlier.filter {
+            if case .item(let itemID) = $0.scope { return !recovered.contains(itemID) }
+            if case .operation(let op) = $0.scope { return !completedOperations.contains(op) }
+            return true
+        } + [diagnostic]
+        return diagnostic.message
+    }
+
+    private func publishMailboxDeliverySummary(
+        _ message: String, finalizedItemIDs: Set<String>, completedOperations: Set<MailboxDeliveryOperation>
+    ) {
+        let failures = currentMailboxDeliveryFailures
+        let recovered = recoveredMailboxFailureIDs(failures)
+        let unresolved = failures.filter { diagnostic in
+            switch diagnostic.scope {
+            case .item(let itemID):
+                if diagnostic.itemOwnership != nil { return !recovered.contains(itemID) }
+                return !finalizedItemIDs.contains(itemID)
+            case .operation(let operation):
+                return !completedOperations.contains(operation)
+            case .unattributed, nil:
+                return true
+            }
+        }
+        mailboxDeliveryDiagnosticLines = unresolved.isEmpty ? [.summary(message)] : unresolved
     }
 
     private static func mailboxDeliveryMessage(
@@ -6739,18 +7772,28 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         store: SleepSyncManifestStoring,
         outbox: FileOutbox
     ) throws {
+        guard terminalTransitionRequestIsActive == snapshot.terminalRequest,
+              backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration,
+              !snapshot.automatic || backgroundSyncEnabled else {
+            throw CancellationError()
+        }
+        try validateSleepOperationAuthority(snapshot, store: store, outbox: outbox)
+    }
+
+    private func validateSleepOperationAuthority(
+        _ snapshot: SleepOperationSnapshot,
+        store: SleepSyncManifestStoring,
+        outbox: FileOutbox
+    ) throws {
         try Task.checkCancellation()
         guard sleepManifestStore === store, self.outbox === outbox,
               settingsStore.receiverSettingsGenerationToken == snapshot.generation,
               settingsStore.receiverBindingID == snapshot.binding,
               settingsStore.receiverURLString == snapshot.url,
               bootstrapRetryGeneration == snapshot.retryGeneration,
-              backgroundSyncPreferenceGeneration == snapshot.preferenceGeneration,
               terminalRecoveryRequestIsActive == snapshot.recovery,
-              terminalTransitionRequestIsActive == snapshot.terminalRequest,
               taskUIPublicationIsSuppressed == snapshot.publicationSuppressed,
-              connectionTerminalBarrier.admissionIsOpen == snapshot.admissionOpen,
-              !snapshot.automatic || backgroundSyncEnabled else { throw CancellationError() }
+              connectionTerminalBarrier.admissionIsOpen == snapshot.admissionOpen else { throw CancellationError() }
         try outbox.requireUploadAdmission()
     }
 
@@ -6779,14 +7822,41 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         return try? outbox.pendingItems().count
     }
 
+    private func sleepFinalizationHold(in outbox: FileOutbox) throws -> AcceptedFinalizationHold? {
+        do {
+            let hold = try outbox.acceptedFinalizationHold()
+            if !taskUIPublicationIsSuppressed, hold != acceptedFinalizationHold {
+                acceptedFinalizationHold = hold
+            }
+            guard hold?.affectedTypeCodes.contains(HealthBridgeHealthType.sleepAnalysis.typeCode) == true else {
+                return nil
+            }
+            return hold
+        } catch {
+            if !taskUIPublicationIsSuppressed { acceptedFinalizationHold = nil }
+            throw error
+        }
+    }
+
     private func refreshPendingOutboxCount() {
         guard !taskUIPublicationIsSuppressed else { return }
         do {
-            pendingOutboxCount = try outbox?.pendingItems().count ?? 0
+            let items = try outbox?.pendingItems() ?? []
+            let generation = settingsStore.receiverSettingsGenerationToken
+            hasPublishedMailboxItem = usesMailboxTransport && items.contains { item in
+                guard let state = item.deliveryState, state.ownership?.receiverGeneration == generation else {
+                    return false
+                }
+                return state.phase == .published || state.phase == .providerObserved
+            }
+            pendingOutboxCount = items.count
+            acceptedFinalizationHold = try outbox?.acceptedFinalizationHold()
         } catch {
             outbox = nil
             privateStorageAdmissionReady = false
+            hasPublishedMailboxItem = false
             pendingOutboxCount = 0
+            acceptedFinalizationHold = nil
             hasPendingSleepTransition = sleepStorageMayNeedRecovery()
             hasPendingOutboxDeletion = true
             return
@@ -7012,6 +8082,12 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     }
 
     private func describe(_ error: Error) -> String {
+        if error is MailboxAckCheckpointWrite {
+            return describe(BackgroundSyncSettingsStoreError.persistenceFailed)
+        }
+        if let mailboxError = error as? ProductionMailboxItemDeliveryError {
+            return describe(mailboxError.phase)
+        }
         if error is SleepStorageOperationFailure {
             return "Private Sleep synchronization state could not be persisted. Retry when private storage is available."
         }
@@ -7070,7 +8146,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             case .outboxIdentityAdmissionNotReady:
                 detail = "Queued-upload identity admission is not ready."
             case .outboxNotEmpty:
-                detail = "Queued uploads remain pending."
+                detail = acceptedFinalizationRecoveryMessage ?? "Queued uploads remain pending."
             case .outboxClearIntentActive:
                 detail = "Queued-upload deletion is still pending."
             }
@@ -7103,6 +8179,9 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             case .oldestItemBelongsToDifferentReceiver:
                 return "Queued uploads belong to a different server. Reset private sync state before reconnecting. | domain=ReceiverOutboxIdentityError | code=different_receiver_identity"
             case .receiverTransitionRequiresEmptyOutbox:
+                if let message = acceptedFinalizationRecoveryMessage {
+                    return "\(message) Review Recovery in Settings. | domain=ReceiverOutboxIdentityError | code=transition_requires_empty_outbox"
+                }
                 return "Send queued uploads or reset private sync state before disconnecting or changing the server. | domain=ReceiverOutboxIdentityError | code=transition_requires_empty_outbox"
             }
         }
@@ -7199,5 +8278,6 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
 
     private func publishPairingFailure(_ prefix: String, error: Error) {
         publishPairingFailure("\(prefix): \(describePairingFailure(error))")
+        pairingInputError = error as? ReceiverPairingBundleError
     }
 }

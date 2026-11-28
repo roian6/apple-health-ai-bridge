@@ -158,7 +158,7 @@ public enum CompanionPrimaryStatusMessage {
             return copy
         }
         if message.contains("sync complete") {
-            return "Sync complete"
+            return "Sync check finished"
         }
         if message.contains("starting sync") || message.contains("starting apple health") {
             return "Sync started"
@@ -169,8 +169,12 @@ public enum CompanionPrimaryStatusMessage {
         if message.contains("recorded") && message.contains("anchor cursor") {
             return "Sync progress saved"
         }
-        if message.contains("returned no") || message.contains("nothing sent") {
+        if message == "healthkit step anchor is unchanged. nothing sent."
+            || message == "healthkit workout anchor is unchanged. nothing sent." {
             return "No new data to send"
+        }
+        if message.contains("returned no") || message.contains("nothing sent") {
+            return "No readable records returned"
         }
         if message.contains("checking local bridge") || message.contains("checking connection") || message.contains("sending receiver test") {
             return "Checking connection"
@@ -255,8 +259,11 @@ public enum CompanionPrimaryStatusMessage {
         if message.contains("cleared") && message.contains("queued upload") {
             return "Cleared queued uploads. Only unsent local retry data was removed."
         }
+        if message.contains("nothing was sent. queued uploads remaining:") {
+            return "Nothing was sent. Uploads are still queued."
+        }
         if message.contains("queued uploads sent") {
-            return trimmed
+            return "Queued uploads sent"
         }
         if message.contains("cancelled") && message.contains("queued uploads") {
             return "Sync cancelled. Already queued uploads are kept for retry."

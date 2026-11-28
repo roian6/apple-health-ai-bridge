@@ -294,6 +294,36 @@ final class AutomaticSyncEngineContractTests: XCTestCase {
     }
 
     @MainActor
+    func testScheduledOpportunitiesReachSleepWhenEarlierTypeIsCancelledAndBlocked() async throws {
+        let fixture = try PendingGenerationFixture()
+        defer { fixture.remove() }
+        try fixture.store.markPendingObserverTypeCodes(["basal_energy", "sleep_analysis"])
+        let observed = TypeCodeRecorder()
+        let engine = AutomaticSyncEngine(
+            pendingStore: fixture.store,
+            processType: { typeCode, _ in
+                await observed.append(typeCode)
+                if typeCode == "basal_energy" {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return .blocked
+                }
+                return .noPayload
+            }
+        )
+
+        for _ in 0..<2 {
+            try await engine.requestRun(reason: .scheduledRefresh)
+        }
+
+        let processed = await observed.values
+        XCTAssertEqual(processed, ["basal_energy", "sleep_analysis", "basal_energy"])
+        XCTAssertEqual(
+            try fixture.store.loadPendingObserverTypeCodeGenerations(),
+            ["basal_energy": 1]
+        )
+    }
+
+    @MainActor
     func testBlockedResultReturnsIncompleteAndRetainsEveryGeneration() async throws {
         let fixture = try PendingGenerationFixture()
         defer { fixture.remove() }

@@ -2,14 +2,14 @@
 
 The normal path is: install the iPhone companion, prepare a receiver on the computer that will store your data, establish a private route that the iPhone can reach away from home, pair once, connect your AI client, and ask about the records that arrive.
 
-This guide targets [Receiver/CLI `1.2.1`](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.1). Confirm that the release is available before installing it. For the optional Mac-only Mailbox Beta, verify the matching helper and complete release assets using the [mailbox installation guide](https://github.com/roian6/apple-health-ai-bridge/blob/receiver-v1.2.1/docs/icloud-mailbox-service.md); stop if the release or its required native qualification is unavailable, and do not substitute `main` or an older helper.
+This guide uses the coordinated installation default: [Receiver/CLI `1.2.0`](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0), iOS Companion `1.2.0` (build `51`), and Batch Protocol `health_bridge.batch.v1` (`1.0.0`). Check the installed app version and build before pairing or upgrading. For the optional Mac-only Mailbox Beta, verify the matching helper and complete release assets using the maintained [mailbox installation guide](icloud-mailbox-service.md), which also covers helper replacement; do not install Receiver or helper code from `main` or substitute an older helper.
 
 ## Before you start
 
 You need:
 
 - an iPhone running iOS 18 or later;
-- the [iPhone app from the App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806); TestFlight builds and self-build options are listed on the [install status page](https://healthbridge.chanhyo.dev/install/);
+- iOS Companion `1.2.0` (build `51`) from the [App Store](https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806), listed as Health Bridge for AI, or the [TestFlight beta](https://testflight.apple.com/join/GF4dbSEV); self-build options are listed on the [install status page](https://healthbridge.chanhyo.dev/install/);
 - a macOS or Linux computer for the receiver and private database; native Windows is not currently supported;
 - [`uv`](https://docs.astral.sh/uv/);
 - for continuous sync away from home, either an existing Tailscale connection or an agent-assisted private HTTPS ingress; for an explicit local-only evaluation, a same-LAN route with the limitations below;
@@ -22,10 +22,12 @@ The receiver URL is the exact address the iPhone uses to upload to the receiver 
 - for continuous sync, be reachable from the physical iPhone on Wi-Fi and cellular data and use a stable private HTTPS route;
 - for an explicit local-only evaluation, be reachable from the iPhone on that LAN and be understood to stop working when the phone leaves it;
 - end exactly in `/v1/batches`;
-- route the same origin's `/health` and `/v1/pairing/redeem` paths to the receiver;
+- route the same origin's `/health`, `/v1/pairing/redeem`, and authenticated `GET /v1/capabilities` paths to the receiver;
 - remain available whenever automatic sync should succeed.
 
 A local-network-only route stops syncing when the iPhone leaves that network. It remains useful for development and explicit local-only use, but it is not the primary continuous-sync path.
+
+Capability discovery uses the authenticated `/v1/capabilities` endpoint. See the [Receiver capability contract](receiver-capabilities.md) for its response and header requirements.
 
 Choose one of the following routes **before** running `health-bridge setup`.
 
@@ -91,7 +93,7 @@ Ask the setup agent to follow this provider-neutral ingress checklist:
 1. **Discover without changing the host.** Inspect the OS, existing private-network clients, DNS and HTTPS ingress or tunnel services, reverse proxies, firewall, service manager, and whether port `8765` is already in use. Do not install a provider, change DNS, open a firewall port, publish a service, or run `health-bridge setup` during discovery.
 2. **Return a reviewable plan.** Show the proposed topology, provider or account prerequisites, exact DNS/ingress/firewall/service changes, whether the route is private or publicly reachable, rollback steps, and privacy/exposure trade-offs. Wait for explicit approval before applying the plan.
 3. **Keep the receiver private.** Bind Health Bridge to `127.0.0.1:8765`; terminate phone-facing TLS at the approved proxy or tunnel. Do not expose port `8765`, use plain HTTP toward the phone, use a self-signed certificate, treat an unguessable hostname as security, enable Tailscale Funnel, or add a browser-login layer that the iOS app cannot satisfy.
-4. **Proxy only the phone protocol.** On one HTTPS origin, allow `GET /health`, `POST /v1/batches`, and `POST /v1/pairing/redeem`. Preserve the `Authorization` header and request bodies. Permit batches up to `5,000,000` bytes and pairing redemption bodies up to `4,096` bytes. Disable request-body and authorization-header logging. Supervise the receiver process and TLS certificate renewal.
+4. **Proxy only the phone protocol.** On one approved private HTTPS origin, allow only `GET /health`, `POST /v1/batches`, `POST /v1/pairing/redeem`, and authenticated `GET /v1/capabilities`. Preserve the `Authorization` header and request bodies. For capability responses, pass through the exact `Content-Type: application/json` and `Cache-Control: no-store` headers. Permit batches up to `5,000,000` bytes and pairing redemption bodies up to `4,096` bytes. Disable request-body and authorization-header logging. Supervise the receiver process and TLS certificate renewal. Do not expose additional routes or make this endpoint publicly reachable.
 5. **Stop at a public-only design.** If the only workable route is publicly reachable, do not silently publish it. Explain that it needs a deployment-specific hardening review outside this private-ingress guide.
 6. **Prepare the common handoff.** After the approved route exists, set `HEALTH_BRIDGE_RECEIVER_URL` to the exact origin plus `/v1/batches`. Do not claim phone reachability yet; continue with common setup, receiver start, and physical-iPhone verification below.
 
@@ -132,12 +134,43 @@ Continue with the common setup sequence below. Route C must use its explicit `0.
 
 After setup, use the printed receiver command with the same bind and port. Keep the iPhone on that LAN, grant the app's iOS Local Network permission, derive the health URL as `${HEALTH_BRIDGE_RECEIVER_URL%/v1/batches}/health`, and open that exact URL on the physical iPhone before pairing. The Local Network permission alert may fail to resolve the first attempt if access is denied or the route does not recover in time. If an exit node is active, enable **Allow LAN access** or use Route A or Route B instead.
 
+## Existing users: Receiver/CLI 1.2.0 upgrade
+
+Upgrade Receiver/CLI `1.1.5` to `1.2.0` together with the matching signed iOS Companion `1.2.0` (build `51`). If your installed app still shows an older build, update it through the App Store or TestFlight before using this matched set. Keep your existing database, device credentials, and pairing.
+
+1. Record the exact database path and existing receiver launch configuration. Stop the Receiver through its current service manager and confirm no process is using the database. Using your established SQLite backup procedure, create and verify an owner-only backup of that database before upgrading, including any SQLite sidecar files that remain. Do not copy a live database.
+2. Verify the complete Receiver/CLI `1.2.0` release packet and the matching signed iOS app build. Do not install from `main`, an unverified checkout, or an older helper.
+3. Set `HEALTH_BRIDGE_DB` to the same database path used by the existing Receiver. If you already use Mailbox, follow [Replace the installed helper](icloud-mailbox-service.md#replace-the-installed-helper) with the verified 1.2.0 wheel and matching signed helper. Use the currently installed CLI to uninstall an owned Mailbox service before replacing its CLI. Pause when the replacement helper reports `ready`, before restoring the service or restarting the foreground Receiver. For Direct without Mailbox, install the tagged release:
+
+   ```bash
+   uv tool install --force "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
+   ```
+
+4. Initialize the same database while the Receiver is still stopped:
+
+   ```bash
+   health-bridge init --db "$HEALTH_BRIDGE_DB"
+   ```
+
+   Initialization applies migrations `012_catalogue_coverage_index`, `013_mailbox_enrollment`, and `014_uv_raw_aggregation`. Migration 012 builds its index synchronously and may need extra disk space or wait for database readers or writers. Migration 013 adds native Mailbox enrollment state. Migration 014 changes legacy raw UV samples from sum aggregation to min/max/average aggregation. Do not run an older Receiver/CLI against the migrated database. To downgrade, stop the Receiver and restore the verified pre-upgrade database backup before reinstalling the older version.
+5. After initialization succeeds, resume the helper replacement procedure for Mailbox and restore the owned service with its original settings, or restart the original foreground command. For Direct without Mailbox, restart the Receiver using its existing supervisor and launch configuration. Keep the same database path, bind address, port, route, credential files, and paired devices. Do not run `health-bridge setup`, create a new pairing, reset private sync state, or change the phone's pairing.
+6. Reload or restart the existing MCP client using its documented configuration-reload procedure. Confirm the local MCP surface and database status:
+
+   ```bash
+   health-bridge mcp smoke --db "$HEALTH_BRIDGE_DB"
+   health-bridge status --db "$HEALTH_BRIDGE_DB" --json
+   ```
+
+   Then use the MCP client's existing connection check and ask it for `get_bridge_status` and `list_synced_metrics`.
+
+The Companion uses a newer queue format after splitting a mixed nutrition batch. Older Companion builds cannot open that queue. An older mixed queue with incomplete delivery history is held rather than replayed or deleted. Do not reset private sync state to work around a held queue; contact support.
+
 ## Install and run core setup
 
-Once the release is published and verified, install Receiver/CLI `1.2.1`:
+Install the published Receiver/CLI `1.2.0` for iOS Companion `1.2.0` (build `51`):
 
 ```bash
-uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.1"
+uv tool install "git+https://github.com/roian6/apple-health-ai-bridge.git@receiver-v1.2.0"
 ```
 
 After the selected route has set `HEALTH_BRIDGE_RECEIVER_URL` to its real, configured `/v1/batches` URL, run exactly one setup command.

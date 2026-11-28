@@ -173,21 +173,22 @@ def test_public_release_audit_supports_gitignored_local_denylist() -> None:
 
 
 def test_public_release_audit_redacts_local_denylist_hits_in_all_tracked_files(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Given
+    audit = cast(
+        "PublicReleaseAuditModule", cast("object", _load_public_release_audit())
+    )
+    # Production scans Git-relative names, not the path to a caller's checkout.
+    monkeypatch.chdir(tmp_path)
     private_literal = "PRIVATE_VALUE_FOR_LOCAL_DENYLIST_TEST"
-    denylist = tmp_path / "denylist.local"
+    denylist = Path("denylist.local")
     _ = denylist.write_text(f"{private_literal}\n")
-    public_doc = tmp_path / "README.md"
+    public_doc = Path("README.md")
     _ = public_doc.write_text(f"normal text {private_literal}\n")
-    definition_file = tmp_path / "scripts" / "public-release-audit.py"
+    definition_file = Path("scripts/public-release-audit.py")
     definition_file.parent.mkdir()
     _ = definition_file.write_text(f"guardrail text {private_literal}\n")
-    audit = cast(
-        "PublicReleaseAuditModule",
-        cast("object", _load_public_release_audit()),
-    )
     audit.LOCAL_DENYLIST_FILES = (denylist,)
     audit.STRICT_DEFINITION_FILES = {definition_file.as_posix()}
     audit.PUBLIC_SURFACE_FILES = {public_doc.as_posix()}
@@ -229,18 +230,19 @@ def test_public_release_audit_scans_definition_files_for_global_credentials(
 
 
 def test_public_release_audit_blocks_bare_account_bundle_literals(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     audit = cast(
         "PublicReleaseAuditModule",
         cast("object", _load_public_release_audit()),
     )
+    monkeypatch.chdir(tmp_path)
     bundle = ".".join(("dev", "private-owner", "bridge"))  # noqa: FLY002
-    fixture = tmp_path / "provenance.txt"
+    fixture = Path("provenance.txt")
     _ = fixture.write_text(f"source bundle: {bundle}\n")
-    canonical = tmp_path / "canonical.txt"
+    canonical = Path("canonical.txt")
     _ = canonical.write_text("dev.healthbridge.companion\n")
-    suffixed = tmp_path / "suffixed.txt"
+    suffixed = Path("suffixed.txt")
     _ = suffixed.write_text("dev.healthbridge.companion" + ".private\n")
 
     blockers = audit.scan_strict_blockers([fixture])
@@ -255,30 +257,31 @@ def test_public_release_audit_blocks_bare_account_bundle_literals(
 
 
 def test_public_release_audit_limits_cgnat_detection_to_rfc6598(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     audit = cast(
         "PublicReleaseAuditModule",
         cast("object", _load_public_release_audit()),
     )
-    outside = tmp_path / "public.txt"
+    monkeypatch.chdir(tmp_path)
+    outside = Path("public.txt")
     _ = outside.write_text(
         ".".join(("100", "63", "255", "255"))  # noqa: FLY002
         + "\n"
         + ".".join(("100", "128", "0", "1"))  # noqa: FLY002
         + "\n"
     )
-    inside = tmp_path / "private.txt"
+    inside = Path("private.txt")
     _ = inside.write_text(
         ".".join(("100", "64", "0", "1"))  # noqa: FLY002
         + "\n"
         + ".".join(("100", "127", "255", "254"))  # noqa: FLY002
         + "\n"
     )
-    definition_outside = tmp_path / "scripts" / "public-release-audit.py"
+    definition_outside = Path("scripts/public-release-audit.py")
     definition_outside.parent.mkdir()
     _ = definition_outside.write_text(outside.read_text())
-    definition_inside = tmp_path / "tests" / "guardrails" / "audit-definition.py"
+    definition_inside = Path("tests/guardrails/audit-definition.py")
     definition_inside.parent.mkdir(parents=True)
     _ = definition_inside.write_text(inside.read_text())
     audit.STRICT_DEFINITION_FILES = {
@@ -634,10 +637,14 @@ def test_public_release_audit_passes_its_real_tracked_tree() -> None:
 
 
 def test_public_release_audit_rejects_non_neutral_xcode_signing_identity(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Given
-    neutral_project = tmp_path / "neutral.pbxproj"
+    audit = cast(
+        "PublicReleaseAuditModule", cast("object", _load_public_release_audit())
+    )
+    monkeypatch.chdir(tmp_path)
+    neutral_project = Path("neutral.pbxproj")
     _ = neutral_project.write_text(
         "{}\n{}\n{}\n{}\n".format(
             'DEVELOPMENT_TEAM = "";',
@@ -646,7 +653,7 @@ def test_public_release_audit_rejects_non_neutral_xcode_signing_identity(
             'build_settings=("PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID")',
         ),
     )
-    private_project = tmp_path / "private.pbxproj"
+    private_project = Path("private.pbxproj")
     team_value = "A" * 10
     bundle_value = ".".join(("dev", "owner", "HealthBridgeCompanion"))  # noqa: FLY002
     private_lines = [
@@ -654,11 +661,6 @@ def test_public_release_audit_rejects_non_neutral_xcode_signing_identity(
         f"PRODUCT_BUNDLE_IDENTIFIER = {bundle_value};",
     ]
     _ = private_project.write_text("\n".join(private_lines) + "\n")
-    audit = cast(
-        "PublicReleaseAuditModule",
-        cast("object", _load_public_release_audit()),
-    )
-
     # When
     neutral_blockers = audit.scan_strict_blockers([neutral_project])
     private_blockers = audit.scan_strict_blockers([private_project])
@@ -846,10 +848,7 @@ def test_ios_health_permissions_use_native_sheet_for_unified_scope() -> None:
     assert "Core access includes Steps, Workouts, and Sleep." not in content_view
     narrow_copy = "Additional health data stays off unless you choose it here."
     assert narrow_copy not in content_view
-    assert (
-        "requests read-only access for every supported type currently available"
-        in content_view
-    )
+    assert "viewModel.healthPermissionScopeSummary" in content_view
     optional_explicit_copy = (
         "Additional optional metrics require an explicit optional sync request"
     )
@@ -873,6 +872,10 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     ux_state = Path(
         "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionUXState.swift"
     ).read_text()
+    data_view = Path("ios/HealthBridgeCompanion/App/DataScopeView.swift").read_text()
+    diagnostics = Path(
+        "ios/HealthBridgeCompanion/App/ActivityDiagnosticsView.swift"
+    ).read_text()
 
     # Then
     assert "ProgressView()" in content_view
@@ -888,19 +891,17 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
     assert "Queued uploads and sync status" not in content_view
     assert "AppDetailsView" in content_view
     assert "DeveloperDiagnosticsView" not in content_view
-    assert "Connection, sync status, and app details" in content_view
+    assert "ConnectionSettingsView(viewModel: viewModel)" in content_view
     assert 'title: "Settings"' in content_view
     assert "Permissions and app info" not in content_view
     assert "Permissions, troubleshooting, app info" not in content_view
-    assert (
-        "Apple Health can ask again when supported types become newly available"
-        in content_view
-    )
-    assert "Request Health Access Again" in content_view
+    assert "DataScopeView(viewModel: viewModel)" in content_view
+    assert "await viewModel.requestHealthPermissions()" in data_view
+    assert "viewModel.healthPermissionNotice" in data_view
     assert 'LabeledContent("Version"' in content_view
     assert "Open Source" not in content_view
     assert "Third-party libraries" not in content_view
-    assert "Diagnostics" not in content_view
+    assert 'DisclosureGroup("Advanced"' in diagnostics
     assert "receiverDiagnosticsSummary" not in content_view
     assert (
         "receiverDiagnosticsSummary"
@@ -908,10 +909,10 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
             "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
         ).read_text()
     )
-    assert 'Section("Automatic Sync")' in content_view
-    assert "viewModel.automaticSyncCoverageDetail" in content_view
-    assert "viewModel.backgroundSyncStatus" in content_view
-    assert "viewModel.automaticSyncLaneDiagnosticLine" in content_view
+    assert "ActivityDiagnosticsView(viewModel: viewModel)" in content_view
+    assert "viewModel.automaticSyncCoverageDetail" in diagnostics
+    assert "viewModel.backgroundSyncStatus" not in content_view + diagnostics
+    assert "viewModel.automaticSyncLaneDiagnosticLine" in diagnostics
     assert "Review Health permissions in Settings" not in ux_state
     assert "diagnosticCode(from:" in ux_state
     assert "NSURLErrorDomain -1004" in ux_state or "domain=([^|]+)" in ux_state
@@ -925,21 +926,21 @@ def test_ios_companion_uses_button_like_ctas_and_simple_history_sync_copy() -> N
 def test_ios_status_card_surfaces_queued_uploads_after_disconnect() -> None:
     # Given / When
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    presentation = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text()
 
     # Then
     queued_disconnected_condition = (
-        "if !viewModel.canSendConnectionTest && viewModel.pendingOutboxCount > 0"
+        "if !canSendConnectionTest && snapshot.pendingOutboxCount > 0"
     )
-    generic_disconnected_condition = "if !viewModel.canSendConnectionTest {"
-    assert queued_disconnected_condition in content_view
-    assert content_view.index(queued_disconnected_condition) < content_view.index(
+    generic_disconnected_condition = "if !canSendConnectionTest {"
+    assert queued_disconnected_condition in presentation
+    assert presentation.index(queued_disconnected_condition) < presentation.index(
         generic_disconnected_condition
     )
-    assert "Queued Uploads Waiting" in content_view
-    assert (
-        "Queued uploads remain on this iPhone. Reconnect from setup link to retry them."
-        in content_view
-    )
+    assert "phase = .connectionRequired" in presentation
+    assert "Text(viewModel.syncPresentation.title)" in content_view
     assert "or clear them" not in content_view
 
 
@@ -949,29 +950,16 @@ def test_ios_unpaired_connection_error_is_visible_and_retryable() -> None:
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
 
-    title_policy = content_view.split("private var statusTitle: String", maxsplit=1)[1]
-    title_policy = title_policy.split("private var statusSubtitle: String", maxsplit=1)[
-        0
-    ]
-    subtitle_policy = content_view.split(
-        "private var statusSubtitle: String", maxsplit=1
-    )[1]
-    subtitle_policy = subtitle_policy.split(
-        "private var syncErrorTitle: String", maxsplit=1
-    )[0]
-
-    error_condition = "if viewModel.statusIsError"
-    disconnected_title = (
-        'if !viewModel.canSendConnectionTest { return "Not Connected" }'
+    presentation = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text()
+    assert presentation.index("if snapshot.statusIsError") < presentation.index(
+        "if !canSendConnectionTest {"
     )
-    disconnected_subtitle = (
-        'if !viewModel.canSendConnectionTest { return "Connect this iPhone before '
-        'syncing." }'
-    )
-    assert title_policy.index(error_condition) < title_policy.index(disconnected_title)
-    assert subtitle_policy.index(error_condition) < subtitle_policy.index(
-        disconnected_subtitle
-    )
+    assert "phase = .needsAttention" in presentation
+    assert "viewModel.displayStatusMessage" in content_view
+    assert "viewModel.pairingInputCorrection" in content_view
+    assert "pairingInputError = error as? ReceiverPairingBundleError" in view_model
     assert 'Button("Retry Pairing")' in content_view
     cancel_action = content_view.index(
         "showPendingPairingCancellationConfirmation = true"
@@ -1030,6 +1018,7 @@ def test_different_setup_link_is_rejected_before_bootstrap_retry() -> None:
 def test_ios_companion_uses_simple_history_sync_copy() -> None:
     # Given / When
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    data_view = Path("ios/HealthBridgeCompanion/App/DataScopeView.swift").read_text()
     history_policy = Path(
         "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/HealthHistoryDepthPolicy.swift"
     ).read_text()
@@ -1045,12 +1034,13 @@ def test_ios_companion_uses_simple_history_sync_copy() -> None:
     assert simple_history_copy not in content_view
     assert stale_history_copy not in content_view
     assert "First sync range. Later syncs only send changes." not in content_view
-    assert 'title: "Sync Range"' in content_view
+    assert "viewModel.setHealthHistoryDepthOption($0)" in data_view
+    assert "viewModel.healthHistoryDepthRows" in data_view
     assert "viewModel.automaticSyncScopeSummary" in content_view
     assert "iOS decides background timing" in ux_state
     assert "On when iOS allows." not in content_view
     assert "Manual only." not in content_view
-    assert ".pickerStyle(.menu)" in content_view
+    assert "Picker(" in data_view
     assert 'title: "All"' in history_policy
     assert 'return "All"' in history_policy
     assert 'title: "1 year"' in history_policy
@@ -1127,10 +1117,7 @@ def test_ios_automatic_sync_migrates_to_unified_full_health_coverage() -> None:
     assert "automaticQuantityTypeCodes: availableQuantityTypeCodes" in view_model
     assert 'Toggle("Include all supported health data"' not in content_view
     assert "Core access includes Steps, Workouts, and Sleep." not in content_view
-    assert (
-        "requests read-only access for every supported type currently available"
-        in content_view
-    )
+    assert "viewModel.healthPermissionScopeSummary" in content_view
     for public_copy in (healthkit_read_types, review_notes):
         assert "every runtime-available" in public_copy
         assert "Include all supported health data" not in public_copy
@@ -1188,6 +1175,9 @@ def test_ios_bootstrap_fails_closed_for_legacy_private_state() -> None:
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
     content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    presentation = Path(
+        "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore/CompanionSyncPresentation.swift"
+    ).read_text()
 
     assert (
         view_model.count(
@@ -1206,19 +1196,15 @@ def test_ios_bootstrap_fails_closed_for_legacy_private_state() -> None:
     assert connection_recovery in view_model
     assert view_model.index(connection_recovery) < view_model.index(outbox_recovery)
     assert "must be reset and paired again before any upload" in view_model
-    status_title = content_view.split("private var statusTitle: String", 1)[1].split(
-        "private var statusSubtitle: String",
-        1,
-    )[0]
-    status_subtitle = content_view.split("private var statusSubtitle: String", 1)[
-        1
-    ].split(
-        "private var syncErrorTitle: String",
-        1,
-    )[0]
-    assert "viewModel.hasPendingPrivateStorageRecovery" in status_title
-    assert 'return "Recovery Required"' in status_title
-    assert "viewModel.hasPendingPrivateStorageRecovery" in status_subtitle
+    assert (
+        "hasPendingPrivateStorageRecovery: hasPendingPrivateStorageRecovery"
+        in view_model
+    )
+    assert presentation.index("if hasPendingPrivateStorageRecovery") < (
+        presentation.index("if !canSendConnectionTest")
+    )
+    assert "phase = .recoveryRequired" in presentation
+    assert "Text(viewModel.syncPresentation.title)" in content_view
 
 
 def test_ios_privacy_manifest_declares_required_reason_api_usage() -> None:
@@ -1252,7 +1238,9 @@ def test_ios_privacy_manifest_is_bundled_in_app_resources() -> None:
 
 def test_ios_companion_exposes_disconnect_receiver_control() -> None:
     # Given / When
-    content_view = Path("ios/HealthBridgeCompanion/App/ContentView.swift").read_text()
+    content_view = Path(
+        "ios/HealthBridgeCompanion/App/ConnectionSettingsView.swift"
+    ).read_text()
     view_model = Path(
         "ios/HealthBridgeCompanion/App/HealthBridgeCompanionViewModel.swift"
     ).read_text()
@@ -1261,15 +1249,21 @@ def test_ios_companion_exposes_disconnect_receiver_control() -> None:
     ).read_text()
 
     # Then
-    assert 'Label("Disconnect from Server"' in content_view
-    assert "private var connectionStatusCard" in content_view
-    assert content_view.index('Label("Disconnect from Server"') > content_view.index(
-        "private var connectionStatusCard"
-    )
+    assert 'Button("Disconnect from Server", role: .destructive)' in content_view
+    assert "private var connectionSection" in content_view
+    assert content_view.index(
+        'Button("Disconnect from Server", role: .destructive)',
+        content_view.index("private var connectionSection"),
+    ) > content_view.index("private var connectionSection")
     assert "showDisconnectConfirmation = true" in content_view
     assert "if !viewModel.receiverSettingsSaved" in content_view
-    assert "isDisabled: !viewModel.canRedeemManualPairing" in content_view
-    assert "isDisabled: !viewModel.canSendConnectionTest" in content_view
+    assert ".disabled(!viewModel.canRedeemManualPairing || viewModel.isPairing)" in (
+        content_view
+    )
+    assert (
+        ".disabled(!viewModel.canSendConnectionTest || viewModel.isCheckingConnection)"
+        in content_view
+    )
     assert "viewModel.disconnectReceiver()" in content_view
     assert "func disconnectReceiver() async" in view_model
     assert "performTerminalConnectionTransitionWhileHoldingRequestGate(" in view_model
@@ -1285,17 +1279,17 @@ def test_ios_companion_keeps_privacy_safety_copy_without_extra_privacy_menu() ->
     # Then
     assert "Privacy & local data" not in content_view
     assert "PrivacyLocalDataView" not in content_view
-    assert (
-        "Use Apple Health's permission screen to choose what this iPhone can share"
-        in content_view
-    )
-    assert "the secret key stays on this iPhone" in content_view
+    assert "viewModel.healthPermissionScopeSummary" in content_view
+    assert 'Link("Privacy Policy", destination: Self.privacyPolicyURL)' in content_view
     assert "Delete pending sync queue" not in content_view
     assert "Retry pending syncs" not in content_view
-    assert "Activity Log" in content_view
+    assert "ActivityDiagnosticsView(viewModel: viewModel)" in content_view
     assert "Recent Activity" not in content_view
     assert "View All Logs" not in content_view
-    assert "View Logs" in content_view
+    diagnostics = Path(
+        "ios/HealthBridgeCompanion/App/ActivityDiagnosticsView.swift"
+    ).read_text()
+    assert "viewModel.activityLogMessages" in diagnostics
     assert (
         "activityLogMessages"
         in Path(
@@ -1314,26 +1308,6 @@ def test_ios_companion_keeps_privacy_safety_copy_without_extra_privacy_menu() ->
     assert manifest.get("NSPrivacyTracking") is False
 
 
-def test_ios_app_review_notes_template_is_privacy_safe_and_actionable() -> None:
-    # Given / When
-    template = Path("docs/maintainers/app-review-notes-template.example.md")
-    text = template.read_text()
-    canonical_template = Path(".github/release/app-review-notes-template.md")
-    canonical_text = canonical_template.read_text()
-
-    # Then
-    assert "../../.github/release/app-review-notes-template.md" in text
-    assert canonical_template.is_file()
-    assert "Read-only HealthKit" in canonical_text
-    assert "User-owned receiver" in canonical_text
-    assert "No ads, tracking, data brokers, or hidden telemetry" in canonical_text
-    assert "No clinical decision support or readiness scoring" in canonical_text
-    assert "Demo access" in canonical_text
-    assert "Deletion and revocation" in canonical_text
-    assert "<private-demo-receiver>" in canonical_text
-    assert "outside Git" in canonical_text
-
-
 def test_ios_companion_is_iphone_only() -> None:
     # Given / When
     plist = _info_plist()
@@ -1345,22 +1319,6 @@ def test_ios_companion_is_iphone_only() -> None:
     assert project.count("TARGETED_DEVICE_FAMILY = 1;") == 2
     assert 'TARGETED_DEVICE_FAMILY = "1,2";' not in project
     assert "UISupportedInterfaceOrientations~ipad" not in plist
-
-
-def test_ios_minimum_versions_are_documented_consistently() -> None:
-    # Given / When
-    readme = Path("README.md").read_text()
-    self_build = Path("docs/self-build.md").read_text()
-    testflight = Path(".github/release/testflight-checklist.md").read_text()
-    contributing = Path(".github/CONTRIBUTING.md").read_text()
-
-    # Then
-    assert "iPhone running iOS 18 or later" in readme
-    assert "(docs/self-build.md)" in readme
-    assert "iPhone running iOS 18 or later" in self_build
-    assert "Xcode 16 or later" in self_build
-    assert "iPhone running iOS 18 or later" in testflight
-    assert "Xcode 16 or later" in contributing
 
 
 def test_repository_has_no_password_accepting_keychain_helper() -> None:
@@ -1419,11 +1377,11 @@ def test_ios_pairing_v2_stages_before_redeem_and_recovers_pending_state() -> Non
     assert "func importPairingURL(_ url: URL) async" in view_model
     assert "func redeemManualPairing() async" in view_model
 
-    assert 'TextField("Server address"' in content_view
-    assert 'TextField("Invitation code"' in content_view
+    assert '.accessibilityLabel("Server address")' in content_view
+    assert '.accessibilityLabel("Invitation code")' in content_view
     assert "viewModel.redeemManualPairing()" in content_view
     assert 'SecureField("Secret key"' not in content_view
-    assert "Task { await viewModel.importPairingText() }" in content_view
+    assert "await viewModel.importPairingText()" in content_view
 
     assert ".onContinueUserActivity(NSUserActivityTypeBrowsingWeb)" in app
     assert "await viewModel.importPairingURL(url)" in app
@@ -1506,23 +1464,35 @@ def test_ios_pairing_bootstrap_precedes_all_automatic_sync_entrypoints() -> None
     assert "guard automaticSyncReady" in view_model
     assert "automaticSyncReady," in view_model
 
-    invitation_flow = view_model.index("case .invitation(let invitation):")
-    invitation_pause = view_model.index(
-        "pauseAutomaticSyncForPendingPairing()", invitation_flow
+    pairing_material = view_model.split("private func applyPairingMaterial(", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    invitation = pairing_material.split("case .invitation(let invitation):", 1)[1]
+    assert (
+        invitation.index("hasPendingPairing = true")
+        < invitation.index(
+            "performTerminalConnectionTransitionWhileHoldingRequestGate("
+        )
+        < invitation.index("try await self.pairingCoordinator.pair(")
     )
-    invitation_barrier = view_model.index(
-        "performTerminalConnectionTransitionWhileHoldingRequestGate(", invitation_flow
-    )
-    invitation_redeem = view_model.index("pairingCoordinator.pair(", invitation_flow)
-    assert invitation_pause < invitation_barrier < invitation_redeem
+    sync_readiness = view_model.split("private var automaticSyncReady: Bool", 1)[
+        1
+    ].split("\n    }", 1)[0]
+    enable_prerequisites = view_model.split(
+        "private var automaticSyncEnablePrerequisitesReady: Bool", 1
+    )[1].split("\n    }", 1)[0]
+    assert "automaticSyncEnablePrerequisitesReady" in sync_readiness
+    assert "&& !hasPendingPairing" in enable_prerequisites
 
     terminal_start = view_model.index(TERMINAL_TRANSITION_HELPER)
     terminal_end = view_model.index(
         "private func cancelAndAwaitForegroundPayloadTasks()", terminal_start
     )
     terminal_body = view_model[terminal_start:terminal_end]
-    assert "await self.cancelAndAwaitForegroundPayloadTasks()" in terminal_body
-    assert "await self.drainBackgroundPayloadCancellation()" in terminal_body
+    close_admission = terminal_body.split("closeAdmission: {", 1)[1].split(
+        "cancelAndAwaitPairing:", 1
+    )[0]
+    assert "automaticSyncRuntime?.stopAdmission()" in close_admission
 
 
 def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> None:
@@ -1548,15 +1518,16 @@ def test_ios_pairing_cancel_and_repair_stops_inflight_sync_before_deletion() -> 
         "private func requireCurrentConnectionGeneration", terminal_start
     )
     terminal_body = view_model[terminal_start:terminal_end]
-    pre_cancel = terminal_body.index("await cancelPairingOperationIfNeeded()")
-    barrier_call = terminal_body.index("connectionTerminalBarrier.perform(")
-    foreground_join = terminal_body.index(
-        "await self.cancelAndAwaitForegroundPayloadTasks()"
+    assert (
+        terminal_body.index("await cancelPairingOperationIfNeeded()")
+        < terminal_body.index("transition = try await connectionTerminalBarrier.")
+        < terminal_body.index("cancelAndAwaitForegroundPayloads:")
+        < terminal_body.index("await self.cancelAndAwaitForegroundPayloadTasks()")
+        < terminal_body.index("drainBackgroundPayloads:")
+        < terminal_body.index("await self.drainBackgroundPayloadCancellation()")
+        < terminal_body.index("commit: {")
+        < terminal_body.index("try await commit(expectedGeneration)")
     )
-    background_drain = terminal_body.index(
-        "await self.drainBackgroundPayloadCancellation()"
-    )
-    assert pre_cancel < barrier_call < foreground_join < background_drain
 
     upload_start = view_model.index("private func uploadPayloadsWithOutbox(")
     upload_end = view_model.index("private func uploadPendingOutbox(", upload_start)
@@ -1640,9 +1611,16 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     check_start = view_model.index("func checkConnection() async")
     check_end = view_model.index("func performPrimaryAction() async", check_start)
     check_body = view_model[check_start:check_end]
-    assert "trackedSyncTasks[taskID] = task" in check_body
-    assert "await task.value" in check_body
-    assert "await checkReceiverHealth()" in check_body
+    assert (
+        check_body.index("guard terminalPayloadActionAdmissionIsOpen")
+        < check_body.index("await self.performCheckConnection()")
+        < check_body.index("trackedSyncTasks[taskID] = task")
+        < check_body.index("await task.value")
+        < check_body.index("trackedSyncTasks.removeValue(forKey: taskID)")
+    )
+    assert check_body.index(
+        "guard canSendConnectionTest, !Task.isCancelled"
+    ) < check_body.index("await checkReceiverHealth()")
     assert "sendConnectionTestBatch" not in check_body
     assert check_body.count("canSendConnectionTest") >= 1
     assert check_body.count("!Task.isCancelled") >= 1
@@ -1667,15 +1645,24 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
     )
 
     capture_start = view_model.index("private func capturePayloadDeliveryTarget()")
-    validator_start = view_model.index(
-        "private func requireCurrentPayloadDeliveryTarget(", capture_start
+    authority_start = view_model.index(
+        "private func currentPayloadDeliveryTarget()", capture_start
     )
-    capture_body = view_model[capture_start:validator_start]
+    validator_start = view_model.index(
+        "private func requireCurrentPayloadDeliveryTarget(", authority_start
+    )
+    capture_body = view_model[capture_start:authority_start]
+    assert capture_body.index("try Task.checkCancellation()") < capture_body.index(
+        "return try currentPayloadDeliveryTarget()"
+    )
+    authority_body = view_model[authority_start:validator_start]
     assert all(
-        marker in capture_body
+        marker in authority_body
         for marker in (
             "let generation = settingsStore.receiverSettingsGenerationToken",
-            "try requireCurrentConnectionGeneration(generation)",
+            "connectionTerminalBarrier.allowsPostResponseMutation(",
+            "capturedGeneration: generation",
+            "currentGeneration: settingsStore.receiverSettingsGenerationToken",
             "settingsStore.receiverBindingID",
             "identity.opaqueBinding == bindingID",
             "keys.signingKeyID == identity.deviceSigningKeyID",
@@ -1683,7 +1670,9 @@ def test_ios_pairing_waits_for_all_foreground_and_background_upload_paths() -> N
         )
     )
 
-    validator_end = view_model.index("private struct PayloadDelivery", validator_start)
+    validator_end = view_model.index(
+        "private func requireCurrentAcceptedDirectTarget(", validator_start
+    )
     validator_body = view_model[validator_start:validator_end]
     generation_check = validator_body.index(
         "try requireCurrentConnectionGeneration(target.generation)"

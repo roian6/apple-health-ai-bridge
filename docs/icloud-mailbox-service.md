@@ -24,30 +24,29 @@ that developer-no-access boundary remains true.
 
 ## Release availability
 
-This versioned guide targets [Receiver/CLI 1.2.1](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.1).
-Stop if that release, its matching helper assets, or its native IPC qualification
-evidence is unavailable. A source checkout is not a qualified distribution.
-
 The published [Receiver/CLI 1.2.0 release](https://github.com/roian6/apple-health-ai-bridge/releases/tag/receiver-v1.2.0)
 uses the legacy file handoff; it does not contain the IPC boundary repair.
-Do not mix its helper with the IPC-required Receiver described here.
+The exact download inventory below identifies that published release, not an
+IPC-qualified upgrade.
 
 The IPC publication path requires a coordinated Receiver/CLI and signed helper
-update. Use matching release artifacts whose compatibility and native qualification
+update. This guide does not identify a released, qualified IPC build set.
+Use matching release artifacts whose compatibility and native qualification
 explicitly cover publication IPC v1; a version number or helper `ready` status
 alone is insufficient. Do not substitute `main` or an older helper.
 
 ## Install and verify the signed helper
-After the 1.2.1 release and its IPC qualification are available, use its exact
-matching inventory below. Do not use the 1.2.0 helper with an IPC-required
-Receiver. Download the selected release's files with
+For the published 1.2.0 release, the asset inventory is listed below. For an IPC
+upgrade, first select a later matching release that explicitly qualifies IPC v1
+and use that release's exact versioned inventory instead. Do not use the 1.2.0
+helper with an IPC-required Receiver. Download the selected release's files with
 a browser into one private local directory; Health Bridge does not silently
 download them:
 
-- `apple_health_ai_bridge-1.2.1-py3-none-any.whl`;
-- `apple_health_ai_bridge-1.2.1.tar.gz`;
-- `HealthBridgeMailboxAckPublisher-1.2.1.zip`;
-- `HealthBridgeMailboxAckPublisher-1.2.1.manifest.json`;
+- `apple_health_ai_bridge-1.2.0-py3-none-any.whl`;
+- `apple_health_ai_bridge-1.2.0.tar.gz`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.zip`;
+- `HealthBridgeMailboxAckPublisher-1.2.0.manifest.json`;
 - `release-metadata.json`;
 - `receiver-build-provenance.intoto.jsonl`;
 - `SHA256SUMS`;
@@ -453,6 +452,14 @@ service, stop and remove it using the currently installed CLI first:
 health-bridge mailbox service uninstall --json
 ```
 
+With the Receiver stopped, confirm that no process is using the database at
+`$HEALTH_BRIDGE_DB`. Before updating the CLI or running `health-bridge init`,
+use your established SQLite backup procedure to create and verify an owner-only
+backup of that database, including any SQLite sidecar files that remain. Do not
+copy a live database. If you cannot verify the backup, stop here and leave the
+Receiver stopped. Keep the verified pre-upgrade backup for rollback; a copy
+made after schema migration is not a pre-upgrade backup.
+
 Update the Receiver/CLI from the verified matching wheel before the first
 helper verification command:
 
@@ -486,11 +493,18 @@ health-bridge mailbox helper install \
 health-bridge mailbox helper status --json
 ```
 
-For a foreground receiver, check helper status before restarting the same
-command. No helper `upgrade` command exists.
-Continue only when helper status reports `{"code": "ready"}`. Then restore the
-service with the original or intentionally updated values; startup must pass
-the IPC discovery and helper-owned self-test:
+No helper `upgrade` command exists. Wait for helper status to report
+`{"code": "ready"}`. For the [Receiver/CLI 1.1.5 to 1.2.0 upgrade](setup.md#existing-users-receivercli-120-upgrade),
+keep the Receiver stopped and initialize the **existing** database with the
+updated CLI. Use the same `HEALTH_BRIDGE_DB` path you backed up before upgrading:
+
+```bash
+health-bridge init --db "$HEALTH_BRIDGE_DB"
+```
+
+If initialization fails, leave the Receiver stopped. Only after the required
+initialization succeeds, restart the original foreground command or restore the service with its
+original or intentionally updated values:
 
 ```bash
 health-bridge mailbox service install \
@@ -501,6 +515,10 @@ health-bridge mailbox service install \
   --json
 health-bridge mailbox service status --json
 ```
+
+For an owned service, require `running_healthy`. An IPC-qualified release must
+also pass IPC discovery and the helper-owned self-test at startup. The stock
+1.2.0 release uses the legacy handoff and does not perform those IPC checks.
 
 Service uninstall stops the loaded LaunchAgent and removes only its verified
 owned service artifacts. It does not remove the receiver database, mailbox,

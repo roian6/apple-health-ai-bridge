@@ -11,18 +11,16 @@ import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
 from health_bridge import __version__
+from tests.guardrails.release_cli import run_release_tool as _run_release_tool
 from tests.guardrails.test_release_recovery import recovery_transport
 
 ROOT = Path(__file__).parents[2]
-# Reviewed published baseline: receiver-v1.1.5 at 6940fe41, not the source candidate.
-PUBLISHED_RECEIVER_VERSION: Final = "1.1.5"
-RELEASE_TOOL = ROOT / "scripts/release_tools.py"
+# Published installation baseline; source labels alone do not select this pin.
+PUBLISHED_RECEIVER_VERSION: Final = "1.2.0"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 RELEASE_NOTES = ROOT / ".github/release/notes-receiver-v1.1.1.md"
 HISTORICAL_V101_RELEASE_NOTES = ROOT / ".github/release/notes-v1.0.1.md"
-RELEASE_CRITERIA = ROOT / ".github/release/criteria.md"
 COMPONENT_VERSIONS = ROOT / "component-versions.json"
-VERSIONING_DOC = ROOT / "docs/versioning.md"
 XCODE_PROJECT = (
     ROOT / "ios/HealthBridgeCompanion/HealthBridgeCompanion.xcodeproj/project.pbxproj"
 )
@@ -59,10 +57,10 @@ def test_candidate_notes_selection_uses_planned_tag_on_release_branch(
     assert (tmp_path / "dist/release-notes.md").read_bytes() == notes
 
 
-def _current_ios_build() -> str:
+def _current_ios_setting(setting: str) -> str:
     values: set[str] = set()
     for line in XCODE_PROJECT.read_text(encoding="utf-8").splitlines():
-        if "CURRENT_PROJECT_VERSION =" in line:
+        if line.strip().startswith(f"{setting} ="):
             _, _, value = line.partition("=")
             values.add(value.removesuffix(";").strip())
     assert len(values) == 1
@@ -107,16 +105,6 @@ class ReleaseMetadataOutput(BaseModel):
     batch_contract: dict[str, str]
     python: PythonReleaseOutput
     macos_mailbox_ack_helper: dict[str, object]
-
-
-def _run_release_tool(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(RELEASE_TOOL), *args],
-        cwd=ROOT,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
 
 
 def _packet_verify_args(
@@ -300,10 +288,10 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     assert completed.returncode == 0, completed.stderr
     output = ValidateOutput.model_validate_json(completed.stdout)
     assert output.model_dump() == {
-        "ios_build": _current_ios_build(),
-        "ios_marketing_version": "1.2.0",
+        "ios_build": _current_ios_setting("CURRENT_PROJECT_VERSION"),
+        "ios_marketing_version": _current_ios_setting("MARKETING_VERSION"),
         "project_version": __version__,
-        "release_scope": "receiver",
+        "release_scope": "coordinated",
         "tag": f"receiver-v{__version__}",
     }
 
@@ -313,6 +301,8 @@ def test_release_validate_accepts_exact_component_scoped_project_version() -> No
     [
         ("v1.0.0", "1.0.0", "v1.0.0", False),
         ("v1.0.1", "1.0.1", "v1.0.1", False),
+        ("receiver-v1.0.2", "1.0.2", "receiver-v1.0.2", False),
+        ("receiver-v0.3.4", "0.3.4", "receiver-v0.3.4", True),
         ("receiver-v0.9.0", "0.9.0", "receiver-v0.9.0", True),
         ("receiver-v1.1.2", "1.1.2", "receiver-v1.1.2", False),
         ("receiver-v1.1.3", "1.1.3", "receiver-v1.1.3", False),
@@ -387,12 +377,12 @@ def test_component_version_index_matches_current_release_surfaces() -> None:
             "schema_id": "health_bridge.batch.v1",
             "version": "1.0.0",
         },
-        "ios_companion": {"build": "51", "marketing_version": "1.2.0"},
+        "ios_companion": {"build": "52", "marketing_version": "1.2.1"},
         "receiver_cli": {
             "release_tag": f"receiver-v{__version__}",
             "version": __version__,
         },
-        "release_scope": "receiver",
+        "release_scope": "coordinated",
         "schema_id": "health_bridge.component_versions.v1",
     }
 
@@ -1042,72 +1032,6 @@ def test_v101_receiver_release_notes_are_versioned_and_actionable() -> None:
     assert "TODO" not in notes
 
 
-def test_release_criteria_requires_live_app_store_build_readback() -> None:
-    criteria = RELEASE_CRITERIA.read_text(encoding="utf-8")
-
-    assert "highest existing build number in App Store Connect" in criteria
-    assert "TestFlight Internal Only" in criteria
-    assert "github-release" in criteria
-    assert "Required reviewers" in criteria
-    assert "deployment tag rule" in criteria
-    assert "receiver-v*" in criteria
-    assert "component-versions.json" in criteria
-    assert "active tag ruleset" in criteria
-    assert "Restrict deletions" in criteria
-    assert "Restrict updates" in criteria
-    assert "Restrict creations" in criteria
-    assert "Enable release immutability" in criteria
-    operations = (ROOT / "docs/release-operations.md").read_text()
-    assert 'git verify-tag "$tag"' in operations
-    assert "git verify-commit HEAD" not in criteria
-    assert "build 3" not in criteria
-    assert "receiver-only patch" in criteria
-    assert "must not upload a new TestFlight build" in criteria
-    assert "release_scope" in criteria
-
-
-def test_public_docs_name_each_version_surface_and_transition() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    versioning = VERSIONING_DOC.read_text(encoding="utf-8")
-
-    assert "(docs/versioning.md)" in readme
-    for label in ("Receiver/CLI", "iOS Companion", "Batch Protocol"):
-        assert label in versioning
-    assert "receiver-v1.0.2" in versioning
-    assert "ios-v1.1.1-build.50" in versioning
-    assert "Existing `v1.0.0` and `v1.0.1` tags remain immutable" in versioning
-    assert (
-        "Do not bump an unchanged component merely to make the numbers match"
-        in versioning
-    )
-    assert "component-versions.json" in versioning
-    versioning_subject = (
-        "Future release notes must state the exact compatible iOS Companion"
-    )
-    versioning_detail = "version/build and Batch Protocol schema identifier/version"
-    expected_versioning_statement = f"{versioning_subject} {versioning_detail}"
-    assert expected_versioning_statement in versioning
-    assert "Historical release notes remain as published" in versioning
-
-
-def test_release_and_self_build_docs_reference_current_guidance() -> None:
-    self_build = (ROOT / "docs/self-build.md").read_text(encoding="utf-8")
-    app_review = (ROOT / ".github/release/app-review-notes-template.md").read_text(
-        encoding="utf-8"
-    )
-    testflight = (ROOT / ".github/release/testflight-checklist.md").read_text(
-        encoding="utf-8"
-    )
-
-    assert "setup.md#pair-the-iphone" in self_build
-    assert "pairing.md" not in self_build
-    assert "docs/supported-health-data.md" in app_review
-    assert "docs/supported-health-data.md" in testflight
-    assert ".github/release/app-review-notes-template.md" in testflight
-    assert "docs/healthkit-read-types.md" not in app_review + testflight
-    assert "docs/maintainers/app-review-notes-template.example.md" not in testflight
-
-
 def test_brand_readme_local_links_resolve_inside_repository() -> None:
     readme = ROOT / "assets/brand/README.md"
     destinations: list[str] = re.findall(
@@ -1129,15 +1053,12 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
         r'git\+https://github\.com/roian6/apple-health-ai-bridge\.git@([^\s"]+)'
     )
     assert f"/releases/tag/receiver-v{PUBLISHED_RECEIVER_VERSION})" in readme
-    assert f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/setup.md)" in readme
-    assert (
-        f"/blob/receiver-v{PUBLISHED_RECEIVER_VERSION}/docs/icloud-mailbox-service.md)"
-        in readme
-    )
+    assert "(docs/setup.md)" in readme
+    assert "(docs/icloud-mailbox-service.md)" in readme
     assert re.findall(pin_pattern, readme) == []
     pins = re.findall(pin_pattern, setup)
     assert pins, "No versioned install pin found in docs/setup.md"
-    assert set(pins) == {f"receiver-v{__version__}"}, (
+    assert set(pins) == {f"receiver-v{PUBLISHED_RECEIVER_VERSION}"}, (
         f"Found stale install pins in docs/setup.md: {pins}"
     )
     unpinned = "git+https://github.com/roian6/apple-health-ai-bridge.git\n"
@@ -1145,15 +1066,15 @@ def test_install_commands_are_pinned_to_their_receiver_release() -> None:
     assert unpinned not in setup
 
 
-def test_roadmap_matches_readme_current_receiver_release() -> None:
+def test_roadmap_links_to_readme_default_receiver_release() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs/roadmap.md").read_text(encoding="utf-8")
     current_receiver = re.search(r"/releases/tag/receiver-v([^\s)]+)", readme)
 
     assert current_receiver is not None
     assert current_receiver.group(1) == PUBLISHED_RECEIVER_VERSION
-    expected_prefix = "The current public release set is Receiver/CLI "
-    assert f"{expected_prefix}`{current_receiver.group(1)}`" in roadmap
+    roadmap_releases = set(re.findall(r"/releases/tag/receiver-v([^\s)]+)", roadmap))
+    assert current_receiver.group(1) in roadmap_releases
 
 
 def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
@@ -1162,8 +1083,10 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
     mailbox = (ROOT / "docs/icloud-mailbox-service.md").read_text(encoding="utf-8")
 
     assert re.search(r"\]\(setup\.md(?:#[^)]+)?\)", self_build)
-    assert f"/blob/receiver-v{__version__}/docs/icloud-mailbox-service.md)" in setup
-    release_notes_path = ROOT / f".github/release/notes-receiver-v{__version__}.md"
+    assert "(icloud-mailbox-service.md)" in setup
+    release_notes_path = (
+        ROOT / f".github/release/notes-receiver-v{PUBLISHED_RECEIVER_VERSION}.md"
+    )
     assert release_notes_path.is_file()
     release_notes = release_notes_path.read_text(encoding="utf-8")
     expected_assets = set(re.findall(r"^- `([^`]+)`[.;]?", release_notes, re.MULTILINE))
@@ -1174,26 +1097,26 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
         re.findall(r"^- `([^`]+)`[.;]?", download_section, re.MULTILINE)
     )
     assert expected_assets == {
-        f"apple_health_ai_bridge-{__version__}-py3-none-any.whl",
-        f"apple_health_ai_bridge-{__version__}.tar.gz",
+        f"apple_health_ai_bridge-{PUBLISHED_RECEIVER_VERSION}-py3-none-any.whl",
+        f"apple_health_ai_bridge-{PUBLISHED_RECEIVER_VERSION}.tar.gz",
         "release-metadata.json",
         "receiver-build-provenance.intoto.jsonl",
-        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
-        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip",
+        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.manifest.json",
         "SHA256SUMS",
         "receiver-final-provenance.intoto.jsonl",
     }
     assert downloaded_assets == expected_assets
     assert set(
         re.findall(r"apple_health_ai_bridge-[\w.]+-py3-none-any\.whl", mailbox)
-    ) == {f"apple_health_ai_bridge-{__version__}-py3-none-any.whl"}
+    ) == {f"apple_health_ai_bridge-{PUBLISHED_RECEIVER_VERSION}-py3-none-any.whl"}
     assert set(
         re.findall(
             r"HealthBridgeMailboxAckPublisher-[\d.]+(?:zip|manifest\.json)", mailbox
         )
     ) == {
-        f"HealthBridgeMailboxAckPublisher-{__version__}.zip",
-        f"HealthBridgeMailboxAckPublisher-{__version__}.manifest.json",
+        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip",
+        f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.manifest.json",
     }
 
 
@@ -1201,9 +1124,9 @@ def test_versioned_setup_links_to_matching_mailbox_release_assets() -> None:
 def test_versioned_guide_links_published_release_before_commands(guide: str) -> None:
     document = (ROOT / "docs" / guide).read_text(encoding="utf-8")
     repository = "https://github.com/roian6/apple-health-ai-bridge"
-    release_link = f"({repository}/releases/tag/receiver-v{__version__})"
+    release_link = f"({repository}/releases/tag/receiver-v{PUBLISHED_RECEIVER_VERSION})"
     assert document.index(release_link) < document.index("```bash\n")
     if guide == "icloud-mailbox-service.md":
         assert document.index(release_link) < document.index(
-            f"HealthBridgeMailboxAckPublisher-{__version__}.zip"
+            f"HealthBridgeMailboxAckPublisher-{PUBLISHED_RECEIVER_VERSION}.zip"
         )

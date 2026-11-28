@@ -318,11 +318,22 @@ public enum FileOutboxDowngradeHoldReason: String, Codable, Equatable, Sendable 
     case v4Manifest
     case finalizationIntent
     case envelopeArtifact
+    case incompatibleEnqueueJournal
 }
 
 public enum FileOutboxDowngradeReadiness: Equatable, Sendable {
     case ready
     case hold(FileOutboxDowngradeHoldReason)
+}
+
+public enum AcceptedFinalizationHoldReason: Equatable, Sendable {
+    case cleanupPending
+    case proofMissing
+}
+
+public struct AcceptedFinalizationHold: Error, Equatable, Sendable {
+    public let reason: AcceptedFinalizationHoldReason
+    public let affectedTypeCodes: Set<String>
 }
 
 enum FileOutboxEnvelopeFinalizationBoundary: CaseIterable, Equatable {
@@ -349,19 +360,23 @@ public struct FileOutboxCursorCheckpoint: Codable, Equatable, Sendable {
     public let cursorKind: String
     public let cursorValue: String
     public let coreLaneUploadProof: FileOutboxCoreLaneUploadProof?
+    /// Coverage associated with this workout anchor, earned by the same transaction.
+    public let workoutHistoryStart: Date?
 
     public init(
         receiverIdentity: String,
         sourceKey: String,
         cursorKind: String,
         cursorValue: String,
-        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil
+        coreLaneUploadProof: FileOutboxCoreLaneUploadProof? = nil,
+        workoutHistoryStart: Date? = nil
     ) {
         self.receiverIdentity = receiverIdentity
         self.sourceKey = sourceKey
         self.cursorKind = cursorKind
         self.cursorValue = cursorValue
         self.coreLaneUploadProof = coreLaneUploadProof
+        self.workoutHistoryStart = workoutHistoryStart
     }
 }
 
@@ -375,6 +390,18 @@ public struct FileOutboxFinalizationRecord: Equatable, Sendable {
         pendingGenerationRetirements.filter {
             $0.key != "steps" || stepsRawAndDailyCoverage == true
         }
+    }
+
+    static let foregroundSleepCursorKind = "foreground_sleep_sync"
+    static let anchoredSleepCursorKind = "anchored_sleep_sync"
+    static let baselineResetSleepCursorKind = "anchored_sleep_baseline_reset"
+
+    var isDirectSleepRecord: Bool {
+        let sleepCursorKinds = [
+            Self.foregroundSleepCursorKind, Self.anchoredSleepCursorKind, Self.baselineResetSleepCursorKind,
+        ]
+        return pendingGenerationRetirements[HealthBridgeHealthType.sleepAnalysis.typeCode] != nil
+            || cursorCheckpoint.map({ sleepCursorKinds.contains($0.cursorKind) }) == true
     }
 
     public init(
@@ -488,6 +515,13 @@ public struct FileOutboxDestructiveRecoveryResult {
     }
 }
 
+struct DirectSleepCleanupIntent: Codable, Equatable {
+    let itemID: String
+    let journalID: String
+    let receiverBindingID: String
+    let receiverGeneration: String
+}
+
 public final class FileOutbox {
     private struct SequenceEntry: Codable, Equatable {
         let sequence: UInt64
@@ -581,6 +615,10 @@ public final class FileOutbox {
         let pendingGenerationRetirements: [String: Int]?
         let stepsRawAndDailyCoverage: Bool?
         let directAcknowledgedItemIDs: [String]?
+        // Older Direct writers could acknowledge an item without checking Sleep.
+        let directSleepCheckedItemIDs: [String]?
+        // Keep the ACK unchecked until the exact Sleep journal is gone.
+        var directSleepCleanupIntent: DirectSleepCleanupIntent? = nil
 
         init(
             version: Int,
@@ -588,7 +626,8 @@ public final class FileOutbox {
             cursorCheckpoint: FileOutboxCursorCheckpoint?,
             pendingGenerationRetirements: [String: Int]? = nil,
             stepsRawAndDailyCoverage: Bool? = nil,
-            directAcknowledgedItemIDs: [String]? = nil
+            directAcknowledgedItemIDs: [String]? = nil,
+            directSleepCheckedItemIDs: [String]? = nil
         ) {
             self.version = version
             self.entries = entries
@@ -596,11 +635,13 @@ public final class FileOutbox {
             self.pendingGenerationRetirements = pendingGenerationRetirements
             self.stepsRawAndDailyCoverage = stepsRawAndDailyCoverage
             self.directAcknowledgedItemIDs = directAcknowledgedItemIDs
+            self.directSleepCheckedItemIDs = directSleepCheckedItemIDs
         }
 
         var finalizationRecord: FileOutboxFinalizationRecord? {
             let retirements = pendingGenerationRetirements ?? [:]
-            guard cursorCheckpoint != nil || !retirements.isEmpty else { return nil }
+            guard cursorCheckpoint != nil || !retirements.isEmpty
+                || directSleepCleanupIntent != nil || directSleepCheckedItemIDs?.isEmpty == false else { return nil }
             return FileOutboxFinalizationRecord(
                 itemIDs: entries.map(\.id),
                 cursorCheckpoint: cursorCheckpoint,
@@ -613,17 +654,31 @@ public final class FileOutbox {
             Set(directAcknowledgedItemIDs ?? [])
         }
 
-        func recordingDirectAcknowledgment(for itemID: String) -> EnqueueTransaction {
+        var uncheckedDirectAcknowledgmentIDs: Set<String> {
+            directAcknowledgedIDs.subtracting(directSleepCheckedItemIDs ?? [])
+        }
+
+        var hasUncheckedDirectSleepAcknowledgment: Bool {
+            !uncheckedDirectAcknowledgmentIDs.isEmpty
+                && (directSleepCleanupIntent != nil || finalizationRecord?.isDirectSleepRecord == true)
+        }
+
+        func recordingDirectAcknowledgment(for itemID: String, sleepChecked: Bool) -> EnqueueTransaction {
             var acknowledged = directAcknowledgedIDs
             acknowledged.insert(itemID)
-            return EnqueueTransaction(
+            var checked = Set(directSleepCheckedItemIDs ?? [])
+            if sleepChecked, directSleepCleanupIntent?.itemID != itemID { checked.insert(itemID) }
+            var updated = EnqueueTransaction(
                 version: version,
                 entries: entries,
                 cursorCheckpoint: cursorCheckpoint,
                 pendingGenerationRetirements: pendingGenerationRetirements,
                 stepsRawAndDailyCoverage: stepsRawAndDailyCoverage,
-                directAcknowledgedItemIDs: acknowledged.sorted()
+                directAcknowledgedItemIDs: acknowledged.sorted(),
+                directSleepCheckedItemIDs: checked.isEmpty ? nil : checked.sorted()
             )
+            updated.directSleepCleanupIntent = directSleepCleanupIntent
+            return updated
         }
     }
 
@@ -651,6 +706,7 @@ public final class FileOutbox {
     private static let mailboxEnvelopeIntentFilename = ".mailbox-envelope-intent"
     private let directory: URL
     private let fileManager: FileManager
+    private var decodedManifest: (bytes: Data, value: SequenceManifest)?
     var observeNutritionCodec: @Sendable () -> Void = {}
     var preparedNutritionPayloads: [String: PreparedNutritionPayload] = [:]
     var nutritionSplitFault: (NutritionSplitBoundary) throws -> Void = { _ in }
@@ -753,7 +809,7 @@ public final class FileOutbox {
             throw FileOutboxClearIntentError.clearIntentRequired
         }
         if !allowsMailboxArtifacts,
-           try downgradeReadiness(directory: directory, fileManager: fileManager) != .ready {
+           try mailboxArtifactReadiness(directory: directory, fileManager: fileManager) != .ready {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let children = try fileManager.contentsOfDirectory(
@@ -842,6 +898,7 @@ public final class FileOutbox {
             }
         }
         for batch in batches {
+            var legacyStepRecordIDs: Set<String> = []
             for sample in batch.samples {
                 guard let start = HealthBridgeUTCFormatter.date(from: sample.startTime),
                       let end = HealthBridgeUTCFormatter.date(from: sample.endTime) else {
@@ -853,8 +910,18 @@ public final class FileOutbox {
                 note(interval)
                 if tracksDaily { index[identity] = interval }
                 evidence[sample.clientRecordID] = .init(clientRecordID: sample.clientRecordID, start: start, end: end)
+                if typeCode == "steps", sample.typeCode == typeCode, sample.sourceKey == source,
+                   sample.metadata["sample_kind"] == "raw_quantity" {
+                    legacyStepRecordIDs.insert(StepCountSyncBatchFactory.legacyDailyStepRecordID(for: start))
+                }
             }
             for deletion in batch.deletedRecords where deletion.recordFamily == "sample" {
+                // Keep the paired legacy aggregate tombstone on the wire. Its raw
+                // sample already provides repair evidence; it is not a raw deletion.
+                if deletion.sourceKey == source, deletion.deletedAt == batch.generatedAt,
+                   legacyStepRecordIDs.contains(deletion.clientRecordID) {
+                    continue
+                }
                 let identity = key + "\n" + deletion.clientRecordID
                 if let previous = index[identity] {
                     note(previous)
@@ -1157,6 +1224,19 @@ public final class FileOutbox {
         try pendingItems(in: reconciledManifest())
     }
 
+    // Route this synchronous operation from one reconciled manifest.
+    func readMailboxPublicationRoute(
+        itemID: String
+    ) throws -> (state: FileOutboxDeliveryStateV1?, pendingItem: FileOutboxItem?) {
+        guard Self.isSafeItemID(itemID) else { return (nil, nil) }
+        let manifest = try reconciledManifest()
+        let state = manifest.entries.first(where: { $0.id == itemID })?.deliveryState
+        let pending = state?.phase == .published
+            ? try pendingItems(in: manifest).first(where: { $0.id == itemID })
+            : nil
+        return (state, pending)
+    }
+
     func pendingItemsForNutritionValidation() throws -> [FileOutboxItem] {
         try requireUploadAdmission()
         guard let manifest = try loadManifest() else { throw CancellationError() }
@@ -1169,10 +1249,17 @@ public final class FileOutbox {
 
     private func pendingItems(in manifest: SequenceManifest) throws -> [FileOutboxItem] {
         let payloadIDs = Set(try payloadFileURLs().map { payloadID(for: $0) })
+        let transactions = terminalResetRequestIsActive ? [] : try loadEnqueueTransactions()
+        let evidenceIDs = transactions.reduce(into: Set<String>()) { ids, transaction in
+            guard transaction.hasUncheckedDirectSleepAcknowledgment else { return }
+            ids.formUnion(transaction.uncheckedDirectAcknowledgmentIDs.filter {
+                $0 != transaction.directSleepCleanupIntent?.itemID
+            })
+        }
         return manifest.entries
             .sorted { $0.sequence < $1.sequence }
             .compactMap { entry in
-                guard payloadIDs.contains(entry.id) else { return nil }
+                guard payloadIDs.contains(entry.id), !evidenceIDs.contains(entry.id) else { return nil }
                 let fileURL = directory
                     .appendingPathComponent(entry.id)
                     .appendingPathExtension("json")
@@ -1252,6 +1339,40 @@ public final class FileOutbox {
         }
     }
 
+    func retirePlainDirectReceiptsForConnectionTransition(receiverBindingID: String?) throws -> Bool {
+        let transactions = try loadEnqueueTransactions()
+        guard transactions.contains(where: { !$0.directAcknowledgedIDs.isEmpty }) else { return true }
+        guard let receiverBindingID, !receiverBindingID.isEmpty, let manifest = try loadManifest(),
+              transactions.allSatisfy({
+                  isRetiredPlainDirectTransaction($0, in: manifest, receiverBindingID: receiverBindingID)
+              }) else { return false }
+        try requireUploadAdmission()
+        try persistEnqueueTransactions([])
+        return true
+    }
+
+    private func isRetiredPlainDirectTransaction(
+        _ transaction: EnqueueTransaction, in manifest: SequenceManifest, receiverBindingID: String
+    ) -> Bool {
+        // A checked standalone ACK can outlive its payload if journal unlink failed.
+        // Only remove receipts for the current binding and never skip another transaction.
+        guard transaction.cursorCheckpoint == nil,
+              transaction.pendingGenerationRetirements?.isEmpty != false,
+              transaction.directSleepCleanupIntent == nil,
+              transaction.entries.count == 1, let entry = transaction.entries.first,
+              entry.receiverIdentity == receiverBindingID,
+              entry.mailboxBinding == nil, entry.deliveryState == nil,
+              transaction.directAcknowledgedIDs == Set([entry.id]),
+              Set(transaction.directSleepCheckedItemIDs ?? []) == Set([entry.id]),
+              manifest.nextSequence > entry.sequence,
+              !manifest.entries.contains(where: { $0.id == entry.id }),
+              manifest.nutritionSplits?.contains(where: { $0.parentID == entry.id }) != true else {
+            return false
+        }
+        return !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
+            && !fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+    }
+
     public func acknowledgeFinalizationRecord(
         _ record: FileOutboxFinalizationRecord
     ) throws {
@@ -1266,6 +1387,9 @@ public final class FileOutbox {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
         let transaction = transactions[transactionIndex]
+        guard transaction.directSleepCleanupIntent == nil, !transaction.hasUncheckedDirectSleepAcknowledgment else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
         guard let manifest = try loadManifest() else {
             throw FileOutboxCursorCheckpointError.pendingCommit
         }
@@ -1313,39 +1437,231 @@ public final class FileOutbox {
         itemID: String,
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
+        try recordDirectUploadAcceptance(
+            itemID: itemID, receiverIdentity: receiverIdentity, onNewAcceptance: {}
+        )
+    }
+
+    func hasDirectAcknowledgmentWithSleepChecked(itemID: String, receiverIdentity: String) throws -> Bool {
+        try loadEnqueueTransactions().contains { transaction in
+            transaction.directSleepCheckedItemIDs?.contains(itemID) == true
+                && transaction.entries.contains { $0.id == itemID && $0.receiverIdentity == receiverIdentity }
+        }
+    }
+
+    func uncheckedDirectAcknowledgmentIDs(for record: FileOutboxFinalizationRecord) throws -> Set<String> {
+        guard let transaction = try loadEnqueueTransactions().first(where: {
+            $0.finalizationRecord == record
+        }) else {
+            throw FileOutboxCursorCheckpointError.checkpointMismatch
+        }
+        return transaction.uncheckedDirectAcknowledgmentIDs
+    }
+
+    func hasUncheckedDirectAcknowledgment(itemID: String, receiverBindingID: String) throws -> Bool {
+        try loadEnqueueTransactions().contains {
+            $0.uncheckedDirectAcknowledgmentIDs.contains(itemID)
+                && $0.entries.contains { $0.id == itemID && $0.receiverIdentity == receiverBindingID }
+        }
+    }
+
+    func directSleepCleanupIntent(for record: FileOutboxFinalizationRecord) throws -> DirectSleepCleanupIntent? {
+        try loadEnqueueTransactions().first { $0.finalizationRecord == record }?.directSleepCleanupIntent
+    }
+
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    func retainsSleepJournalItem(_ itemID: String) throws -> Bool {
+        if try pendingItem(id: itemID) != nil { return true }
+        // The payload can be gone while its checkpoint or observer work is still owned.
+        return try loadEnqueueTransactions().contains { $0.entries.contains { $0.id == itemID } }
+    }
+
+    func hasPendingDirectSleepCleanup() throws -> Bool {
+        try acceptedFinalizationHold()?.affectedTypeCodes.contains(HealthBridgeHealthType.sleepAnalysis.typeCode) == true
+    }
+
+    public func acceptedFinalizationHold() throws -> AcceptedFinalizationHold? {
+        try acceptedFinalizationHold(matching: nil)
+    }
+
+    func acceptedFinalizationHold(
+        matching item: (id: String, receiverBindingID: String)?
+    ) throws -> AcceptedFinalizationHold? {
+        let sleepTypes: Set<String> = [HealthBridgeHealthType.sleepAnalysis.typeCode]
+        var cleanupPending = false
+        for transaction in try loadEnqueueTransactions() {
+            let intent = transaction.directSleepCleanupIntent
+            guard transaction.hasUncheckedDirectSleepAcknowledgment else { continue }
+            if let item {
+                guard transaction.entries.allSatisfy({ $0.receiverIdentity == item.receiverBindingID }),
+                      transaction.cursorCheckpoint.map({ $0.receiverIdentity == item.receiverBindingID }) != false
+                else { continue }
+            }
+            for id in transaction.uncheckedDirectAcknowledgmentIDs where item == nil || id == item?.id {
+                // An intent proves only its own item. A missing sibling payload may
+                // still need independent proof from the domain finalizer.
+                if id != intent?.itemID,
+                   !fileManager.fileExists(atPath: finalPayloadURL(for: id).path),
+                   !fileManager.fileExists(atPath: stagedPayloadURL(for: id).path) {
+                    return AcceptedFinalizationHold(reason: .proofMissing, affectedTypeCodes: sleepTypes)
+                }
+                cleanupPending = true
+            }
+        }
+        return cleanupPending ? AcceptedFinalizationHold(reason: .cleanupPending, affectedTypeCodes: sleepTypes) : nil
+    }
+
+    func hasUncheckedDirectSleepAcknowledgment(for transition: SleepSyncPendingTransition) throws -> Bool {
+        guard let itemID = transition.outboxItemID else { return false }
+        return try hasUncheckedDirectAcknowledgment(itemID: itemID, receiverBindingID: transition.receiverBindingID)
+    }
+    #endif
+
+    func directSleepCleanupRecord(
+        receiverBindingID: String, itemID: String? = nil
+    ) throws -> FileOutboxFinalizationRecord? {
+        try requireUploadAdmission()
+        let transactions = try loadEnqueueTransactions()
+        for (index, transaction) in transactions.enumerated() {
+            guard let intent = transaction.directSleepCleanupIntent,
+                  intent.receiverBindingID == receiverBindingID,
+                  itemID == nil || intent.itemID == itemID,
+                  transaction.cursorCheckpoint.map({ $0.receiverIdentity == receiverBindingID }) != false,
+                  try canFinalizeNutritionIndependentTransaction(index, in: transactions) else { continue }
+            // The validated intent proves this item, not its unaccepted siblings.
+            return transaction.finalizationRecord
+        }
+        return nil
+    }
+
+    func hasDirectSleepCleanupIntent(itemID: String, receiverBindingID: String, receiverGeneration: String) throws -> Bool {
+        try loadEnqueueTransactions().contains {
+            guard let intent = $0.directSleepCleanupIntent else { return false }
+            return intent.itemID == itemID && intent.receiverBindingID == receiverBindingID
+                && intent.receiverGeneration == receiverGeneration
+        }
+    }
+
+    func beginDirectSleepCleanup(_ intent: DirectSleepCleanupIntent, for record: FileOutboxFinalizationRecord) throws {
+        try requireUploadAdmission()
+        var transactions = try loadEnqueueTransactions()
+        guard let index = transactions.firstIndex(where: { $0.finalizationRecord == record }),
+              transactions[index].directSleepCleanupIntent == nil,
+              transactions[index].uncheckedDirectAcknowledgmentIDs.contains(intent.itemID),
+              try canFinalizeNutritionIndependentTransaction(index, in: transactions) else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        transactions[index].directSleepCleanupIntent = intent
+        try persistEnqueueTransactions(transactions)
+    }
+
+    func recordDirectSleepAcceptance(
+        _ intent: DirectSleepCleanupIntent,
+        onNewAcceptance: () -> Void
+    ) throws -> FileOutboxFinalizationRecord {
+        try requireUploadAdmission()
+        try requireDirectRetirementAllowed(itemID: intent.itemID)
+        guard try nutritionCollectionOwner(intent.itemID) == intent.itemID,
+              let entry = try loadManifest()?.entries.first(where: { $0.id == intent.itemID }),
+              entry.receiverIdentity == intent.receiverBindingID else {
+            throw OutboxDeliveryCoordinatorError.ownershipMismatch
+        }
+        var transactions = try loadEnqueueTransactions()
+        let index: Int
+        if let existing = transactions.firstIndex(where: { $0.entries.contains(where: { $0.id == entry.id }) }) {
+            index = existing
+        } else {
+            // A manual Sleep upload may have no cursor or observer tokens. Give only
+            // this exact accepted item a transaction, with no cursor or retirements.
+            index = transactions.firstIndex(where: { $0.entries[0].sequence > entry.sequence })
+                ?? transactions.endIndex
+            transactions.insert(EnqueueTransaction(
+                version: EnqueueTransaction.currentVersion, entries: [entry], cursorCheckpoint: nil
+            ), at: index)
+        }
+        let transaction = transactions[index]
+        guard transaction.directSleepCleanupIntent == nil,
+              !transaction.directAcknowledgedIDs.contains(intent.itemID),
+              transaction.entries.allSatisfy({ $0.receiverIdentity == intent.receiverBindingID }),
+              transaction.cursorCheckpoint.map({ $0.receiverIdentity == intent.receiverBindingID }) != false else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        try acknowledgeProjectionPayload(itemID: intent.itemID, receiverBindingID: intent.receiverBindingID)
+        #endif
+        transactions[index] = transaction.recordingDirectAcknowledgment(for: intent.itemID, sleepChecked: false)
+        transactions[index].directSleepCleanupIntent = intent
+        guard let record = transactions[index].finalizationRecord else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        try persistEnqueueTransactions(transactions, onPublished: onNewAcceptance)
+        return record
+    }
+
+    func finishDirectSleepCleanup(_ intent: DirectSleepCleanupIntent, for record: FileOutboxFinalizationRecord) throws {
+        try requireUploadAdmission()
+        var transactions = try loadEnqueueTransactions()
+        guard let index = transactions.firstIndex(where: { $0.finalizationRecord == record }),
+              transactions[index].directSleepCleanupIntent == intent else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
+        transactions[index].directSleepCleanupIntent = nil
+        transactions[index] = transactions[index].recordingDirectAcknowledgment(for: intent.itemID, sleepChecked: true)
+        try persistEnqueueTransactions(transactions)
+    }
+
+    // A new durable ACK is observable even if this call later throws during cleanup.
+    func recordDirectUploadAcceptance(
+        itemID: String,
+        receiverIdentity: String,
+        sleepChecked: Bool = false,
+        onNewAcceptance: () -> Void
+    ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         guard Self.isSafeItemID(itemID), !receiverIdentity.isEmpty else {
             throw ReceiverOutboxIdentityError.missingReceiverIdentity
         }
         if try nutritionCollectionOwner(itemID) != itemID {
             try requireDirectRetirementAllowed(itemID: itemID)
-            try recordNutritionChildAcceptance(itemID: itemID, receiverIdentity: receiverIdentity)
+            try recordNutritionChildAcceptance(
+                itemID: itemID, receiverIdentity: receiverIdentity, onNewAcceptance: onNewAcceptance
+            )
             return try directFinalizationRecordReady(receiverIdentity: receiverIdentity)
         }
         var transactions = try loadEnqueueTransactions()
+        // A checked plain upload needs the same durable ACK boundary as an
+        // upload with a cursor. Its record carries no cursor or retirements.
+        if sleepChecked, !transactions.contains(where: { $0.entries.contains(where: { $0.id == itemID }) }),
+           let entry = try loadManifest()?.entries.first(where: { $0.id == itemID }) {
+            let index = transactions.firstIndex(where: { $0.entries[0].sequence > entry.sequence })
+                ?? transactions.endIndex
+            transactions.insert(EnqueueTransaction(
+                version: EnqueueTransaction.currentVersion, entries: [entry], cursorCheckpoint: nil
+            ), at: index)
+        }
         if let transactionIndex = transactions.firstIndex(where: {
-            $0.finalizationRecord != nil && $0.entries.contains(where: { $0.id == itemID })
+            (sleepChecked || $0.finalizationRecord != nil) && $0.entries.contains(where: { $0.id == itemID })
         }) {
             let transaction = transactions[transactionIndex]
-            guard let finalizationRecord = transaction.finalizationRecord else {
-                throw FileOutboxCursorCheckpointError.pendingCommit
-            }
             guard transaction.entries.allSatisfy({
                 $0.receiverIdentity == receiverIdentity
-            }), finalizationRecord.cursorCheckpoint?.receiverIdentity
-                == receiverIdentity || finalizationRecord.cursorCheckpoint == nil else {
+            }), transaction.cursorCheckpoint?.receiverIdentity
+                == receiverIdentity || transaction.cursorCheckpoint == nil else {
                 throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
             }
-            if !transaction.directAcknowledgedIDs.contains(itemID) {
+            let isNewAcceptance = !transaction.directAcknowledgedIDs.contains(itemID)
+            if isNewAcceptance {
                 try requireDirectRetirementAllowed(itemID: itemID)
             }
             #if !HEALTH_BRIDGE_MAILBOX_QA
             try acknowledgeProjectionPayload(itemID: itemID, receiverBindingID: receiverIdentity)
             #endif
-            let updated = transaction.recordingDirectAcknowledgment(for: itemID)
+            let updated = transaction.recordingDirectAcknowledgment(for: itemID, sleepChecked: sleepChecked)
             if updated != transaction {
                 transactions[transactionIndex] = updated
-                try persistEnqueueTransactions(transactions)
+                try persistEnqueueTransactions(transactions) {
+                    if isNewAcceptance { onNewAcceptance() }
+                }
             }
             let manifest = try reconciledManifest()
             guard try canFinalizeNutritionIndependentTransaction(transactionIndex, in: transactions),
@@ -1355,7 +1671,7 @@ public final class FileOutbox {
                   }) else {
                 return nil
             }
-            return finalizationRecord
+            return updated.finalizationRecord
         }
         guard let item = try pendingItem(id: itemID) else {
             // A replayed successful callback may follow durable local retirement.
@@ -1364,18 +1680,26 @@ public final class FileOutbox {
         guard item.receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        try markUploaded(item)
+        try markUploaded(item, onPayloadRemoved: onNewAcceptance)
         return nil
     }
 
     public func directFinalizationRecordReady(
         receiverIdentity: String
     ) throws -> FileOutboxFinalizationRecord? {
+        try directFinalizationRecordReady(receiverIdentity: receiverIdentity) { _, _, _ in true }
+    }
+
+    func directFinalizationRecordReady(
+        receiverIdentity: String,
+        where accepts: (FileOutboxFinalizationRecord, Set<String>, DirectSleepCleanupIntent?) -> Bool
+    ) throws -> FileOutboxFinalizationRecord? {
         try requireUploadAdmission()
         let manifest = try reconciledManifest()
         let transactions = try loadEnqueueTransactions()
         for (index, transaction) in transactions.enumerated() {
             guard let finalizationRecord = transaction.finalizationRecord,
+                  accepts(finalizationRecord, transaction.uncheckedDirectAcknowledgmentIDs, transaction.directSleepCleanupIntent),
                   transaction.entries.allSatisfy({ $0.receiverIdentity == receiverIdentity }),
                   finalizationRecord.cursorCheckpoint?.receiverIdentity
                     == receiverIdentity || finalizationRecord.cursorCheckpoint == nil,
@@ -1397,6 +1721,7 @@ public final class FileOutbox {
         guard index > 0 else { return true }
         let target = transactions[index]
         for previous in transactions.prefix(index) {
+            guard previous.directSleepCleanupIntent == nil else { return false }
             guard previous.entries.allSatisfy({
                 $0.receiverIdentity == target.entries.first?.receiverIdentity
             }) else { return false }
@@ -1434,11 +1759,26 @@ public final class FileOutbox {
         guard oldestReceiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
-        let uploadable = items.prefix { $0.receiverIdentity == receiverIdentity }.map { $0 }
+        let uploadable = try pendingItemsBeforeDirectSleepCleanup(items)
+            .prefix { $0.receiverIdentity == receiverIdentity }.map { $0 }
         for item in uploadable {
             try requireDirectRetirementAllowed(itemID: item.id)
         }
         return uploadable
+    }
+
+    func pendingItemsBeforeDirectSleepCleanup(_ items: [FileOutboxItem]) throws -> [FileOutboxItem] {
+        // Use the retained transaction's position even if an older writer already
+        // removed the accepted payload and only the cleanup intent remains.
+        guard let barrier = try loadEnqueueTransactions().lazy.compactMap({ transaction in
+            transaction.directSleepCleanupIntent.flatMap { intent in
+                transaction.entries.first { $0.id == intent.itemID }?.sequence
+            }
+        }).first else { return items }
+        let earlierIDs = Set(try loadManifest()?.entries.compactMap {
+            $0.sequence < barrier ? $0.id : nil
+        } ?? [])
+        return Array(items.prefix { earlierIDs.contains($0.id) })
     }
 
     func prepareNutritionProjection(
@@ -1497,17 +1837,21 @@ public final class FileOutbox {
         try recoverNutritionSplits()
         preparedNutritionPayloads[split.supportedID] = PreparedNutritionPayload(
             revision: try NutritionPayloadRevision(finalPayloadURL(for: split.supportedID)),
-            containsNutrition: false, permitsSupported: true, projection: nil,
+            containsNutrition: false, mayContainSleep: prepared.mayContainSleep,
+            permitsSupported: true, projection: nil,
             remainder: nil, cursors: []
         )
         preparedNutritionPayloads[split.remainderID] = PreparedNutritionPayload(
             revision: try NutritionPayloadRevision(finalPayloadURL(for: split.remainderID)),
-            containsNutrition: true, permitsSupported: prepared.permitsSupported,
+            containsNutrition: true, mayContainSleep: prepared.mayContainSleep,
+            permitsSupported: prepared.permitsSupported,
             projection: nil, remainder: nil, cursors: prepared.cursors
         )
     }
 
-    func nutritionPendingGroups(for receiverIdentity: String) throws -> [NutritionPendingGroup] {
+    func nutritionPendingGroups(
+        for receiverIdentity: String, admittedItemIDs: Set<String>?
+    ) throws -> [NutritionPendingGroup] {
         guard let manifest = try loadManifest() else { return [] }
         let splits = manifest.nutritionSplits ?? []
         guard splits.allSatisfy({
@@ -1517,8 +1861,11 @@ public final class FileOutbox {
         let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
         let children = Set(splits.flatMap { [$0.supportedID, $0.remainderID] })
         var groups: [NutritionPendingGroup] = []
-        for item in items.prefix(while: { $0.receiverIdentity == receiverIdentity }) {
+        for item in try pendingItemsBeforeDirectSleepCleanup(items).prefix(while: { $0.receiverIdentity == receiverIdentity }) {
+            // Bound selection by the logical parent; its prepared children can
+            // have later physical FIFO IDs without becoming newly admitted work.
             if children.contains(item.id) { continue }
+            if let admittedItemIDs, !admittedItemIDs.contains(item.id) { break }
             if let split = splits.first(where: { $0.parentID == item.id }) {
                 guard split.supportedAccepted || byID[split.supportedID] != nil,
                       split.remainderAccepted || byID[split.remainderID] != nil else {
@@ -1563,23 +1910,27 @@ public final class FileOutbox {
     }
 
     private func recordNutritionChildAcceptance(
-        itemID: String, receiverIdentity: String
+        itemID: String, receiverIdentity: String, onNewAcceptance: () -> Void = {}
     ) throws {
         guard var manifest = try loadManifest(),
               let index = manifest.nutritionSplits?.firstIndex(where: {
                   $0.supportedID == itemID || $0.remainderID == itemID
               }),
-              var splits = manifest.nutritionSplits else { return }
+               var splits = manifest.nutritionSplits else { return }
         guard splits[index].receiverIdentity == receiverIdentity else {
             throw ReceiverOutboxIdentityError.oldestItemBelongsToDifferentReceiver
         }
+        let alreadyAccepted: Bool
         if splits[index].supportedID == itemID {
+            alreadyAccepted = splits[index].supportedAccepted
             splits[index].supportedAccepted = true
         } else {
+            alreadyAccepted = splits[index].remainderAccepted
             splits[index].remainderAccepted = true
         }
         manifest.nutritionSplits = splits
         try persistManifest(manifest)
+        if !alreadyAccepted { onNewAcceptance() }
         try nutritionSplitFault(.acceptancePersisted)
         try recoverNutritionSplits()
     }
@@ -1671,7 +2022,14 @@ public final class FileOutbox {
     }
 
     public func markUploaded(_ item: FileOutboxItem) throws {
+        try markUploaded(item, onPayloadRemoved: {})
+    }
+
+    private func markUploaded(_ item: FileOutboxItem, onPayloadRemoved: () -> Void) throws {
         try requireDirectRetirementAllowed(itemID: item.id)
+        guard try !loadEnqueueTransactions().contains(where: { $0.directSleepCleanupIntent?.itemID == item.id }) else {
+            throw FileOutboxCursorCheckpointError.pendingCommit
+        }
         if let identity = item.receiverIdentity {
             try recordNutritionChildAcceptance(itemID: item.id, receiverIdentity: identity)
         }
@@ -1682,11 +2040,12 @@ public final class FileOutbox {
         #endif
         if fileManager.fileExists(atPath: item.fileURL.path) {
             try fileManager.removeItem(at: item.fileURL)
+            onPayloadRemoved()
         }
         _ = try reconciledManifest()
     }
 
-    private func requireDirectRetirementAllowed(itemID: String) throws {
+    func requireDirectRetirementAllowed(itemID: String) throws {
         let current = try reconciledManifest().entries.first { $0.id == itemID }
         let hasMailboxBinding = current?.mailboxBinding != nil
         let hasDeliveryState = current?.deliveryState != nil
@@ -1699,7 +2058,7 @@ public final class FileOutbox {
 
     public func beginClearIntent() throws {
         if clearIntentIsActive { return }
-        guard try downgradeReadiness() == .ready else {
+        guard try Self.mailboxArtifactReadiness(directory: directory, fileManager: fileManager) == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         try Data("clear".utf8).write(to: clearIntentURL, options: [.atomic])
@@ -1710,7 +2069,7 @@ public final class FileOutbox {
         guard clearIntentIsActive else {
             throw FileOutboxClearIntentError.clearIntentRequired
         }
-        guard try downgradeReadiness() == .ready else {
+        guard try Self.mailboxArtifactReadiness(directory: directory, fileManager: fileManager) == .ready else {
             throw FileOutboxMailboxError.mailboxArtifactsRequireHold
         }
         let payloadURLs = try payloadFileURLs()
@@ -1832,6 +2191,23 @@ public final class FileOutbox {
             .deliveryState
     }
 
+    func recoveredMailboxFinalizationIDs(
+        matching expectedOwnership: [String: OutboxDeliveryOwnershipV1]
+    ) throws -> Set<String> {
+        try requireUploadAdmission()
+        // Reconciliation must finish artifact cleanup before a tombstone is recovery proof.
+        let manifest = try reconciledManifest()
+        return Set(manifest.entries.compactMap { entry in
+            guard let expected = expectedOwnership[entry.id],
+                  entry.receiverIdentity == expected.receiverBindingID,
+                  let state = entry.deliveryState, state.phase == .committedFinalized,
+                  state.ownership == expected,
+                  let binding = entry.mailboxBinding,
+                  state.committedReceipt?.payloadSHA256 == binding.payloadSHA256 else { return nil }
+            return entry.id
+        })
+    }
+
     func compareAndSetDeliveryState(
         itemID: String,
         expected: FileOutboxDeliveryStateV1?,
@@ -1923,11 +2299,13 @@ public final class FileOutbox {
         return finalizationRecord
     }
 
+    @MainActor
     func finalizeCommittedMailboxDelivery(
         itemID: String,
         expected: FileOutboxDeliveryStateV1,
         committed: FileOutboxDeliveryStateV1,
-        fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void = { _ in }
+        fault: (FileOutboxCommittedFinalizationBoundary) throws -> Void,
+        onNewFinalization: @MainActor () -> Void
     ) throws -> FileOutboxDeliveryStateV1 {
         try requireUploadAdmission()
         guard expected.phase == .ackVerified,
@@ -1949,7 +2327,7 @@ public final class FileOutbox {
             throw FileOutboxMailboxError.deliveryTransitionConflict
         }
         manifest.entries[index].deliveryState = committed
-        try persistManifest(manifest)
+        try persistManifest(manifest) { onNewFinalization() }
         try fault(.statePersisted)
         try retireCommittedArtifacts(for: manifest.entries[index], fault: fault)
         if let identity = manifest.entries[index].receiverIdentity {
@@ -1992,6 +2370,29 @@ public final class FileOutbox {
     public static func downgradeReadiness(
         directory: URL,
         fileManager: FileManager = .default
+    ) throws -> FileOutboxDowngradeReadiness {
+        let readiness = try mailboxArtifactReadiness(directory: directory, fileManager: fileManager)
+        guard readiness == .ready else { return readiness }
+        let journalURL = directory.appendingPathComponent(enqueueTransactionFilename)
+        guard fileManager.fileExists(atPath: journalURL.path) else { return .ready }
+        let transactions = try decodeEnqueueTransactions(at: journalURL)
+        // A legacy reader could release an unchecked Sleep ACK even with a readable cursor.
+        if transactions.contains(where: { $0.directSleepCleanupIntent != nil || $0.hasUncheckedDirectSleepAcknowledgment }) {
+            return .hold(.finalizationIntent)
+        }
+        // V3 rejects ACKs without a cursor or retirement.
+        if transactions.contains(where: {
+            !$0.directAcknowledgedIDs.isEmpty && $0.cursorCheckpoint == nil
+                && $0.pendingGenerationRetirements?.isEmpty != false
+        }) {
+            return .hold(.incompatibleEnqueueJournal)
+        }
+        return .ready
+    }
+
+    private static func mailboxArtifactReadiness(
+        directory: URL,
+        fileManager: FileManager
     ) throws -> FileOutboxDowngradeReadiness {
         let manifestURL = directory.appendingPathComponent(sequenceFilename)
         if fileManager.fileExists(atPath: manifestURL.path) {
@@ -2505,7 +2906,8 @@ public final class FileOutbox {
     }
 
     private func persistEnqueueTransactions(
-        _ transactions: [EnqueueTransaction]
+        _ transactions: [EnqueueTransaction],
+        onPublished: () -> Void = {}
     ) throws {
         guard !transactions.isEmpty else {
             try removeIfExists(enqueueTransactionURL)
@@ -2522,6 +2924,7 @@ public final class FileOutbox {
             to: enqueueTransactionURL,
             options: [.atomic]
         )
+        onPublished()
         try Self.applySensitiveFileAttributes(
             to: enqueueTransactionURL,
             fileManager: fileManager
@@ -2532,19 +2935,21 @@ public final class FileOutbox {
         guard fileManager.fileExists(atPath: enqueueTransactionURL.path) else {
             return []
         }
-        let data = try Data(contentsOf: enqueueTransactionURL)
+        let transactions = try Self.decodeEnqueueTransactions(at: enqueueTransactionURL)
+        try validateEnqueueTransactions(transactions)
+        return transactions
+    }
+
+    private static func decodeEnqueueTransactions(at url: URL) throws -> [EnqueueTransaction] {
+        let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
-        let transactions: [EnqueueTransaction]
         if let journal = try? decoder.decode(EnqueueTransactionJournal.self, from: data) {
             guard journal.version == EnqueueTransactionJournal.currentVersion else {
                 throw SequenceError.invalidManifest
             }
-            transactions = journal.transactions
-        } else {
-            transactions = [try decoder.decode(EnqueueTransaction.self, from: data)]
+            return journal.transactions
         }
-        try validateEnqueueTransactions(transactions)
-        return transactions
+        return [try decoder.decode(EnqueueTransaction.self, from: data)]
     }
 
     private func validateEnqueueTransactions(
@@ -2560,11 +2965,27 @@ public final class FileOutbox {
             let entryIDs = Set(transaction.entries.map(\.id))
             let sequences = Set(transaction.entries.map(\.sequence))
             let acknowledgedIDs = transaction.directAcknowledgedIDs
+            if let intent = transaction.directSleepCleanupIntent {
+                // An intent owns one unchecked ACK, not the status of its siblings.
+                guard !intent.journalID.isEmpty, !intent.receiverBindingID.isEmpty, !intent.receiverGeneration.isEmpty,
+                      transaction.uncheckedDirectAcknowledgmentIDs.contains(intent.itemID),
+                      transaction.entries.allSatisfy({ $0.receiverIdentity == intent.receiverBindingID }),
+                      transaction.cursorCheckpoint.map({ $0.receiverIdentity == intent.receiverBindingID }) != false else {
+                    throw SequenceError.invalidManifest
+                }
+            }
+            if transaction.cursorCheckpoint == nil, transaction.pendingGenerationRetirements?.isEmpty != false,
+               !acknowledgedIDs.isEmpty {
+                guard transaction.entries.count == 1, acknowledgedIDs == entryIDs else {
+                    throw SequenceError.invalidManifest
+                }
+            }
             guard transaction.version == EnqueueTransaction.currentVersion,
                   !transaction.entries.isEmpty,
                   entryIDs.count == transaction.entries.count,
                   sequences.count == transaction.entries.count,
                   acknowledgedIDs.isSubset(of: entryIDs),
+                  Set(transaction.directSleepCheckedItemIDs ?? []).isSubset(of: acknowledgedIDs),
                   transaction.pendingGenerationRetirements?.allSatisfy({
                       !$0.key.isEmpty && $0.value > 0
                   }) != false,
@@ -2591,23 +3012,126 @@ public final class FileOutbox {
     }
 
     private func recoverEnqueueTransactionsIfNeeded() throws {
-        let transactions = try loadEnqueueTransactions()
+        var transactions = try loadEnqueueTransactions()
+        guard !transactions.isEmpty else { return }
+        let loadedManifest = try loadManifest()
+        var manifest = loadedManifest ?? .empty
+        var manifestEntries = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
+        )
+        var unreadableEvidence: Set<String> = []
+        #if !HEALTH_BRIDGE_MAILBOX_QA
+        if !destructiveRecoveryIsRequested {
+            let checked = transactions.map {
+                recoverLegacyDirectStepsChecks($0, manifestEntries: manifestEntries, unreadableEvidence: &unreadableEvidence)
+            }
+            if checked != transactions {
+                // Keep the classification durable before unlinking the only
+                // surviving evidence, including across a second restart.
+                try persistEnqueueTransactions(checked)
+                transactions = checked
+            }
+        }
+        #endif
+        var sequenceOwners = Dictionary(
+            uniqueKeysWithValues: manifest.entries.map { ($0.sequence, $0.id) }
+        )
+        var removedIDs: Set<String> = []
+        var additions: [SequenceEntry] = []
+        var retainedTransactions: [EnqueueTransaction] = []
         for transaction in transactions {
-            let loadedManifest = try loadManifest()
-            var manifest = loadedManifest ?? .empty
-            try Self.validate(manifest)
-            let manifestEntries = Dictionary(
-                uniqueKeysWithValues: manifest.entries.map { ($0.id, $0) }
-            )
+            let payloads = transaction.entries.map { entry in
+                (
+                    entry: entry,
+                    staged: fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path),
+                    final: fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
+                )
+            }
+            var acknowledgedIDs = transaction.directAcknowledgedIDs
+            if let cleanupItemID = transaction.directSleepCleanupIntent?.itemID,
+               payloads.contains(where: { $0.entry.id == cleanupItemID && ($0.final || $0.staged) }) {
+                // This ACK prevents further sends, but its payload still owns the
+                // FIFO position until the scoped journal cleanup completes.
+                acknowledgedIDs.remove(cleanupItemID)
+            }
+            let isApplied = !destructiveRecoveryIsRequested
+                && payloads.allSatisfy { payload in
+                    let entry = payload.entry
+                    guard manifest.nextSequence > entry.sequence, !payload.staged else {
+                        return false
+                    }
+                    if acknowledgedIDs.contains(entry.id) {
+                        return manifestEntries[entry.id] == nil && !payload.final
+                    }
+                    guard let current = manifestEntries[entry.id],
+                          Self.hasSameCollectionIdentity(current, entry) else {
+                        return false
+                    }
+                    return payload.final || current.deliveryState?.phase == .committedFinalized
+                }
+            if isApplied {
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
+                continue
+            }
             let allPayloadsAreRecoverable = !clearIntentIsActive
-                && transaction.entries.allSatisfy { entry in
-                    transaction.directAcknowledgedIDs.contains(entry.id)
-                        || fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path)
-                        || fileManager.fileExists(atPath: finalPayloadURL(for: entry.id).path)
-                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized
+                && payloads.allSatisfy { payload in
+                    acknowledgedIDs.contains(payload.entry.id)
+                        || payload.staged || payload.final
+                        || manifestEntries[payload.entry.id]?.deliveryState?.phase == .committedFinalized
                 }
             if allPayloadsAreRecoverable {
-                _ = try commitEnqueueTransaction(transaction, manifest: manifest)
+                let additionsStart = additions.endIndex
+                for payload in payloads {
+                    let entry = payload.entry
+                    guard entry.sequence < UInt64.max else { throw SequenceError.exhausted }
+                    manifest.nextSequence = max(manifest.nextSequence, entry.sequence + 1)
+                    let stagedURL = stagedPayloadURL(for: entry.id)
+                    let finalURL = finalPayloadURL(for: entry.id)
+                    if acknowledgedIDs.contains(entry.id) {
+                        if unreadableEvidence.contains(entry.id) { continue }
+                        try removeIfExists(stagedURL)
+                        try removeIfExists(finalURL)
+                        if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                            sequenceOwners.removeValue(forKey: removed.sequence)
+                            removedIDs.insert(entry.id)
+                        }
+                        continue
+                    }
+                    if payload.staged {
+                        try Self.applySensitiveFileAttributes(to: stagedURL, fileManager: fileManager)
+                        if payload.final {
+                            try fileManager.removeItem(at: stagedURL)
+                        } else {
+                            try fileManager.moveItem(at: stagedURL, to: finalURL)
+                        }
+                    }
+                    let hasFinalPayload = fileManager.fileExists(atPath: finalURL.path)
+                    guard hasFinalPayload
+                        || manifestEntries[entry.id]?.deliveryState?.phase == .committedFinalized else {
+                        throw SequenceError.invalidManifest
+                    }
+                    if hasFinalPayload {
+                        try Self.applySensitiveFileAttributes(to: finalURL, fileManager: fileManager)
+                    }
+                    if manifestEntries[entry.id] == nil {
+                        guard entry.sequence > 0, Self.isSafeItemID(entry.id) else {
+                            throw SequenceError.invalidManifest
+                        }
+                        manifestEntries[entry.id] = entry
+                        additions.append(entry)
+                    }
+                }
+                for entry in additions[additionsStart...] {
+                    guard sequenceOwners[entry.sequence] == nil else {
+                        throw SequenceError.invalidManifest
+                    }
+                    sequenceOwners[entry.sequence] = entry.id
+                }
+                if transaction.finalizationRecord != nil {
+                    retainedTransactions.append(transaction)
+                }
                 continue
             }
             if !transaction.directAcknowledgedIDs.isEmpty
@@ -2617,18 +3141,75 @@ public final class FileOutbox {
                 throw FileOutboxCursorCheckpointError.pendingCommit
             }
 
-            let transactionIDs = Set(transaction.entries.map(\.id))
             for entry in transaction.entries {
                 try removeIfExists(stagedPayloadURL(for: entry.id))
                 try removeIfExists(finalPayloadURL(for: entry.id))
+                if let removed = manifestEntries.removeValue(forKey: entry.id) {
+                    sequenceOwners.removeValue(forKey: removed.sequence)
+                    removedIDs.insert(entry.id)
+                }
             }
-            manifest.entries.removeAll { transactionIDs.contains($0.id) }
-            if manifest != loadedManifest {
-                try persistManifest(manifest)
-            }
-            try removeEnqueueTransaction(transaction)
+        }
+        manifest.entries.removeAll { removedIDs.contains($0.id) }
+        manifest.entries.append(contentsOf: additions)
+        if manifest != loadedManifest {
+            try persistManifest(manifest)
+        }
+        // Journal pruning must follow the manifest durability boundary, including
+        // when a later transaction fails after earlier payloads have moved.
+        if retainedTransactions != transactions {
+            try persistEnqueueTransactions(retainedTransactions)
         }
     }
+
+    #if !HEALTH_BRIDGE_MAILBOX_QA
+    private func recoverLegacyDirectStepsChecks(
+        _ transaction: EnqueueTransaction, manifestEntries: [String: SequenceEntry], unreadableEvidence: inout Set<String>
+    ) -> EnqueueTransaction {
+        let unchecked = transaction.uncheckedDirectAcknowledgmentIDs
+        guard !unchecked.isEmpty, transaction.finalizationRecord?.isDirectSleepRecord == true else {
+            return transaction
+        }
+        var checked = transaction
+        for entry in transaction.entries where unchecked.contains(entry.id) {
+            guard transaction.directSleepCleanupIntent?.itemID != entry.id,
+                  let binding = entry.receiverIdentity, !binding.isEmpty,
+                  transaction.entries.allSatisfy({ $0.receiverIdentity == binding }),
+                  transaction.cursorCheckpoint.map({ $0.receiverIdentity == binding }) != false,
+                  let current = manifestEntries[entry.id], Self.hasSameCollectionIdentity(current, entry),
+                  current.mailboxBinding == nil, entry.mailboxBinding == nil,
+                  current.deliveryState == nil, entry.deliveryState == nil,
+                  !fileManager.fileExists(atPath: stagedPayloadURL(for: entry.id).path) else { continue }
+            do {
+                if try legacyPayloadIsStepsOnly(finalPayloadURL(for: entry.id)) {
+                    checked = checked.recordingDirectAcknowledgment(for: entry.id, sleepChecked: true)
+                }
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                continue
+            } catch {
+                unreadableEvidence.insert(entry.id)
+            }
+        }
+        return checked
+    }
+
+    private func legacyPayloadIsStepsOnly(_ url: URL) throws -> Bool {
+        let file = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard let regular = file.isRegularFile, let symlink = file.isSymbolicLink else { throw CocoaError(.fileReadUnknown) }
+        guard regular, !symlink else { return false }
+        let bytes = try Data(contentsOf: url)
+        guard let batch = try? JSONDecoder().decode(HealthBridgeBatchV1.self, from: bytes),
+              batch.schemaID == "health_bridge.batch.v1", batch.schemaVersion == "1.0.0",
+              batch.healthTypes == [.steps], batch.workouts.isEmpty, batch.sleepSessions.isEmpty,
+              batch.samples.allSatisfy({ $0.typeCode == HealthBridgeHealthType.steps.typeCode }),
+              batch.deletedRecords.allSatisfy({ $0.recordFamily == "sample" }),
+              !batch.sync.cursors.isEmpty else { return false }
+        return batch.sync.cursors.allSatisfy {
+            $0.cursorKind == StepCountSyncBatchFactory.anchoredCursorKind
+                || $0.cursorKind == StepCountSyncBatchFactory.foregroundDailyCursorKind
+        }
+    }
+    #endif
 
     private func removeIfExists(_ fileURL: URL) throws {
         guard fileManager.fileExists(atPath: fileURL.path) else { return }
@@ -2636,6 +3217,10 @@ public final class FileOutbox {
     }
 
     private func reconciledManifest() throws -> SequenceManifest {
+        // Hold all recovery, including orphan adoption, until terminal reset proceeds.
+        if terminalResetRequestIsActive {
+            return try loadManifest() ?? .empty
+        }
         try recoverNutritionSplits()
         try recoverEnqueueTransactionsIfNeeded()
         let loadedManifest = try loadManifest()
@@ -2725,21 +3310,31 @@ public final class FileOutbox {
 
     private func loadManifest() throws -> SequenceManifest? {
         guard fileManager.fileExists(atPath: sequenceURL.path) else { return nil }
-        let manifest = try JSONDecoder().decode(
-            SequenceManifest.self,
-            from: Data(contentsOf: sequenceURL)
-        )
+        let bytes = try Data(contentsOf: sequenceURL)
+        let manifest: SequenceManifest
+        if let decodedManifest, decodedManifest.bytes == bytes {
+            manifest = decodedManifest.value
+        } else {
+            manifest = try JSONDecoder().decode(SequenceManifest.self, from: bytes)
+        }
         try Self.validate(manifest)
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
         return manifest
     }
 
-    private func persistManifest(_ manifest: SequenceManifest) throws {
+    private func persistManifest(
+        _ manifest: SequenceManifest, onAtomicWrite: () -> Void = {}
+    ) throws {
         try Self.validate(manifest)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(manifest).write(to: sequenceURL, options: [.atomic])
+        let bytes = try encoder.encode(manifest)
+        try bytes.write(to: sequenceURL, options: [.atomic])
+        // The replacement is visible on disk even if hardening the new file fails.
+        onAtomicWrite()
         try Self.applySensitiveFileAttributes(to: sequenceURL, fileManager: fileManager)
+        decodedManifest = (bytes, manifest)
     }
 
     private static func validate(_ manifest: SequenceManifest) throws {
@@ -3069,6 +3664,14 @@ public struct SleepSyncPendingTransition: Codable, Equatable, Sendable {
         self.connectionGeneration = connectionGeneration
         self.outboxItemID = outboxItemID
         self.rejectedMinimumResetEpoch = rejectedMinimumResetEpoch
+    }
+
+    public func hasFinalizedMailboxProof(_ state: FileOutboxDeliveryStateV1?) -> Bool {
+        guard let state else { return false }
+        return state.phase == .committedFinalized
+            && state.ownership?.receiverGeneration == connectionGeneration
+            && state.ownership?.receiverBindingID == receiverBindingID
+            && state.ownership?.resetEpoch == manifest.baselineResetEpoch
     }
 
     public func assigningOutboxItemID(_ outboxItemID: String) -> SleepSyncPendingTransition {
@@ -4639,8 +5242,11 @@ public final class ReceiverSettingsStore {
     }
 
     @discardableResult
-    public func invalidateReceiverSettingsGeneration() throws -> String {
+    public func invalidateReceiverSettingsGeneration(expectedGeneration: String? = nil) throws -> String {
         let current = try authoritativeRecordForMutation()
+        guard expectedGeneration == nil || expectedGeneration == "g\(current.localScope.generation)" else {
+            throw ReceiverSettingsGenerationError.staleGeneration
+        }
         let record = ReceiverConnectionRecordV2(
             localScope: ReceiverLocalConnectionScopeV1(
                 generation: try Self.nextGeneration(after: current.localScope.generation),
